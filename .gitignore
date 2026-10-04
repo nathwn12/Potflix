@@ -1,0 +1,14 @@
+# build outputs / caches
+build/
+dist/discord_game_sdk.dll
+dist/*.log
+tools/titles-sample*.txt
+tools/batch-*.txt
+tools/*.orig
+
+# local / secrets-ish
+client-id.txt
+
+# os
+Thumbs.db
+desktop.ini
