@@ -103,27 +103,20 @@ public class Main {
                     Thread.sleep(160);
                     continue;
                 }
-                String t = null;
-                PlayStatus ps = null;
-                long ct = -1;
-                long lastPush = 0;
+                // One anchor is held for the whole play session; it is re-anchored only
+                // on a real seek (per-poll ct jump > SEEK_JUMP_MS) or a title/state
+                // change. Paused sends exactly one frozen update, then stays silent.
+                PresenceTracker tracker = new PresenceTracker();
                 while (User32.INSTANCE.IsWindow(player.getWindow().getHwnd())) {
                     String tmp = WindowUtils.getWindowTitle(player.getWindow().getHwnd());
                     if (!tmp.endsWith(end) && !tmp.equals(appName)) break;
                     PlayStatus tmpps = player.getPlayStatus();
                     long tmpct = player.getCurrentTime();
                     long now = System.currentTimeMillis();
-                    boolean fresh = t == null || !t.equals(tmp) || tmpps != ps;
-                    // Discord interpolates the timer in realtime from ONE anchor.
-                    // Re-anchoring every second made it jump ahead then snap back,
-                    // so push only on real change: title, play/pause, or a seek.
-                    boolean seeked = tmpps == PlayStatus.Running && ps == PlayStatus.Running
-                            && ct >= 0 && Math.abs(tmpct - ct) > 1600;
-                    if (fresh || seeked) {
-                        t = tmp;
-                        ps = tmpps;
-                        ct = tmpct;
-                        pushActivity(core, player, t, end, ps, ct);
+                    PresenceAction action = tracker.poll(tmp, tmpps, tmpct, now);
+                    if (action != null) {
+                        dlog("decision ms=" + now + " st=" + tmpps + " ct=" + tmpct + " title=[" + tmp + "] action=" + describe(action));
+                        pushActivity(core, player, tmp, end, action);
                     }
                     core.runCallbacks();
                     Thread.sleep(250);
@@ -143,7 +136,7 @@ public class Main {
         }
     }
 
-    static void pushActivity(Core core, PotPlayer player, String rawTitle, String end, PlayStatus ps, long ct) {
+    static void pushActivity(Core core, PotPlayer player, String rawTitle, String end, PresenceAction a) {
         String raw = rawTitle;
         if (raw.endsWith(end)) raw = raw.substring(0, raw.lastIndexOf(end));
         if (raw.trim().isEmpty() || raw.equals("PotPlayer")) {
@@ -175,28 +168,152 @@ public class Main {
             }
             context = trunc(context, 120);
             // Headless rows already carry the episode tag in details.
-            activity.setState(context.equals(details) ? "" : context);
             // Netflix-native: text carries title+episode only; elapsed+remaining
             // come from Discord native timers (start+end), never duplicated.
-            if (ps == PlayStatus.Running) {
-                Instant start = Instant.now().minusMillis(ct);
-                activity.timestamps().setStart(start);
+            // Paused carries no timer at all, so its frozen position rides the text.
+            activity.setState(withStateTime(context.equals(details) ? "" : context, a.stateSuffix));
+            if (a.hasStart) {
+                activity.timestamps().setStart(Instant.ofEpochMilli(a.start));
                 activity.assets().setSmallImage("play");
-                activity.assets().setSmallText("");
-            } else if (ps == PlayStatus.Paused) {
+            } else if (a.paused) {
                 activity.assets().setSmallImage("pause");
-                activity.assets().setSmallText("");
             } else {
                 activity.assets().setSmallImage("stop");
-                activity.assets().setSmallText("");
             }
+            activity.assets().setSmallText("");
             core.activityManager().updateActivity(activity);
-            dlog("push details=[" + activity.getDetails() + "] state=[" + activity.getState() + "] ct=" + ct + " total=" + total);
+            dlog("push details=[" + activity.getDetails() + "] state=[" + activity.getState() + "] ct=" + a.ct + " total=" + total);
         }
-        String st = ps == PlayStatus.Running ? "Playing" : ps == PlayStatus.Paused ? "Paused" : "Stopped";
+        String st = a.paused ? "Paused" : a.running ? "Playing" : "Stopped";
         setUi(cleaned.display, st,
-                (ps == PlayStatus.Running || ps == PlayStatus.Paused) ? fmt(ct) + " / " + fmt(total) : "",
-                (int) Math.min(ct, Integer.MAX_VALUE), (int) Math.max(total, 1));
+                (a.running || a.paused) ? fmt(a.ct) + " / " + fmt(total) : "",
+                (int) Math.min(a.ct, Integer.MAX_VALUE), (int) Math.max(total, 1));
+    }
+
+    // ---------- presence timing/state logic (pure: no Discord, unit-testable) ----------
+
+    /** Per-poll ct jump above this is a real seek; normal playback advance is far smaller. */
+    public static final long SEEK_JUMP_MS = 1500;
+
+    /** ct advance across the window that proves the position is really moving (settles a flapping status read). */
+    public static final long SETTLE_MOVE_MS = 50;
+
+    /** ct samples kept to prove real movement; a single coarse delta is not enough (reviewer F2). */
+    private static final int MOVE_WINDOW = 3;
+
+    /** One decision from {@link PresenceTracker}: whether/how to update Discord. */
+    public static final class PresenceAction {
+        public final boolean running;
+        public final boolean paused;
+        public final boolean hasStart;
+        public final long start;          // epoch millis, meaningful when hasStart
+        public final String stateSuffix;  // "" or " - MM:SS" (paused only)
+        public final long ct;
+        PresenceAction(boolean running, boolean paused, boolean hasStart, long start, String stateSuffix, long ct) {
+            this.running = running;
+            this.paused = paused;
+            this.hasStart = hasStart;
+            this.start = start;
+            this.stateSuffix = stateSuffix;
+            this.ct = ct;
+        }
+    }
+
+    /** Compact one-line rendering of a poll decision for the debug log (null when nothing was sent). */
+    static String describe(PresenceAction a) {
+        if (a == null) return "null";
+        String tag = a.running ? "RUN" : a.paused ? "PAUSE" : "STOP";
+        return tag + " running=" + a.running
+                + " paused=" + a.paused
+                + " hasStart=" + a.hasStart
+                + " start=" + a.start
+                + " suf=" + a.stateSuffix
+                + " ct=" + a.ct;
+    }
+
+    /**
+     * Discord interpolates its timer from ONE anchor. Re-anchoring on every poll made
+     * the timer jump ahead then snap back, so the anchor is held and re-taken only when
+     * a valid ct jumps by more than SEEK_JUMP_MS (a real seek) or the title/play state
+     * changes. A not-ready read (ct<=0) is ignored, so it neither erases the seek
+     * baseline (F1) nor anchors zero; movement is proven across a short window because
+     * ct ticks are coarse (F2); Undefined carries no information and changes nothing.
+     * Paused holds a frozen position in text (" - MM:SS") and emits nothing further
+     * until a title change or a paused seek.
+     */
+    public static final class PresenceTracker {
+        private String lastTitle;
+        private PlayStatus lastStatus;
+        private long prevCt = -1;         // last VALID ct (used only as the seek baseline)
+        private long frozenCt = -1;       // position held in the paused text
+        private boolean havePrev;
+        private final long[] ctWindow = new long[MOVE_WINDOW];
+        private int ctWindowLen = 0;
+        private int ctWindowIdx = 0;
+
+        private void sampleCt(long ct) {
+            ctWindow[ctWindowIdx] = ct;
+            ctWindowIdx = (ctWindowIdx + 1) % MOVE_WINDOW;
+            if (ctWindowLen < MOVE_WINDOW) ctWindowLen++;
+        }
+        private long oldestCt() {
+            long m = Long.MAX_VALUE;
+            for (int i = 0; i < ctWindowLen; i++) if (ctWindow[i] < m) m = ctWindow[i];
+            return m;
+        }
+
+        public PresenceAction poll(String rawTitle, PlayStatus ps, long ct, long now) {
+            // New media: forget everything.
+            if (havePrev && !Objects.equals(lastTitle, rawTitle)) {
+                havePrev = false; lastStatus = null; frozenCt = -1; prevCt = -1;
+                ctWindowLen = 0; ctWindowIdx = 0;
+            }
+            // A not-ready read (ct<=0) must NOT overwrite the seek baseline, or a later
+            // real jump can never be seen again (reviewer F1).
+            boolean ctOk = ct > 0;
+            long prevCtBefore = prevCt;
+            if (ctOk) { sampleCt(ct); prevCt = ct; }
+            // ct ticks are coarse (~500 ms), so one poll delta is not enough proof of
+            // movement; require progress across a short window (reviewer F2).
+            boolean moving = ctOk && ctWindowLen >= 2 && (ct - oldestCt()) >= SETTLE_MOVE_MS;
+
+            // Undefined carries no information: never emit or change state on it.
+            if (ps == PlayStatus.Undefined) { havePrev = true; return null; }
+
+            // A non-Running report while the position is still moving, having settled into
+            // Running, is a transient glitch: the player is really playing.
+            PlayStatus eff = ps;
+            if (ps != PlayStatus.Running && moving && lastStatus == PlayStatus.Running) eff = PlayStatus.Running;
+
+            boolean changed = !havePrev || eff != lastStatus;
+            boolean seeked = !changed && eff == PlayStatus.Running && lastStatus == PlayStatus.Running
+                    && havePrev && ctOk && Math.abs(ct - prevCtBefore) > SEEK_JUMP_MS;
+            boolean pausedSeek = !changed && eff == PlayStatus.Paused && lastStatus == PlayStatus.Paused
+                    && frozenCt >= 0 && ctOk && Math.abs(ct - frozenCt) > SEEK_JUMP_MS;
+
+            PresenceAction action = null;
+            if (eff == PlayStatus.Running) {
+                if ((changed || seeked) && ctOk) action = new PresenceAction(true, false, true, now - ct, "", ct);
+            } else if (eff == PlayStatus.Paused) {
+                if ((changed || pausedSeek) && ctOk) {
+                    action = new PresenceAction(false, true, false, 0, " - " + fmt(ct), ct);
+                    frozenCt = ct;
+                }
+            } else if (changed) {
+                action = new PresenceAction(false, false, false, 0, "", ct);
+            }
+
+            if (action != null) { lastTitle = rawTitle; lastStatus = eff; }
+            havePrev = true;
+            return action;
+        }
+    }
+
+    /** Compose the activity state line: context plus an optional frozen " - MM:SS". */
+    public static String withStateTime(String context, String suffix) {
+        if (suffix == null || suffix.isEmpty()) return context == null ? "" : context;
+        if (context == null || context.isEmpty()) return suffix.replaceFirst("^\\s*-\\s*", "");
+        return trunc(context + suffix, 128);
     }
 
     // ---------- title cleaner: raw filename -> Netflix-style display ----------

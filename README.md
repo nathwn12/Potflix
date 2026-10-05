@@ -39,12 +39,17 @@ No Gradle needed — `javac` against the upstream fat jar:
 powershell -ExecutionPolicy Bypass -File tools\build.ps1
 ```
 
-Outputs `dist\Potflix.jar`. Title-cleaner playground:
+Outputs `dist\Potflix.jar`. Plain-JVM tests (no Discord, no PotPlayer) live in
+`tools\` and run against `build\classes`:
 
 ```powershell
 cd tools
+# cleaner playground
 javac -cp "$env:TEMP\pot-rpc\PotPlayer-DiscordRPC.jar;..\build\classes" -d ..\build\classes TestClean.java
 java -cp "..\build\classes;$env:TEMP\pot-rpc\PotPlayer-DiscordRPC.jar" TestClean
+# presence timing/state logic (elapsed-timer fix)
+javac -cp "$env:TEMP\pot-rpc\PotPlayer-DiscordRPC.jar;..\build\classes" -d ..\build\classes TestPresence.java
+java -cp "..\build\classes;$env:TEMP\pot-rpc\PotPlayer-DiscordRPC.jar" TestPresence
 ```
 
 Upstream: https://github.com/ayunami2000/PotPlayer-DiscordRPC (MIT-style? check LICENSE before publishing).
