@@ -12,3 +12,4 @@ client-id.txt
 # os
 Thumbs.db
 desktop.ini
+dist/
