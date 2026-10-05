@@ -166,13 +166,16 @@ public class Main {
             activity.setType(ActivityType.PLAYING);
             activity.assets().setLargeImage("logo");
             activity.assets().setLargeText("");
-            activity.setDetails(trunc(cleaned.title, 120));
+            String details = trunc(cleaned.title, 120);
+            activity.setDetails(details);
             String context = "";
             if (!cleaned.episodeTag.isEmpty()) {
                 context = cleaned.episodeTag
                         + (cleaned.episodeName.isEmpty() ? "" : " \"" + trunc(cleaned.episodeName, 60) + "\"");
             }
-            activity.setState(trunc(context, 120));
+            context = trunc(context, 120);
+            // Headless rows already carry the episode tag in details.
+            activity.setState(context.equals(details) ? "" : context);
             // Netflix-native: text carries title+episode only; elapsed+remaining
             // come from Discord native timers (start+end), never duplicated.
             if (ps == PlayStatus.Running) {
@@ -330,8 +333,11 @@ public class Main {
         }
         String core = got ? stripTags(head) : stripTags(s);
         String epName = (got && rest != null) ? stripTags(rest) : "";
-        // single leftover tokens are release-group junk, not episode names
-        if (!epName.contains(" ")) epName = "";
+        // Uppercase release groups can remain even without codec/source hints.
+        epName = epName.replaceAll("\\s*-\\s*[A-Z0-9]{2,}$", "").trim();
+        // Drop observed release metadata, not legitimate single-word episode titles.
+        // Numeric tails are episode/version fragments; '+' can survive HDR10+ stripping.
+        if (epName.matches("(?i)(?:WEB|DS4K|OVA|v\\d+|\\d+|\\+)")) epName = "";
         if (got && core.isEmpty()) {
             out.episodeTag = epTag;
             if (!epName.isEmpty()) { // P12: use the episode name as the head
