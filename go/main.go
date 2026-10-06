@@ -139,6 +139,14 @@ func pollLoop(log *logger, dc *discord.Client) {
 	cleared := true
 	lastGen := int64(-1)
 	var tracker *presence.Tracker
+	var gate *presence.Gate
+
+	// A fresh segment (new window, or a reconnect that starts a new Discord
+	// session) gets a fresh tracker and gate: the next poll re-emits the card.
+	reset := func() {
+		tracker = &presence.Tracker{}
+		gate = &presence.Gate{}
+	}
 
 	// A reconnect starts a fresh Discord session: reset the tracker so the next
 	// poll re-emits the current card (contract section 4, "first poll after
@@ -146,7 +154,7 @@ func pollLoop(log *logger, dc *discord.Client) {
 	freshSession := func() {
 		if gen := dc.Generation(); gen != lastGen {
 			lastGen = gen
-			tracker = &presence.Tracker{}
+			reset()
 		}
 	}
 
@@ -173,7 +181,7 @@ func pollLoop(log *logger, dc *discord.Client) {
 		// Java makes one PresenceTracker per outer iteration (Main.java:109), so
 		// a window that disappears and returns starts a fresh segment rather
 		// than inheriting the previous segment's last-seen state.
-		tracker = &presence.Tracker{}
+		reset()
 
 		// Track this window until it dies or stops looking like PotPlayer.
 		for player.Alive(hwnd) {
@@ -186,10 +194,20 @@ func pollLoop(log *logger, dc *discord.Client) {
 			ct := player.GetCurrentTime(hwnd)
 			total := player.GetTotalTime(hwnd)
 			now := time.Now().UnixMilli()
-			if a := tracker.Poll(title, st, ct, now); a != nil {
+			a := tracker.Poll(title, st, ct, now)
+			if a != nil {
 				log.eventDecision(now, st.String(), ct, title, a.Tag(),
 					a.Running, a.Paused, a.HasStart, a.Start, a.Suffix)
-				pushActivity(log, dc, title, a, ct, total)
+			}
+			// The tracker yields only on change/seek (or its trailing edge); the
+			// gate is consulted EVERY poll with the current card so it can
+			// re-anchor on divergence, fire the heartbeat, and log the verdict.
+			cur := a
+			if cur == nil {
+				cur = tracker.Current()
+			}
+			if cur != nil {
+				pushActivity(log, dc, gate, title, cur, ct, total, now, a != nil, tracker.PendingDebounce())
 			}
 			time.Sleep(pollInterval)
 		}
@@ -201,19 +219,26 @@ func pollLoop(log *logger, dc *discord.Client) {
 	}
 }
 
-// pushActivity logs the contract's `push ...` line and sends the card. A failed
-// send is not fatal - the client's supervisor reconnects and a later decision
-// resends - but it is never silent: the transport error is logged, and Discord's
-// own reply (ack or ERROR) is logged by the client's OnReply handler.
-func pushActivity(log *logger, dc *discord.Client, rawTitle string, a *presence.Action, ct, total int64) {
-	act := presence.BuildActivity(rawTitle, a)
-	log.eventPush(act.Details, act.State, ct, total)
+// pushActivity builds the card, asks the gate whether it must go out, logs the
+// attempt (the observation boundary), and sends only when the gate says so. A
+// failed send is not fatal - the client's supervisor reconnects and a later
+// decision resends - but it is never silent: the transport error is logged, and
+// Discord's own reply (ack or ERROR) is logged by the client's OnReply handler.
+func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle string, a *presence.Action, ct, total, now int64, event, debounced bool) {
+	card := presence.BuildActivity(rawTitle, a)
+	out, verdict := gate.Decide(card, ct, total, now, event, debounced)
+	log.eventPushAttempt(out, verdict)
+	if !verdict.Send {
+		return
+	}
+	log.eventPush(out.Details, out.State, ct, total)
 	if err := dc.SetActivity(discord.Activity{
-		Details:    act.Details,
-		State:      act.State,
-		SmallImage: act.SmallImage,
-		HasStart:   act.HasStart,
-		Start:      act.Start,
+		Details:    out.Details,
+		State:      out.State,
+		SmallImage: out.SmallImage,
+		HasStart:   out.HasStart,
+		Start:      out.Start,
+		End:        out.End,
 	}); err != nil {
 		log.eventSendError(err)
 	}

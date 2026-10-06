@@ -1,6 +1,7 @@
 package discord
 
 import (
+	"encoding/json"
 	"os"
 	"strconv"
 	"sync/atomic"
@@ -19,8 +20,11 @@ import (
 //	                               "small_image":...,"small_text":""}}},
 //	 "nonce":"<unique>"}
 //
-// A clear is the same command with "activity":null. Deliberately NOT set:
-// timestamps.end, party, secrets, instance, buttons, application_id/name.
+// A clear is the same command with "activity":null. timestamps.end IS set while
+// running when the duration is known (README deviation 5; the Java reference
+// left it absent), so Discord extrapolates between pushes and every push
+// self-corrects. Deliberately NOT set: party, secrets, instance, buttons,
+// application_id/name.
 //
 // Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
 // whose assets carry a present-but-empty large_text/small_text (code 4000:
@@ -36,6 +40,7 @@ type Activity struct {
 	SmallImage string // "play" running, "pause" paused, "stop" idle/stopped
 	HasStart   bool
 	Start      int64 // epoch ms, set only while running
+	End        int64 // epoch ms, set while running when the duration is known; 0 omits it
 }
 
 // activityPayload is the wire activity object. Every empty string field is
@@ -48,9 +53,12 @@ type activityPayload struct {
 	Assets     activityAsst `json:"assets"`
 }
 
-// timestamps is the only timestamp field the contract sets.
+// timestamps carries the elapsed anchor and (README deviation 5) the projected
+// end, so Discord extrapolates between pushes and every push self-corrects.
+// end is omitted when the duration is unknown.
 type timestamps struct {
 	Start int64 `json:"start"`
+	End   int64 `json:"end,omitempty"`
 }
 
 // activityAsst mirrors the contract's asset field names exactly; empty text is
@@ -90,9 +98,23 @@ func newActivity(a Activity) *activityPayload {
 		},
 	}
 	if a.HasStart {
-		p.Timestamps = &timestamps{Start: a.Start}
+		ts := &timestamps{Start: a.Start}
+		if a.End > 0 {
+			ts.End = a.End
+		}
+		p.Timestamps = ts
 	}
 	return p
+}
+
+// WireJSON renders the exact activity object SetActivity puts on the wire, for
+// the push-attempt log line (the observation boundary).
+func WireJSON(a Activity) string {
+	b, err := json.Marshal(newActivity(a))
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }
 
 // pid is os.Getpid, isolated so tests can reason about the one dynamic field.

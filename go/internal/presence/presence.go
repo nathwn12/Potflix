@@ -14,7 +14,9 @@ import (
 // Ported from me.potflix.rpc.Main (PresenceTracker.poll :265-309,
 // withStateTime :313-317, pushActivity :139-191, fmt :501-508), with one
 // deliberate deviation from the fleet decisions (see Tracker and the README):
-// repeated RUN pushes within ~1 s are debounced unless the title changed.
+// repeated RUN pushes within ~1 s are debounced unless the title changed. The
+// debounce is trailing-edge: the suppressed anchor is HELD and emitted when the
+// window expires, so a seek is never dropped forever.
 
 // Timing constants, exactly as Java (:196-202).
 const (
@@ -69,10 +71,19 @@ type Tracker struct {
 	ctWindowLen int
 	ctWindowIdx int
 
-	// Fleet decision 10 (deviation): RUN debounce anchor.
+	// Fleet decision 10 (deviation, revised): RUN debounce anchor. A repeated
+	// RUN push inside the window is HELD (pendingRun), not dropped, and emitted
+	// on the first poll after the window expires (trailing edge).
 	hasRunPush       bool
 	lastRunPushAt    int64
 	lastRunPushTitle string
+	pendingRun       bool
+	pendingTitle     string
+
+	// lastAction is the most recent emitted action. Current() exposes it so the
+	// send gate can rebuild the card on every poll, including polls where the
+	// tracker emits nothing.
+	lastAction *Action
 }
 
 func (t *Tracker) sampleCt(ct int64) {
@@ -107,6 +118,8 @@ func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Ac
 		t.prevCt = -1
 		t.ctWindowLen = 0
 		t.ctWindowIdx = 0
+		t.pendingRun = false
+		t.lastAction = nil
 	}
 
 	// A not-ready read (ct<=0) must NOT overwrite the seek baseline (:273-275).
@@ -156,17 +169,39 @@ func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Ac
 		}
 	}
 
-	// Fleet decision 10: debounce repeated RUN pushes (seek bursts) within ~1 s
-	// unless the title changed. A `changed` RUN push is a real state/title
-	// transition and always emits.
-	if action != nil && action.Running {
-		if !changed && t.hasRunPush && (now-t.lastRunPushAt) < RunDebounceMS && rawTitle == t.lastRunPushTitle {
-			action = nil
+	// Fleet decision 10 (revised): debounce repeated RUN pushes (seek bursts)
+	// within ~1 s unless the title changed, but HOLD the suppressed anchor
+	// instead of dropping it. The old drop-then-forget behaviour lost the seek
+	// re-anchor forever: the per-poll delta never re-fires, so the card kept the
+	// pre-seek anchor. A `changed` RUN push is a real state/title transition and
+	// always emits.
+	if action != nil {
+		if action.Running {
+			if !changed && t.hasRunPush && (now-t.lastRunPushAt) < RunDebounceMS && rawTitle == t.lastRunPushTitle {
+				t.pendingRun = true
+				t.pendingTitle = rawTitle
+				action = nil
+			} else {
+				t.hasRunPush = true
+				t.lastRunPushAt = now
+				t.lastRunPushTitle = rawTitle
+				t.pendingRun = false
+			}
 		} else {
-			t.hasRunPush = true
-			t.lastRunPushAt = now
-			t.lastRunPushTitle = rawTitle
+			// Any non-RUN emit supersedes a held seek.
+			t.pendingRun = false
 		}
+	}
+
+	// Trailing edge: once the window has expired the held seek lands with a fresh
+	// anchor (start = now - ct), so the last seek of a scrub is never lost.
+	if action == nil && t.pendingRun && ctOk && eff == player.StatusRunning &&
+		rawTitle == t.pendingTitle && (now-t.lastRunPushAt) >= RunDebounceMS {
+		action = &Action{Running: true, HasStart: true, Start: now - ct, CT: ct}
+		t.hasRunPush = true
+		t.lastRunPushAt = now
+		t.lastRunPushTitle = rawTitle
+		t.pendingRun = false
 	}
 
 	// On emit only, remember title/status; havePrev is always set (:306-308).
@@ -174,10 +209,26 @@ func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Ac
 		t.lastTitle = rawTitle
 		t.lastStatus = eff
 		t.hasLastStatus = true
+		t.lastAction = action
 	}
 	t.havePrev = true
 	return action
 }
+
+// Current returns the most recent emitted action, or nil before any emit. The
+// send gate uses it to rebuild the card on every poll, including polls where the
+// tracker emits nothing.
+func (t *Tracker) Current() *Action {
+	if t.lastAction == nil {
+		return nil
+	}
+	c := *t.lastAction
+	return &c
+}
+
+// PendingDebounce reports whether a RUN push was suppressed by the trailing-edge
+// debounce and is waiting for the window to expire.
+func (t *Tracker) PendingDebounce() bool { return t.pendingRun }
 
 func abs64(v int64) int64 {
 	if v < 0 {
@@ -225,6 +276,9 @@ type Activity struct {
 	SmallText  string
 	HasStart   bool
 	Start      int64
+	// End is the projected end (epoch ms), set by the send gate while running
+	// and the duration is known; 0 omits timestamps.end (README deviation 5).
+	End int64
 }
 
 // BuildActivity composes the payload for one action from the raw window title

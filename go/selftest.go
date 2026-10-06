@@ -269,13 +269,25 @@ func runSelfTest(log *logger) {
 	}
 	ok("presence: WithStateTime and Fmt ok")
 
-	// (10) fleet decision 10: a repeated RUN seek within ~1 s is debounced.
+	// (10) fleet decision 10 (revised): a repeated RUN seek within ~1 s is held
+	// (trailing edge) and lands once the window expires, so the last seek of a
+	// scrub is never lost.
 	dtr := &presence.Tracker{}
 	dtr.Poll("D - PotPlayer", player.StatusRunning, 1000, 0)
-	if a := dtr.Poll("D - PotPlayer", player.StatusRunning, 5000, 200); a != nil {
-		fail("debounce: seek within 1 s should be suppressed, got %+v", a)
+	if held := dtr.Poll("D - PotPlayer", player.StatusRunning, 5000, 200); held != nil {
+		fail("debounce: seek within 1 s should be held, got %+v", held)
 	}
-	ok("presence: RUN debounce suppressed a repeat within 1 s")
+	if !dtr.PendingDebounce() {
+		fail("debounce: held seek should report PendingDebounce")
+	}
+	da := dtr.Poll("D - PotPlayer", player.StatusRunning, 5000, 1200)
+	if da == nil || !da.Running {
+		fail("debounce: held seek should land after the window, got %v", da)
+	}
+	if da.Start != 1200-5000 {
+		fail("debounce: trailing anchor start=%d, want %d", da.Start, 1200-5000)
+	}
+	ok("presence: RUN debounce holds a repeat within 1 s and lands it after the window")
 
 	// (11) live PotPlayer window: report, never fail, when absent.
 	if hwnd, found := player.FindFirst(); found {
@@ -527,6 +539,28 @@ func runSelfTest(log *logger) {
 	}
 	ok("m3: reconnect handshake ok, generation %d -> %d", genBefore, genAfter)
 	log.logf("selftest: m3 reconnect ok generation=%d->%d", genBefore, genAfter)
+
+	// (13) push-attempt recorder positive control: force one gate decision
+	// through the real event writer, then read the line back from the log. A
+	// silent log proves nothing until a known event is recorded.
+	pg := &presence.Gate{}
+	pcard := presence.BuildActivity("Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+		&presence.Action{Running: true, HasStart: true, Start: 1000, CT: 1000})
+	pg.ForceNext()
+	pout, pv := pg.Decide(pcard, 1000, 60000, 900000, false, false)
+	if !pv.Send {
+		m3fail("positive control: forced Decide returned %s, want sent", pv)
+	}
+	log.eventPushAttempt(pout, pv)
+	logData, lerr := os.ReadFile(log.path)
+	if lerr != nil {
+		m3fail("positive control: read %s: %v", log.path, lerr)
+	}
+	if !strings.Contains(string(logData), "push attempt gate=sent") {
+		m3fail("positive control: forced push-attempt line missing from %s", log.path)
+	}
+	ok("push-attempt recorder: forced push logged (gate=sent) and read back from %s", log.path)
+	log.logf("selftest: positive control push attempt recorded")
 
 	fmt.Fprintln(out, "M3 LAYER SELFTEST PASS")
 	fmt.Fprintln(out, "M2 LAYER SELFTEST PASS")

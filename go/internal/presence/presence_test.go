@@ -185,20 +185,35 @@ func TestTransitionMatrix(t *testing.T) {
 }
 
 func TestRunDebounce(t *testing.T) {
-	// A seek inside the ~1 s window, same title, is suppressed.
+	// A seek inside the ~1 s window, same title, is HELD (trailing edge) and
+	// lands when the window expires - it is no longer dropped forever, which is
+	// what froze the card on a stale anchor.
 	const x = "X - PotPlayer"
 	tr := &Tracker{}
 	if a := tr.Poll(x, player.StatusRunning, 1000, 0); a == nil || !a.Running {
 		t.Fatalf("first RUN should emit, got %v", a)
 	}
 	if a := tr.Poll(x, player.StatusRunning, 5000, 200); a != nil {
-		t.Fatalf("seek within 1s same title should be debounced, got %+v", a)
+		t.Fatalf("seek within 1s same title should be held, got %+v", a)
+	}
+	if !tr.PendingDebounce() {
+		t.Fatalf("held seek should report PendingDebounce")
 	}
 	if a := tr.Poll(x, player.StatusRunning, 5000, 900); a != nil {
-		t.Fatalf("no new seek should emit nothing, got %+v", a)
+		t.Fatalf("seek still inside the window should be held, got %+v", a)
 	}
+	// The window expires: the held seek lands with a fresh anchor.
+	if a := tr.Poll(x, player.StatusRunning, 5200, 1001); a == nil || !a.Running {
+		t.Fatalf("held seek should land after the window, got %v", a)
+	} else if a.Start != 1001-5200 {
+		t.Fatalf("trailing-edge anchor start=%d, want %d", a.Start, 1001-5200)
+	}
+	if tr.PendingDebounce() {
+		t.Fatalf("pending flag should clear after the held seek lands")
+	}
+
 	// A title change bypasses the debounce even inside the window.
-	if a := tr.Poll("Y - PotPlayer", player.StatusRunning, 500, 950); a == nil || !a.Running {
+	if a := tr.Poll("Y - PotPlayer", player.StatusRunning, 500, 1050); a == nil || !a.Running {
 		t.Fatalf("title change should bypass debounce, got %v", a)
 	}
 
@@ -207,7 +222,7 @@ func TestRunDebounce(t *testing.T) {
 	tr2 := &Tracker{}
 	tr2.Poll(z, player.StatusRunning, 1000, 0)
 	if a := tr2.Poll(z, player.StatusRunning, 3000, 999); a != nil {
-		t.Fatalf("seek at +999ms should be debounced, got %+v", a)
+		t.Fatalf("seek at +999ms should be held, got %+v", a)
 	}
 	if a := tr2.Poll(z, player.StatusRunning, 5000, 1200); a == nil || !a.Running {
 		t.Fatalf("seek after the window should emit, got %v", a)

@@ -1,5 +1,12 @@
 package main
 
+import (
+	"strconv"
+
+	"potflix/internal/discord"
+	"potflix/internal/presence"
+)
+
 // events.go - the exact event strings the port contract lists (section 7).
 // These are the later modules' log lines; M1 defines them so M2/M3 reuse one
 // place. The presence/decision string is listed verbatim, including the
@@ -39,6 +46,34 @@ func (l *logger) eventSendError(err error) {
 
 func (l *logger) eventPush(details, state string, ct, total int64) {
 	l.logf("push details=[%s] state=[%s] ct=%d total=%d", details, state, ct, total)
+}
+
+// eventPushAttempt is the observation boundary for the push: one line per poll
+// that has a card, carrying the exact activity that would go on the wire (the
+// verbatim payload, including timestamps.start/end or "none") and the gate
+// verdict. Suppressed polls are logged too - a silent log hid the swallowed
+// seek re-anchor, which is why that defect was invisible.
+func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
+	start, end := "none", "none"
+	if a.HasStart {
+		start = strconv.FormatInt(a.Start, 10)
+		if a.End > 0 {
+			end = strconv.FormatInt(a.End, 10)
+		}
+	}
+	payload := discord.WireJSON(discord.Activity{
+		Details:    a.Details,
+		State:      a.State,
+		SmallImage: a.SmallImage,
+		HasStart:   a.HasStart,
+		Start:      a.Start,
+		End:        a.End,
+	})
+	if v.Send {
+		l.logf("push attempt gate=sent start=%s end=%s payload=%s", start, end, payload)
+	} else {
+		l.logf("push attempt gate=suppressed reason=%s start=%s end=%s payload=%s", v.Reason, start, end, payload)
+	}
 }
 
 func (l *logger) eventDecision(ms int64, st string, ct int64, title, action string, running, paused, hasStart bool, start int64, suf string) {
