@@ -400,7 +400,7 @@ func runSelfTest(log *logger) {
 
 	// (12b) SET_ACTIVITY: command envelope + activity object + assets + timer.
 	if err := client.SetActivity(discord.Activity{
-		Details: "Show", State: `S1 E2 "Pilot"`, SmallImage: "play", HasStart: true, Start: 12345,
+		Details: "Show", State: `S1 E2 "Pilot"`, SmallImage: "play", HasStart: true, Start: 12345, End: 67890,
 	}); err != nil {
 		m3fail("SetActivity: %v", err)
 	}
@@ -422,6 +422,7 @@ func runSelfTest(log *logger) {
 				State      string `json:"state"`
 				Timestamps *struct {
 					Start int64 `json:"start"`
+					End   int64 `json:"end"`
 				} `json:"timestamps"`
 				Assets map[string]any `json:"assets"`
 			} `json:"activity"`
@@ -443,11 +444,11 @@ func runSelfTest(log *logger) {
 	if a == nil {
 		m3fail("activity null, want an object")
 	}
-	if a.Type != 0 || a.Details != "Show" || a.State != `S1 E2 "Pilot"` {
+	if a.Type != 3 || a.Details != "Show" || a.State != `S1 E2 "Pilot"` {
 		m3fail("activity = %+v", a)
 	}
-	if a.Timestamps == nil || a.Timestamps.Start != 12345 {
-		m3fail("timestamps = %+v, want start=12345", a.Timestamps)
+	if a.Timestamps == nil || a.Timestamps.Start != 12345 || a.Timestamps.End != 67890 {
+		m3fail("timestamps = %+v, want start=12345 end=67890", a.Timestamps)
 	}
 	// Empty asset text is omitted on the wire (Discord rejects empty
 	// large_text/small_text with code 4000).
@@ -460,7 +461,7 @@ func runSelfTest(log *logger) {
 	if _, ok := a.Assets["small_text"]; ok {
 		m3fail("small_text present while empty, want omitted: %v", a.Assets)
 	}
-	ok("m3: SET_ACTIVITY pid=%d details=%q small_image=%q start=%d", setCmd.Args.PID, a.Details, a.Assets["small_image"], a.Timestamps.Start)
+	ok("m3: SET_ACTIVITY pid=%d details=%q small_image=%q start=%d end=%d", setCmd.Args.PID, a.Details, a.Assets["small_image"], a.Timestamps.Start, a.Timestamps.End)
 	log.logf("selftest: m3 set_activity ok")
 
 	// (12c) null clear: SET_ACTIVITY with "activity":null.

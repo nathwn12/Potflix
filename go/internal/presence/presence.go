@@ -39,7 +39,7 @@ type Action struct {
 	Paused   bool
 	HasStart bool
 	Start    int64  // epoch ms, meaningful when HasStart
-	Suffix   string // "" or " - MM:SS" (paused only)
+	Suffix   string // legacy position suffix; no longer populated (the paused card uses a "Paused" marker)
 	CT       int64
 }
 
@@ -168,7 +168,10 @@ func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Ac
 		}
 	case eff == player.StatusPaused:
 		if (changed || pausedSeek) && ctOk {
-			action = &Action{Paused: true, Suffix: " - " + Fmt(ct), CT: ct}
+			// No position suffix any more: the paused card carries a "Paused"
+			// marker and counts the pause duration UP from timestamps.start
+			// (set by the send gate), so there is no frozen " - 00:00" artifact.
+			action = &Action{Paused: true, CT: ct}
 			t.frozenCt = ct
 		}
 	default: // Stopped
@@ -257,11 +260,20 @@ func Fmt(ms int64) string {
 	return fmt.Sprintf("%d:%02d:%02d", h, m, s)
 }
 
+// pausedMarker is the paused card's state suffix: episode context plus this
+// reads e.g. `S1 E2 "Pilot" - Paused` (or just `Paused` with no context).
+const pausedMarker = " - Paused"
+
 // leadingDashRe is Java's `^\s*-\s*` with Java's \s class.
 var leadingDashRe = regexp.MustCompile(`^[ \t\n\x0B\f\r]*-[ \t\n\x0B\f\r]*`)
 
-// WithStateTime mirrors Main.withStateTime (:313-317): context plus the paused
-// " - MM:SS" suffix; a leading dash is stripped when there is no context.
+// WithStateTime mirrors Main.withStateTime (:313-317): context plus a suffix; a
+// leading dash is stripped when there is no context. Used for the paused card's
+// "Paused" marker (pausedMarker). Deviation from the Java reference: the Java
+// code truncates context+suffix together, which let the 128-unit cap eat the
+// tail of the marker (a 120-unit context + the 9-unit " - Paused" rendered
+// "... - Paus..."). Here the context is budgeted to limit - len(suffix) first, so
+// the suffix always survives whole and the result stays within the limit.
 func WithStateTime(context, suffix string) string {
 	if suffix == "" {
 		return context
@@ -269,7 +281,7 @@ func WithStateTime(context, suffix string) string {
 	if context == "" {
 		return leadingDashRe.ReplaceAllString(suffix, "")
 	}
-	return titleclean.Trunc(context+suffix, 128)
+	return titleclean.Trunc(context, 128-len(suffix)) + suffix
 }
 
 // Activity is the Discord payload (contract section 5). Type is always
@@ -285,9 +297,8 @@ type Activity struct {
 	HasStart   bool
 	Start      int64
 	// End is the projected end (epoch ms), set by the send gate while running
-	// and the duration is known. It is retained for the gate's bookkeeping but
-	// deliberately NOT serialized (README deviation 5, corrected): the client
-	// would render a countdown from it.
+	// and the duration is known. Serialized as timestamps.end while playing so
+	// Discord renders the remaining-time bar; zero (and omitted) while paused.
 	End int64
 }
 
@@ -326,10 +337,17 @@ func BuildActivity(rawTitle string, a *Action) Activity {
 		context = ""
 	}
 
+	// Paused: the state is the episode context plus a "Paused" marker, not a
+	// frozen position. The pause duration is the count-UP timer anchored by the
+	// gate (timestamps.start = the pause moment).
+	state := context
+	if a.Paused {
+		state = WithStateTime(context, pausedMarker)
+	}
 	act := Activity{
 		Type:       "PLAYING",
 		Details:    details,
-		State:      WithStateTime(context, a.Suffix),
+		State:      state,
 		LargeImage: "logo",
 		SmallText:  "",
 	}

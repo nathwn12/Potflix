@@ -17,9 +17,10 @@ import (
 // the in-process fake pipe. It drives the REAL tracker, the REAL gate and the
 // REAL pushActivity over a scripted position sequence, and asserts the exact
 // sequence of SET_ACTIVITY frames that would go to Discord: playing cards carry
-// timestamps.start and never end, a pause clears the activity (activity:null)
-// with no paused card, and a suppressed poll produces no frame at all. No live
-// Discord and no real PotPlayer window are touched.
+// timestamps.start AND the projected end, a pause sends one parked paused card
+// (start only, no end) and never clears the activity, and a suppressed poll
+// produces no frame at all. No live Discord and no real PotPlayer window are
+// touched.
 
 const itTitle = "Breaking Bad (2008) - S04E07 - Problem Dog (1080p BluRay x265 Silence).mkv - PotPlayer"
 
@@ -142,7 +143,7 @@ func TestGateFakePipeSequence(t *testing.T) {
 	drive(R, 15000, itN+2000) // 8 seek after window -> tracker event sent
 	drive(R, 15250, itN+2250) // 9 steady
 	drive(P, 15250, itN+2500) // 10 flap -> still running
-	drive(P, 15250, itN+2750) // 11 real pause -> clear (activity:null), no card
+	drive(P, 15250, itN+2750) // 11 real pause -> parked paused card (no clear)
 	drive(P, 15250, itN+3000) // 12 paused steady
 	drive(R, 15250, itN+3250) // 13 resume -> sent
 	// 14+ : 120 smooth 250 ms polls = 30 s with no tracker event; only the
@@ -201,19 +202,29 @@ drain:
 		start2 = itN - 7500
 		start3 = itN - 13000
 		start4 = itN - 12000
+		// The paused card anchors timestamps.start at the pause moment (now) and
+		// carries no end.
+		pauseStart = itN + 2750
+		// Playing cards carry start + end = now + (total - pos).
+		end0 = itN + (itTotal - 1000)
+		end1 = itN + 1000 + (itTotal - 2800)
+		end2 = itN + 1500 + (itTotal - 9000)
+		end3 = itN + 2000 + (itTotal - 15000)
+		end5 = itN + 3250 + (itTotal - 15250)
+		end6 = itN + 33250 + (itTotal - 45250)
 	)
 	want := []itSent{
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start0}, // first
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start1}, // trailing edge
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start2}, // divergence
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start3}, // seek event
-		{clear: true}, // pause -> activity:null, NO paused card
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4}, // resume
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start0, hasEnd: true, end: end0}, // first
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start1, hasEnd: true, end: end1}, // trailing edge
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start2, hasEnd: true, end: end2}, // divergence
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start3, hasEnd: true, end: end3}, // seek event
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog" - Paused`, hasStart: true, start: pauseStart},             // pause -> parked card, no end, no clear
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4, hasEnd: true, end: end5}, // resume
 		// The 30 s heartbeat re-pushes the same card: at 1x the anchor is
 		// unchanged, so the payload is byte-identical to the resume - that is
 		// exactly the self-healing re-push.
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4}, // heartbeat
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4}, // positive control (forced)
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4, hasEnd: true, end: end6}, // heartbeat
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4, hasEnd: true, end: end6}, // positive control (forced)
 	}
 
 	if len(got) != len(want) {
@@ -227,20 +238,31 @@ drain:
 		}
 	}
 
-	// R1: NO frame may carry timestamps.end (the client would render a
-	// countdown from it).
+	// R1: playing frames carry BOTH timestamps.start and timestamps.end (the
+	// time bar); the paused frame carries start only, never end.
 	for i, s := range got {
-		if s.hasEnd {
-			t.Errorf("frame %d carries end=%d, want no end: %s", i, s.end, raws[i])
+		if i == 4 {
+			if s.hasEnd {
+				t.Errorf("paused frame %d carries end=%d, want none: %s", i, s.end, raws[i])
+			}
+			continue
+		}
+		if !s.hasStart || !s.hasEnd {
+			t.Errorf("playing frame %d hasStart=%t hasEnd=%t, want both: %s", i, s.hasStart, s.hasEnd, raws[i])
 		}
 	}
-	// R2: the pause frame is a null activity and NO paused card is sent.
-	if !got[4].clear {
-		t.Fatalf("frame 4 = %+v, want the pause clear (activity:null)", got[4])
+	// R2: the pause frame is a parked paused card, and NO frame is a null clear.
+	if got[4].clear || got[4].state != `S4 E7 "Problem Dog" - Paused` {
+		t.Fatalf("frame 4 = %+v, want the parked paused card (no clear)", got[4])
+	}
+	for i, s := range got {
+		if s.clear {
+			t.Errorf("frame %d is an activity:null clear, want a card", i)
+		}
 	}
 	for i, raw := range raws {
 		if strings.Contains(raw, "00:15") {
-			t.Errorf("frame %d looks like a paused card: %s", i, raw)
+			t.Errorf("frame %d looks like a frozen-position paused card: %s", i, raw)
 		}
 	}
 	// Resume re-anchors to the live position within the poll: now - start == ct.
@@ -270,11 +292,11 @@ drain:
 	}
 	logText := string(logData)
 	const totalPolls = 14 + 120 + 1 // + the forced positive-control push
-	if n := strings.Count(logText, "gate=sent"); n != len(want)-1 {
-		t.Errorf("log gate=sent lines = %d, want %d (the pause is a clear)", n, len(want)-1)
+	if n := strings.Count(logText, "gate=sent"); n != len(want) {
+		t.Errorf("log gate=sent lines = %d, want %d (every frame, the parked pause included)", n, len(want))
 	}
-	if n := strings.Count(logText, "gate=clear"); n != 1 {
-		t.Errorf("log gate=clear lines = %d, want 1", n)
+	if n := strings.Count(logText, "gate=clear"); n != 0 {
+		t.Errorf("log gate=clear lines = %d, want 0 (pause parks a card, it never clears)", n)
 	}
 	if n := strings.Count(logText, "gate=suppressed"); n != totalPolls-len(want) {
 		t.Errorf("log gate=suppressed lines = %d, want %d", n, totalPolls-len(want))
@@ -288,6 +310,50 @@ drain:
 	if !strings.Contains(logText, "reason=paused") {
 		t.Errorf("log is missing a suppressed reason=paused line")
 	}
-	t.Logf("observation boundary: %d polls, %d cards sent, 1 clear, %d suppressed (reasons logged)",
-		totalPolls, len(want)-1, totalPolls-len(want))
+	// F1: the logged payload (the observation boundary) must agree with the
+	// frame that actually went on the wire, timestamps.end included. The log
+	// line carries the activity object without the cmd/args envelope, so parse
+	// it directly and compare each sent line to its frame.
+	type logActivity struct {
+		Timestamps *struct {
+			Start *int64 `json:"start"`
+			End   *int64 `json:"end"`
+		} `json:"timestamps"`
+	}
+	type logEnd struct {
+		has bool
+		val int64
+	}
+	var loggedEnds []logEnd
+	for _, line := range strings.Split(logText, "\n") {
+		if !strings.Contains(line, "gate=sent") {
+			continue
+		}
+		at := strings.Index(line, "payload=")
+		if at < 0 {
+			t.Fatalf("sent line has no payload=: %s", line)
+		}
+		var la logActivity
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line[at+len("payload="):])), &la); err != nil {
+			t.Fatalf("decode logged payload %q: %v", line, err)
+		}
+		var le logEnd
+		if la.Timestamps != nil && la.Timestamps.End != nil {
+			le.has = true
+			le.val = *la.Timestamps.End
+		}
+		loggedEnds = append(loggedEnds, le)
+	}
+	if len(loggedEnds) != len(got) {
+		t.Fatalf("logged sent payloads = %d, want %d (one per frame)", len(loggedEnds), len(got))
+	}
+	for i := range got {
+		if loggedEnds[i].has != got[i].hasEnd || (got[i].hasEnd && loggedEnds[i].val != got[i].end) {
+			t.Errorf("frame %d: logged end=%+v, wire end has=%t val=%d (logged payload must match the wire)",
+				i, loggedEnds[i], got[i].hasEnd, got[i].end)
+		}
+	}
+	t.Logf("push-attempt payloads agree with the wire on timestamps.end (%d frames)", len(got))
+	t.Logf("observation boundary: %d polls, %d cards sent, 0 clears, %d suppressed (reasons logged)",
+		totalPolls, len(want), totalPolls-len(want))
 }

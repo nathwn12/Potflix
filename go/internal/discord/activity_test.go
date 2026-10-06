@@ -82,8 +82,8 @@ func TestSetActivityPayload(t *testing.T) {
 
 	a := asMap(t, args["activity"], "activity")
 	wantKeys(t, "activity", a, "type", "details", "state", "timestamps", "assets")
-	if a["type"].(float64) != 0 {
-		t.Fatalf("type = %v, want 0 (PLAYING)", a["type"])
+	if a["type"].(float64) != 3 {
+		t.Fatalf("type = %v, want 3 (WATCHING)", a["type"])
 	}
 	if a["details"] != "Show" {
 		t.Fatalf("details = %v, want Show", a["details"])
@@ -163,10 +163,11 @@ func TestSetActivityNoTimer(t *testing.T) {
 	}
 }
 
-func TestSetActivityStartOnlyNoEnd(t *testing.T) {
-	// README deviation 5 (corrected): a playing card carries timestamps.start
-	// ONLY. timestamps.end would make the client render a countdown, so even a
-	// caller-supplied End is never serialized.
+func TestSetActivityPlayingCarriesStartAndEnd(t *testing.T) {
+	// While playing the payload carries BOTH timestamps.start and
+	// timestamps.end (the remaining-time math is computed by the send gate:
+	// end = now + (total - pos)), so Discord renders the time bar against the
+	// real media position.
 	c, sc, _ := connectPair(t, 0, Config{})
 	defer sc.Close()
 
@@ -177,15 +178,46 @@ func TestSetActivityStartOnlyNoEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read activity frame: %v", err)
 	}
+	top := decodeFrame(t, payload)
+	a := asMap(t, asMap(t, top["args"], "args")["activity"], "activity")
+	if a["type"].(float64) != 3 {
+		t.Fatalf("type = %v, want 3 (WATCHING)", a["type"])
+	}
+	ts := asMap(t, a["timestamps"], "timestamps")
+	wantKeys(t, "timestamps", ts, "start", "end")
+	if ts["start"].(float64) != 111 {
+		t.Fatalf("timestamps.start = %v, want 111", ts["start"])
+	}
+	if ts["end"].(float64) != 222 {
+		t.Fatalf("timestamps.end = %v, want 222", ts["end"])
+	}
+}
+
+func TestSetActivityPausedStartOnlyNoEnd(t *testing.T) {
+	// A paused card carries timestamps.start anchored at the pause moment and NO
+	// timestamps.end, so the client counts the pause UP ("paused for M:SS").
+	c, sc, _ := connectPair(t, 0, Config{})
+	defer sc.Close()
+
+	if err := c.SetActivity(Activity{Details: "Show", State: `S1 E2 "Pilot" - Paused`, SmallImage: "pause", HasStart: true, Start: 5000}); err != nil {
+		t.Fatalf("SetActivity: %v", err)
+	}
+	_, payload, err := sc.ReadFrame()
+	if err != nil {
+		t.Fatalf("read activity frame: %v", err)
+	}
 	if strings.Contains(string(payload), `"end"`) {
-		t.Fatalf("playing payload carries end: %s", payload)
+		t.Fatalf("paused payload carries end: %s", payload)
 	}
 	top := decodeFrame(t, payload)
 	a := asMap(t, asMap(t, top["args"], "args")["activity"], "activity")
+	if a["type"].(float64) != 3 {
+		t.Fatalf("type = %v, want 3 (WATCHING)", a["type"])
+	}
 	ts := asMap(t, a["timestamps"], "timestamps")
 	wantKeys(t, "timestamps", ts, "start")
-	if ts["start"].(float64) != 111 {
-		t.Fatalf("timestamps.start = %v, want 111", ts["start"])
+	if ts["start"].(float64) != 5000 {
+		t.Fatalf("timestamps.start = %v, want 5000", ts["start"])
 	}
 }
 

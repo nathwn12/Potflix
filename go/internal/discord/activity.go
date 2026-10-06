@@ -14,20 +14,21 @@ import (
 //
 //	{"cmd":"SET_ACTIVITY",
 //	 "args":{"pid":<os.Getpid()>,
-//	         "activity":{"type":0,"details":...,"state":...,
-//	                     "timestamps":{"start":...},
+//	         "activity":{"type":3,"details":...,"state":...,
+//	                     "timestamps":{"start":...,"end":...},
 //	                     "assets":{"large_image":"logo","large_text":"",
 //	                               "small_image":...,"small_text":""}}},
 //	 "nonce":"<unique>"}
 //
-// A clear is the same command with "activity":null. Only timestamps.start goes
-// on the wire while running: the Discord client renders a COUNTDOWN from
-// timestamps.end (README deviation 5, corrected), and the owner requires a
-// count-UP elapsed timer matching PotPlayer's left-hand number, so end is
-// deliberately omitted even when the send gate knows the projected end. The
-// Java reference left it absent too, which is what the port contract's section 5
-// specifies. Deliberately NOT set: party, secrets, instance, buttons,
-// application_id/name.
+// A clear is the same command with "activity":null. The activity type is
+// Watching (3), not the Java reference's Playing (0): Discord documents the
+// activity time bar as requiring Listening (2) or Watching (3), and "Watching
+// <title>" fits a video player. While playing the payload carries BOTH
+// timestamps.start and (when the duration is known) timestamps.end, so the
+// client renders the time bar against the real media position. While paused it
+// carries timestamps.start only, anchored at the pause moment, so the client
+// counts the pause UP ("paused for M:SS"). Deliberately NOT set: party, secrets,
+// instance, buttons, application_id/name.
 //
 // Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
 // whose assets carry a present-but-empty large_text/small_text (code 4000:
@@ -42,9 +43,15 @@ type Activity struct {
 	State      string
 	SmallImage string // "play" running, "pause" paused, "stop" idle/stopped
 	HasStart   bool
-	Start      int64 // epoch ms, set only while running
-	End        int64 // epoch ms, projected end from the gate; deliberately not serialized (deviation 5)
+	Start      int64 // epoch ms, set while running and paused
+	End        int64 // epoch ms, projected end from the gate; serialized while playing (deviation)
 }
+
+// activityTypeWatching is Discord's ActivityType "Watching" (3). The Java
+// reference hardcoded 0 (Playing). Discord documents the activity time bar as
+// requiring Listening (2) or Watching (3); Watching fits a video player and
+// renders "Watching <title>". Deliberate, user-visible deviation (see README).
+const activityTypeWatching = 3
 
 // activityPayload is the wire activity object. Every empty string field is
 // omitted (`omitempty`) so Discord never sees `"large_text":""`.
@@ -56,11 +63,9 @@ type activityPayload struct {
 	Assets     activityAsst `json:"assets"`
 }
 
-// timestamps carries the elapsed anchor. Only Start is ever put on the wire: a
-// playing card carries start and never end (README deviation 5, corrected),
-// because the client renders a COUNTDOWN from end while the owner requires a
-// count-up elapsed timer. A paused card is never sent at all - the presence is
-// cleared (see gate.go) - so this object is absent while paused.
+// timestamps carries the elapsed anchor and, while playing, the projected end.
+// A playing card carries start + end (the time bar); a paused card carries start
+// only, anchored at the pause moment, so the client counts the pause UP.
 type timestamps struct {
 	Start int64 `json:"start,omitempty"`
 	End   int64 `json:"end,omitempty"`
@@ -88,11 +93,11 @@ type command struct {
 	Nonce string          `json:"nonce"`
 }
 
-// newActivity maps one card to the wire payload. type is always 0 (PLAYING);
+// newActivity maps one card to the wire payload. type is Watching (3);
 // large_image is always "logo" with an empty large_text/small_text.
 func newActivity(a Activity) *activityPayload {
 	p := &activityPayload{
-		Type:    0,
+		Type:    activityTypeWatching,
 		Details: a.Details,
 		State:   a.State,
 		Assets: activityAsst{
@@ -103,11 +108,15 @@ func newActivity(a Activity) *activityPayload {
 		},
 	}
 	if a.HasStart {
-		// Playing: start ONLY. end is deliberately not sent (README deviation 5,
-		// corrected): the client renders a countdown from it, and the owner
-		// requires a count-up elapsed timer. This is the single place the
-		// timestamp pair is decided, so re-enabling is one line here.
-		p.Timestamps = &timestamps{Start: a.Start}
+		// Playing: start + end (when the duration is known) so the client renders
+		// the time bar. Paused: start only (a.End == 0) so the client counts the
+		// pause UP from the pause moment. This is the single place the timestamp
+		// pair is decided.
+		ts := &timestamps{Start: a.Start}
+		if a.End > 0 {
+			ts.End = a.End
+		}
+		p.Timestamps = ts
 	}
 	return p
 }

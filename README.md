@@ -77,45 +77,40 @@ Recorded deliberately; each is a behaviour change, not a parity claim.
   (logging `send error: discord: not ready` before it), logs
   `connected clientId=<redacted>` on `READY`, and logs `push ack timeout` if a
   command is still unanswered after 2 s rather than assuming it was sent.
-- **`timestamps.end` is deliberately omitted; only `start` is sent (deviation 5,
-  corrected).** The original deviation 5 sent `start` and, when the duration was
-  known, `end = now + (total - pos)`. That was wrong: the Discord client renders
-  a COUNTDOWN from `timestamps.end` (documented in the Social SDK
-  `ActivityTimestamps::End` - "the Discord client will render a countdown timer
-  showing how long until the activity ends" - and confirmed by
-  `discord-api-docs` PR #8431: "as long as `end` is set the timer displays the
-  remaining time"), so the card showed the time REMAINING instead of elapsed.
-  The owner observed it directly: the card read `11:50` while PotPlayer showed
-  `00:35:22 / 00:47:12`, and `47:12 - 35:22 = 11:50`. The Go port now sends
-  `timestamps.start` only, so the client counts UP from it - which is what the
-  port contract's section 5 already specified (`timestamps.end` absent) and what
-  the Java reference did. The send gate still computes the projected end for its
-  own bookkeeping (`internal/presence/gate.go`), but it is never serialized; the
-  wire decision lives in one place (`internal/discord/activity.go`,
-  `newActivity`). The drift-avoiding machinery is unchanged: the tracker's seek
-  debounce is trailing-edge (a suppressed seek is held and lands when the window
-  expires), the gate re-anchors at once when the live position diverges from the
-  last-sent anchor by more than 2 s (throttled to one per 5 s), and a 30 s
-  heartbeat re-pushes a steady card. Not rate-limit mitigation: the tracker
-  emits 0/min while steady, the heartbeat adds 2/min, and a scrub is ~9/min.
-- **While paused the presence is cleared, so there is no timer at all.** The
-  owner requires no timer while paused ("when paused there's no more 00:00 or
-  timestamp"). The Discord client renders a timer for ANY activity: `start` =>
-  count-up, `end` => countdown, and NEITHER => an auto-generated elapsed timer
-  anchored to the last activity update (undocumented, but reported independently
-  twice; one report tried `clearPresence()` then `setPresence()` and the timer
-  came straight back). So omitting `timestamps` does NOT clear the timer, and
-  the only way to show none is to have no presence: on pause the app sends
-  `SET_ACTIVITY` with `activity: null` (the existing `ClearActivity` path) and
-  sends NO paused card. The card and its timer disappear while paused; on resume
-  the card is re-set immediately with a fresh `start` and no `end`. The pause
-  clear and the resume re-set are part of the transition, not separate gate
-  decisions, so neither can be debounced or throttled (the pause branch in
-  `Gate.Decide` returns before the suppression paths, and the resume is a
-  content change). Two alternatives were deliberately NOT taken: a `00:00`
-  countdown via `timestamps.end = now` (a timer is still shown), and switching
-  the activity type to Competing (which disables timestamps but changes the
-  card's meaning).
+- **The activity type is Watching (3), and playing cards carry both
+  `timestamps.start` and `timestamps.end`.** The Java reference sent type 0
+  (Playing) and only `timestamps.start`. Discord draws an activity time bar only
+  for Listening (2) / Watching (3), and the type also picks the card's verb
+  ("Watching <title>"), so the Go port sets type 3. While playing with a known
+  duration it sends both `start` (the media's real position anchor, `now - pos`)
+  and `end = now + (total - pos)`, so Discord renders the bar against the true
+  playback position rather than a bare elapsed count; when the duration is
+  unknown only `start` is sent. The wire decision lives in one place
+  (`internal/discord/activity.go`, `newActivity`). The drift-avoiding machinery
+  is unchanged: the tracker's seek debounce is trailing-edge (a suppressed seek
+  is held and lands when the window expires), the gate re-anchors at once when
+  the live position diverges from the last-sent anchor by more than 2 s
+  (throttled to one per 5 s), and a 30 s heartbeat re-pushes a steady card. Not
+  rate-limit mitigation: the tracker emits 0/min while steady, the heartbeat
+  adds 2/min, and a scrub is ~9/min.
+- **While paused the card is parked with a count-UP pause timer; the pause path
+  never clears the activity.** The paused card keeps the cleaned title/episode context and
+  marks the state with a ` - Paused` suffix, sets `small_image` to `pause`, and
+  anchors `timestamps.start` at the pause moment with no `timestamps.end`, so
+  the client counts the pause UP ("paused for M:SS"). The parked card is sent
+  once; while the player stays paused no further card goes out - not even the
+  30 s heartbeat - so the pause timer is neither restarted nor spammed. On
+  resume the card is re-set immediately with a fresh `start` (and `end`) anchored
+  to the live position. The pause send and the resume re-set are part of the
+  transition, not separate gate decisions, so neither can be debounced or
+  throttled (the pause branch in `Gate.Decide` returns before the suppression
+  paths, and the resume is a content change). This supersedes the earlier
+  "clear the presence so there is no timer at all" behaviour, which was chosen
+  when the owner asked for no timer while paused; the current requirement is the
+  parked count-up card. The dead ` - MM:SS` position suffix (which produced a
+  frozen `00:00` on the paused card) was removed. Only the pause path parks a
+  card; the app still clears the activity on the paths that end a segment - app
+  exit, no PotPlayer window found, and the player window disappearing.
 
 ## Dev
 

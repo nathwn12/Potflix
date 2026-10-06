@@ -40,17 +40,18 @@ const (
 	// ReasonHeartbeatNotDue: the card is steady, divergence is within tolerance,
 	// and the heartbeat interval has not elapsed.
 	ReasonHeartbeatNotDue = "heartbeat-not-due"
-	// ReasonPaused: the player is paused and its presence was already cleared;
-	// no card may be (re)sent while paused, so even the heartbeat stays quiet.
+	// ReasonPaused: the paused card with this content was already sent and is
+	// parked; no further card is (re)sent while paused and the content is
+	// unchanged, so even the heartbeat stays quiet.
 	ReasonPaused = "paused"
 )
 
 // Verdict is one gate decision.
 type Verdict struct {
 	Send bool
-	// Clear means the transition is a pause: the activity must be cleared
-	// (SET_ACTIVITY with activity:null) and NO card sent. It rides on the same
-	// Send decision, so it can never be suppressed or throttled on its own.
+	// Clear is retained for the consumer's SET_ACTIVITY-null path but is no
+	// longer set: the pause transition now sends a paused card and keeps it
+	// (outcome: pause persists), so no decision clears the activity.
 	Clear  bool
 	Reason string // "" when Send; else one of the Reason* constants
 }
@@ -114,9 +115,9 @@ func (g *Gate) ForceNext() { g.force = true }
 // tracker state; pos/total are the live PotPlayer times; now is epoch ms; event
 // reports whether the tracker emitted a change/seek this poll; debounced reports
 // whether the tracker is holding a seek for the trailing edge. It returns the
-// card with its timestamps anchored (start while running; the projected end is
-// retained but never serialized - README deviation 5) and the verdict. A pause
-// returns Verdict{Clear:true}: the activity is cleared and no card is sent.
+// card with its timestamps anchored (start while running, plus the projected end
+// when the duration is known; start only, anchored at the pause moment, while
+// paused) and the verdict. A pause sends a paused card once and then stays quiet.
 func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced bool) (Activity, Verdict) {
 	// Interval bookkeeping runs on a monotonic clock; the anchors below keep the
 	// epoch now.
@@ -128,26 +129,35 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	if out.HasStart && pos > 0 {
 		out.Start = now - pos
 		out.End = 0
-		// end = now + (total - pos); retained for the gate's bookkeeping but NOT
-		// serialized while playing (README deviation 5, corrected).
+		// end = now + (total - pos); serialized as timestamps.end while playing
+		// (README deviation: both start and end go on the wire), so Discord
+		// renders the time bar against the real media position.
 		if total > pos {
 			out.End = now + (total - pos)
 		}
 	}
 
-	// Pause: the owner requires NO timer while paused. The client renders a
-	// timer for ANY activity (start => count-up, end => countdown, neither =>
-	// auto-elapsed), so the only way to show none is to have no presence. The
-	// pause transition clears the activity and sends no card. This is decided
-	// here, on the same verdict, before the suppression paths below, so the
-	// clear is never a separate decision that could be debounced or throttled.
+	// Pause: send a paused card and KEEP it. The activity type is Watching and
+	// the card carries a count-UP timer anchored at the pause moment
+	// (timestamps.start = now - pausedElapsedMs, where pausedElapsedMs is 0 at
+	// the transition), so the client reads "paused for M:SS". There is NO
+	// timestamps.end while paused. Decided here, before the suppression paths,
+	// so the pause card is never debounced or throttled.
 	if out.SmallImage == "pause" {
-		if g.hasSent && g.last.SmallImage == "pause" {
-			// Already cleared: stay quiet. Never re-push a paused card, not even
-			// on the heartbeat.
+		if g.hasSent && g.last.SmallImage == "pause" &&
+			g.last.Details == out.Details && g.last.State == out.State {
+			// Already showing the parked paused card for this content: stay
+			// quiet, so the pause timer is not restarted and Discord is not
+			// spammed. Not even the heartbeat re-pushes while paused. A content
+			// change (a different title/state, e.g. the next episode) falls
+			// through and re-sends, so the parked card cannot go stale - while
+			// the unchanged card keeps the no-spam property.
 			return out, Verdict{Reason: ReasonPaused}
 		}
-		return g.commit(out, clk), Verdict{Send: true, Clear: true}
+		out.HasStart = true
+		out.Start = now // now - pausedElapsedMs; pausedElapsedMs == 0 here
+		out.End = 0
+		return g.commit(out, clk), Verdict{Send: true}
 	}
 
 	if g.force {

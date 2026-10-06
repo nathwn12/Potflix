@@ -50,13 +50,16 @@ func (l *logger) eventPush(details, state string, ct, total int64) {
 
 // eventPushAttempt is the observation boundary for the push: one line per poll
 // that has a card, carrying the exact activity that would go on the wire (the
-// verbatim payload, including timestamps.start or "none") and the gate verdict.
-// A pause clears the activity instead of sending a card, and that is logged as
-// gate=clear. Suppressed polls are logged too - a silent log hid the swallowed
+// verbatim payload, including timestamps.start or "none", and timestamps.end
+// when the gate projected one) and the gate verdict. A pause parks a paused
+// card and sends it once; the gate no longer sets Clear (that branch is
+// dormant), so the gate=clear arm below is retained only for the null-activity
+// path. Suppressed polls are logged too - a silent log hid the swallowed
 // seek re-anchor, which is why that defect was invisible.
 func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
-	// A pause clears the activity and sends NO card, so the wire carries a null
-	// activity. Log that, not the unsent paused card.
+	// Dormant: Verdict.Clear is no longer set - a pause now parks and sends a
+	// paused card. Kept so a clear decision could still be logged as a null
+	// activity without changing the callers.
 	if v.Clear {
 		l.logf("push attempt gate=clear activity=null")
 		return
@@ -80,6 +83,7 @@ func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
 		SmallImage: a.SmallImage,
 		HasStart:   a.HasStart,
 		Start:      a.Start,
+		End:        a.End,
 	})
 	if v.Send {
 		l.logf("push attempt gate=sent start=%s payload=%s", start, payload)

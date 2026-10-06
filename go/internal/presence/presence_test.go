@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"potflix/internal/player"
 	"potflix/internal/titleclean"
@@ -22,15 +23,14 @@ type sample struct {
 
 type want struct {
 	tag      string // "" means no emit
-	suffix   string
 	start    int64
 	hasStart bool
 }
 
-func none() want                { return want{} }
-func runW(start int64) want     { return want{tag: "RUN", start: start, hasStart: true} }
-func pauseW(suffix string) want { return want{tag: "PAUSE", suffix: suffix} }
-func stopW() want               { return want{tag: "STOP"} }
+func none() want            { return want{} }
+func runW(start int64) want { return want{tag: "RUN", start: start, hasStart: true} }
+func pauseW() want          { return want{tag: "PAUSE"} }
+func stopW() want           { return want{tag: "STOP"} }
 
 // decisionLine reproduces the contract's `decision ...` log line (events.go's
 // eventDecision shape). The tracker itself does not log; this is the test's
@@ -66,9 +66,6 @@ func runSequence(t *testing.T, name string, samples []sample, wants []want) {
 		if a == nil {
 			continue
 		}
-		if a.Suffix != wants[i].suffix {
-			t.Errorf("%s[%d]: suffix=%q want=%q", name, i, a.Suffix, wants[i].suffix)
-		}
 		if a.HasStart != wants[i].hasStart || a.Start != wants[i].start {
 			t.Errorf("%s[%d]: hasStart=%t start=%d want hasStart=%t start=%d",
 				name, i, a.HasStart, a.Start, wants[i].hasStart, wants[i].start)
@@ -92,7 +89,7 @@ func TestTransitionMatrix(t *testing.T) {
 		}, []want{
 			// Index 2 is a Running->Paused report while ct still moves in the
 			// window: flap suppression keeps it Running, so Pause lands on 3.
-			runW(99000), none(), none(), pauseW(" - 00:01"), runW(99740), stopW(), none(),
+			runW(99000), none(), none(), pauseW(), runW(99740), stopW(), none(),
 		})
 	})
 
@@ -120,7 +117,7 @@ func TestTransitionMatrix(t *testing.T) {
 			{tC, player.StatusPaused, 4000, 301500}, // paused seek
 			{tC, player.StatusPaused, 4000, 301750},
 		}, []want{
-			runW(299000), none(), none(), none(), pauseW(" - 00:02"), none(), pauseW(" - 00:04"), none(),
+			runW(299000), none(), none(), none(), pauseW(), none(), pauseW(), none(),
 		})
 	})
 
@@ -169,7 +166,7 @@ func TestTransitionMatrix(t *testing.T) {
 			{tG, player.StatusPaused, 0, 700250},
 			{tG, player.StatusPaused, 1000, 700500},
 		}, []want{
-			none(), none(), pauseW(" - 00:01"),
+			none(), none(), pauseW(),
 		})
 	})
 
@@ -298,11 +295,33 @@ func TestWithStateTime(t *testing.T) {
 
 	long := strings.Repeat("x", 200)
 	got := WithStateTime(long, " - 00:01")
-	if got != titleclean.Trunc(long+" - 00:01", 128) {
-		t.Errorf("long context should be Java-truncated to 128: %q", got)
+	if got != titleclean.Trunc(long, 128-len(" - 00:01"))+" - 00:01" {
+		t.Errorf("long context should be truncated to leave room for the suffix: %q", got)
 	}
-	if !strings.HasSuffix(got, "\u2026") {
-		t.Errorf("long context should end with an ellipsis: %q", got)
+	if !strings.HasSuffix(got, " - 00:01") {
+		t.Errorf("the suffix must survive truncation: %q", got)
+	}
+	if n := javaUnits(got); n > 128 {
+		t.Errorf("state length %d exceeds the 128 limit: %q", n, got)
+	}
+}
+
+// javaUnits is String.length(): UTF-16 code units, the unit the Java-exact
+// titleclean.Trunc limit is measured in.
+func javaUnits(s string) int { return len(utf16.Encode([]rune(s))) }
+
+// F3: the paused marker must never be truncated. A 120-unit context plus the
+// 9-unit " - Paused" marker is 129 units; the old concatenate-then-truncate
+// rendered the state as "... - Paus...". The budgeted context keeps the marker
+// whole and the total within 128.
+func TestPausedMarkerSurvivesContextCap(t *testing.T) {
+	ctx := strings.Repeat("x", 120)
+	got := WithStateTime(ctx, pausedMarker)
+	if !strings.HasSuffix(got, pausedMarker) {
+		t.Fatalf("paused marker was truncated: %q", got)
+	}
+	if n := javaUnits(got); n > 128 {
+		t.Fatalf("state length %d exceeds the 128 limit: %q", n, got)
 	}
 }
 
@@ -322,9 +341,15 @@ func TestBuildActivity(t *testing.T) {
 	if run.Details != "Show" || run.State != `S1 E2 "Pilot"` || run.SmallImage != "play" || !run.HasStart || run.Start != 12345 {
 		t.Fatalf("running card = %+v", run)
 	}
-	paused := BuildActivity(raw, &Action{Paused: true, Suffix: " - 01:23", CT: 83000})
-	if paused.State != `S1 E2 "Pilot" - 01:23` || paused.SmallImage != "pause" || paused.HasStart {
+	paused := BuildActivity(raw, &Action{Paused: true, CT: 83000})
+	if paused.State != `S1 E2 "Pilot" - Paused` || paused.SmallImage != "pause" || paused.HasStart {
 		t.Fatalf("paused card = %+v", paused)
+	}
+	// No episode context: the state is the marker alone, and there is no
+	// user-visible "00:00" artifact from the removed position suffix.
+	pausedMovie := BuildActivity("Movie.mkv - PotPlayer", &Action{Paused: true, CT: 83000})
+	if pausedMovie.State != "Paused" || pausedMovie.SmallImage != "pause" {
+		t.Fatalf("paused movie card = %+v", pausedMovie)
 	}
 	stopped := BuildActivity(raw, &Action{CT: 0})
 	if stopped.SmallImage != "stop" || stopped.State != `S1 E2 "Pilot"` {

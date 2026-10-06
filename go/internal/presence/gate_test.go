@@ -113,47 +113,52 @@ func TestGateDebounceReason(t *testing.T) {
 	}
 }
 
-func TestGatePauseClears(t *testing.T) {
-	// Pause must clear the presence and send NO card: the client renders a timer
-	// for any activity, and the owner requires none while paused.
+func TestGatePauseSendsParkedCard(t *testing.T) {
+	// Pause sends a parked paused card and does NOT clear the activity. The card
+	// keeps the cleaned details/state, small_image "pause", and a count-UP start
+	// anchored at the pause moment (now), with no end.
 	g := &Gate{}
 	out, v := g.Decide(Activity{
-		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+		Type: "PLAYING", Details: "Show", State: `S1 E1 - Paused`, SmallImage: "pause",
 	}, 1000, 60000, 100000, true, false)
-	if !v.Send || !v.Clear {
-		t.Fatalf("pause must send a clear, got %s (clear=%t)", v, v.Clear)
+	if !v.Send {
+		t.Fatalf("pause must send a parked card, got %s", v)
 	}
-	if out.HasStart || out.End != 0 {
-		t.Fatalf("paused card must carry no timestamps: hasStart=%t end=%d", out.HasStart, out.End)
+	if v.Clear {
+		t.Fatalf("pause must NOT clear the activity")
+	}
+	if out.SmallImage != "pause" || !out.HasStart || out.Start != 100000 || out.End != 0 {
+		t.Fatalf("paused card = %+v, want pause start=100000 end=0", out)
 	}
 }
 
-func TestGatePauseClearNotDebounced(t *testing.T) {
+func TestGatePauseNotDebounced(t *testing.T) {
 	// Regression: a pause arriving while the tracker is holding a seek (the
-	// debounced flag set) must still clear. The clear rides on the pause
-	// transition, not on the debounce-suppressed path.
+	// debounced flag set) must still send the parked card. The pause rides on
+	// the transition, not on the debounce-suppressed path.
 	g := &Gate{}
 	g.Decide(runningCard("Show", "S1 E1"), 1000, 60000, 100000, false, false)
 	_, v := g.Decide(Activity{
-		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+		Type: "PLAYING", Details: "Show", State: `S1 E1 - Paused`, SmallImage: "pause",
 	}, 1000, 60000, 100250, true, true)
-	if !v.Send || !v.Clear {
-		t.Fatalf("pause clear was suppressed/debounced: %s", v)
+	if !v.Send || v.Clear {
+		t.Fatalf("pause was suppressed/debounced or cleared: %s (clear=%t)", v, v.Clear)
 	}
 }
 
 func TestGatePausedSteadyStaysQuiet(t *testing.T) {
-	// Once cleared, no card may be re-sent while paused - not even by the
-	// heartbeat, which would resurrect the timer.
+	// Once the parked card is sent, no further card goes out while paused - not
+	// even the heartbeat, which would restart the pause timer. The activity is
+	// never cleared.
 	g := &Gate{}
 	if _, v := g.Decide(Activity{
-		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
-	}, 1000, 60000, 100000, true, false); !v.Clear {
-		t.Fatalf("first pause should clear, got %s", v)
+		Type: "PLAYING", Details: "Show", State: `S1 E1 - Paused`, SmallImage: "pause",
+	}, 1000, 60000, 100000, true, false); !v.Send || v.Clear {
+		t.Fatalf("first pause should send a parked card (no clear), got %s (clear=%t)", v, v.Clear)
 	}
 	for _, now := range []int64{100250, 120000, 140000, 200000} {
 		_, v := g.Decide(Activity{
-			Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+			Type: "PLAYING", Details: "Show", State: `S1 E1 - Paused`, SmallImage: "pause",
 		}, 1000, 60000, now, false, false)
 		if v.Send {
 			t.Fatalf("paused poll at now=%d sent (clear=%t, reason=%s); want quiet", now, v.Clear, v.Reason)
@@ -164,10 +169,41 @@ func TestGatePausedSteadyStaysQuiet(t *testing.T) {
 	}
 }
 
+func TestGatePausedContentChangeResends(t *testing.T) {
+	// The parked paused card is suppressed only while its content is unchanged.
+	// A content change while paused (e.g. a different title/state) must re-send,
+	// or the parked card stays stale forever. This pins BOTH halves: the
+	// unchanged card sends exactly once and stays quiet, the changed card sends.
+	g := &Gate{}
+	paused := func(details, state string) Activity {
+		return Activity{Type: "PLAYING", Details: details, State: state, SmallImage: "pause"}
+	}
+	if _, v := g.Decide(paused("ShowA", `S1 E1 - Paused`), 1000, 60000, 100000, true, false); !v.Send {
+		t.Fatalf("first paused card should send, got %s", v)
+	}
+	// Unchanged: still quiet (the no-spam property).
+	if _, v := g.Decide(paused("ShowA", `S1 E1 - Paused`), 1000, 60000, 100250, false, false); v.Send || v.Reason != ReasonPaused {
+		t.Fatalf("unchanged paused card = %s, want suppressed:%s", v, ReasonPaused)
+	}
+	// Changed content: must re-send, anchored at the new pause moment.
+	out, v := g.Decide(paused("ShowB", `S1 E2 - Paused`), 1000, 60000, 100500, false, false)
+	if !v.Send {
+		t.Fatalf("changed paused card should re-send, got %s", v)
+	}
+	if out.Details != "ShowB" || out.State != `S1 E2 - Paused` || !out.HasStart || out.Start != 100500 || out.End != 0 {
+		t.Fatalf("changed paused card = %+v, want ShowB/S1 E2 - Paused start=100500 end=0", out)
+	}
+	// The re-sent card becomes the new parked reference: unchanged again stays
+	// quiet.
+	if _, v := g.Decide(paused("ShowB", `S1 E2 - Paused`), 1000, 60000, 100750, false, false); v.Send || v.Reason != ReasonPaused {
+		t.Fatalf("re-parked unchanged card = %s, want suppressed:%s", v, ReasonPaused)
+	}
+}
+
 func TestGateResumeReanchors(t *testing.T) {
 	g := &Gate{}
 	g.Decide(Activity{
-		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+		Type: "PLAYING", Details: "Show", State: `S1 E1 - Paused`, SmallImage: "pause",
 	}, 1000, 60000, 100000, true, false)
 	out, v := g.Decide(runningCard("Show", "S1 E1"), 1000, 60000, 101000, true, false)
 	if !v.Send || v.Clear {
@@ -225,8 +261,8 @@ func TestGateNotReadyHeartbeatKeepsAnchor(t *testing.T) {
 func TestGateBackwardClockStepDoesNotStallHeartbeat(t *testing.T) {
 	// An idle card carries no start, so the divergence path cannot fire: the
 	// heartbeat is the only self-healing route - the case the reviewer saw stall
-	// with a -55 s step. (A paused card cannot be used here: pause clears the
-	// presence and stays quiet, by design.)
+	// with a -55 s step. (A paused card cannot be used here: the parked pause
+	// stays quiet after its one send, by design.)
 	idle := Activity{Type: "PLAYING", Details: "Browsing", State: "Idle", SmallImage: "stop"}
 	g := &Gate{}
 	if _, v := g.Decide(idle, 0, 0, 100000, false, false); !v.Send {
