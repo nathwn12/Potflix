@@ -87,8 +87,9 @@ Recorded deliberately; each is a behaviour change, not a parity claim.
   diverges from the last-sent anchor by more than 2 s (throttled to one per 5 s)
   and re-pushes on a 30 s heartbeat; the tracker's seek debounce is trailing-edge
   so a suppressed seek is held and lands when the window expires rather than
-  being dropped forever. This is not rate-limit mitigation: measured pushes are
-  0/min while steady and ~9/min during scrubs.
+  being dropped forever. This is not rate-limit mitigation: the tracker emits
+  0/min while steady (change/seek events only), the 30 s heartbeat adds 2/min,
+  and a scrub is ~9/min - all far below Discord's update limit.
 
 ## Dev
 

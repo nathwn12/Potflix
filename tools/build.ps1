@@ -17,6 +17,16 @@ param(
   [string]$Out = ""
 )
 $ErrorActionPreference = 'Stop'
+
+# Go does not create GOTMPDIR; if a temp cleaner removes it, every go build/test
+# fails with "creating work dir: ... The system cannot find the file specified".
+# Create it when it is set and missing. No machine-specific path is hardcoded -
+# the directory is whatever `go env GOTMPDIR` reports.
+$goTmp = go env GOTMPDIR
+if (-not [string]::IsNullOrWhiteSpace($goTmp) -and -not (Test-Path -LiteralPath $goTmp)) {
+  New-Item -ItemType Directory -Force -Path $goTmp | Out-Null
+}
+
 $root = Split-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) -Parent
 if ([string]::IsNullOrWhiteSpace($Out)) { $Out = Join-Path $root 'dist\potflix.exe' }
 $Out = [IO.Path]::GetFullPath($Out)

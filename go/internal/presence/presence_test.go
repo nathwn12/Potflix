@@ -229,6 +229,28 @@ func TestRunDebounce(t *testing.T) {
 	}
 }
 
+// F2: the trailing-edge debounce runs on the monotonic clock too, so a backward
+// wall-clock step cannot strand a held seek until the wall clock catches up.
+func TestRunDebounceBackwardClockStep(t *testing.T) {
+	const x = "X - PotPlayer"
+	tr := &Tracker{}
+	if a := tr.Poll(x, player.StatusRunning, 1000, 100000); a == nil || !a.Running {
+		t.Fatalf("first RUN should emit, got %v", a)
+	}
+	// A seek 200 ms later is held inside the ~1 s window.
+	if a := tr.Poll(x, player.StatusRunning, 5000, 100200); a != nil {
+		t.Fatalf("seek inside the window should be held, got %+v", a)
+	}
+	// The wall clock steps back 55 s: the held seek is still inside the window.
+	if a := tr.Poll(x, player.StatusRunning, 5000, 45200); a != nil {
+		t.Fatalf("seek should still be held right after the step, got %+v", a)
+	}
+	// ~1 s of monotonic interval later it lands, rather than waiting 55 s.
+	if a := tr.Poll(x, player.StatusRunning, 5000, 46300); a == nil || !a.Running {
+		t.Fatalf("held seek stranded after a backward step, got %v", a)
+	}
+}
+
 func TestPausedNotDebounced(t *testing.T) {
 	const s = "T - PotPlayer"
 	tr := &Tracker{}

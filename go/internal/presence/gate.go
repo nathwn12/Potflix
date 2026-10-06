@@ -11,9 +11,10 @@ package presence
 // anchor Discord was told) and a coarse heartbeat. It also records EVERY
 // decision, so a suppressed poll is visible instead of silent.
 //
-// This is NOT about Discord rate limiting: measured pushes are 0/min while
-// steady and ~9/min during scrubs, far below Discord's update limit. The
-// heartbeat is self-healing for residual divergence, nothing more.
+// This is NOT about Discord rate limiting: the tracker emits 0/min while steady
+// (change/seek events only), the 30 s heartbeat adds 2/min, and a scrub is
+// ~9/min - all far below Discord's update limit. The heartbeat is self-healing
+// for residual divergence, nothing more.
 
 // Timing constants for the send gate.
 const (
@@ -54,6 +55,35 @@ func (v Verdict) String() string {
 	return "suppressed:" + v.Reason
 }
 
+// intervalClock is a monotonic interval clock. It is fed the wall-clock (epoch)
+// `now` on every poll and returns a value that advances only by positive wall
+// deltas, holding through a backward step. Interval comparisons (the heartbeat,
+// the divergence throttle, the tracker's trailing-edge debounce) use this value,
+// so a wall-clock adjustment can never make an interval go negative and stall
+// self-healing for the step's duration. Anchors keep the epoch `now`: Discord
+// timestamps are epoch ms.
+type intervalClock struct {
+	started bool
+	last    int64 // last wall-clock value fed in
+	value   int64 // monotonic interval value, same units (ms)
+}
+
+// tick folds one wall-clock observation in and returns the monotonic value. The
+// first observation seeds value=now, so on a forward-only clock tick(now)==now.
+func (c *intervalClock) tick(now int64) int64 {
+	if !c.started {
+		c.started = true
+		c.last = now
+		c.value = now
+		return c.value
+	}
+	if d := now - c.last; d > 0 {
+		c.value += d
+	}
+	c.last = now
+	return c.value
+}
+
 // Gate remembers what was last sent so it can decide whether the current card
 // needs to go out. The zero value is ready to use.
 type Gate struct {
@@ -63,6 +93,7 @@ type Gate struct {
 	lastSentAt       int64
 	lastDivergenceAt int64
 	force            bool
+	clock            intervalClock
 }
 
 // ForceNext makes the next Decide send regardless of the card. Positive control
@@ -76,8 +107,14 @@ func (g *Gate) ForceNext() { g.force = true }
 // card with its timestamps anchored (start, and end when the duration is known)
 // and the verdict.
 func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced bool) (Activity, Verdict) {
+	// Interval bookkeeping runs on a monotonic clock; the anchors below keep the
+	// epoch now.
+	clk := g.clock.tick(now)
 	out := card
-	if out.HasStart {
+	// Re-anchor only on a ready position read. A not-ready read (pos<=0, see
+	// presence.go) must keep the card's existing anchor: recomputing here would
+	// reset the elapsed clock to 0:00 and emit a full-duration countdown.
+	if out.HasStart && pos > 0 {
 		out.Start = now - pos
 		out.End = 0
 		// end = now + (total - pos); omitted when the duration is unknown.
@@ -87,10 +124,10 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	}
 	if g.force {
 		g.force = false
-		return g.commit(out, now), Verdict{Send: true}
+		return g.commit(out, clk), Verdict{Send: true}
 	}
 	if !g.hasSent {
-		return g.commit(out, now), Verdict{Send: true}
+		return g.commit(out, clk), Verdict{Send: true}
 	}
 
 	contentChanged := out.Details != g.last.Details ||
@@ -100,21 +137,21 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	anchorMoved := out.HasStart && out.Start != g.lastStart
 
 	if contentChanged {
-		return g.commit(out, now), Verdict{Send: true}
+		return g.commit(out, clk), Verdict{Send: true}
 	}
 	if event && anchorMoved {
-		return g.commit(out, now), Verdict{Send: true}
+		return g.commit(out, clk), Verdict{Send: true}
 	}
 	// Divergence: the live position no longer matches what the last-sent anchor
 	// predicts (a seek the tracker swallowed, a resume, or clock drift). Re-anchor
 	// at once, throttled.
 	if out.HasStart && pos > 0 && abs64(pos-(now-g.lastStart)) > DivergenceMS &&
-		(now-g.lastDivergenceAt) >= DivergenceThrottleMS {
-		g.lastDivergenceAt = now
-		return g.commit(out, now), Verdict{Send: true}
+		(clk-g.lastDivergenceAt) >= DivergenceThrottleMS {
+		g.lastDivergenceAt = clk
+		return g.commit(out, clk), Verdict{Send: true}
 	}
-	if now-g.lastSentAt >= HeartbeatMS {
-		return g.commit(out, now), Verdict{Send: true}
+	if clk-g.lastSentAt >= HeartbeatMS {
+		return g.commit(out, clk), Verdict{Send: true}
 	}
 
 	switch {
@@ -127,11 +164,12 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	}
 }
 
-// commit records a sent card as the new reference point.
-func (g *Gate) commit(out Activity, now int64) Activity {
+// commit records a sent card as the new reference point. clk is the monotonic
+// interval clock; out.Start is the epoch anchor.
+func (g *Gate) commit(out Activity, clk int64) Activity {
 	g.hasSent = true
 	g.last = out
 	g.lastStart = out.Start
-	g.lastSentAt = now
+	g.lastSentAt = clk
 	return out
 }

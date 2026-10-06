@@ -54,6 +54,14 @@ func (l *logger) eventPush(details, state string, ct, total int64) {
 // verdict. Suppressed polls are logged too - a silent log hid the swallowed
 // seek re-anchor, which is why that defect was invisible.
 func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
+	// The steady-state heartbeat-not-due line dominates the log (~4/s). It keeps
+	// the verdict but drops the payload suffix: at ~300 B/line the full payload
+	// cut retention to ~2-4 h against the 5 MiB x 3 cap. Sent, debounce,
+	// unchanged and divergence lines keep the full payload.
+	if !v.Send && v.Reason == presence.ReasonHeartbeatNotDue {
+		l.logf("push attempt gate=suppressed reason=%s", v.Reason)
+		return
+	}
 	start, end := "none", "none"
 	if a.HasStart {
 		start = strconv.FormatInt(a.Start, 10)

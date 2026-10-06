@@ -159,3 +159,50 @@ func TestGateForceNext(t *testing.T) {
 		t.Fatalf("forced Decide should send, got %s", v)
 	}
 }
+
+// F1: a running card can be handed back by the tracker while the player read is
+// not ready (ct<=0, presence.go). The heartbeat is due, but the not-ready read
+// must keep the card's existing anchor instead of resetting the elapsed clock
+// to 0:00 and emitting a full-duration countdown.
+func TestGateNotReadyHeartbeatKeepsAnchor(t *testing.T) {
+	g := &Gate{}
+	out, v := g.Decide(runningCard("Show", "S1 E1"), 1000, 60000, 100000, false, false)
+	if !v.Send || out.Start != 99000 {
+		t.Fatalf("first send start=%d verdict=%s, want 99000/sent", out.Start, v)
+	}
+	// The card carries the last anchor; pos=0 marks the not-ready read.
+	card := runningCard("Show", "S1 E1")
+	card.Start = 99000
+	out2, v2 := g.Decide(card, 0, 60000, 130000, false, false)
+	if !v2.Send {
+		t.Fatalf("heartbeat due should send, got %s", v2)
+	}
+	if out2.Start != 99000 || out2.End != 0 {
+		t.Fatalf("not-ready heartbeat reset the anchor: start=%d end=%d, want start=99000 end=0", out2.Start, out2.End)
+	}
+}
+
+// F2: intervals run on a monotonic clock. A backward wall-clock step must not
+// make the heartbeat delta negative and stall self-healing for the step.
+func TestGateBackwardClockStepDoesNotStallHeartbeat(t *testing.T) {
+	// A paused card carries no start, so the divergence path cannot fire: the
+	// heartbeat is the only self-healing route - the case the reviewer saw stall
+	// with a -55 s step.
+	paused := Activity{Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause"}
+	g := &Gate{}
+	if _, v := g.Decide(paused, 1000, 60000, 100000, false, false); !v.Send {
+		t.Fatalf("first paused card should send, got %s", v)
+	}
+	if _, v := g.Decide(paused, 1000, 60000, 120000, false, false); v.Send {
+		t.Fatalf("20 s in, heartbeat should not be due, got %s", v)
+	}
+	// The wall clock steps back 55 s; only 20 s of interval has elapsed.
+	if _, v := g.Decide(paused, 1000, 60000, 65000, false, false); v.Send {
+		t.Fatalf("55 s backward step fired the heartbeat early: %s", v)
+	}
+	// 10 s of real interval later the monotonic clock reaches 30 s: the
+	// heartbeat self-heals instead of stalling for the 55 s step.
+	if _, v := g.Decide(paused, 1000, 60000, 75000, false, false); !v.Send {
+		t.Fatalf("heartbeat stalled after a backward step, got %s", v)
+	}
+}

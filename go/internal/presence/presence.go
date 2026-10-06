@@ -84,6 +84,10 @@ type Tracker struct {
 	// send gate can rebuild the card on every poll, including polls where the
 	// tracker emits nothing.
 	lastAction *Action
+
+	// clock is the monotonic interval clock for the trailing-edge debounce, so a
+	// wall-clock step cannot strand a held seek.
+	clock intervalClock
 }
 
 func (t *Tracker) sampleCt(ct int64) {
@@ -109,6 +113,10 @@ func (t *Tracker) oldestCt() int64 {
 // Poll consumes one sample and returns the action to push, or nil. ps/ct are
 // the raw reads; now is epoch ms.
 func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Action {
+	// Interval bookkeeping (the trailing-edge debounce) runs on a monotonic
+	// clock; anchors below keep the epoch now.
+	clk := t.clock.tick(now)
+
 	// New media: forget everything (Java :267-270).
 	if t.havePrev && t.lastTitle != rawTitle {
 		t.havePrev = false
@@ -177,13 +185,13 @@ func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Ac
 	// always emits.
 	if action != nil {
 		if action.Running {
-			if !changed && t.hasRunPush && (now-t.lastRunPushAt) < RunDebounceMS && rawTitle == t.lastRunPushTitle {
+			if !changed && t.hasRunPush && (clk-t.lastRunPushAt) < RunDebounceMS && rawTitle == t.lastRunPushTitle {
 				t.pendingRun = true
 				t.pendingTitle = rawTitle
 				action = nil
 			} else {
 				t.hasRunPush = true
-				t.lastRunPushAt = now
+				t.lastRunPushAt = clk
 				t.lastRunPushTitle = rawTitle
 				t.pendingRun = false
 			}
@@ -196,10 +204,10 @@ func (t *Tracker) Poll(rawTitle string, ps player.PlayStatus, ct, now int64) *Ac
 	// Trailing edge: once the window has expired the held seek lands with a fresh
 	// anchor (start = now - ct), so the last seek of a scrub is never lost.
 	if action == nil && t.pendingRun && ctOk && eff == player.StatusRunning &&
-		rawTitle == t.pendingTitle && (now-t.lastRunPushAt) >= RunDebounceMS {
+		rawTitle == t.pendingTitle && (clk-t.lastRunPushAt) >= RunDebounceMS {
 		action = &Action{Running: true, HasStart: true, Start: now - ct, CT: ct}
 		t.hasRunPush = true
-		t.lastRunPushAt = now
+		t.lastRunPushAt = clk
 		t.lastRunPushTitle = rawTitle
 		t.pendingRun = false
 	}
