@@ -163,10 +163,10 @@ func TestSetActivityNoTimer(t *testing.T) {
 	}
 }
 
-func TestSetActivityEndPresentWhenKnown(t *testing.T) {
-	// README deviation 5: while running and the duration is known, the wire
-	// carries both timestamps.start and timestamps.end so Discord extrapolates
-	// between pushes.
+func TestSetActivityStartOnlyNoEnd(t *testing.T) {
+	// README deviation 5 (corrected): a playing card carries timestamps.start
+	// ONLY. timestamps.end would make the client render a countdown, so even a
+	// caller-supplied End is never serialized.
 	c, sc, _ := connectPair(t, 0, Config{})
 	defer sc.Close()
 
@@ -177,31 +177,16 @@ func TestSetActivityEndPresentWhenKnown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read activity frame: %v", err)
 	}
-	top := decodeFrame(t, payload)
-	a := asMap(t, asMap(t, top["args"], "args")["activity"], "activity")
-	ts := asMap(t, a["timestamps"], "timestamps")
-	wantKeys(t, "timestamps", ts, "start", "end")
-	if ts["start"].(float64) != 111 || ts["end"].(float64) != 222 {
-		t.Fatalf("timestamps = %v, want start=111 end=222", ts)
-	}
-}
-
-func TestSetActivityEndOmittedWhenUnknown(t *testing.T) {
-	// total unknown (End 0): end is omitted, start still sent.
-	c, sc, _ := connectPair(t, 0, Config{})
-	defer sc.Close()
-
-	if err := c.SetActivity(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", HasStart: true, Start: 111}); err != nil {
-		t.Fatalf("SetActivity: %v", err)
-	}
-	_, payload, err := sc.ReadFrame()
-	if err != nil {
-		t.Fatalf("read activity frame: %v", err)
+	if strings.Contains(string(payload), `"end"`) {
+		t.Fatalf("playing payload carries end: %s", payload)
 	}
 	top := decodeFrame(t, payload)
 	a := asMap(t, asMap(t, top["args"], "args")["activity"], "activity")
 	ts := asMap(t, a["timestamps"], "timestamps")
 	wantKeys(t, "timestamps", ts, "start")
+	if ts["start"].(float64) != 111 {
+		t.Fatalf("timestamps.start = %v, want 111", ts["start"])
+	}
 }
 
 func TestClearActivityIsNull(t *testing.T) {

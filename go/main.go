@@ -231,6 +231,17 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 	if !verdict.Send {
 		return
 	}
+	// A pause clears the whole presence and sends NO card, so no timer of any
+	// kind is shown while paused: the client renders a timer for any activity,
+	// so the only way to have none is to have no presence. The clear is part of
+	// this send decision (Gate.Decide), so it is never a separate decision that
+	// could be debounced or throttled.
+	if verdict.Clear {
+		if err := dc.ClearActivity(); err != nil {
+			log.eventSendError(err)
+		}
+		return
+	}
 	log.eventPush(out.Details, out.State, ct, total)
 	if err := dc.SetActivity(discord.Activity{
 		Details:    out.Details,

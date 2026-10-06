@@ -20,10 +20,13 @@ import (
 //	                               "small_image":...,"small_text":""}}},
 //	 "nonce":"<unique>"}
 //
-// A clear is the same command with "activity":null. timestamps.end IS set while
-// running when the duration is known (README deviation 5; the Java reference
-// left it absent), so Discord extrapolates between pushes and every push
-// self-corrects. Deliberately NOT set: party, secrets, instance, buttons,
+// A clear is the same command with "activity":null. Only timestamps.start goes
+// on the wire while running: the Discord client renders a COUNTDOWN from
+// timestamps.end (README deviation 5, corrected), and the owner requires a
+// count-UP elapsed timer matching PotPlayer's left-hand number, so end is
+// deliberately omitted even when the send gate knows the projected end. The
+// Java reference left it absent too, which is what the port contract's section 5
+// specifies. Deliberately NOT set: party, secrets, instance, buttons,
 // application_id/name.
 //
 // Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
@@ -40,7 +43,7 @@ type Activity struct {
 	SmallImage string // "play" running, "pause" paused, "stop" idle/stopped
 	HasStart   bool
 	Start      int64 // epoch ms, set only while running
-	End        int64 // epoch ms, set while running when the duration is known; 0 omits it
+	End        int64 // epoch ms, projected end from the gate; deliberately not serialized (deviation 5)
 }
 
 // activityPayload is the wire activity object. Every empty string field is
@@ -53,11 +56,13 @@ type activityPayload struct {
 	Assets     activityAsst `json:"assets"`
 }
 
-// timestamps carries the elapsed anchor and (README deviation 5) the projected
-// end, so Discord extrapolates between pushes and every push self-corrects.
-// end is omitted when the duration is unknown.
+// timestamps carries the elapsed anchor. Only Start is ever put on the wire: a
+// playing card carries start and never end (README deviation 5, corrected),
+// because the client renders a COUNTDOWN from end while the owner requires a
+// count-up elapsed timer. A paused card is never sent at all - the presence is
+// cleared (see gate.go) - so this object is absent while paused.
 type timestamps struct {
-	Start int64 `json:"start"`
+	Start int64 `json:"start,omitempty"`
 	End   int64 `json:"end,omitempty"`
 }
 
@@ -98,11 +103,11 @@ func newActivity(a Activity) *activityPayload {
 		},
 	}
 	if a.HasStart {
-		ts := &timestamps{Start: a.Start}
-		if a.End > 0 {
-			ts.End = a.End
-		}
-		p.Timestamps = ts
+		// Playing: start ONLY. end is deliberately not sent (README deviation 5,
+		// corrected): the client renders a countdown from it, and the owner
+		// requires a count-up elapsed timer. This is the single place the
+		// timestamp pair is decided, so re-enabling is one line here.
+		p.Timestamps = &timestamps{Start: a.Start}
 	}
 	return p
 }

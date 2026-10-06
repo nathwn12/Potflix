@@ -77,19 +77,45 @@ Recorded deliberately; each is a behaviour change, not a parity claim.
   (logging `send error: discord: not ready` before it), logs
   `connected clientId=<redacted>` on `READY`, and logs `push ack timeout` if a
   command is still unanswered after 2 s rather than assuming it was sent.
-- **`timestamps.end` is sent while playing (deviation 5).** The Java reference
-  and fleet decision 7 set only `timestamps.start` (contract section 5). The Go
-  port sends `start` and, when the duration is known, `end = now + (total - pos)`
-  (`end` is omitted when `total` is 0). This gives Discord's progress bar a real
-  duration and makes every push self-correcting: Discord extrapolates the clock
-  between pushes instead of freezing on a stale anchor. The send gate
-  (`internal/presence/gate.go`) re-anchors at once when the live position
-  diverges from the last-sent anchor by more than 2 s (throttled to one per 5 s)
-  and re-pushes on a 30 s heartbeat; the tracker's seek debounce is trailing-edge
-  so a suppressed seek is held and lands when the window expires rather than
-  being dropped forever. This is not rate-limit mitigation: the tracker emits
-  0/min while steady (change/seek events only), the 30 s heartbeat adds 2/min,
-  and a scrub is ~9/min - all far below Discord's update limit.
+- **`timestamps.end` is deliberately omitted; only `start` is sent (deviation 5,
+  corrected).** The original deviation 5 sent `start` and, when the duration was
+  known, `end = now + (total - pos)`. That was wrong: the Discord client renders
+  a COUNTDOWN from `timestamps.end` (documented in the Social SDK
+  `ActivityTimestamps::End` - "the Discord client will render a countdown timer
+  showing how long until the activity ends" - and confirmed by
+  `discord-api-docs` PR #8431: "as long as `end` is set the timer displays the
+  remaining time"), so the card showed the time REMAINING instead of elapsed.
+  The owner observed it directly: the card read `11:50` while PotPlayer showed
+  `00:35:22 / 00:47:12`, and `47:12 - 35:22 = 11:50`. The Go port now sends
+  `timestamps.start` only, so the client counts UP from it - which is what the
+  port contract's section 5 already specified (`timestamps.end` absent) and what
+  the Java reference did. The send gate still computes the projected end for its
+  own bookkeeping (`internal/presence/gate.go`), but it is never serialized; the
+  wire decision lives in one place (`internal/discord/activity.go`,
+  `newActivity`). The drift-avoiding machinery is unchanged: the tracker's seek
+  debounce is trailing-edge (a suppressed seek is held and lands when the window
+  expires), the gate re-anchors at once when the live position diverges from the
+  last-sent anchor by more than 2 s (throttled to one per 5 s), and a 30 s
+  heartbeat re-pushes a steady card. Not rate-limit mitigation: the tracker
+  emits 0/min while steady, the heartbeat adds 2/min, and a scrub is ~9/min.
+- **While paused the presence is cleared, so there is no timer at all.** The
+  owner requires no timer while paused ("when paused there's no more 00:00 or
+  timestamp"). The Discord client renders a timer for ANY activity: `start` =>
+  count-up, `end` => countdown, and NEITHER => an auto-generated elapsed timer
+  anchored to the last activity update (undocumented, but reported independently
+  twice; one report tried `clearPresence()` then `setPresence()` and the timer
+  came straight back). So omitting `timestamps` does NOT clear the timer, and
+  the only way to show none is to have no presence: on pause the app sends
+  `SET_ACTIVITY` with `activity: null` (the existing `ClearActivity` path) and
+  sends NO paused card. The card and its timer disappear while paused; on resume
+  the card is re-set immediately with a fresh `start` and no `end`. The pause
+  clear and the resume re-set are part of the transition, not separate gate
+  decisions, so neither can be debounced or throttled (the pause branch in
+  `Gate.Decide` returns before the suppression paths, and the resume is a
+  content change). Two alternatives were deliberately NOT taken: a `00:00`
+  countdown via `timestamps.end = now` (a timer is still shown), and switching
+  the activity type to Competing (which disables timestamps but changes the
+  card's meaning).
 
 ## Dev
 

@@ -50,24 +50,29 @@ func (l *logger) eventPush(details, state string, ct, total int64) {
 
 // eventPushAttempt is the observation boundary for the push: one line per poll
 // that has a card, carrying the exact activity that would go on the wire (the
-// verbatim payload, including timestamps.start/end or "none") and the gate
-// verdict. Suppressed polls are logged too - a silent log hid the swallowed
+// verbatim payload, including timestamps.start or "none") and the gate verdict.
+// A pause clears the activity instead of sending a card, and that is logged as
+// gate=clear. Suppressed polls are logged too - a silent log hid the swallowed
 // seek re-anchor, which is why that defect was invisible.
 func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
-	// The steady-state heartbeat-not-due line dominates the log (~4/s). It keeps
-	// the verdict but drops the payload suffix: at ~300 B/line the full payload
-	// cut retention to ~2-4 h against the 5 MiB x 3 cap. Sent, debounce,
-	// unchanged and divergence lines keep the full payload.
-	if !v.Send && v.Reason == presence.ReasonHeartbeatNotDue {
+	// A pause clears the activity and sends NO card, so the wire carries a null
+	// activity. Log that, not the unsent paused card.
+	if v.Clear {
+		l.logf("push attempt gate=clear activity=null")
+		return
+	}
+	// The steady-state heartbeat-not-due line dominates the log (~4/s); the
+	// paused line is likewise steady. Both keep the verdict but drop the payload
+	// suffix: at ~300 B/line the full payload cut retention to ~2-4 h against
+	// the 5 MiB x 3 cap. Sent, debounce, unchanged and divergence lines keep the
+	// full payload.
+	if !v.Send && (v.Reason == presence.ReasonHeartbeatNotDue || v.Reason == presence.ReasonPaused) {
 		l.logf("push attempt gate=suppressed reason=%s", v.Reason)
 		return
 	}
-	start, end := "none", "none"
+	start := "none"
 	if a.HasStart {
 		start = strconv.FormatInt(a.Start, 10)
-		if a.End > 0 {
-			end = strconv.FormatInt(a.End, 10)
-		}
 	}
 	payload := discord.WireJSON(discord.Activity{
 		Details:    a.Details,
@@ -75,12 +80,11 @@ func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
 		SmallImage: a.SmallImage,
 		HasStart:   a.HasStart,
 		Start:      a.Start,
-		End:        a.End,
 	})
 	if v.Send {
-		l.logf("push attempt gate=sent start=%s end=%s payload=%s", start, end, payload)
+		l.logf("push attempt gate=sent start=%s payload=%s", start, payload)
 	} else {
-		l.logf("push attempt gate=suppressed reason=%s start=%s end=%s payload=%s", v.Reason, start, end, payload)
+		l.logf("push attempt gate=suppressed reason=%s start=%s payload=%s", v.Reason, start, payload)
 	}
 }
 

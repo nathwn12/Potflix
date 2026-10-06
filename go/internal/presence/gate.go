@@ -40,16 +40,26 @@ const (
 	// ReasonHeartbeatNotDue: the card is steady, divergence is within tolerance,
 	// and the heartbeat interval has not elapsed.
 	ReasonHeartbeatNotDue = "heartbeat-not-due"
+	// ReasonPaused: the player is paused and its presence was already cleared;
+	// no card may be (re)sent while paused, so even the heartbeat stays quiet.
+	ReasonPaused = "paused"
 )
 
 // Verdict is one gate decision.
 type Verdict struct {
-	Send   bool
+	Send bool
+	// Clear means the transition is a pause: the activity must be cleared
+	// (SET_ACTIVITY with activity:null) and NO card sent. It rides on the same
+	// Send decision, so it can never be suppressed or throttled on its own.
+	Clear  bool
 	Reason string // "" when Send; else one of the Reason* constants
 }
 
 func (v Verdict) String() string {
 	if v.Send {
+		if v.Clear {
+			return "sent+clear"
+		}
 		return "sent"
 	}
 	return "suppressed:" + v.Reason
@@ -104,8 +114,9 @@ func (g *Gate) ForceNext() { g.force = true }
 // tracker state; pos/total are the live PotPlayer times; now is epoch ms; event
 // reports whether the tracker emitted a change/seek this poll; debounced reports
 // whether the tracker is holding a seek for the trailing edge. It returns the
-// card with its timestamps anchored (start, and end when the duration is known)
-// and the verdict.
+// card with its timestamps anchored (start while running; the projected end is
+// retained but never serialized - README deviation 5) and the verdict. A pause
+// returns Verdict{Clear:true}: the activity is cleared and no card is sent.
 func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced bool) (Activity, Verdict) {
 	// Interval bookkeeping runs on a monotonic clock; the anchors below keep the
 	// epoch now.
@@ -117,11 +128,28 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	if out.HasStart && pos > 0 {
 		out.Start = now - pos
 		out.End = 0
-		// end = now + (total - pos); omitted when the duration is unknown.
+		// end = now + (total - pos); retained for the gate's bookkeeping but NOT
+		// serialized while playing (README deviation 5, corrected).
 		if total > pos {
 			out.End = now + (total - pos)
 		}
 	}
+
+	// Pause: the owner requires NO timer while paused. The client renders a
+	// timer for ANY activity (start => count-up, end => countdown, neither =>
+	// auto-elapsed), so the only way to show none is to have no presence. The
+	// pause transition clears the activity and sends no card. This is decided
+	// here, on the same verdict, before the suppression paths below, so the
+	// clear is never a separate decision that could be debounced or throttled.
+	if out.SmallImage == "pause" {
+		if g.hasSent && g.last.SmallImage == "pause" {
+			// Already cleared: stay quiet. Never re-push a paused card, not even
+			// on the heartbeat.
+			return out, Verdict{Reason: ReasonPaused}
+		}
+		return g.commit(out, clk), Verdict{Send: true, Clear: true}
+	}
+
 	if g.force {
 		g.force = false
 		return g.commit(out, clk), Verdict{Send: true}

@@ -113,16 +113,54 @@ func TestGateDebounceReason(t *testing.T) {
 	}
 }
 
-func TestGatePauseNoTimestamps(t *testing.T) {
+func TestGatePauseClears(t *testing.T) {
+	// Pause must clear the presence and send NO card: the client renders a timer
+	// for any activity, and the owner requires none while paused.
 	g := &Gate{}
 	out, v := g.Decide(Activity{
 		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
 	}, 1000, 60000, 100000, true, false)
-	if !v.Send {
-		t.Fatalf("pause should send, got %s", v)
+	if !v.Send || !v.Clear {
+		t.Fatalf("pause must send a clear, got %s (clear=%t)", v, v.Clear)
 	}
 	if out.HasStart || out.End != 0 {
-		t.Fatalf("pause must carry no timestamps: hasStart=%t end=%d", out.HasStart, out.End)
+		t.Fatalf("paused card must carry no timestamps: hasStart=%t end=%d", out.HasStart, out.End)
+	}
+}
+
+func TestGatePauseClearNotDebounced(t *testing.T) {
+	// Regression: a pause arriving while the tracker is holding a seek (the
+	// debounced flag set) must still clear. The clear rides on the pause
+	// transition, not on the debounce-suppressed path.
+	g := &Gate{}
+	g.Decide(runningCard("Show", "S1 E1"), 1000, 60000, 100000, false, false)
+	_, v := g.Decide(Activity{
+		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+	}, 1000, 60000, 100250, true, true)
+	if !v.Send || !v.Clear {
+		t.Fatalf("pause clear was suppressed/debounced: %s", v)
+	}
+}
+
+func TestGatePausedSteadyStaysQuiet(t *testing.T) {
+	// Once cleared, no card may be re-sent while paused - not even by the
+	// heartbeat, which would resurrect the timer.
+	g := &Gate{}
+	if _, v := g.Decide(Activity{
+		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+	}, 1000, 60000, 100000, true, false); !v.Clear {
+		t.Fatalf("first pause should clear, got %s", v)
+	}
+	for _, now := range []int64{100250, 120000, 140000, 200000} {
+		_, v := g.Decide(Activity{
+			Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
+		}, 1000, 60000, now, false, false)
+		if v.Send {
+			t.Fatalf("paused poll at now=%d sent (clear=%t, reason=%s); want quiet", now, v.Clear, v.Reason)
+		}
+		if v.Reason != ReasonPaused {
+			t.Fatalf("paused suppression reason = %q, want %q", v.Reason, ReasonPaused)
+		}
 	}
 }
 
@@ -132,8 +170,8 @@ func TestGateResumeReanchors(t *testing.T) {
 		Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause",
 	}, 1000, 60000, 100000, true, false)
 	out, v := g.Decide(runningCard("Show", "S1 E1"), 1000, 60000, 101000, true, false)
-	if !v.Send {
-		t.Fatalf("resume should send, got %s", v)
+	if !v.Send || v.Clear {
+		t.Fatalf("resume should send a card (not a clear), got %s (clear=%t)", v, v.Clear)
 	}
 	if !out.HasStart || out.Start != 100000 || out.End != 160000 {
 		t.Fatalf("resume anchors start=%d end=%d, want 100000/160000", out.Start, out.End)
@@ -185,24 +223,25 @@ func TestGateNotReadyHeartbeatKeepsAnchor(t *testing.T) {
 // F2: intervals run on a monotonic clock. A backward wall-clock step must not
 // make the heartbeat delta negative and stall self-healing for the step.
 func TestGateBackwardClockStepDoesNotStallHeartbeat(t *testing.T) {
-	// A paused card carries no start, so the divergence path cannot fire: the
+	// An idle card carries no start, so the divergence path cannot fire: the
 	// heartbeat is the only self-healing route - the case the reviewer saw stall
-	// with a -55 s step.
-	paused := Activity{Type: "PLAYING", Details: "Show", State: "S1 E1 - 00:01", SmallImage: "pause"}
+	// with a -55 s step. (A paused card cannot be used here: pause clears the
+	// presence and stays quiet, by design.)
+	idle := Activity{Type: "PLAYING", Details: "Browsing", State: "Idle", SmallImage: "stop"}
 	g := &Gate{}
-	if _, v := g.Decide(paused, 1000, 60000, 100000, false, false); !v.Send {
-		t.Fatalf("first paused card should send, got %s", v)
+	if _, v := g.Decide(idle, 0, 0, 100000, false, false); !v.Send {
+		t.Fatalf("first idle card should send, got %s", v)
 	}
-	if _, v := g.Decide(paused, 1000, 60000, 120000, false, false); v.Send {
+	if _, v := g.Decide(idle, 0, 0, 120000, false, false); v.Send {
 		t.Fatalf("20 s in, heartbeat should not be due, got %s", v)
 	}
 	// The wall clock steps back 55 s; only 20 s of interval has elapsed.
-	if _, v := g.Decide(paused, 1000, 60000, 65000, false, false); v.Send {
+	if _, v := g.Decide(idle, 0, 0, 65000, false, false); v.Send {
 		t.Fatalf("55 s backward step fired the heartbeat early: %s", v)
 	}
 	// 10 s of real interval later the monotonic clock reaches 30 s: the
 	// heartbeat self-heals instead of stalling for the 55 s step.
-	if _, v := g.Decide(paused, 1000, 60000, 75000, false, false); !v.Send {
+	if _, v := g.Decide(idle, 0, 0, 75000, false, false); !v.Send {
 		t.Fatalf("heartbeat stalled after a backward step, got %s", v)
 	}
 }

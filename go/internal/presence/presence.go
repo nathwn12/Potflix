@@ -285,7 +285,9 @@ type Activity struct {
 	HasStart   bool
 	Start      int64
 	// End is the projected end (epoch ms), set by the send gate while running
-	// and the duration is known; 0 omits timestamps.end (README deviation 5).
+	// and the duration is known. It is retained for the gate's bookkeeping but
+	// deliberately NOT serialized (README deviation 5, corrected): the client
+	// would render a countdown from it.
 	End int64
 }
 

@@ -16,9 +16,10 @@ import (
 // gate_integration_test.go - headless end-to-end proof of the push gate through
 // the in-process fake pipe. It drives the REAL tracker, the REAL gate and the
 // REAL pushActivity over a scripted position sequence, and asserts the exact
-// sequence of SET_ACTIVITY frames that would go to Discord - including
-// timestamps.start/end - and that a suppressed poll produces no frame at all.
-// No live Discord and no real PotPlayer window are touched.
+// sequence of SET_ACTIVITY frames that would go to Discord: playing cards carry
+// timestamps.start and never end, a pause clears the activity (activity:null)
+// with no paused card, and a suppressed poll produces no frame at all. No live
+// Discord and no real PotPlayer window are touched.
 
 const itTitle = "Breaking Bad (2008) - S04E07 - Problem Dog (1080p BluRay x265 Silence).mkv - PotPlayer"
 
@@ -34,19 +35,21 @@ type itWire struct {
 			Details    string `json:"details"`
 			State      string `json:"state"`
 			Timestamps *struct {
-				Start int64 `json:"start"`
-				End   int64 `json:"end"`
+				Start *int64 `json:"start"`
+				End   *int64 `json:"end"`
 			} `json:"timestamps"`
 		} `json:"activity"`
 	} `json:"args"`
 }
 
 type itSent struct {
-	details string
-	state   string
-	hasTS   bool
-	start   int64
-	end     int64
+	clear    bool // activity:null
+	details  string
+	state    string
+	hasStart bool
+	start    int64
+	hasEnd   bool
+	end      int64
 }
 
 func TestGateFakePipeSequence(t *testing.T) {
@@ -139,7 +142,7 @@ func TestGateFakePipeSequence(t *testing.T) {
 	drive(R, 15000, itN+2000) // 8 seek after window -> tracker event sent
 	drive(R, 15250, itN+2250) // 9 steady
 	drive(P, 15250, itN+2500) // 10 flap -> still running
-	drive(P, 15250, itN+2750) // 11 real pause -> sent (no timestamps)
+	drive(P, 15250, itN+2750) // 11 real pause -> clear (activity:null), no card
 	drive(P, 15250, itN+3000) // 12 paused steady
 	drive(R, 15250, itN+3250) // 13 resume -> sent
 	// 14+ : 120 smooth 250 ms polls = 30 s with no tracker event; only the
@@ -158,22 +161,33 @@ func TestGateFakePipeSequence(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	var got []itSent
+	var raws []string
 drain:
 	for {
 		select {
 		case payload := <-frames:
+			raws = append(raws, string(payload))
 			var w itWire
 			if err := json.Unmarshal(payload, &w); err != nil {
 				t.Fatalf("decode frame %s: %v", payload, err)
 			}
-			if w.Cmd != "SET_ACTIVITY" || w.Args.Activity == nil {
+			if w.Cmd != "SET_ACTIVITY" {
 				t.Fatalf("unexpected frame: %s", payload)
+			}
+			if w.Args.Activity == nil {
+				got = append(got, itSent{clear: true})
+				continue
 			}
 			s := itSent{details: w.Args.Activity.Details, state: w.Args.Activity.State}
 			if ts := w.Args.Activity.Timestamps; ts != nil {
-				s.hasTS = true
-				s.start = ts.Start
-				s.end = ts.End
+				if ts.Start != nil {
+					s.hasStart = true
+					s.start = *ts.Start
+				}
+				if ts.End != nil {
+					s.hasEnd = true
+					s.end = *ts.End
+				}
 			}
 			got = append(got, s)
 		default:
@@ -183,28 +197,23 @@ drain:
 
 	const (
 		start0 = itN - 1000
-		end0   = itN + 2831979
 		start1 = itN - 1800
-		end1   = itN + 2831179
 		start2 = itN - 7500
-		end2   = itN + 2825479
 		start3 = itN - 13000
-		end3   = itN + 2819979
 		start4 = itN - 12000
-		end4   = itN + 2820979
 	)
 	want := []itSent{
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start0, end0},  // first
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start1, end1},  // trailing edge
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start2, end2},  // divergence
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start3, end3},  // seek event
-		{"Breaking Bad", `S4 E7 "Problem Dog" - 00:15`, false, 0, 0}, // pause, no timestamps
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start4, end4},  // resume
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start0}, // first
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start1}, // trailing edge
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start2}, // divergence
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start3}, // seek event
+		{clear: true}, // pause -> activity:null, NO paused card
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4}, // resume
 		// The 30 s heartbeat re-pushes the same card: at 1x the anchor is
 		// unchanged, so the payload is byte-identical to the resume - that is
 		// exactly the self-healing re-push.
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start4, end4}, // heartbeat
-		{"Breaking Bad", `S4 E7 "Problem Dog"`, true, start4, end4}, // positive control (forced)
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4}, // heartbeat
+		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4}, // positive control (forced)
 	}
 
 	if len(got) != len(want) {
@@ -214,8 +223,43 @@ drain:
 		if got[i] != want[i] {
 			t.Errorf("frame %d = %+v, want %+v", i, got[i], want[i])
 		} else {
-			t.Logf("frame %d sent: details=%q state=%q start=%d end=%d", i, got[i].details, got[i].state, got[i].start, got[i].end)
+			t.Logf("frame %d raw: %s", i, raws[i])
 		}
+	}
+
+	// R1: NO frame may carry timestamps.end (the client would render a
+	// countdown from it).
+	for i, s := range got {
+		if s.hasEnd {
+			t.Errorf("frame %d carries end=%d, want no end: %s", i, s.end, raws[i])
+		}
+	}
+	// R2: the pause frame is a null activity and NO paused card is sent.
+	if !got[4].clear {
+		t.Fatalf("frame 4 = %+v, want the pause clear (activity:null)", got[4])
+	}
+	for i, raw := range raws {
+		if strings.Contains(raw, "00:15") {
+			t.Errorf("frame %d looks like a paused card: %s", i, raw)
+		}
+	}
+	// Resume re-anchors to the live position within the poll: now - start == ct.
+	const (
+		resumeNow = itN + 3250
+		resumeCT  = int64(15250)
+	)
+	if got[5].start != resumeNow-resumeCT {
+		t.Errorf("resume start=%d, want %d (now-ct); off by %d ms",
+			got[5].start, resumeNow-resumeCT, got[5].start-(resumeNow-resumeCT))
+	}
+	// Post-seek re-anchor within one poll: the seek-event frame's start matches
+	// the live position at that poll.
+	const (
+		seekNow = itN + 2000
+		seekCT  = int64(15000)
+	)
+	if got[3].start != seekNow-seekCT {
+		t.Errorf("post-seek start=%d, want %d (now-ct)", got[3].start, seekNow-seekCT)
 	}
 
 	// The observation boundary: every poll logged an attempt, suppressed polls
@@ -226,8 +270,11 @@ drain:
 	}
 	logText := string(logData)
 	const totalPolls = 14 + 120 + 1 // + the forced positive-control push
-	if n := strings.Count(logText, "gate=sent"); n != len(want) {
-		t.Errorf("log gate=sent lines = %d, want %d", n, len(want))
+	if n := strings.Count(logText, "gate=sent"); n != len(want)-1 {
+		t.Errorf("log gate=sent lines = %d, want %d (the pause is a clear)", n, len(want)-1)
+	}
+	if n := strings.Count(logText, "gate=clear"); n != 1 {
+		t.Errorf("log gate=clear lines = %d, want 1", n)
 	}
 	if n := strings.Count(logText, "gate=suppressed"); n != totalPolls-len(want) {
 		t.Errorf("log gate=suppressed lines = %d, want %d", n, totalPolls-len(want))
@@ -238,6 +285,9 @@ drain:
 	if !strings.Contains(logText, "reason=heartbeat-not-due") {
 		t.Errorf("log is missing a suppressed reason=heartbeat-not-due line")
 	}
-	t.Logf("observation boundary: %d polls, %d sent, %d suppressed (reasons logged)",
-		totalPolls, len(want), totalPolls-len(want))
+	if !strings.Contains(logText, "reason=paused") {
+		t.Errorf("log is missing a suppressed reason=paused line")
+	}
+	t.Logf("observation boundary: %d polls, %d cards sent, 1 clear, %d suppressed (reasons logged)",
+		totalPolls, len(want)-1, totalPolls-len(want))
 }
