@@ -127,6 +127,8 @@ go vet ./...
 go test ./... -count=1
 ```
 
+One-command gate: `powershell -ExecutionPolicy Bypass -File tools\check.ps1` (add `-Build -Selftest` to also rebuild and self-test).
+
 `.\dist\potflix.exe --selftest` proves the headless wiring (window/icon/tray
 add, log rotation, second-instance lock, and a full IPC round-trip against an
 in-process fake pipe).

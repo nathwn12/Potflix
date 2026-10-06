@@ -9,6 +9,12 @@ tools/*.orig
 # local / secrets-ish
 client-id.txt
 
+# opencode / agent instructions (kept local)
+AGENTS.md
+.opencode/
+opencode.json
+opencode.jsonc
+
 # os
 Thumbs.db
 desktop.ini
