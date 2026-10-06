@@ -135,11 +135,36 @@ func messageLoop() {
 	}
 }
 
+// trayMouseMessage extracts the mouse/context message from a Shell_NotifyIcon
+// callback. Both shell conventions carry it in LOWORD(lParam): legacy (uVersion
+// 0, which is what this app gets - it never calls NIM_SETVERSION) sends
+// wParam = icon id and lParam = the mouse message; NOTIFYICON_VERSION_4 sends
+// LOWORD(lParam) = the event (a mouse message or NIN_*), HIWORD(lParam) = icon
+// id, and wParam = anchor coordinates (NOTIFYICONDATAW docs). The owner's real
+// right-click delivered wParam=1, lParam=WM_RBUTTONUP - the legacy shape - so
+// reading LOWORD(lParam) is the honest fix; reading wParam here was the bug.
+// LOWORD(wParam) is checked only as a defensive fallback, so a future version
+// or loader change that moved the message cannot silently kill the menu again.
+// Returns wmNull when neither word is a menu-opening message.
+func trayMouseMessage(wparam, lparam uintptr) uint16 {
+	if m := uint16(lparam & 0xFFFF); opensTrayMenu(m) {
+		return m
+	}
+	if m := uint16(wparam & 0xFFFF); opensTrayMenu(m) {
+		return m
+	}
+	return wmNull
+}
+
+// opensTrayMenu reports whether m is a message that should open the tray menu.
+func opensTrayMenu(m uint16) bool {
+	return m == wmRButtonUp || m == wmContextMenu
+}
+
 func wndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 	switch msg {
 	case wmAppTray:
-		// Classic (non-V4) NOTIFYICON callback: wParam = mouse message.
-		switch wparam & 0xFFFF {
+		switch trayMouseMessage(wparam, lparam) {
 		case wmRButtonUp, wmContextMenu:
 			showTrayMenu(hwnd)
 		}
