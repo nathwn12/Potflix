@@ -20,14 +20,20 @@ Outputs:
   assets\\discord\\logo.png   1024x1024 chosen lockup on black rounded tile
   assets\\appicon.png          1024x1024 Ribbon P on black rounded tile
   assets\\appicon-square.png   1024x1024 Ribbon P on full-bleed black square
-  assets\\discord\\play|pause|stop.png  1024x1024 red-disc badge set
+  assets\\discord\\play|pause|stop.png  1024x1024 V1 dark badge set (black disc,
+    red ring + red glyph; PROTECTED writers below leave logo/appicons/ico
+    byte-identical - this script reads logo.png, it does not rewrite it)
+  assets\\discord\\cover.png  1024x576 C1 PRIMARY invite cover (no wordmark)
+  design\\preview\\cover-variants.png  labelled C1/C2/C3 plain + mock-overlay sheet
+  design\\preview\\badges-variants.png  labelled V1/V2/V3 sheet (large + 24px
+    actual on #232428 and #0B0B0B)
   assets\\icon.ico             ONE 256x256 BMP/DIB frame, transparent corners
-  design\\preview\\card-*.png  refreshed communication-aid cards
+  design\\preview\\card-*.png  refreshed communication-aid cards (V1 small art)
 """
 
 import os
 import struct
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SS = 8  # supersample factor: the crispness source
@@ -214,11 +220,26 @@ def render_lockup(size, key):
     return down(t), fam
 
 
-def render_badge(size, kind):
-    img = new((size, size))
-    d = ImageDraw.Draw(img)
-    d.ellipse([0, 0, size * SS, size * SS], fill=RED)
-    c, r = size / 2 * SS, size * 0.30 * SS
+# ---------------------------------------------------------------- badge variants
+# Dark-mode Discord badges (1024 fractions; S = 1024):
+#   DISC_D  = 0.90 S  disc diameter (V1 + V3); margin 0.05 S per side (51.2 px)
+#   RING_W  = 0.055 S ring stroke (56.3 px); ring outer flush with disc edge,
+#             inner diameter 0.79 S. At 24 px: 24/1024 scale -> stroke 1.32 px,
+#             disc ~21.6 px. Clearly visible, fully inside canvas.
+#   V2_DISC = 0.86 S  disc diameter; base margin 0.07 S per side (71.7 px)
+#   FACET   = dx=dy=0.032 S (32.8 px each, magnitude ~0.045 S / 46.4 px):
+#             dark disc offset behind black disc -> bottom-right crescent up to
+#             ~1.1 px at 24 px. Max extent 0.962 S, min 0.07 S: nothing clipped.
+# Glyph geometry (play triangle / pause bars / stop square, optical shift)
+# is unchanged from the original badge; glyph fill is now RED.
+BADGE_DISC_D = 0.90
+BADGE_RING_W = 0.055
+BADGE_V2_D = 0.86
+BADGE_FACET_DX = 0.032
+BADGE_FACET_DY = 0.032
+
+
+def draw_badge_glyph(d, c, r, kind):
     if kind == "play":
         sh = r * 0.10  # optical shift right
         d.polygon(
@@ -227,23 +248,71 @@ def render_badge(size, kind):
                 (c - r * 0.55 + sh, c + r * 0.75),
                 (c + r * 0.75 + sh, c),
             ],
-            fill=WHITE,
+            fill=RED,
         )
     elif kind == "pause":
         w = r * 0.52
         d.rectangle(
-            [c - r * 0.72, c - r * 0.72, c - r * 0.72 + w, c + r * 0.72], fill=WHITE
+            [c - r * 0.72, c - r * 0.72, c - r * 0.72 + w, c + r * 0.72], fill=RED
         )
         d.rectangle(
-            [c + r * 0.72 - w, c - r * 0.72, c + r * 0.72, c + r * 0.72], fill=WHITE
+            [c + r * 0.72 - w, c - r * 0.72, c + r * 0.72, c + r * 0.72], fill=RED
         )
     else:
         d.rounded_rectangle(
             [c - r * 0.62, c - r * 0.62, c + r * 0.62, c + r * 0.62],
             radius=int(r * 0.12),
-            fill=WHITE,
+            fill=RED,
         )
+
+
+def render_badge_v1(size, kind):
+    """V1 PRIMARY: black disc + red ring + red glyph."""
+    img = new((size, size))
+    d = ImageDraw.Draw(img)
+    disc = size * BADGE_DISC_D * SS
+    ringw = size * BADGE_RING_W * SS
+    x0 = (size * SS - disc) / 2
+    box = [x0, x0, x0 + disc, x0 + disc]
+    d.ellipse(box, fill=RED)  # ring outer
+    inner = ringw * 2
+    d.ellipse(
+        [box[0] + ringw, box[1] + ringw, box[2] - ringw, box[3] - ringw], fill=BLACK
+    )
+    c, r = size / 2 * SS, size * 0.30 * SS
+    draw_badge_glyph(d, c, r, kind)
     return down(img)
+
+
+def render_badge_v2(size, kind):
+    """V2: black disc + red glyph + dark-red offset facet (no ring)."""
+    img = new((size, size))
+    d = ImageDraw.Draw(img)
+    disc = size * BADGE_V2_D * SS
+    dx, dy = size * BADGE_FACET_DX * SS, size * BADGE_FACET_DY * SS
+    x0 = (size * SS - disc) / 2
+    d.ellipse([x0 + dx, x0 + dy, x0 + disc + dx, x0 + disc + dy], fill=DARK)
+    d.ellipse([x0, x0, x0 + disc, x0 + disc], fill=BLACK)
+    c, r = size / 2 * SS, size * 0.30 * SS
+    draw_badge_glyph(d, c, r, kind)
+    return down(img)
+
+
+def render_badge_v3(size, kind):
+    """V3: dark-red disc + red glyph (no black)."""
+    img = new((size, size))
+    d = ImageDraw.Draw(img)
+    disc = size * BADGE_DISC_D * SS
+    x0 = (size * SS - disc) / 2
+    d.ellipse([x0, x0, x0 + disc, x0 + disc], fill=DARK)
+    c, r = size / 2 * SS, size * 0.30 * SS
+    draw_badge_glyph(d, c, r, kind)
+    return down(img)
+
+
+def render_badge(size, kind):
+    """V1 is the shipped asset; cards + assets/discord use this."""
+    return render_badge_v1(size, kind)
 
 
 def candidate_sheet():
@@ -313,6 +382,379 @@ def candidate_sheet():
     for i, r in enumerate(rows):
         sheet.paste(r, (0, HEAD + RH * i))
     return sheet, fams
+
+
+# ---------------------------------------------------------------- badge sheet
+VARIANT_BLURB = {
+    "V1": "V1 PRIMARY: black disc + red ring + red glyph",
+    "V2": "V2: black disc + red glyph + dark-red offset facet (no ring)",
+    "V3": "V3: dark-red disc + red glyph (no black)",
+}
+
+
+def badges_variants_sheet(badges):
+    """Labelled sheet: V1/V2/V3 x (large + 24px actual, 6x nearest) x CARD/BLACK.
+
+    badges: {(variant, kind): 1024 RGBA}. Sheet is 1x RGB (no supersample).
+    """
+    W, HEAD, ROWH = 1800, 170, 560
+    sheet = Image.new("RGB", (W, HEAD + ROWH * 3), (26, 27, 30))
+    dh = ImageDraw.Draw(sheet)
+    ft = load_inter(44, "Bold")
+    fs = load_inter(24, "Regular")
+    dh.text(
+        (W // 2, HEAD // 2),
+        "POTFLIX DISCORD BADGES - DARK VARIANTS",
+        font=ft,
+        fill=WHITE,
+        anchor="mm",
+    )
+    y = HEAD
+    for vi, v in enumerate(("V1", "V2", "V3")):
+        dh.text(
+            (40, y + 14),
+            "%s  .  %s" % (v, VARIANT_BLURB[v]),
+            font=load_inter(28, "Bold"),
+            fill=WHITE,
+        )
+        dh.text(
+            (40, y + 52),
+            "disc/ring numbers state fractions of 1024 in make_logo.py header",
+            font=fs,
+            fill=CARD_MUT[:3],
+        )
+        panels = (("CARD #232428", (0x23, 0x24, 0x28)), ("BLACK #0B0B0B", (11, 11, 11)))
+        pw = (W - 80) // 2
+        for pi, (plabel, bg) in enumerate(panels):
+            x = 40 + pi * pw
+            panel = Image.new("RGB", (pw, ROWH - 110), bg)
+            pd = ImageDraw.Draw(panel)
+            fl = load_inter(24, "Bold")
+            pd.text(
+                (20, 8),
+                "%s  .  large + 24px actual (6x nearest)" % plabel,
+                font=fl,
+                fill=(255, 255, 255) if pi == 0 else (245, 245, 245),
+            )
+            bx = 20
+            for kind in ("play", "pause", "stop"):
+                b = badges[(v, kind)]
+                lg = b.resize((150, 150), Image.LANCZOS)
+                panel.paste(lg, (bx, 50), lg)
+                pd.text(
+                    (bx + 75, 210),
+                    kind,
+                    font=load_inter(22, "Regular"),
+                    fill=(181, 186, 193),
+                    anchor="mm",
+                )
+                sm = b.resize((24, 24), Image.LANCZOS)
+                big = sm.resize((144, 144), Image.NEAREST)
+                panel.paste(big, (bx + 3, 240), big)
+                pd.text(
+                    (bx + 75, 394),
+                    "24px",
+                    font=load_inter(22, "Regular"),
+                    fill=(181, 186, 193),
+                    anchor="mm",
+                )
+                bx += 270
+            sheet.paste(panel, (x, y + 90))
+        y += ROWH
+    return sheet
+
+
+def _is_redish(px, alpha_floor=128):
+    r, g, b, a = px if len(px) == 4 else (px[0], px[1], px[2], 255)
+    return a >= alpha_floor and r >= 150 and g <= 80 and b <= 80
+
+
+def probe_badges(v1, v2, v3):
+    """Pixel probes: disc interior / ring-facet / glyph. Prints + asserts."""
+    for kind, im in v1.items():
+        disc = im.getpixel((512, 180))  # above glyph, inside ring
+        ring = im.getpixel((512, 80))  # ring mid-top (radius ~432)
+        if kind == "play":
+            gly = im.getpixel((512, 512))
+        elif kind == "pause":
+            gly = im.getpixel((371, 512))  # left bar middle
+        else:
+            gly = im.getpixel((512, 512))
+        print(
+            "V1 %s raw disc=%s ring=%s glyph=%s"
+            % (kind, tuple(disc), tuple(ring), tuple(gly))
+        )
+        assert tuple(disc)[:3] == (0x0B, 0x0B, 0x0B), "V1 %s disc not black" % kind
+        assert tuple(ring)[:3] == (0xE5, 0x09, 0x14), "V1 %s ring not red" % kind
+        assert tuple(gly)[:3] == (0xE5, 0x09, 0x14), "V1 %s glyph not red" % kind
+    for kind, im in v3.items():
+        disc = im.getpixel((512, 180))
+        print("V3 %s raw disc=%s" % (kind, tuple(disc)))
+        assert tuple(disc)[:3] == (0x8E, 0x06, 0x0C), "V3 %s disc not dark" % kind
+    for kind, im in v2.items():
+        disc = im.getpixel((512, 180))  # black interior above glyph
+        print("V2 %s raw interior=%s" % (kind, tuple(disc)))
+        assert tuple(disc)[:3] == (0x0B, 0x0B, 0x0B), "V2 %s interior not black" % kind
+        # facet: walk the SE diagonal for a DARK pixel outside the black disc
+        found = None
+        for t in range(430, 520):
+            off = int(t * 0.7071)
+            p = (512 + off, 512 + off)
+            if p[0] >= 1024 or p[1] >= 1024:
+                continue
+            px = im.getpixel(p)
+            if tuple(px)[:3] == (0x8E, 0x06, 0x0C):
+                found = (p, tuple(px))
+                break
+        print("V2 %s facet probe=%s" % (kind, found))
+        assert found is not None, "V2 %s facet not found on SE diagonal" % kind
+
+
+def legibility_24(v1):
+    """Downscale V1 to 24x24; count red-ish ring + glyph pixels. Prints+asserts."""
+    for kind, im in v1.items():
+        sm = im.resize((24, 24), Image.LANCZOS)
+        reds = [
+            (x, y)
+            for y in range(24)
+            for x in range(24)
+            if _is_redish(sm.getpixel((x, y)))
+        ]
+        core = [
+            (x, y)
+            for y in range(6, 18)
+            for x in range(6, 18)
+            if _is_redish(sm.getpixel((x, y)))
+        ]
+        print(
+            "legibility24 V1 %s red_total=%d/576 red_core12x12=%d/144"
+            % (kind, len(reds), len(core))
+        )
+        assert len(reds) >= 30, "V1 %s ring washed out at 24px" % kind
+        assert len(core) >= 8, "V1 %s glyph lost at 24px" % kind
+
+
+def border_check(named):
+    """Outermost 2px border of each badge must be fully transparent."""
+    for name, im in named.items():
+        w, h = im.size
+        bad, sample = 0, None
+        for y in list(range(2)) + list(range(h - 2, h)):
+            for x in range(w):
+                if im.getpixel((x, y))[3] != 0:
+                    bad += 1
+                    sample = ((x, y), tuple(im.getpixel((x, y))))
+        for y in range(2, h - 2):
+            for x in list(range(2)) + list(range(w - 2, w)):
+                if im.getpixel((x, y))[3] != 0:
+                    bad += 1
+                    sample = ((x, y), tuple(im.getpixel((x, y))))
+        tl = tuple(im.getpixel((0, 0)))
+        tr = tuple(im.getpixel((w - 1, 0)))
+        print(
+            "border %s nonzero=%d/8192 corners TL=%s TR=%s sample=%s"
+            % (name, bad, tl, tr, sample)
+        )
+        assert bad == 0, "%s clipped: %d border pixels opaque" % (name, bad)
+
+
+# ---------------------------------------------------------------- cover art
+# Discord Rich Presence Invite "Cover Image" slot: 1024x576 RGBA.
+# Discord draws over it: the app icon top-left, name/status lines beside it,
+# and a full-width Join button across the bottom band. So: NO wordmark in the
+# art (Discord draws the app name), atmospheric right-side interest only, and
+# the top-left quadrant + bottom ~30% kept quiet and dark.
+COVER_W, COVER_H = 1024, 576
+COVER_TEXT_BOX = (140, 24, 512, 140)  # name/status lines beside the icon
+COVER_JOIN_BOX = (24, 462, 1000, 540)  # Join button footprint
+COVER_BAND_Y = 403  # bottom band starts (~70% of height)
+
+COVER_BLURBS = {
+    "C1": "C1 PRIMARY: black field + dark-red facet sweep, watermark P right third",
+    "C2": "C2: black field, full-red mark center-right, soft dark-red vignette",
+    "C3": "C3: black field, film-strip sprocket motif right edge, small mark lower right",
+}
+
+
+def _paste_mark(base, box, opacity=1.0):
+    """Full Ribbon-P (RED face / DARK plane / BLACK counter) over a 1x base."""
+    x0, y0, x1, y1 = box
+    mw = x1 - x0
+    pad = int(mw * 0.08) + 1
+    layer = new((mw + 2 * pad, mw + 2 * pad))
+    ribbon_p(layer, (pad, pad, pad + mw, pad + mw))
+    mark = down(layer)
+    if opacity < 1.0:
+        mark.putalpha(mark.split()[3].point(lambda v: int(v * opacity + 0.5)))
+    base.alpha_composite(mark, (int(x0 - pad), int(y0 - pad)))
+    return base
+
+
+def render_cover_c1():
+    """C1 PRIMARY: black field, DARK diagonal facet sweep, watermark P right."""
+    img = new((COVER_W, COVER_H), BLACK)
+    d = ImageDraw.Draw(img)
+    outer = [(560, 0), (1024, 0), (1024, 240), (780, 400), (600, 400)]
+    d.polygon([(x * SS, y * SS) for x, y in outer], fill=DARK)
+    crease = [(772, 0), (812, 0), (602, 400), (567, 400)]
+    d.polygon([(x * SS, y * SS) for x, y in crease], fill=BLACK)
+    base = down(img)
+    _paste_mark(base, (700, 50, 996, 346), opacity=0.16)
+    return base
+
+
+def render_cover_c2():
+    """C2: black field, full-RED mark center-right, soft DARK vignette right."""
+    base = down(new((COVER_W, COVER_H), BLACK))
+    vig = Image.new("RGBA", (COVER_W, COVER_H), (0, 0, 0, 0))
+    ImageDraw.Draw(vig).ellipse([560, -60, 1100, 460], fill=DARK)
+    vig = vig.filter(ImageFilter.GaussianBlur(70))
+    vig.putalpha(vig.split()[3].point(lambda v: int(v * 0.45 + 0.5)))
+    base.alpha_composite(vig)
+    _paste_mark(base, (670, 120, 880, 330))
+    return base
+
+
+def render_cover_c3():
+    """C3: black field, DARK film strip + sprocket holes, right edge only."""
+    img = new((COVER_W, COVER_H), BLACK)
+    d = ImageDraw.Draw(img)
+    d.rectangle([946 * SS, 0, 1024 * SS, 392 * SS], fill=DARK)
+    for y in range(28, 360, 56):
+        rr(d, (968, y, 1002, y + 26), 6, BLACK)
+    base = down(img)
+    _paste_mark(base, (800, 240, 930, 370))
+    return base
+
+
+def mock_invite_overlay(cover):
+    """Mock Discord invite card over a cover copy (preview sheet only)."""
+    im = cover.copy()
+    d = ImageDraw.Draw(im)
+    im.alpha_composite(render_mark_tile(88), (24, 24))
+    d.text((132, 30), "Potflix", font=load_inter(36, "Bold"), fill=WHITE)
+    d.text(
+        (132, 72),
+        "Watching The Rising of the Shield Hero",
+        font=load_inter(24, "Regular"),
+        fill=(0xB5, 0xBA, 0xC1, 255),
+    )
+    d.rounded_rectangle([24, 462, 1000, 540], radius=14, fill=WHITE)
+    d.text(
+        (512, 501),
+        "Join",
+        font=load_inter(30, "Bold"),
+        fill=(0x0B, 0x0B, 0x0B, 255),
+        anchor="mm",
+    )
+    return im
+
+
+def cover_variants_sheet(covers):
+    """Labelled sheet: C1/C2/C3 plain + with mock invite overlay, full size."""
+    W, HEAD, LABEL = 1024, 150, 64
+    order = ("C1", "C2", "C3")
+    sheet = Image.new(
+        "RGB", (W, HEAD + len(order) * 2 * (LABEL + COVER_H)), (26, 27, 30)
+    )
+    d = ImageDraw.Draw(sheet)
+    d.text(
+        (W // 2, 52),
+        "POTFLIX DISCORD COVERS - INVITE IMAGE VARIANTS",
+        font=load_inter(44, "Bold"),
+        fill=WHITE,
+        anchor="mm",
+    )
+    d.text(
+        (W // 2, 108),
+        "1024x576 RGBA . no wordmark in art . mock invite overlay below each",
+        font=load_inter(24, "Regular"),
+        fill=CARD_MUT[:3],
+        anchor="mm",
+    )
+    y = HEAD
+    for key in order:
+        for tag, im in (
+            ("plain", covers[key]),
+            ("+ mock invite overlay", mock_invite_overlay(covers[key])),
+        ):
+            label = (
+                "%s . plain" % COVER_BLURBS[key]
+                if tag == "plain"
+                else "%s . %s" % (COVER_BLURBS[key], tag)
+            )
+            d.text((24, y + 14), label, font=load_inter(26, "Bold"), fill=WHITE)
+            y += LABEL
+            sheet.paste(im.convert("RGB"), (0, y))
+            y += COVER_H
+    return sheet
+
+
+def cover_region_stats(im, box):
+    """Mean luminance + population std over a 1x box (Rec.709 luma)."""
+    import statistics
+
+    x0, y0, x1, y1 = box
+    vals = [
+        0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2]
+        for y in range(y0, y1)
+        for x in range(x0, x1)
+        for p in [im.getpixel((x, y))]
+    ]
+    return sum(vals) / len(vals), statistics.pstdev(vals)
+
+
+def probe_cover(c1):
+    """Overlay-legibility + wordmark-absence + palette report for C1."""
+    for name, box in (("text", COVER_TEXT_BOX), ("join", COVER_JOIN_BOX)):
+        mean, sd = cover_region_stats(c1, box)
+        print(
+            "cover legibility %s box=%s mean_lum=%.2f std=%.2f"
+            " (gate: mean<=40.0 std<=20.0 for white overlay text)"
+            % (name, box, mean, sd)
+        )
+        assert mean <= 40.0 and sd <= 20.0, "cover %s region too bright/busy" % name
+    raw = c1.tobytes()
+    n = COVER_W * COVER_H
+    whites = sum(1 for i in range(0, len(raw), 4) if min(raw[i : i + 3]) >= 240)
+    print("cover wordmark check near-white pixels=%d/%d (gate: 0)" % (whites, n))
+    assert whites == 0, "cover contains wordmark-like white pixels"
+    from collections import Counter
+
+    cnt = Counter(tuple(raw[i : i + 3]) for i in range(0, len(raw), 4))
+    top = cnt.most_common(8)
+    print(
+        "cover distinct colours=%d top=%s"
+        % (len(cnt), [("#%02X%02X%02X" % c, k) for c, k in top])
+    )
+    brand = [(0xE5, 0x09, 0x14), (0x8E, 0x06, 0x0C), (0x0B, 0x0B, 0x0B)]
+    near = sum(
+        k
+        for c, k in cnt.items()
+        if min(max(abs(c[i] - b[i]) for i in range(3)) for b in brand) <= 8
+    )
+    print("cover palette near-brand(<=8 per channel)=%.4f" % (near / n))
+
+
+def sha256_file(path):
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        h.update(f.read())
+    return h.hexdigest()
+
+
+PROTECTED = [
+    "assets/discord/logo.png",
+    "assets/discord/play.png",
+    "assets/discord/pause.png",
+    "assets/discord/stop.png",
+    "assets/appicon.png",
+    "assets/appicon-square.png",
+    "assets/icon.ico",
+    "go/assets/icon.ico",
+]
 
 
 # ---------------------------------------------------------------- cards
@@ -497,6 +939,10 @@ def main():
     P = lambda *a: os.path.join(ROOT, *a)
     os.makedirs(P("design", "preview"), exist_ok=True)
     os.makedirs(P("assets", "discord"), exist_ok=True)
+    sha_before = {}
+    for rel in PROTECTED:
+        fp = P(*rel.split("/"))
+        sha_before[rel] = sha256_file(fp) if os.path.exists(fp) else "MISSING"
 
     stale = P("design", "preview", "logo-concepts.png")
     if os.path.exists(stale):
@@ -506,27 +952,28 @@ def main():
     sheet, fams = candidate_sheet()
     sheet.save(P("design", "preview", "logo-candidates.png"))
 
-    logo, lockfam = render_lockup(1024, CHOSEN)
-    logo.save(P("assets", "discord", "logo.png"))
-    render_mark_tile(1024, 0.12).save(P("assets", "appicon.png"))
-    render_mark_square(1024, 0.12).save(P("assets", "appicon-square.png"))
+    # PROTECTED (brief boundary): logo/appicons/ico are NOT rewritten here.
+    # Render the lockup in memory only (wordmark font proof), read the large
+    # card art from disk.
+    _, lockfam = render_lockup(1024, CHOSEN)
+    v1, v2, v3 = {}, {}, {}
+    for k in ("play", "pause", "stop"):
+        v1[k] = render_badge_v1(1024, k)
+        v2[k] = render_badge_v2(1024, k)
+        v3[k] = render_badge_v3(1024, k)
     kinds = {}
     for k in ("play", "pause", "stop"):
-        b = render_badge(1024, k)
+        b = v1[k]
         b.save(P("assets", "discord", "%s.png" % k))
         kinds[k] = b
-    write_ico(render_mark_tile(256, 0.12), P("assets", "icon.ico"))
-    # go\embed.go embeds go\assets\icon.ico, so mirror the same bytes there.
-    with open(P("assets", "icon.ico"), "rb") as f:
-        _icon_bytes = f.read()
-    _go_icon = P("go", "assets", "icon.ico")
-    os.makedirs(os.path.dirname(_go_icon), exist_ok=True)
-    with open(_go_icon, "wb") as f:
-        f.write(_icon_bytes)
-    with open(_go_icon, "rb") as f:
-        _go_bytes = f.read()
-    assert _go_bytes == _icon_bytes, "go/assets/icon.ico diverged from assets/icon.ico"
-    print("go/assets/icon.ico parity ok bytes=%d" % len(_go_bytes))
+    badges = {}
+    badges.update({("V1", k): v1[k] for k in v1})
+    badges.update({("V2", k): v2[k] for k in v2})
+    badges.update({("V3", k): v3[k] for k in v3})
+    badges_variants_sheet(badges).save(P("design", "preview", "badges-variants.png"))
+    print(
+        "protected-skip logo.png appicon.png appicon-square.png icon.ico go/assets/icon.ico"
+    )
 
     W, H = 1100, 340
     lg_btn = Image.open(P("assets", "discord", "logo.png")).convert("RGBA")
@@ -573,18 +1020,28 @@ def main():
             P("design", "preview", name)
         )
 
+    covers = {
+        "C1": render_cover_c1(),
+        "C2": render_cover_c2(),
+        "C3": render_cover_c3(),
+    }
+    for key, im in covers.items():
+        assert im.size == (COVER_W, COVER_H) and im.mode == "RGBA", key
+    covers["C1"].save(P("assets", "discord", "cover.png"))
+    cover_variants_sheet(covers).save(P("design", "preview", "cover-variants.png"))
+
     # ---- PROOF ----
     from PIL import Image as I
 
     print("palette " + PALETTE_REPORT)
     for rel in [
         "design/preview/logo-candidates.png",
-        "assets/discord/logo.png",
-        "assets/appicon.png",
-        "assets/appicon-square.png",
         "assets/discord/play.png",
         "assets/discord/pause.png",
         "assets/discord/stop.png",
+        "assets/discord/cover.png",
+        "design/preview/badges-variants.png",
+        "design/preview/cover-variants.png",
         "design/preview/card-before.png",
         "design/preview/card-after.png",
         "design/preview/card-after-movie.png",
@@ -596,24 +1053,50 @@ def main():
     for k, fam in list(fams.items()) + [("lockup:" + CHOSEN, lockfam)]:
         print("wordmark font %s -> getname family=%r" % (k, fam))
     check_mark_32()
-    for rel in ["assets/icon.ico", "go/assets/icon.ico"]:
-        with open(P(*rel.split("/")), "rb") as f:
-            _d = f.read()
-        _n = struct.unpack("<H", _d[4:6])[0]
-        print("%s bytes=%d frames=%d magic=%s" % (rel, len(_d), _n, _d[0:4].hex(" ")))
-    im = I.open(P("assets", "icon.ico"))
-    print(
-        "assets/icon.ico n_frames=%s size=%s" % (getattr(im, "n_frames", "?"), im.size)
+    for k in ("play", "pause", "stop"):
+        for vn, d in (("V1", v1), ("V2", v2), ("V3", v3)):
+            im = d[k]
+            assert im.size == (1024, 1024) and im.mode == "RGBA"
+    probe_badges(v1, v2, v3)
+    legibility_24(v1)
+    border_check(
+        {
+            "V1 play": v1["play"],
+            "V1 pause": v1["pause"],
+            "V1 stop": v1["stop"],
+            "V2 play": v2["play"],
+            "V2 pause": v2["pause"],
+            "V2 stop": v2["stop"],
+            "V3 play": v3["play"],
+            "V3 pause": v3["pause"],
+            "V3 stop": v3["stop"],
+        }
     )
-    # tray transparency: tile corners must be transparent, center opaque
-    lg = I.open(P("assets", "discord", "logo.png"))
     print(
-        "logo corners alpha=%s center alpha=%s"
-        % (
-            [lg.getpixel(p)[3] for p in [(0, 0), (1023, 0), (0, 1023), (1023, 1023)]],
-            lg.getpixel((512, 512))[3],
+        "badge geometry DISC_D=%.3f RING_W=%.3f V2_DISC=%.3f FACET_DX=%.3f FACET_DY=%.3f (fractions of 1024)"
+        % (BADGE_DISC_D, BADGE_RING_W, BADGE_V2_D, BADGE_FACET_DX, BADGE_FACET_DY)
+    )
+    print("cover.png bytes=%d" % os.path.getsize(P("assets", "discord", "cover.png")))
+    probe_cover(covers["C1"])
+    for rel, want in (
+        ("design/preview/badges-variants.png", (1800, 1850)),
+        ("design/preview/card-before.png", (1100, 340)),
+        ("design/preview/card-after.png", (1100, 340)),
+        ("design/preview/card-after-movie.png", (1100, 340)),
+        ("design/preview/card-after-paused.png", (1100, 340)),
+        ("design/preview/card-netflix-reference.png", (1100, 340)),
+    ):
+        got = I.open(P(*rel.split("/"))).size
+        print("carddim %s %dx%d" % (rel, got[0], got[1]))
+        assert tuple(got) == want, "%s dim %s != %s" % (rel, got, want)
+    for rel in PROTECTED:
+        after = sha256_file(P(*rel.split("/")))
+        same = after == sha_before[rel]
+        print(
+            "sha %s before=%s after=%s unchanged=%s"
+            % (rel, sha_before[rel][:12], after[:12], same)
         )
-    )
+        assert same, "%s changed by run" % rel
 
 
 if __name__ == "__main__":
