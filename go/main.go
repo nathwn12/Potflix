@@ -245,9 +245,12 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 	}
 	log.eventPush(out.Details, out.State, ct, total)
 	if err := dc.SetActivity(discord.Activity{
+		Name:       out.Name,
 		Details:    out.Details,
 		State:      out.State,
+		LargeText:  out.LargeText,
 		SmallImage: out.SmallImage,
+		SmallText:  out.SmallText,
 		HasStart:   out.HasStart,
 		Start:      out.Start,
 		End:        out.End,

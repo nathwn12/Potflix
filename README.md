@@ -7,8 +7,11 @@ PotPlayer as a Discord Rich Presence card.
 - **Clean titles always** - `Breaking.Bad.S01E02.1080p.WEB-DL.DD5.1.x264-CtrlHD.mkv`
   shows as **Breaking Bad - S1 E2**. Codecs, tags, release groups stripped,
   years parenthesized (`Dune Part Two (2024)`), `SxxEyy` parsed.
-- **Standardized presence** - `PLAYING` type, `Details` = clean title,
-  `State` = `Playing S1 E2 12:34 / 45:00` / `Paused .` / `Stopped`.
+- **Standardized presence** - `Watching` type (3); header (`name`) = clean
+  title, `Details` = episode name / episode tag / title, `State` = episode
+  tag (unless already the details line; ` - Paused` appended while paused,
+  `Browsing` / `Idle` when idle); tooltips `PotFlix` + `Playing` / `Paused` /
+  `Stopped` (`Idle` when idle).
 - **Netflix look** - red-on-black tray icon; right-click it for **Exit Potflix**.
 - **Your own app name/logo (optional)** - without this, presence uses the
   upstream Discord app (works out of the box, art keys `logo`/`play`/`pause`/`stop`).
@@ -93,9 +96,10 @@ Recorded deliberately; each is a behaviour change, not a parity claim.
   (throttled to one per 5 s), and a 30 s heartbeat re-pushes a steady card. Not
   rate-limit mitigation: the tracker emits 0/min while steady, the heartbeat
   adds 2/min, and a scrub is ~9/min.
+- **Netflix-style card mapping.** SET_ACTIVITY `name` is the cleaned media title, so the header reads `Watching <title>` instead of the app name; `details` is the episode name when known, else the episode tag, else the title; `state` is the episode tag when it adds information beyond `details`; `large_text` is `PotFlix`, `small_text` is `Playing` / `Paused` / `Stopped` (`Idle` when idle). The `name` override is isolated behind one const (`activityNameHeader` in `presence.go`): setting it to false drops the override and the header falls back to the app name.
 - **While paused the card is parked with a count-UP pause timer; the pause path
-  never clears the activity.** The paused card keeps the cleaned title/episode context and
-  marks the state with a ` - Paused` suffix, sets `small_image` to `pause`, and
+  never clears the activity.** The paused card keeps the title in the header/details lines and
+  marks `state` (the episode tag; bare `Paused` with no tag) with the ` - Paused` suffix, sets `small_image` to `pause`, and
   anchors `timestamps.start` at the pause moment with no `timestamps.end`, so
   the client counts the pause UP ("paused for M:SS"). The parked card is sent
   once; while the player stays paused no further card goes out - not even the

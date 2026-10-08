@@ -14,11 +14,17 @@ import (
 //
 //	{"cmd":"SET_ACTIVITY",
 //	 "args":{"pid":<os.Getpid()>,
-//	         "activity":{"type":3,"details":...,"state":...,
+//	         "activity":{"type":3,"name":...,"details":...,"state":...,
 //	                     "timestamps":{"start":...,"end":...},
-//	                     "assets":{"large_image":"logo","large_text":"",
-//	                               "small_image":...,"small_text":""}}},
+//	                     "assets":{"large_image":"logo","large_text":"PotFlix",
+//	                               "small_image":...,"small_text":...}}},
 //	 "nonce":"<unique>"}
+//
+// `name` overrides the header line ("Watching <title>"); when absent the header
+// falls back to the app name. The override is driven by presence.BuildActivity
+// (presence.activityNameHeader, the single revert point) and arrives here as
+// Activity.Name. The body is two lines: details (episode name, else episode
+// tag, else title) and state (episode tag, else empty).
 //
 // A clear is the same command with "activity":null. The activity type is
 // Watching (3), not the Java reference's Playing (0): Discord documents the
@@ -39,9 +45,14 @@ import (
 // Activity is the caller-facing subset: the poll loop fills it from
 // presence.BuildActivity and the fixed brand fields are added here.
 type Activity struct {
+	// Name overrides the header line ("Watching <Name>"); empty omits `name`
+	// and the header falls back to the app name.
+	Name       string
 	Details    string
 	State      string
+	LargeText  string // "PotFlix"; empty is omitted on the wire
 	SmallImage string // "play" running, "pause" paused, "stop" idle/stopped
+	SmallText  string // "Playing"/"Paused"/"Stopped"/"Idle"; empty is omitted
 	HasStart   bool
 	Start      int64 // epoch ms, set while running and paused
 	End        int64 // epoch ms, projected end from the gate; serialized while playing (deviation)
@@ -57,6 +68,7 @@ const activityTypeWatching = 3
 // omitted (`omitempty`) so Discord never sees `"large_text":""`.
 type activityPayload struct {
 	Type       int          `json:"type"`
+	Name       string       `json:"name,omitempty"`
 	Details    string       `json:"details,omitempty"`
 	State      string       `json:"state,omitempty"`
 	Timestamps *timestamps  `json:"timestamps,omitempty"`
@@ -94,17 +106,19 @@ type command struct {
 }
 
 // newActivity maps one card to the wire payload. type is Watching (3);
-// large_image is always "logo" with an empty large_text/small_text.
+// large_image is always "logo" with the caller's LargeText/SmallText (empty
+// text stays omitted via `omitempty`); name carries the header override.
 func newActivity(a Activity) *activityPayload {
 	p := &activityPayload{
 		Type:    activityTypeWatching,
+		Name:    a.Name,
 		Details: a.Details,
 		State:   a.State,
 		Assets: activityAsst{
 			LargeImage: "logo",
-			LargeText:  "",
+			LargeText:  a.LargeText,
 			SmallImage: a.SmallImage,
-			SmallText:  "",
+			SmallText:  a.SmallText,
 		},
 	}
 	if a.HasStart {

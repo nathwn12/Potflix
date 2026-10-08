@@ -261,8 +261,14 @@ func Fmt(ms int64) string {
 }
 
 // pausedMarker is the paused card's state suffix: episode context plus this
-// reads e.g. `S1 E2 "Pilot" - Paused` (or just `Paused` with no context).
+// reads e.g. `S1 E2 - Paused` (or just `Paused` with no context).
 const pausedMarker = " - Paused"
+
+// activityNameHeader enables the SET_ACTIVITY `name` header override: the card
+// header becomes "Watching <title>" instead of the Discord app name.
+// REVERT IN ONE EDIT: set this to false to drop the override entirely (the
+// header then falls back to the app name); nothing else needs to change.
+const activityNameHeader = true
 
 // leadingDashRe is Java's `^\s*-\s*` with Java's \s class.
 var leadingDashRe = regexp.MustCompile(`^[ \t\n\x0B\f\r]*-[ \t\n\x0B\f\r]*`)
@@ -286,8 +292,16 @@ func WithStateTime(context, suffix string) string {
 
 // Activity is the Discord payload (contract section 5). Type is always
 // "PLAYING"; the fields not listed are deliberately unset.
+//
+// Netflix-style mapping (no buttons): the header (Name) is the media title,
+// the first body line (Details) is the episode name when known, else the
+// episode tag, else the title, and the second body line (State) is the episode
+// tag when it adds information, else empty. LargeText names the app
+// ("PotFlix"); SmallText names the playback state. Name is governed by
+// activityNameHeader: empty falls back to the Discord app name header.
 type Activity struct {
 	Type       string
+	Name       string
 	Details    string
 	State      string
 	LargeImage string
@@ -319,47 +333,60 @@ func BuildActivity(rawTitle string, a *Action) Activity {
 			Details:    "Browsing",
 			State:      "Idle",
 			LargeImage: "logo",
+			LargeText:  "PotFlix",
 			SmallImage: "stop",
+			SmallText:  "Idle",
+			// Name intentionally unset: the header falls back to the app name.
 		}
 	}
 
 	c := titleclean.Clean(raw)
-	details := titleclean.Trunc(c.Title, 120)
-	context := ""
-	if c.EpisodeTag != "" {
-		context = c.EpisodeTag
-		if c.EpisodeName != "" {
-			context += " \"" + titleclean.Trunc(c.EpisodeName, 60) + "\""
-		}
+	title := titleclean.Trunc(c.Title, 128)
+	// First body line: the episode name when known, else the episode tag,
+	// else the title.
+	details := title
+	if c.EpisodeName != "" {
+		details = titleclean.Trunc(c.EpisodeName, 128)
+	} else if c.EpisodeTag != "" {
+		details = titleclean.Trunc(c.EpisodeTag, 128)
 	}
-	context = titleclean.Trunc(context, 120)
-	if context == details {
-		context = ""
+	// Second body line: the episode tag, but only when it adds information
+	// beyond the first line. The comparison uses the FINAL emitted values:
+	// both sides are truncated to the 128 cap first, so a tag longer than
+	// the cap cannot repeat the details line it already fills.
+	state := ""
+	if tag := titleclean.Trunc(c.EpisodeTag, 128); tag != "" && tag != details {
+		state = tag
 	}
 
-	// Paused: the state is the episode context plus a "Paused" marker, not a
+	// Paused: the state is the episode tag plus a "Paused" marker, not a
 	// frozen position. The pause duration is the count-UP timer anchored by the
 	// gate (timestamps.start = the pause moment).
-	state := context
 	if a.Paused {
-		state = WithStateTime(context, pausedMarker)
+		state = WithStateTime(state, pausedMarker)
 	}
 	act := Activity{
 		Type:       "PLAYING",
 		Details:    details,
 		State:      state,
 		LargeImage: "logo",
-		SmallText:  "",
+		LargeText:  "PotFlix",
+	}
+	if activityNameHeader {
+		act.Name = title
 	}
 	switch {
 	case a.HasStart:
 		act.HasStart = true
 		act.Start = a.Start
 		act.SmallImage = "play"
+		act.SmallText = "Playing"
 	case a.Paused:
 		act.SmallImage = "pause"
+		act.SmallText = "Paused"
 	default:
 		act.SmallImage = "stop"
+		act.SmallText = "Stopped"
 	}
 	return act
 }

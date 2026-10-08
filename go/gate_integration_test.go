@@ -33,6 +33,7 @@ type itWire struct {
 	Cmd  string `json:"cmd"`
 	Args struct {
 		Activity *struct {
+			Name       string `json:"name"`
 			Details    string `json:"details"`
 			State      string `json:"state"`
 			Timestamps *struct {
@@ -45,6 +46,7 @@ type itWire struct {
 
 type itSent struct {
 	clear    bool // activity:null
+	name     string
 	details  string
 	state    string
 	hasStart bool
@@ -179,7 +181,7 @@ drain:
 				got = append(got, itSent{clear: true})
 				continue
 			}
-			s := itSent{details: w.Args.Activity.Details, state: w.Args.Activity.State}
+			s := itSent{name: w.Args.Activity.Name, details: w.Args.Activity.Details, state: w.Args.Activity.State}
 			if ts := w.Args.Activity.Timestamps; ts != nil {
 				if ts.Start != nil {
 					s.hasStart = true
@@ -214,17 +216,17 @@ drain:
 		end6 = itN + 33250 + (itTotal - 45250)
 	)
 	want := []itSent{
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start0, hasEnd: true, end: end0}, // first
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start1, hasEnd: true, end: end1}, // trailing edge
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start2, hasEnd: true, end: end2}, // divergence
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start3, hasEnd: true, end: end3}, // seek event
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog" - Paused`, hasStart: true, start: pauseStart},             // pause -> parked card, no end, no clear
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4, hasEnd: true, end: end5}, // resume
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start0, hasEnd: true, end: end0}, // first
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start1, hasEnd: true, end: end1}, // trailing edge
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start2, hasEnd: true, end: end2}, // divergence
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start3, hasEnd: true, end: end3}, // seek event
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7 - Paused`, hasStart: true, start: pauseStart},             // pause -> parked card, no end, no clear
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start4, hasEnd: true, end: end5}, // resume
 		// The 30 s heartbeat re-pushes the same card: at 1x the anchor is
 		// unchanged, so the payload is byte-identical to the resume - that is
 		// exactly the self-healing re-push.
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4, hasEnd: true, end: end6}, // heartbeat
-		{details: "Breaking Bad", state: `S4 E7 "Problem Dog"`, hasStart: true, start: start4, hasEnd: true, end: end6}, // positive control (forced)
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start4, hasEnd: true, end: end6}, // heartbeat
+		{name: "Breaking Bad", details: "Problem Dog", state: `S4 E7`, hasStart: true, start: start4, hasEnd: true, end: end6}, // positive control (forced)
 	}
 
 	if len(got) != len(want) {
@@ -252,7 +254,7 @@ drain:
 		}
 	}
 	// R2: the pause frame is a parked paused card, and NO frame is a null clear.
-	if got[4].clear || got[4].state != `S4 E7 "Problem Dog" - Paused` {
+	if got[4].clear || got[4].name != "Breaking Bad" || got[4].state != `S4 E7 - Paused` {
 		t.Fatalf("frame 4 = %+v, want the parked paused card (no clear)", got[4])
 	}
 	for i, s := range got {

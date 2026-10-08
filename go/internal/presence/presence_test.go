@@ -326,34 +326,102 @@ func TestPausedMarkerSurvivesContextCap(t *testing.T) {
 }
 
 func TestBuildActivity(t *testing.T) {
-	idle := BuildActivity("PotPlayer", &Action{})
-	if idle.Type != "PLAYING" || idle.Details != "Browsing" || idle.State != "Idle" ||
-		idle.LargeImage != "logo" || idle.SmallImage != "stop" || idle.HasStart {
-		t.Fatalf("idle card = %+v", idle)
+	// Netflix-style mapping: the header (Name) is the media title, the first
+	// body line (Details) is the episode name when known, else the episode
+	// tag, else the title, and the second body line (State) is the episode
+	// tag when it adds information, else empty.
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	const tvTagOnlyRaw = "Show.S01E02.1080p.mkv - PotPlayer"
+	const movieRaw = "Movie.mkv - PotPlayer"
+	cases := []struct {
+		name  string
+		raw   string
+		act   *Action
+		want  Activity
+		start int64
+	}{
+		{
+			name: "movie running",
+			raw:  movieRaw,
+			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
+			want: Activity{Type: "PLAYING", Name: "Movie", Details: "Movie", State: "",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				HasStart: true},
+			start: 12345,
+		},
+		{
+			name: "tv with episode name and tag",
+			raw:  tvRaw,
+			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
+			want: Activity{Type: "PLAYING", Name: "Show", Details: "Pilot", State: "S1 E2",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				HasStart: true},
+			start: 12345,
+		},
+		{
+			name: "tv with tag only",
+			raw:  tvTagOnlyRaw,
+			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
+			want: Activity{Type: "PLAYING", Name: "Show", Details: "S1 E2", State: "",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				HasStart: true},
+			start: 12345,
+		},
+		{
+			name: "tv paused",
+			raw:  tvRaw,
+			act:  &Action{Paused: true, CT: 83000},
+			want: Activity{Type: "PLAYING", Name: "Show", Details: "Pilot", State: `S1 E2 - Paused`,
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "pause", SmallText: "Paused"},
+		},
+		{
+			name: "movie paused has marker alone",
+			raw:  movieRaw,
+			act:  &Action{Paused: true, CT: 83000},
+			want: Activity{Type: "PLAYING", Name: "Movie", Details: "Movie", State: "Paused",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "pause", SmallText: "Paused"},
+		},
+		{
+			name: "tv stopped",
+			raw:  tvRaw,
+			act:  &Action{CT: 0},
+			want: Activity{Type: "PLAYING", Name: "Show", Details: "Pilot", State: "S1 E2",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Stopped"},
+		},
+		{
+			name: "idle",
+			raw:  "PotPlayer",
+			act:  &Action{},
+			want: Activity{Type: "PLAYING", Details: "Browsing", State: "Idle",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Idle"},
+		},
+		{
+			name: "empty media is idle",
+			raw:  " - PotPlayer",
+			act:  &Action{},
+			want: Activity{Type: "PLAYING", Details: "Browsing", State: "Idle",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Idle"},
+		},
+		{
+			// No episode name, and the over-128-unit title fills the
+			// details line on its own: the state line must stay empty
+			// rather than repeating the truncated details.
+			name: "long title without episode context emits no state",
+			raw:  strings.Repeat("A", 200) + ".mkv - PotPlayer",
+			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
+			want: Activity{Type: "PLAYING", Name: strings.Repeat("A", 99) + string([]rune{0x2026}), Details: strings.Repeat("A", 99) + string([]rune{0x2026}), State: "",
+				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				HasStart: true},
+			start: 12345,
+		},
 	}
-	if a := BuildActivity(" - PotPlayer", &Action{}); a.Details != "Browsing" {
-		t.Fatalf("empty media should be the idle card, got %+v", a)
-	}
-
-	// Episode numbers are Integer.parseInt'd, so leading zeros drop: S01 -> S1.
-	raw := "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
-	run := BuildActivity(raw, &Action{Running: true, HasStart: true, Start: 12345, CT: 1000})
-	if run.Details != "Show" || run.State != `S1 E2 "Pilot"` || run.SmallImage != "play" || !run.HasStart || run.Start != 12345 {
-		t.Fatalf("running card = %+v", run)
-	}
-	paused := BuildActivity(raw, &Action{Paused: true, CT: 83000})
-	if paused.State != `S1 E2 "Pilot" - Paused` || paused.SmallImage != "pause" || paused.HasStart {
-		t.Fatalf("paused card = %+v", paused)
-	}
-	// No episode context: the state is the marker alone, and there is no
-	// user-visible "00:00" artifact from the removed position suffix.
-	pausedMovie := BuildActivity("Movie.mkv - PotPlayer", &Action{Paused: true, CT: 83000})
-	if pausedMovie.State != "Paused" || pausedMovie.SmallImage != "pause" {
-		t.Fatalf("paused movie card = %+v", pausedMovie)
-	}
-	stopped := BuildActivity(raw, &Action{CT: 0})
-	if stopped.SmallImage != "stop" || stopped.State != `S1 E2 "Pilot"` {
-		t.Fatalf("stopped card = %+v", stopped)
+	for _, c := range cases {
+		got := BuildActivity(c.raw, c.act)
+		want := c.want
+		want.Start = c.start
+		if got != want {
+			t.Errorf("%s: card = %+v, want %+v", c.name, got, want)
+		}
 	}
 }
 

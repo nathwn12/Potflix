@@ -221,6 +221,47 @@ func TestSetActivityPausedStartOnlyNoEnd(t *testing.T) {
 	}
 }
 
+func TestWireJSONMapping(t *testing.T) {
+	// The Netflix-style card on the exact wire object: header `name`, two body
+	// lines (`details`, `state`), brand texts, and no buttons/party/secrets.
+	cases := []struct {
+		name string
+		act  Activity
+		want string
+	}{
+		{
+			name: "movie",
+			act:  Activity{Name: "Movie", Details: "Movie", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing", HasStart: true, Start: 12345, End: 67890},
+			want: `{"type":3,"name":"Movie","details":"Movie","timestamps":{"start":12345,"end":67890},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"play","small_text":"Playing"}}`,
+		},
+		{
+			name: "tv with episode name and tag",
+			act:  Activity{Name: "Show", Details: "Pilot", State: "S1 E2", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing", HasStart: true, Start: 111, End: 222},
+			want: `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"play","small_text":"Playing"}}`,
+		},
+		{
+			name: "tv with tag only",
+			act:  Activity{Name: "Show", Details: "S1 E2", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing", HasStart: true, Start: 111, End: 222},
+			want: `{"type":3,"name":"Show","details":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"play","small_text":"Playing"}}`,
+		},
+		{
+			name: "paused",
+			act:  Activity{Name: "Show", Details: "Pilot", State: "S1 E2 - Paused", LargeText: "PotFlix", SmallImage: "pause", SmallText: "Paused", HasStart: true, Start: 5000},
+			want: `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2 - Paused","timestamps":{"start":5000},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"pause","small_text":"Paused"}}`,
+		},
+		{
+			name: "idle",
+			act:  Activity{Details: "Browsing", State: "Idle", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Idle"},
+			want: `{"type":3,"details":"Browsing","state":"Idle","assets":{"large_image":"logo","large_text":"PotFlix","small_image":"stop","small_text":"Idle"}}`,
+		},
+	}
+	for _, c := range cases {
+		if got := WireJSON(c.act); got != c.want {
+			t.Errorf("%s: WireJSON = %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
 func TestClearActivityIsNull(t *testing.T) {
 	c, sc, _ := connectPair(t, 0, Config{})
 	defer sc.Close()

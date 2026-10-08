@@ -145,6 +145,7 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	// so the pause card is never debounced or throttled.
 	if out.SmallImage == "pause" {
 		if g.hasSent && g.last.SmallImage == "pause" &&
+			g.last.Name == out.Name &&
 			g.last.Details == out.Details && g.last.State == out.State {
 			// Already showing the parked paused card for this content: stay
 			// quiet, so the pause timer is not restarted and Discord is not
@@ -168,7 +169,8 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 		return g.commit(out, clk), Verdict{Send: true}
 	}
 
-	contentChanged := out.Details != g.last.Details ||
+	contentChanged := out.Name != g.last.Name ||
+		out.Details != g.last.Details ||
 		out.State != g.last.State ||
 		out.SmallImage != g.last.SmallImage ||
 		out.HasStart != g.last.HasStart

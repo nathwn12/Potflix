@@ -78,9 +78,12 @@ func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
 		start = strconv.FormatInt(a.Start, 10)
 	}
 	payload := discord.WireJSON(discord.Activity{
+		Name:       a.Name,
 		Details:    a.Details,
 		State:      a.State,
+		LargeText:  a.LargeText,
 		SmallImage: a.SmallImage,
+		SmallText:  a.SmallText,
 		HasStart:   a.HasStart,
 		Start:      a.Start,
 		End:        a.End,
