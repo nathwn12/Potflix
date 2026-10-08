@@ -506,6 +506,14 @@ def main():
         b.save(P("assets", "discord", "%s.png" % k))
         kinds[k] = b
     write_ico(render_mark_tile(256, 0.12), P("assets", "icon.ico"))
+    # go\embed.go resolves //go:embed relative to go\, so the compiled-in
+    # tray icon is go\assets\icon.ico, not assets\icon.ico. Keep it byte-identical.
+    with open(P("assets", "icon.ico"), "rb") as f:
+        _icon_bytes = f.read()
+    os.makedirs(P("go", "assets"), exist_ok=True)
+    with open(P("go", "assets", "icon.ico"), "wb") as f:
+        f.write(_icon_bytes)
+    verify_ico(P("go", "assets", "icon.ico"))
 
     W, H = 1100, 340
     lg_btn = Image.open(P("assets", "discord", "logo.png")).convert("RGBA")
@@ -574,6 +582,11 @@ def main():
     for k, fam in list(fams.items()) + [("lockup:" + CHOSEN, lockfam)]:
         print("wordmark font %s -> getname family=%r" % (k, fam))
     check_mark_32()
+    for rel in ["assets/icon.ico", "go/assets/icon.ico"]:
+        with open(P(*rel.split("/")), "rb") as f:
+            _d = f.read()
+        _n = struct.unpack("<H", _d[4:6])[0]
+        print("%s bytes=%d frames=%d magic=%s" % (rel, len(_d), _n, _d[0:4].hex(" ")))
     im = I.open(P("assets", "icon.ico"))
     print(
         "assets/icon.ico n_frames=%s size=%s" % (getattr(im, "n_frames", "?"), im.size)

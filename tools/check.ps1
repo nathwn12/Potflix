@@ -50,6 +50,28 @@ if (-not [string]::IsNullOrWhiteSpace($goTmp)) {
   }
 }
 
+# go\embed.go resolves //go:embed relative to go\, so the compiled-in tray
+# icon is go\assets\icon.ico, not assets\icon.ico. design\make_logo.py writes
+# both; fail here if they ever drift apart again.
+Write-Host '[check] icon parity'
+$iconRoot = Join-Path $root 'assets\icon.ico'
+$iconGo = Join-Path $root 'go\assets\icon.ico'
+if (-not (Test-Path -LiteralPath $iconRoot)) {
+  Write-Host "CHECK FAILED: icon parity ($iconRoot not found)" -ForegroundColor Red
+  exit 1
+}
+if (-not (Test-Path -LiteralPath $iconGo)) {
+  Write-Host "CHECK FAILED: icon parity ($iconGo not found)" -ForegroundColor Red
+  exit 1
+}
+$iconA = [IO.File]::ReadAllBytes($iconRoot)
+$iconB = [IO.File]::ReadAllBytes($iconGo)
+$iconSame = ($iconA.Length -eq $iconB.Length) -and [Linq.Enumerable]::SequenceEqual($iconA, $iconB)
+if (-not $iconSame) {
+  Write-Host 'CHECK FAILED: icon parity (assets\icon.ico and go\assets\icon.ico differ; re-run python design\make_logo.py)' -ForegroundColor Red
+  exit 1
+}
+
 # `go version` is the first toolchain probe. A broken toolchain, or an inherited
 # GOFLAGS that go cannot even parse, must stop the run here rather than be
 # papered over by a later success.
