@@ -18,7 +18,8 @@ square tile, geometric faces read soft).
 Outputs:
   design\\preview\\logo-candidates.png  (6-typeface labelled sheet)
   assets\\discord\\logo.png   1024x1024 chosen lockup on black rounded tile
-  assets\\appicon.png          512x512 Ribbon P on black rounded tile
+  assets\\appicon.png          1024x1024 Ribbon P on black rounded tile
+  assets\\appicon-square.png   1024x1024 Ribbon P on full-bleed black square
   assets\\discord\\play|pause|stop.png  1024x1024 red-disc badge set
   assets\\icon.ico             ONE 256x256 BMP/DIB frame, transparent corners
   design\\preview\\card-*.png  refreshed communication-aid cards
@@ -192,6 +193,14 @@ def render_mark_tile(size, margin_frac=0.21):
     m = size * margin_frac
     ribbon_p(t, (m, m, size - m, size - m))
     return down(t)
+
+
+def render_mark_square(size, margin_frac=0.12):
+    """Mark on a full-bleed opaque black square (for circular masking)."""
+    img = new((size, size), BLACK)
+    m = size * margin_frac
+    ribbon_p(img, (m, m, size - m, size - m))
+    return down(img)
 
 
 def render_lockup(size, key):
@@ -499,21 +508,25 @@ def main():
 
     logo, lockfam = render_lockup(1024, CHOSEN)
     logo.save(P("assets", "discord", "logo.png"))
-    render_mark_tile(512, 0.12).save(P("assets", "appicon.png"))
+    render_mark_tile(1024, 0.12).save(P("assets", "appicon.png"))
+    render_mark_square(1024, 0.12).save(P("assets", "appicon-square.png"))
     kinds = {}
     for k in ("play", "pause", "stop"):
         b = render_badge(1024, k)
         b.save(P("assets", "discord", "%s.png" % k))
         kinds[k] = b
     write_ico(render_mark_tile(256, 0.12), P("assets", "icon.ico"))
-    # go\embed.go resolves //go:embed relative to go\, so the compiled-in
-    # tray icon is go\assets\icon.ico, not assets\icon.ico. Keep it byte-identical.
+    # go\embed.go embeds go\assets\icon.ico, so mirror the same bytes there.
     with open(P("assets", "icon.ico"), "rb") as f:
         _icon_bytes = f.read()
-    os.makedirs(P("go", "assets"), exist_ok=True)
-    with open(P("go", "assets", "icon.ico"), "wb") as f:
+    _go_icon = P("go", "assets", "icon.ico")
+    os.makedirs(os.path.dirname(_go_icon), exist_ok=True)
+    with open(_go_icon, "wb") as f:
         f.write(_icon_bytes)
-    verify_ico(P("go", "assets", "icon.ico"))
+    with open(_go_icon, "rb") as f:
+        _go_bytes = f.read()
+    assert _go_bytes == _icon_bytes, "go/assets/icon.ico diverged from assets/icon.ico"
+    print("go/assets/icon.ico parity ok bytes=%d" % len(_go_bytes))
 
     W, H = 1100, 340
     lg_btn = Image.open(P("assets", "discord", "logo.png")).convert("RGBA")
@@ -568,6 +581,7 @@ def main():
         "design/preview/logo-candidates.png",
         "assets/discord/logo.png",
         "assets/appicon.png",
+        "assets/appicon-square.png",
         "assets/discord/play.png",
         "assets/discord/pause.png",
         "assets/discord/stop.png",

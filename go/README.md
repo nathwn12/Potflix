@@ -53,6 +53,21 @@ go build ./cmd/titleclean
 
 All run from this directory. No network or external dependencies.
 
+## Windows exe icon
+
+`rsrc_windows_amd64.syso` carries the Explorer icon resource (built from
+`..\assets\icon.ico`). `go build` picks up the `*.syso` automatically, so the
+build stays offline. Regenerate only when the ico changes (needs network once
+for the generator):
+
+```
+go install github.com/akavel/rsrc@latest
+rsrc -arch amd64 -ico assets\icon.ico -o go\rsrc_windows_amd64.syso
+```
+
+(run from the repo root). Do not alter the `.ico` files; the tray loader
+(`embed.go` / `tray.go`) is untouched - this only adds the file icon.
+
 The deliberate behaviour deviations from the Java reference (empty asset text
 omitted on the wire, clear-on-exit, capped debug log, `READY` handshake
 requirement) are recorded in the repository `README.md`.
