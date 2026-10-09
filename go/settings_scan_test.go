@@ -1,25 +1,21 @@
 package main
 
 import (
-	"errors"
 	"strings"
 	"testing"
-
-	"potflix/internal/metadata"
 )
 
 // TestSettingsScanHitTest proves the SCAN segmented control resolves: the
 // three segments hit-test back to their own ids, stay inside the client,
-// never overlap each other or any existing control, and the Test button id
-// is present (relabelled from "Test (TODO)" to "Test").
+// and never overlap any existing control.
 func TestSettingsScanHitTest(t *testing.T) {
 	oldScan := scanSpeedState
 	scanSpeedState = "balanced"
 	defer func() { scanSpeedState = oldScan }()
 
-	l := computeSettingsLayout(mainClientW, mainClientH, 96, false, false)
-	if len(l.btns) != 16 {
-		t.Fatalf("settings buttons = %d, want 16 (13 existing + 3 SCAN segments)", len(l.btns))
+	l := computeSettingsLayout(mainClientW, mainClientH, 96, false)
+	if len(l.btns) != 9 {
+		t.Fatalf("settings buttons = %d, want 9 (Back + 3 LIBRARY + 2 STARTUP + 3 SCAN)", len(l.btns))
 	}
 	for _, id := range []int{btnScanGentle, btnScanBalanced, btnScanTurbo} {
 		rc, ok := l.settingsBtn(id)
@@ -52,26 +48,12 @@ func TestSettingsScanHitTest(t *testing.T) {
 			}
 		}
 	}
-	// SCAN lives below STARTUP (ends 452) and above the Save-anchored
-	// attribution (starts at 554 with the 680 client).
+	// SCAN lives below STARTUP (ends 204) and above the status line.
 	for _, id := range []int{btnScanGentle, btnScanBalanced, btnScanTurbo} {
 		rc, _ := l.settingsBtn(id)
-		if rc.top < 454 || rc.bottom > 554 {
-			t.Fatalf("SCAN segment %d rect %+v leaves the SCAN strip (want y 454..554)", id, rc)
+		if rc.top < 204 || rc.bottom > 340 {
+			t.Fatalf("SCAN segment %d rect %+v leaves the SCAN strip (want y 204..340)", id, rc)
 		}
-	}
-	// The Test button is present and relabelled.
-	found := false
-	for _, btn := range l.btns {
-		if btn.id == btnTest {
-			found = true
-			if btn.label != "Test" {
-				t.Fatalf("Test button label = %q, want Test", btn.label)
-			}
-		}
-	}
-	if !found {
-		t.Fatal("Test button id missing from settings layout")
 	}
 }
 
@@ -105,8 +87,8 @@ func TestScanSegmentModel(t *testing.T) {
 			t.Fatalf("scanProfileForButton(%d) = %q, want %q", tc.id, got, tc.profile)
 		}
 	}
-	if got := scanProfileForButton(btnTest); got != "" {
-		t.Fatalf("scanProfileForButton(Test) = %q, want empty", got)
+	if got := scanProfileForButton(btnBack); got != "" {
+		t.Fatalf("scanProfileForButton(Back) = %q, want empty", got)
 	}
 	// Selection: only the current profile is accent-filled.
 	for _, cur := range []string{"gentle", "balanced", "turbo"} {
@@ -136,25 +118,5 @@ func TestScanSegmentModel(t *testing.T) {
 	// The hint states the default honestly.
 	if !strings.Contains(scanHintText, "Turbo") || !strings.Contains(scanHintText, "(default)") {
 		t.Fatalf("scanHintText = %q, want it to name Turbo as the default", scanHintText)
-	}
-}
-
-// TestTMDBTestStatusMessage proves the Test-button status mapping.
-func TestTMDBTestStatusMessage(t *testing.T) {
-	if got := tmdbTestStatusMessage(nil); got != "TMDB key OK" {
-		t.Fatalf("nil status = %q, want TMDB key OK", got)
-	}
-	if got := tmdbTestStatusMessage(metadata.ErrTMDBKeyRejected); got != "TMDB key rejected" {
-		t.Fatalf("rejected status = %q, want TMDB key rejected", got)
-	}
-	other := errors.New("boom")
-	if got := tmdbTestStatusMessage(other); got != "TMDB test failed: boom" {
-		t.Fatalf("other status = %q, want TMDB test failed: boom", got)
-	}
-	// A long reason is shortened, and never carries the key (the producer
-	// redacts; the mapper only truncates).
-	long := errors.New(strings.Repeat("x", 500))
-	if got := tmdbTestStatusMessage(long); len(got) > len("TMDB test failed: ")+123 {
-		t.Fatalf("long status not shortened: len=%d", len(got))
 	}
 }

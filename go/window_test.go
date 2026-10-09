@@ -212,48 +212,31 @@ func TestMainSettingsAffordance(t *testing.T) {
 
 // saveViewState snapshots the settings-view globals so view tests restore
 // them.
-func saveViewState() (uiView, keyField, bool, bool, bool) {
-	return curView, tmdbField, tmdbShow, fieldFocused, windowFocused
+func saveViewState() uiView {
+	return curView
 }
 
-func restoreViewState(v uiView, f keyField, show, focused, winFocused bool) {
-	curView, tmdbField, tmdbShow, fieldFocused, windowFocused = v, f, show, focused, winFocused
+func restoreViewState(v uiView) {
+	curView = v
 }
 
-// TestViewSwitch proves the state machine: main -> settings (field loaded,
-// masked) -> back to main.
+// TestViewSwitch proves the state machine: main -> settings -> back to main.
 func TestViewSwitch(t *testing.T) {
-	v, f, show, focused, winFocused := saveViewState()
-	defer restoreViewState(v, f, show, focused, winFocused)
+	v := saveViewState()
+	defer restoreViewState(v)
 
 	curView = viewMain
-	openSettings("secret-key")
+	openSettings()
 	if curView != viewSettings {
 		t.Fatalf("view = %d, want settings", curView)
-	}
-	if tmdbField.text != "secret-key" {
-		t.Fatalf("field = %q, want the loaded value", tmdbField.text)
-	}
-	if tmdbShow {
-		t.Fatalf("reveal = true on entry, want masked by default")
-	}
-	if fieldFocused {
-		t.Fatalf("field focused on entry, want unfocused until clicked")
-	}
-	if got := MaskKey(tmdbField.text); got == "secret-key" {
-		t.Fatalf("masked field shows the raw value")
 	}
 	closeSettings()
 	if curView != viewMain {
 		t.Fatalf("view = %d, want main after Back", curView)
 	}
-	if fieldFocused {
-		t.Fatalf("field still focused after Back, want unfocused")
-	}
 }
 
-// TestSettingsHitTest proves every settings control resolves: Back, Save,
-// Show/Hide, the TMDB get-a-key link, Test, the three planned links, the
+// TestSettingsHitTest proves every settings control resolves: Back, the
 // LIBRARY row (Clear cache/Export/Import), the STARTUP row (toggle/Open
 // log folder), and the SCAN segments (covered in depth by
 // TestSettingsScanHitTest) all hit-test back to their own ids, stay inside
@@ -262,11 +245,11 @@ func TestSettingsHitTest(t *testing.T) {
 	oldScan := scanSpeedState
 	scanSpeedState = "balanced"
 	defer func() { scanSpeedState = oldScan }()
-	l := computeSettingsLayout(mainClientW, mainClientH, 96, false, false)
-	if len(l.btns) != 16 {
-		t.Fatalf("settings buttons = %d, want 16 (Back/Show/GetTMDB/Test/3 planned/Save + Clear/Export/Import/Startup/OpenLog + 3 SCAN)", len(l.btns))
+	l := computeSettingsLayout(mainClientW, mainClientH, 96, false)
+	if len(l.btns) != 9 {
+		t.Fatalf("settings buttons = %d, want 9 (Back + Clear/Export/Import + Startup/OpenLog + 3 SCAN)", len(l.btns))
 	}
-	for _, id := range []int{btnBack, btnSave, btnShow, btnGetTMDB, btnTest, btnGetOMDb, btnGetTVDB, btnGetTrakt,
+	for _, id := range []int{btnBack,
 		btnClearCache, btnExport, btnImport, btnStartup, btnOpenLog} {
 		rc, ok := l.settingsBtn(id)
 		if !ok {
@@ -287,34 +270,9 @@ func TestSettingsHitTest(t *testing.T) {
 			}
 		}
 	}
-	// The field rect is the focus target, not a button.
-	if got := buttonAtPoint(l.btns, (l.field.left+l.field.right)/2, (l.field.top+l.field.bottom)/2); got != 0 {
-		t.Fatalf("field center hits button %d, want 0 (field is not a button)", got)
-	}
-	if l.field.right > mainClientW || l.field.left < 0 {
-		t.Fatalf("field rect %+v escapes the client width", l.field)
-	}
-	// Reveal state only flips the Show/Hide label.
-	shown := computeSettingsLayout(mainClientW, mainClientH, 96, true, false)
-	rc, _ := shown.settingsBtn(btnShow)
-	var label string
-	for _, b := range shown.btns {
-		if b.id == btnShow {
-			label = b.label
-		}
-	}
-	_ = rc
-	if label != "Hide" {
-		t.Fatalf("revealed Show label = %q, want Hide", label)
-	}
-	for _, b := range l.btns {
-		if b.id == btnShow && b.label != "Show" {
-			t.Fatalf("masked Show label = %q, want Show", b.label)
-		}
-	}
 	// Startup state only flips the toggle checkbox label.
-	off := computeSettingsLayout(mainClientW, mainClientH, 96, false, false)
-	on := computeSettingsLayout(mainClientW, mainClientH, 96, false, true)
+	off := computeSettingsLayout(mainClientW, mainClientH, 96, false)
+	on := computeSettingsLayout(mainClientW, mainClientH, 96, true)
 	offRc, _ := off.settingsBtn(btnStartup)
 	onRc, _ := on.settingsBtn(btnStartup)
 	if offRc != onRc {
@@ -330,109 +288,101 @@ func TestSettingsHitTest(t *testing.T) {
 			t.Fatalf("startup on label = %q, want checked", b.label)
 		}
 	}
-	// The LIBRARY/STARTUP rows sit in the free strip: below the planned row
-	// (ends y=336) and above the attribution footer (starts above Save at
-	// y=502, i.e. well clear of the Save-anchored attribution at 454).
+	// The LIBRARY/STARTUP rows sit stacked from the top: LIBRARY at 100,
+	// STARTUP at 172, SCAN at 244.
 	for _, id := range []int{btnClearCache, btnExport, btnImport} {
 		rc, _ := l.settingsBtn(id)
-		if rc.top < 336 || rc.bottom > 454 {
-			t.Fatalf("library button %d rect %+v leaves the free strip (want y 336..454)", id, rc)
+		if rc.top < 100 || rc.bottom > 140 {
+			t.Fatalf("library button %d rect %+v leaves its strip (want y 100..140)", id, rc)
 		}
 	}
 	for _, id := range []int{btnStartup, btnOpenLog} {
 		rc, _ := l.settingsBtn(id)
-		if rc.top < 336 || rc.bottom > 454 {
-			t.Fatalf("startup button %d rect %+v leaves the free strip (want y 336..454)", id, rc)
+		if rc.top < 172 || rc.bottom > 212 {
+			t.Fatalf("startup button %d rect %+v leaves its strip (want y 172..212)", id, rc)
 		}
 	}
 }
 
-// TestKeyFieldEditing proves the owner-drawn text-input model as a pure
-// function: printable append, backspace, paste, and select-all-replace.
-func TestKeyFieldEditing(t *testing.T) {
-	var f keyField
-	f.typeRune('a')
-	f.typeRune('b')
-	if f.text != "ab" {
-		t.Fatalf("append = %q, want ab", f.text)
+// TestLayoutTextInvariants walks computeLayout + computeSettingsLayout at
+// 96/120/144/192 DPI and asserts the structural layout contract behind the
+// live UI-AUDIT: every painted text rect lies inside the client, has
+// positive width and height, and no two text rects intersect (shared edges
+// do not count). Row counts 0/2/many cover the empty, normal, and clamped
+// card shapes.
+func TestLayoutTextInvariants(t *testing.T) {
+	oldDirs := uiDirs
+	oldScan := scanSpeedState
+	defer func() { uiDirs = oldDirs; scanSpeedState = oldScan }()
+	scanSpeedState = "balanced"
+
+	inside := func(cw, ch int32, r rect) bool {
+		return r.left >= 0 && r.top >= 0 && r.right <= cw && r.bottom <= ch
 	}
-	f.backspace()
-	if f.text != "a" {
-		t.Fatalf("backspace = %q, want a", f.text)
-	}
-	f.paste("cd-123")
-	if f.text != "acd-123" {
-		t.Fatalf("paste = %q, want acd-123", f.text)
-	}
-	// Select-all + printable replaces the whole buffer.
-	f.selectAll()
-	if !f.selAll {
-		t.Fatalf("selectAll armed = false, want true")
-	}
-	f.typeRune('Z')
-	if f.text != "Z" || f.selAll {
-		t.Fatalf("select-all-replace = %q sel=%t, want Z/false", f.text, f.selAll)
-	}
-	// Select-all + paste replaces too.
-	f.paste("xy")
-	f.selectAll()
-	f.paste("NEW")
-	if f.text != "NEW" || f.selAll {
-		t.Fatalf("select-all-paste = %q sel=%t, want NEW/false", f.text, f.selAll)
-	}
-	// Select-all + backspace clears.
-	f.selectAll()
-	f.backspace()
-	if f.text != "" || f.selAll {
-		t.Fatalf("select-all-backspace = %q sel=%t, want empty/false", f.text, f.selAll)
-	}
-	// Edge cases: no-ops, never panic.
-	var e keyField
-	e.backspace()
-	e.selectAll() // empty: nothing to select
-	if e.selAll {
-		t.Fatalf("selectAll on empty armed, want false")
-	}
-	e.paste("")
-	if e.text != "" {
-		t.Fatalf("empty paste = %q, want empty", e.text)
+	for _, dpi := range []int{96, 120, 144, 192} {
+		cw := scalePx(int32(dpi), mainClientW)
+		ch := scalePx(int32(dpi), mainClientH)
+		for _, n := range []int{0, 2, 20} {
+			uiDirs = make([]string, n)
+			for i := range uiDirs {
+				uiDirs[i] = string(rune('A'+i%26)) + `:\Media`
+			}
+			l := computeLayout(cw, ch, dpi)
+			rects := mainTextRects(cw, ch, dpi, l, n)
+			for _, r := range rects {
+				w, h := r.rc.right-r.rc.left, r.rc.bottom-r.rc.top
+				if w <= 0 || h <= 0 {
+					t.Fatalf("dpi %d dirs %d: text rect %s %+v has non-positive size", dpi, n, r.id, r.rc)
+				}
+				if !inside(cw, ch, r.rc) {
+					t.Fatalf("dpi %d dirs %d: text rect %s %+v escapes the %dx%d client", dpi, n, r.id, r.rc, cw, ch)
+				}
+			}
+			for i := 0; i < len(rects); i++ {
+				for j := i + 1; j < len(rects); j++ {
+					a, b := rects[i], rects[j]
+					if rectsIntersect(a.rc, b.rc) {
+						t.Fatalf("dpi %d dirs %d: text rects %s and %s intersect: %+v vs %+v",
+							dpi, n, a.id, b.id, a.rc, b.rc)
+					}
+				}
+			}
+		}
+
+		sl := computeSettingsLayout(cw, ch, dpi, false)
+		srects := settingsTextRects(cw, ch, dpi, sl)
+		for _, r := range srects {
+			w, h := r.rc.right-r.rc.left, r.rc.bottom-r.rc.top
+			if w <= 0 || h <= 0 {
+				t.Fatalf("dpi %d settings: text rect %s %+v has non-positive size", dpi, r.id, r.rc)
+			}
+			if !inside(cw, ch, r.rc) {
+				t.Fatalf("dpi %d settings: text rect %s %+v escapes the %dx%d client", dpi, r.id, r.rc, cw, ch)
+			}
+		}
+		for i := 0; i < len(srects); i++ {
+			for j := i + 1; j < len(srects); j++ {
+				a, b := srects[i], srects[j]
+				if rectsIntersect(a.rc, b.rc) {
+					t.Fatalf("dpi %d settings: text rects %s and %s intersect: %+v vs %+v",
+						dpi, a.id, b.id, a.rc, b.rc)
+				}
+			}
+		}
 	}
 }
 
-// TestSettingsCharGate proves the WM_CHAR gate: keystrokes land only when
-// the settings view is visible with a focused field, backspace deletes, and
-// control echoes (Ctrl+A/V) never apply twice.
-func TestSettingsCharGate(t *testing.T) {
-	v, f, show, focused, winFocused := saveViewState()
-	defer restoreViewState(v, f, show, focused, winFocused)
+// TestSettingsEsc proves Esc in the settings view returns to main.
+func TestSettingsEsc(t *testing.T) {
+	v := saveViewState()
+	defer restoreViewState(v)
 
-	curView, tmdbField, tmdbShow, fieldFocused, windowFocused =
-		viewSettings, keyField{}, false, true, true
-	if !onSettingsChar('k') || tmdbField.text != "k" {
-		t.Fatalf("char gate: printable did not append (text=%q)", tmdbField.text)
-	}
-	if onSettingsChar(0x16) {
-		t.Fatalf("char gate: Ctrl+V echo applied, want ignored (WM_KEYDOWN owns paste)")
-	}
-	if onSettingsChar(0x01) {
-		t.Fatalf("char gate: Ctrl+A echo applied, want ignored")
-	}
-	if !onSettingsChar(rune(vkBack)) || tmdbField.text != "" {
-		t.Fatalf("char gate: backspace did not delete (text=%q)", tmdbField.text)
-	}
-	// Unfocused field: keystrokes go nowhere.
-	fieldFocused = false
-	if onSettingsChar('x') || tmdbField.text != "" {
-		t.Fatalf("char gate: unfocused field accepted input (text=%q)", tmdbField.text)
-	}
-	// Main view: keystrokes go nowhere.
-	curView, fieldFocused = viewMain, true
-	if onSettingsChar('x') {
-		t.Fatalf("char gate: main view accepted settings input")
-	}
-	// Esc returns to the main view.
 	curView = viewSettings
 	if !onSettingsKeyDown(0, vkEscape) || curView != viewMain {
 		t.Fatalf("Esc: view = %d, want main", curView)
+	}
+	curView = viewMain
+	if onSettingsKeyDown(0, vkEscape) {
+		t.Fatalf("Esc in main view handled, want ignored")
 	}
 }
