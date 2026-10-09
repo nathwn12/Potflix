@@ -44,6 +44,9 @@ func TestFirstNonEmpty(t *testing.T) {
 }
 
 func TestCapSynopsis(t *testing.T) {
+	if maxSynopsisRunes != 128 {
+		t.Fatalf("maxSynopsisRunes = %d, want 128 (Discord 128-unit asset-text cap)", maxSynopsisRunes)
+	}
 	short := "A short synopsis."
 	if got := capSynopsis(short); got != short {
 		t.Fatalf("capSynopsis short = %q", got)

@@ -5,9 +5,13 @@ import (
 	"unicode"
 )
 
-// maxSynopsisRunes caps a synopsis at ~300 runes; capSynopsis backs off to
-// a word/sentence boundary so the card never shows a cut-off word.
-const maxSynopsisRunes = 300
+// maxSynopsisRunes caps a synopsis at 128 runes (Discord's asset-text cap, so
+// the LargeText hover tooltip carries the short synopsis whole; details/state
+// must be snippets, not sentences, staying on one line; Netflix timed-text:
+// 42 chars/line, max 2 lines, break after punctuation, single U+2026);
+// capSynopsis backs off to a word/sentence boundary so the card never shows
+// a cut-off word.
+const maxSynopsisRunes = 128
 
 // firstNonEmpty returns the first string that is non-empty after trimming
 // whitespace, or "" when all are blank.

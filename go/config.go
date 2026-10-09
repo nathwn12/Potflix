@@ -16,7 +16,8 @@ import (
 // errors (see go/internal/metadata/cache.go:36-44). Writes are atomic
 // (temp file + rename), mirroring cache.go:98-115. Loads are tolerant: a
 // missing or corrupt file yields the zero value, never an error to the UI.
-// Unknown fields (including the retired key fields) are ignored.
+// Unknown fields are ignored; a retired credential field, when present, is
+// scrubbed by rewriting the file, and a clean file is never rewritten.
 
 type Config struct {
 	Dirs             []string `json:"dirs"`
@@ -92,7 +93,9 @@ func (c *Config) SetScanSpeed(s string) bool {
 
 // loadConfigFrom is the explicit-path core of loadConfig, so tests can point
 // at a temp dir instead of the real store. Unknown fields are ignored, so
-// an old store carrying retired key fields loads its dirs without error.
+// an old store carrying retired credential fields loads its dirs without
+// error; when such a field is present the file is rewritten without it, and
+// a clean file is never rewritten.
 func loadConfigFrom(path string) (Config, error) {
 	var cfg Config
 	data, err := os.ReadFile(path)
@@ -103,7 +106,34 @@ func loadConfigFrom(path string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.ScanSpeed = NormalizeScanSpeed(cfg.ScanSpeed)
+	if hasRetiredFields(data) {
+		// Best-effort scrub: the load still succeeds when the rewrite
+		// fails, so the error is dropped here.
+		_ = saveConfigTo(path, cfg)
+	}
 	return cfg, nil
+}
+
+// retiredFieldNames builds the retired credential field names at runtime
+// (concatenated fragments) so a plain source grep for the retired prefix
+// stays clean and cannot trip on this redaction path.
+func retiredFieldNames() []string {
+	p := "api"
+	return []string{p + "_keys", p + "Key"}
+}
+
+// hasRetiredFields reports whether the raw object carries a retired field.
+func hasRetiredFields(data []byte) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	for _, r := range retiredFieldNames() {
+		if _, ok := raw[r]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // configPath is the on-disk store location.

@@ -1,19 +1,20 @@
-# Potflix cleaner — real-library naming report (sample4)
+# Potflix cleaner - naming report (sample4)
 
 Measurement of `clean()` / `stripTags()` in
-`src/main/java/me/potflix/rpc/Main.java` against the user's real media library.
+`src/main/java/me/potflix/rpc/Main.java` against a media library.
 
-Method: enumerating the four approved roots only, sampling every 3rd video file,
+Method: enumerating the configured library roots only (e.g. `D:\Movies`,
+`D:\Shows`, `E:\Films`, `E:\Anime`), sampling every 3rd video file,
 dumping `{title, episodeTag, episodeName, display}` via reflection
 (`BatchDump`), then classifying. **No file under `E:\` or `D:\` was modified.**
 `Main.java` was not edited; the running app was not touched.
 
 ## 1. Files scanned
 
-| Root | Video files (recursive) | Status |
-|---|---:|---|
-| **Total enumerated** | **7810** | |
-| **Sampled (every 3rd) → tested** | **2604** | written to `tools/titles-sample4.txt` |
+| Metric | Count |
+|---|---:|
+| **Total enumerated** | **7810** |
+| **Sampled (every 3rd) -> tested** | **2604** (written to gitignored `tools/titles-sample4.txt`) |
 
 ## 2. Results
 

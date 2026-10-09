@@ -2,6 +2,8 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -76,13 +78,85 @@ func (s *wikipediaSource) wikiGet(ctx context.Context, fullURL string) (*http.Re
 // wikiTransient wraps a transient failure with the sentinel so the
 // resolver's honest counters stay honest: a wrapped error is transient
 // (persist nothing), while (nil, nil) is a definitive miss. The cause is
-// kept for the log; the query title is never included.
+// sanitized: the request URL (which carries the escaped title) and any
+// URL-like payload never reach the message, so an owner title cannot land
+// in a log via the resolver's error log.
 func wikiTransient(cause error) error {
-	return fmt.Errorf("metadata: wikipedia lookup unavailable (%v): %w", cause, ErrLookupUnavailable)
+	return fmt.Errorf("metadata: wikipedia lookup unavailable (%s): %w", wikiSanitizeCause(cause), ErrLookupUnavailable)
+}
+
+// wikiSanitizeCause reports a title-free diagnostic for cause. Transport
+// (*url.Error) messages embed the request URL - which carries the escaped
+// search title - so only the operation is kept and the URL is redacted.
+// Any other message carrying an http(s) URL is redacted the same way;
+// URL-free diagnostics (status, decode, context) pass through verbatim.
+func wikiSanitizeCause(cause error) string {
+	var uerr *url.Error
+	if errors.As(cause, &uerr) {
+		op := strings.TrimSpace(uerr.Op)
+		if op == "" {
+			op = "request"
+		}
+		return op + " failed (URL redacted)"
+	}
+	s := strings.TrimSpace(cause.Error())
+	if s == "" {
+		return "request failed (URL redacted)"
+	}
+	if strings.Contains(s, "http://") || strings.Contains(s, "https://") || strings.Contains(s, "api.php") {
+		return "request failed (URL redacted)"
+	}
+	return s
+}
+
+// wikiAPIError is the Action API error envelope served with HTTP 200
+// (e.g. {"error":{"code":"maxlag","info":"Waiting..."}}): Query is empty,
+// so without this check the empty result reads as a definitive miss and
+// the resolver would persist a negative for a lookup that never happened.
+type wikiAPIError struct {
+	Code string `json:"code"`
+	Info string `json:"info"`
+}
+
+// wikiMissingBool accepts the API's missing marker in either shape: the
+// live API serves {"missing":""} (string), while some fixtures use
+// {"missing":true} (bool). Presence of the key always means missing;
+// absent means present. Any string value marks missing; bools follow
+// their value; null/absent means present.
+type wikiMissingBool bool
+
+// UnmarshalJSON implements json.Unmarshaler for wikiMissingBool.
+func (b *wikiMissingBool) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		*b = false
+		return nil
+	}
+	switch data[0] {
+	case '"':
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return err
+		}
+		*b = true
+		return nil
+	case 't', 'f':
+		var v bool
+		if err := json.Unmarshal(data, &v); err != nil {
+			return err
+		}
+		*b = wikiMissingBool(v)
+		return nil
+	case 'n':
+		*b = false
+		return nil
+	default:
+		return fmt.Errorf("metadata: invalid missing value %s", string(data))
+	}
 }
 
 // wikiSearchResp is GET w/api.php?action=query&list=search.
 type wikiSearchResp struct {
+	Error *wikiAPIError `json:"error"`
 	Query struct {
 		Search []struct {
 			Title string `json:"title"`
@@ -93,11 +167,12 @@ type wikiSearchResp struct {
 // wikiDetailResp is GET w/api.php?action=query&prop=extracts|pageimages.
 // Pages is keyed by pageid; a "missing" page carries {"missing":""}.
 type wikiDetailResp struct {
+	Error *wikiAPIError `json:"error"`
 	Query struct {
 		Pages map[string]struct {
-			Title     string `json:"title"`
-			Missing   bool   `json:"missing"`
-			Extract   string `json:"extract"`
+			Title     string          `json:"title"`
+			Missing   wikiMissingBool `json:"missing"`
+			Extract   string          `json:"extract"`
 			Thumbnail struct {
 				Source string `json:"source"`
 			} `json:"thumbnail"`
@@ -123,7 +198,7 @@ type wikiImagesResp struct {
 type wikiImageInfoResp struct {
 	Query struct {
 		Pages map[string]struct {
-			Missing   bool `json:"missing"`
+			Missing   wikiMissingBool `json:"missing"`
 			ImageInfo []struct {
 				URL string `json:"url"`
 			} `json:"imageinfo"`
@@ -146,14 +221,65 @@ func wikiPosterExtRank(lower string) (rank int, ok bool) {
 	return 0, false
 }
 
+// wikiPosterBlocked reports whether a lowercased file name looks like
+// documentation about posters rather than a poster itself (guidelines,
+// logos, lists, sheets, styles). Such names contain "poster" but are
+// never the artwork - picking one would invent a wrong poster.
+func wikiPosterBlocked(lower string) bool {
+	for _, bad := range []string{"guideline", "logo", "list", "sheet", "style"} {
+		if strings.Contains(lower, bad) {
+			return true
+		}
+	}
+	return false
+}
+
+// wikiPosterPlausible reports whether "poster" appears as a standalone
+// word (plural "posters" allowed), not as part of a longer word such as
+// "posterize". The check scans every "poster" occurrence for non-letter
+// boundaries; one plausible occurrence suffices.
+func wikiPosterPlausible(lower string) bool {
+	for i := 0; i+6 <= len(lower); {
+		idx := strings.Index(lower[i:], "poster")
+		if idx < 0 {
+			return false
+		}
+		start := i + idx
+		beforeOK := start == 0 || !isASCIILetter(lower[start-1])
+		after := start + 6
+		afterOK := false
+		switch {
+		case after >= len(lower):
+			afterOK = true
+		case !isASCIILetter(lower[after]):
+			afterOK = true
+		case lower[after] == 's' || lower[after] == 'S':
+			// Allow plural "posters": trailing s must itself be bounded.
+			if after+1 >= len(lower) || !isASCIILetter(lower[after+1]) {
+				afterOK = true
+			}
+		}
+		if beforeOK && afterOK {
+			return true
+		}
+		i = start + 1
+	}
+	return false
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 // wikiPickPoster returns the poster-like File: title from an article image
 // list, or "". The rule is deliberately strict - a wrong poster is worse
-// than none: the file name must contain "poster" (case-insensitive) AND
-// end in a plausible photo extension (.jpg/.jpeg preferred, then .png,
-// then .webp). When several match, the best extension wins, ties broken
-// by first listed. Anything else - a cast photo, a logo, a screenshot -
-// has no "poster" in its name (or no photo extension) and is rejected,
-// so a page with no poster-like file yields "".
+// than none: the file name must contain "poster" as a standalone word
+// (case-insensitive, plural allowed) AND end in a plausible photo
+// extension (.jpg/.jpeg preferred, then .png, then .webp), and must not
+// look like documentation about posters (guideline/logo/list/sheet/style
+// in the name). When several match, the best extension wins, ties broken
+// by first listed. Anything else - a cast photo, a logo, a screenshot, a
+// "poster guidelines" doc - is rejected, so an ambiguous list yields "".
 func wikiPickPoster(titles []string) string {
 	best := ""
 	bestRank := 0
@@ -165,6 +291,12 @@ func wikiPickPoster(titles []string) string {
 		}
 		lower := strings.ToLower(name)
 		if !strings.Contains(lower, "poster") {
+			continue
+		}
+		if wikiPosterBlocked(lower) {
+			continue
+		}
+		if !wikiPosterPlausible(lower) {
 			continue
 		}
 		rank, ok := wikiPosterExtRank(lower)
@@ -287,6 +419,13 @@ func (s *wikipediaSource) Find(ctx context.Context, q Query) (*Media, error) {
 	if err := decodeCapped(resp, &sr); err != nil {
 		return nil, wikiTransient(err)
 	}
+	if sr.Error != nil {
+		code := strings.TrimSpace(sr.Error.Code)
+		if code == "" {
+			code = "unknown"
+		}
+		return nil, wikiTransient(errors.New("wikipedia api error " + code))
+	}
 	page := ""
 	for _, h := range sr.Query.Search {
 		if t := strings.TrimSpace(h.Title); t != "" {
@@ -307,6 +446,13 @@ func (s *wikipediaSource) Find(ctx context.Context, q Query) (*Media, error) {
 	var dr wikiDetailResp
 	if err := decodeCapped(resp, &dr); err != nil {
 		return nil, wikiTransient(err)
+	}
+	if dr.Error != nil {
+		code := strings.TrimSpace(dr.Error.Code)
+		if code == "" {
+			code = "unknown"
+		}
+		return nil, wikiTransient(errors.New("wikipedia api error " + code))
 	}
 	if len(dr.Query.Pages) == 0 {
 		return nil, nil

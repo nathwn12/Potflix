@@ -79,7 +79,7 @@ var walkDir = filepath.WalkDir
 // whose fetch failed transiently (metadata.ErrLookupUnavailable - timeout,
 // 429, DNS, outage - unknown outcome, never a miss). A transient failure is
 // never binned as not-found, so every key lands in exactly one bucket.
-// Invariant: KeysDone == KeysCached + KeysFetched + KeysNotFound + KeysFailed == Keys.
+// Invariant (completed runs): KeysDone == KeysCached + KeysFetched + KeysNotFound + KeysFailed == Keys; a cancelled run leaves unfinished keys uncounted.
 type Stats struct {
 	Keys           int
 	KeysCached     int

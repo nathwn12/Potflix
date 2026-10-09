@@ -34,10 +34,10 @@ var (
 	// lookup in the live negative cache (gag/blooper reels, outtakes, tv
 	// spots, extended scenes, behind-the-story, making-of, meet-the-cast,
 	// visual-effects, in-search-of, how-to-survive, previz, production
-	// design, time lapse, secret auditions). Guarded by
+	// design, time lapse video, secret auditions). Guarded by
 	// TestParseExtrasNoRealTitleCollision: no real title in the same cache
 	// may match.
-	extraRe = regexp.MustCompile(`(?i)\b(deleted scenes?|extended\s+scenes?|trailers?|gallery|alternate endings?|interviews?|behind the scenes|behind\s+the\s+stor(?:y|ies)|featurettes?|music videos?|samples?|extras?|gag\s+reels?|blooper\s+reels?|outtakes?|tv\s+spots?|making\s+of|meet\s+the\s+cast|visual\s+effects|in\s+search\s+of|how\s+to\s+survive|previz|production\s+design|time[\s\-]*lapse|secret\s+auditions?)\b`)
+	extraRe = regexp.MustCompile(`(?i)\b(deleted scenes?|extended\s+scenes?|trailers?|gallery|alternate endings?|interviews?|behind the scenes|behind\s+the\s+stor(?:y|ies)|featurettes?|music videos?|samples?|extras?|gag\s+reels?|blooper\s+reels?|outtakes?|tv\s+spots?|making\s+of|meet\s+the\s+cast|visual\s+effects|in\s+search\s+of|how\s+to\s+survive|previz|production\s+design|time[\s\-]*lapse\s+videos?|secret\s+auditions?)\b`)
 	// lettersRe and yearOnlyRe detect titles with no usable show/film name:
 	// bare numbers ("01") are unresolvable, a lone year ("2012") is a film.
 	lettersRe  = regexp.MustCompile(`[A-Za-z]`)
@@ -55,12 +55,12 @@ func ParseRaw(rawTitle string) Query {
 // out by titleclean and ignored; the title is re-scanned only for the
 // "Episode N+M" ranges titleclean mis-splits.
 //
-// Classification follows the library inventory's validated rules:
+// Classification follows the synthetic library's validated rules:
 //   - OP/ED theme tokens are themes, never episodes (KindUnknown, so the
 //     resolver never fetches for them); themes outrank every episode form.
 //   - An episode signal must be contextual: SxxEyy, E##, Episode N, EP N, a
 //     dash-number absolute of 2-3 digits, or a single-digit " - N" clearly
-//     dash-separated. Bare sequel/version digits (Escape Plan 2, Cars 3,
+//     dash-separated. Bare sequel/version digits (Harbor Run 2, Trucks 3,
 //     3.0+1.0), quality tokens (1080p, 5.1, 10bit, x265) and years never
 //     count; 19xx/20xx is a year, never an episode.
 //   - Ranges use the first number (S02E12-E13 -> 12, Episode 53+54 -> 53).

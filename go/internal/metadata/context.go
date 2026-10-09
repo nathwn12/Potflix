@@ -10,8 +10,8 @@ import (
 // context.go - folder context for filename-poor media.
 //
 // Many anime files carry no usable show in the filename; the show lives in
-// the folder (e.g. ...\Naruto\Season 1\01.mkv, or a release-style tree like
-// ...\Mr.Robot.S01.1080p... \Mr.Robot.S01E01... .mkv). ContextFromPath reads
+// the folder (e.g. ...\Zentaro\Season 1\01.mkv, or a release-style tree like
+// ...\Mr.Harbor.S01.1080p... \Mr.Harbor.S01E01... .mkv). ContextFromPath reads
 // the show/season out of the FULL playing-file path (player.CurrentFile) and
 // ResolveQuery merges that context into the filename-only ParseRaw result.
 
@@ -21,7 +21,7 @@ var (
 	seasonDirRe   = regexp.MustCompile(`(?i)^Season\s*(\d+)$`)
 	seasonShortRe = regexp.MustCompile(`(?i)^S(\d{1,2})$`)
 	// seasonEmbeddedRe finds a season token inside a release-style folder
-	// ("Mr.Robot.S01.1080p...", "Show.Season.2.BluRay"). Fallback only: the
+	// ("Mr.Harbor.S01.1080p...", "Show.Season.2.BluRay"). Fallback only: the
 	// exact pass above wins, and the deepest component wins.
 	seasonEmbeddedRe = regexp.MustCompile(`(?i)(?:^|[.\s_\-])(?:Season\s*(\d{1,2})|S(\d{1,2}))(?:$|[.\s_\-])`)
 	// genericFolderRe matches whole folders that are never a show: season
@@ -35,18 +35,18 @@ var (
 	// in genericFolderRe above). Bonus-phrase stems mirror extraRe so file
 	// and folder levels stay consistent (gag/blooper reels, outtakes, tv
 	// spots, extended scenes, behind-the-story, making-of, ...).
-	extrasWordRe = regexp.MustCompile(`(?i)\b(deleted\s+scenes?|extended\s+scenes?|trailers?|gallery|alternate\s+endings?|interviews?|behind\s+the\s+scenes|behind\s+the\s+stor(?:y|ies)|featurettes?|music\s+videos?|samples?|extras?|specials?|gag\s+reels?|blooper\s+reels?|outtakes?|tv\s+spots?|making\s+of|meet\s+the\s+cast|visual\s+effects|in\s+search\s+of|how\s+to\s+survive|previz|production\s+design|time[\s\-]*lapse|secret\s+auditions?|ncop|nced|\bnc\b)\b`)
+	extrasWordRe = regexp.MustCompile(`(?i)\b(deleted\s+scenes?|extended\s+scenes?|trailers?|gallery|alternate\s+endings?|interviews?|behind\s+the\s+scenes|behind\s+the\s+stor(?:y|ies)|featurettes?|music\s+videos?|samples?|extras?|specials?|gag\s+reels?|blooper\s+reels?|outtakes?|tv\s+spots?|making\s+of|meet\s+the\s+cast|visual\s+effects|in\s+search\s+of|how\s+to\s+survive|previz|production\s+design|time[\s\-]*lapse\s+videos?|secret\s+auditions?|ncop|nced|\bnc\b)\b`)
 	// qualityTitleRe rejects cleaned folder titles that are bare
 	// numbers/quality tokens, mirroring the Parse floor.
 	qualityTitleRe = regexp.MustCompile(`(?i)^(\d+|1080p|720p|480p|360p|2160p|4k|uhd|bd|bdrip|brrip|10bit|8bit)$`)
 	// driveRe spots a Windows volume component ("C:").
 	driveRe = regexp.MustCompile(`^[A-Za-z]:$`)
 	// rootLookRe spots a library-root-looking top folder: no lowercase
-	// letters (MOVIES, SHOWS, Anime). Show folders carry
-	// lowercase (Naruto, Mr.Robot.S01...).
+	// letters (1ARCHIVE, 2SERIES, 2NEW ARCHIVE AND FILMS). Show folders carry
+	// lowercase (Zentaro, Mr.Harbor.S01...).
 	rootLookRe = regexp.MustCompile(`^[^a-z]*$`)
 	// seasonSuffixRe trims a trailing season token off a cleaned folder show
-	// ("Mr Robot S01" -> "Mr Robot").
+	// ("Mr Harbor S01" -> "Mr Harbor").
 	seasonSuffixRe = regexp.MustCompile(`(?i)\s+S\d{1,2}$`)
 	// videoExtRe strips one trailing media extension before number hunting.
 	videoExtRe = regexp.MustCompile(`(?i)\.(mkv|mp4|avi|m4v|mov|wmv|ts|flv|webm|mpg|mpeg|m4v|ass|srt)$`)
@@ -59,7 +59,7 @@ var (
 
 // splitDirs splits a full path into components on either separator, drops the
 // trailing filename, and reports the index of the top folder under the volume
-// (the library root: D:\Movies, E:\Anime, ...). Both
+// (the library root: M:\1ARCHIVE, Q:\2NEW ARCHIVE AND FILMS, ...). Both
 // separators are accepted so unit paths and live paths behave alike.
 func splitDirs(path string) (dirs []string, top int) {
 	parts := strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
@@ -152,10 +152,11 @@ func ContextFromPath(path string) (string, int) {
 		if d == "" || d == "." || d == ".." || driveRe.MatchString(d) {
 			continue
 		}
-		// The volume-top folder is the library root (the inventory roots are
+		// The volume-top folder is the library root (the synthetic roots are
 		// all volume tops; root-direct files carry no show). It is skipped
 		// only when it looks like a root rather than a show: library roots
-		// carry no lowercase letters (MOVIES, SHOWS, Anime) while show folders do (Naruto, Mr.Robot.S01...).
+		// carry no lowercase letters (1ARCHIVE, 2SERIES, 2NEW ARCHIVE AND
+		// FILMS) while show folders do (Zentaro, Mr.Harbor.S01...).
 		if i == top && rootLookRe.MatchString(d) {
 			continue
 		}
