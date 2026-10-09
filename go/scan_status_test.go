@@ -18,7 +18,7 @@ import (
 
 func TestScanProgressTextFolders(t *testing.T) {
 	p := library.Progress{KeysDone: 12, KeysTotal: 24, KeysFetched: 3, KeysCached: 5, FoldersScanned: 4, FoldersSkipped: 2}
-	want := "Scanning 12/24 keys | 3 fetched - 5 cached | folders: 4 scanned, 2 skipped"
+	want := "Scan 12/24 keys | 3 fetched, 5 cached | 4/2 folders"
 	if got := scanProgressText(p); got != want {
 		t.Fatalf("scanProgressText = %q, want %q", got, want)
 	}
@@ -27,9 +27,20 @@ func TestScanProgressTextFolders(t *testing.T) {
 func TestScanProgressTextAllCached(t *testing.T) {
 	p := library.Progress{KeysDone: 24, KeysTotal: 24, KeysFetched: 0, KeysCached: 24, FoldersScanned: 6, FoldersSkipped: 1}
 	got := scanProgressText(p)
-	want := "Scanning 24/24 keys | 0 fetched - 24 cached | folders: 6 scanned, 1 skipped"
+	want := "Scan 24/24 keys | 0 fetched, 24 cached | 6/1 folders"
 	if got != want {
 		t.Fatalf("all-cached scanProgressText = %q, want %q", got, want)
+	}
+}
+
+// TestScanProgressTextFourBucket proves the bucket counts ride the line in
+// the documented order: X/Y key progress, fetched, cached, then the
+// folders scanned/skipped pair.
+func TestScanProgressTextFourBucket(t *testing.T) {
+	p := library.Progress{KeysDone: 10, KeysTotal: 20, KeysFetched: 2, KeysCached: 7, KeysFailed: 1, FoldersScanned: 3, FoldersSkipped: 1}
+	want := "Scan 10/20 keys | 2 fetched, 7 cached, 1 failed | 3/1 folders"
+	if got := scanProgressText(p); got != want {
+		t.Fatalf("four-bucket scanProgressText = %q, want %q", got, want)
 	}
 }
 
@@ -43,7 +54,7 @@ func TestScanProgressTextHugeElides(t *testing.T) {
 	if strings.Contains(got, "12345678") || strings.Contains(got, "98765432") {
 		t.Fatalf("huge scanProgressText shows full digits: %q (want compact k/M)", got)
 	}
-	if !strings.Contains(got, "folders:") || !strings.Contains(got, "scanned,") || !strings.Contains(got, "skipped") {
+	if !strings.Contains(got, "folders") || !strings.Contains(got, "/") {
 		t.Fatalf("huge scanProgressText lost folder counts: %q", got)
 	}
 	if len(got) > maxScanStatusLen {
@@ -59,7 +70,7 @@ func TestScanProgressTextHugeElides(t *testing.T) {
 	if strings.Contains(gotHuge, fmt.Sprintf("%d", 1<<60)) {
 		t.Fatalf("extreme scanProgressText shows full digits: %q", gotHuge)
 	}
-	if !strings.Contains(gotHuge, "folders:") {
+	if !strings.Contains(gotHuge, "folders") {
 		t.Fatalf("extreme scanProgressText lost folder counts: %q", gotHuge)
 	}
 	if len(gotHuge) > maxScanStatusLen {
@@ -69,12 +80,12 @@ func TestScanProgressTextHugeElides(t *testing.T) {
 
 func TestScanDoneTextFolders(t *testing.T) {
 	st := library.Stats{Keys: 24, KeysCached: 5, KeysFetched: 2, KeysNotFound: 1, Files: 10, FoldersScanned: 4, FoldersSkipped: 2}
-	want := "Scan complete: 24 keys - 5 cached - 2 fetched - 1 not found | 10 files - folders: 4 scanned, 2 skipped"
+	want := "Scan done: 24 keys - 5 cached, 2 fetched - 4/2 folders"
 	if got := scanDoneText("Scan", st); got != want {
 		t.Fatalf("scanDoneText = %q, want %q", got, want)
 	}
 	// Refresh kind prefix is preserved.
-	if got := scanDoneText("Refresh", st); !strings.HasPrefix(got, "Refresh complete: ") || !strings.Contains(got, "folders: 4 scanned, 2 skipped") {
+	if got := scanDoneText("Refresh", st); !strings.HasPrefix(got, "Refresh done: ") || !strings.Contains(got, "4/2 folders") {
 		t.Fatalf("refresh scanDoneText = %q, want Refresh prefix + folder counts", got)
 	}
 }
@@ -82,7 +93,7 @@ func TestScanDoneTextFolders(t *testing.T) {
 func TestScanDoneTextAllCached(t *testing.T) {
 	st := library.Stats{Keys: 5, KeysCached: 5, KeysFetched: 0, KeysNotFound: 0, Files: 5, FoldersScanned: 3, FoldersSkipped: 0}
 	got := scanDoneText("Scan", st)
-	want := "Scan complete: 5 keys - 5 cached - 0 fetched - 0 not found | 5 files - folders: 3 scanned, 0 skipped"
+	want := "Scan done: 5 keys - 5 cached, 0 fetched - 3/0 folders"
 	if got != want {
 		t.Fatalf("all-cached scanDoneText = %q, want %q", got, want)
 	}
@@ -90,12 +101,12 @@ func TestScanDoneTextAllCached(t *testing.T) {
 
 func TestScanDoneTextNothingToFetch(t *testing.T) {
 	st := library.Stats{Keys: 7, KeysCached: 7, KeysFetched: 0, KeysNotFound: 0, Files: 9, FoldersScanned: 4, FoldersSkipped: 3}
-	want := "Scan complete: nothing to fetch (7 cached) - 3 folders skipped"
+	want := "Scan done: nothing to fetch (7 cached) - 3 folders skipped"
 	if got := scanDoneText("Scan", st); got != want {
 		t.Fatalf("nothing-to-fetch scanDoneText = %q, want %q", got, want)
 	}
 	// Kind prefix carries through the nothing-to-do case.
-	wantRefresh := "Refresh complete: nothing to fetch (7 cached) - 3 folders skipped"
+	wantRefresh := "Refresh done: nothing to fetch (7 cached) - 3 folders skipped"
 	if got := scanDoneText("Refresh", st); got != wantRefresh {
 		t.Fatalf("refresh nothing-to-fetch scanDoneText = %q, want %q", got, wantRefresh)
 	}
@@ -111,7 +122,7 @@ func TestScanDoneTextHugeElides(t *testing.T) {
 	if strings.Contains(got, "12345678") {
 		t.Fatalf("huge scanDoneText shows full digits: %q (want compact k/M)", got)
 	}
-	if !strings.Contains(got, "folders:") || !strings.Contains(got, "scanned,") {
+	if !strings.Contains(got, "folders") {
 		t.Fatalf("huge scanDoneText lost folder counts: %q", got)
 	}
 	if len(got) > maxScanStatusLen {
@@ -120,13 +131,13 @@ func TestScanDoneTextHugeElides(t *testing.T) {
 }
 
 func TestScanStatusKeepsFoldersSuffix(t *testing.T) {
-	// A pathological >160-char line must still keep the folders: suffix.
-	long := strings.Repeat("k", maxScanStatusLen) + " folders: 4 scanned, 2 skipped"
+	// A pathological >160-char line must still keep the folders suffix.
+	long := strings.Repeat("k", maxScanStatusLen) + " 4/2 folders"
 	got := fitScanStatus(long)
 	if len(got) > maxScanStatusLen {
 		t.Fatalf("fitScanStatus len=%d > %d: %q", len(got), maxScanStatusLen, got)
 	}
-	if !strings.Contains(got, "folders: 4 scanned, 2 skipped") {
+	if !strings.Contains(got, "4/2 folders") {
 		t.Fatalf("fitScanStatus lost folders suffix: %q", got)
 	}
 	// The done formatter with an oversized kind keeps the suffix too.
@@ -135,7 +146,7 @@ func TestScanStatusKeepsFoldersSuffix(t *testing.T) {
 	if len(gotDone) > maxScanStatusLen {
 		t.Fatalf("long-kind scanDoneText len=%d > %d: %q", len(gotDone), maxScanStatusLen, gotDone)
 	}
-	if !strings.Contains(gotDone, "folders: 4 scanned, 2 skipped") {
+	if !strings.Contains(gotDone, "4/2 folders") {
 		t.Fatalf("long-kind scanDoneText lost folders suffix: %q", gotDone)
 	}
 }
@@ -233,17 +244,17 @@ func TestScanResultCancelledNeverFails(t *testing.T) {
 func TestScanFailedSuffix(t *testing.T) {
 	// Clean lines are byte-identical to the pre-patch shape.
 	clean := library.Progress{KeysDone: 12, KeysTotal: 24, KeysFetched: 3, KeysCached: 5, FoldersScanned: 4, FoldersSkipped: 2}
-	if got := scanProgressText(clean); got != "Scanning 12/24 keys | 3 fetched - 5 cached | folders: 4 scanned, 2 skipped" {
+	if got := scanProgressText(clean); got != "Scan 12/24 keys | 3 fetched, 5 cached | 4/2 folders" {
 		t.Fatalf("clean progress = %q", got)
 	}
 	// Non-zero failures append before the folders pipe.
 	bad := clean
 	bad.KeysFailed = 2
-	if got := scanProgressText(bad); got != "Scanning 12/24 keys | 3 fetched - 5 cached - 2 failed | folders: 4 scanned, 2 skipped" {
+	if got := scanProgressText(bad); got != "Scan 12/24 keys | 3 fetched, 5 cached, 2 failed | 4/2 folders" {
 		t.Fatalf("failed progress = %q", got)
 	}
 	st := library.Stats{Keys: 7, KeysCached: 7, KeysFetched: 0, KeysNotFound: 0, Files: 9, FoldersScanned: 4, FoldersSkipped: 3}
-	if got := scanDoneText("Scan", st); got != "Scan complete: nothing to fetch (7 cached) - 3 folders skipped" {
+	if got := scanDoneText("Scan", st); got != "Scan done: nothing to fetch (7 cached) - 3 folders skipped" {
 		t.Fatalf("clean nothing-to-fetch = %q", got)
 	}
 	stBad := st

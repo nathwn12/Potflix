@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 
 	"potflix/internal/player"
@@ -265,6 +266,14 @@ func Fmt(ms int64) string {
 // reads e.g. `S1 E2 - Paused` (or just `Paused` with no context).
 const pausedMarker = " - Paused"
 
+// stateSynopsisBudget is the target budget (UTF-16 units) for synopsis-bearing
+// State lines: Discord best-practices says details/state must be snippets, not
+// sentences, staying on one line (the 128-unit hard cap stays as the ceiling;
+// 72 < 128 so every budgeted State respects it); Netflix timed-text (42
+// chars/line, max 2 lines, break after punctuation, single U+2026) motivates
+// ~72 units so the card never fills to the API max.
+const stateSynopsisBudget = 72
+
 // activityNameHeader enables the SET_ACTIVITY `name` header override: the card
 // header becomes "Watching <title>" instead of the Discord app name.
 // REVERT IN ONE EDIT: set this to false to drop the override entirely (the
@@ -468,6 +477,164 @@ func trimWord(s string, max int) string {
 	return rpText(s, max)
 }
 
+// synopsisConnectors are words that must never dangle before the ellipsis:
+// "... and" / "... the" reads as a cut-off thought, so they are stripped first.
+var synopsisConnectors = map[string]struct{}{
+	"and": {}, "or": {}, "but": {}, "the": {}, "a": {}, "an": {},
+	"of": {}, "to": {}, "in": {}, "on": {}, "with": {}, "for": {},
+	"from": {}, "by": {}, "as": {}, "at": {}, "into": {}, "than": {},
+	"that": {}, "which": {}, "while": {}, "when": {}, "his": {}, "her": {},
+	"their": {}, "its": {}, "this": {}, "these": {}, "those": {},
+	"is": {}, "are": {}, "was": {}, "were": {}, "who": {},
+}
+
+// stripDanglingConnector drops trailing connector words (case-insensitive)
+// from base so the ellipsis never follows "and"/"the"/etc.
+func stripDanglingConnector(base string) string {
+	for {
+		t := strings.TrimSpace(base)
+		if t == "" {
+			return ""
+		}
+		idx := strings.LastIndex(t, " ")
+		var last, rest string
+		if idx < 0 {
+			last, rest = t, ""
+		} else {
+			last, rest = t[idx+1:], t[:idx]
+		}
+		clean := strings.ToLower(strings.Trim(last, ",;:.!?\"'()[]---.\u00b7"))
+		if clean == "" {
+			return t
+		}
+		if _, ok := synopsisConnectors[clean]; !ok {
+			return t
+		}
+		if idx < 0 {
+			return ""
+		}
+		base = rest
+	}
+}
+
+// fitRunes returns how many leading runes of rs fit in maxUnits UTF-16 units.
+func fitRunes(rs []rune, maxUnits int) int {
+	if maxUnits <= 0 {
+		return 0
+	}
+	used := 0
+	for i, r := range rs {
+		sz := 1
+		if r >= 0x10000 {
+			sz = 2
+		}
+		if used+sz > maxUnits {
+			return i
+		}
+		used += sz
+	}
+	return len(rs)
+}
+
+// runeCountForUnits returns the smallest leading rune count of rs[:end] whose
+// UTF-16 length reaches targetUnits (the start of the back half).
+func runeCountForUnits(rs []rune, end, targetUnits int) int {
+	if targetUnits <= 0 {
+		return 0
+	}
+	used := 0
+	for i := 0; i < end; i++ {
+		sz := 1
+		if rs[i] >= 0x10000 {
+			sz = 2
+		}
+		used += sz
+		if used >= targetUnits {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// smartTrimSynopsis is trimWord with a seamless cut (Netflix: break after
+// punctuation, single U+2026; Discord: snippet, one line), all measured in
+// UTF-16 units: fits unchanged; else last sentence end (.!?, end-or-space) in
+// the back half with NO ellipsis; else last clause boundary (, ; space-dash
+// variants) in the back half plus U+2026; else last word boundary plus U+2026
+// (dangling connectors stripped first); never mid-word, never "...".
+func smartTrimSynopsis(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	const huge = 1 << 28
+	full := rpText(s, huge)
+	if len(utf16.Encode([]rune(full))) <= max {
+		return full
+	}
+	if max == 1 {
+		return "\u2026"
+	}
+	runes := []rune(full)
+	endFit := fitRunes(runes, max)
+	halfFit := runeCountForUnits(runes, endFit, max/2)
+	for i := endFit - 1; i >= halfFit; i-- {
+		if c := runes[i]; c == '.' || c == '!' || c == '?' {
+			if i+1 == len(runes) || unicode.IsSpace(runes[i+1]) {
+				cand := strings.TrimSpace(string(runes[:i+1]))
+				if len(utf16.Encode([]rune(cand))) <= max {
+					return cand
+				}
+			}
+		}
+	}
+	endEll := fitRunes(runes, max-1)
+	halfEll := runeCountForUnits(runes, endEll, (max-1)/2)
+	upper := endEll
+	if upper >= len(runes) {
+		upper = len(runes) - 1
+	}
+	for i := upper; i >= halfEll; i-- {
+		if i < 0 || i >= len(runes) {
+			continue
+		}
+		if i < endEll && (runes[i] == ',' || runes[i] == ';') {
+			if i+1 < len(runes) && unicode.IsSpace(runes[i+1]) {
+				base := stripDanglingConnector(strings.TrimSpace(string(runes[:i+1])))
+				if base == "" {
+					return "\u2026"
+				}
+				return base + "\u2026"
+			}
+		}
+		if runes[i] == '-' || runes[i] == '\u2013' || runes[i] == '\u2014' {
+			if i-1 >= 0 && i+1 < len(runes) && runes[i-1] == ' ' && unicode.IsSpace(runes[i+1]) {
+				start := i - 1
+				if start >= halfEll && start < endEll {
+					base := stripDanglingConnector(strings.TrimSpace(string(runes[:start])))
+					if base == "" {
+						return "\u2026"
+					}
+					return base + "\u2026"
+				}
+			}
+		}
+	}
+	for i := endEll - 1; i >= 0; i-- {
+		if runes[i] == ' ' {
+			base := stripDanglingConnector(strings.TrimSpace(string(runes[:i])))
+			if base == "" {
+				return "\u2026"
+			}
+			res := base + "\u2026"
+			if len(utf16.Encode([]rune(res))) <= max {
+				return res
+			}
+			return res
+		}
+	}
+	return rpText(s, max)
+}
+
 // filterButtons keeps at most two buttons with a non-empty label and an
 // http(s) URL; labels are sanitized and capped at 32 units.
 func filterButtons(in []Button) []Button {
@@ -502,6 +669,14 @@ func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
 		act.Name = titleclean.Trunc(r.Series, 128)
 		act.LargeText = titleclean.Trunc(r.Series, 128)
 	}
+	// Hover slot: assets.large_text is the poster tooltip. Name already
+	// carries the series title as the card header, so repeating it here
+	// wastes the slot; carry the complete short synopsis instead (capped at
+	// Discord's 128-unit asset-text cap, so it arrives whole). No synopsis:
+	// keep today's fallback (series title when known, else "PotFlix").
+	if s := rpText(r.Synopsis, 128); s != "" {
+		act.LargeText = s
+	}
 	if r.IsMovie {
 		if r.Series != "" {
 			if r.Year > 0 {
@@ -510,21 +685,53 @@ func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
 				act.Details = titleclean.Trunc(r.Series, 128)
 			}
 		}
-		var parts []string
-		if g := rpText(r.Genres, 1<<28); g != "" {
-			parts = append(parts, g)
+		g := rpText(r.Genres, 1<<28)
+		l := rpText(r.Length, 1<<28)
+		sFull := rpText(r.Synopsis, 1<<28)
+		var prefixParts []string
+		if g != "" {
+			prefixParts = append(prefixParts, g)
 		}
-		if l := rpText(r.Length, 1<<28); l != "" {
-			parts = append(parts, l)
+		if l != "" {
+			prefixParts = append(prefixParts, l)
 		}
-		if s := rpText(r.Synopsis, 1<<28); s != "" {
-			parts = append(parts, s)
-		}
-		if joined := strings.Join(parts, " \u00b7 "); joined != "" {
+		prefix := strings.Join(prefixParts, " \u00b7 ")
+		switch {
+		case prefix == "" && sFull == "":
+			// Empty join: keep BuildActivity's state (including any Paused marker).
+		case sFull == "":
+			// No synopsis: keep the 128 ceiling (non-synopsis states untouched).
 			if a != nil && a.Paused {
-				act.State = WithStateTime(trimWord(joined, 128-len(pausedMarker)), pausedMarker)
+				act.State = WithStateTime(trimWord(prefix, 128-len(pausedMarker)), pausedMarker)
 			} else {
-				act.State = trimWord(joined, 128)
+				act.State = trimWord(prefix, 128)
+			}
+		default:
+			joinBudget := stateSynopsisBudget
+			if a != nil && a.Paused {
+				joinBudget = stateSynopsisBudget - len(pausedMarker)
+			}
+			sep := " \u00b7 "
+			if prefix == "" {
+				sep = ""
+			}
+			prefixUnits := len(utf16.Encode([]rune(prefix)))
+			sepUnits := len(utf16.Encode([]rune(sep)))
+			if prefixUnits+sepUnits >= joinBudget {
+				fullJoined := prefix + sep + sFull
+				if a != nil && a.Paused {
+					act.State = WithStateTime(trimWord(fullJoined, joinBudget), pausedMarker)
+				} else {
+					act.State = trimWord(fullJoined, joinBudget)
+				}
+			} else {
+				trimmed := smartTrimSynopsis(sFull, joinBudget-prefixUnits-sepUnits)
+				joined := prefix + sep + trimmed
+				if a != nil && a.Paused {
+					act.State = WithStateTime(joined, pausedMarker)
+				} else {
+					act.State = joined
+				}
 			}
 		}
 		// Empty join: keep BuildActivity's state (including any Paused marker).
@@ -548,24 +755,40 @@ func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
 		case tagT == "" && synFull == "":
 			// Neither: keep BuildActivity's state (including any Paused marker).
 		case a != nil && a.Paused:
-			var joined string
-			switch {
-			case tagT != "" && synFull != "":
-				joined = tagT + " \u00b7 " + synFull
-			case tagT != "":
-				joined = tagT
-			default:
-				joined = synFull
+			if synFull == "" {
+				// Tag-only paused: no synopsis, keep the 128 ceiling.
+				act.State = WithStateTime(trimWord(tagT, 128-len(pausedMarker)), pausedMarker)
+				break
 			}
-			act.State = WithStateTime(trimWord(joined, 128-len(pausedMarker)), pausedMarker)
+			joinBudget := stateSynopsisBudget - len(pausedMarker)
+			sep := " \u00b7 "
+			if tagT == "" {
+				sep = ""
+			}
+			prefixUnits := len(utf16.Encode([]rune(tagT)))
+			sepUnits := len(utf16.Encode([]rune(sep)))
+			if prefixUnits+sepUnits >= joinBudget {
+				act.State = WithStateTime(trimWord(tagT+sep+synFull, joinBudget), pausedMarker)
+			} else {
+				trimmed := smartTrimSynopsis(synFull, joinBudget-prefixUnits-sepUnits)
+				act.State = WithStateTime(tagT+sep+trimmed, pausedMarker)
+			}
 		default:
 			switch {
 			case tagT != "" && synFull != "":
-				act.State = trimWord(tagT+" \u00b7 "+synFull, 128)
+				joinBudget := stateSynopsisBudget
+				prefixUnits := len(utf16.Encode([]rune(tagT)))
+				sepUnits := len(utf16.Encode([]rune(" \u00b7 ")))
+				if prefixUnits+sepUnits >= joinBudget {
+					act.State = trimWord(tagT+" \u00b7 "+synFull, joinBudget)
+				} else {
+					trimmed := smartTrimSynopsis(synFull, joinBudget-prefixUnits-sepUnits)
+					act.State = tagT + " \u00b7 " + trimmed
+				}
 			case tagT != "":
 				act.State = tagT
 			default:
-				act.State = trimWord(synFull, 128)
+				act.State = smartTrimSynopsis(synFull, stateSynopsisBudget)
 			}
 		}
 	}

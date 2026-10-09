@@ -544,7 +544,9 @@ func TestBuildActivityResolvedRich(t *testing.T) {
 		if want := "S1 E2 \u00b7 A brave synopsis"; got.State != want {
 			t.Errorf("State = %q, want exact %q", got.State, want)
 		}
-		if want := titleclean.Trunc("Canonical Series", 128); got.LargeText != want {
+		// Hover slot: LargeText carries the complete short synopsis, not a
+		// duplicate of Name (the card header already shows the series).
+		if want := rpText("A brave synopsis", 128); got.LargeText != want {
 			t.Errorf("LargeText = %q, want %q", got.LargeText, want)
 		}
 	})
@@ -563,11 +565,14 @@ func TestBuildActivityResolvedRich(t *testing.T) {
 		}
 	})
 
-	t.Run("long synopsis truncated to 128", func(t *testing.T) {
+	t.Run("long synopsis truncated to synopsis budget", func(t *testing.T) {
 		long := strings.Repeat("s", 200)
 		got := BuildActivityResolved(movieRaw, runAct, Resolved{Synopsis: long})
-		if want := rpText(long, 128); got.State != want {
+		if want := rpText(long, stateSynopsisBudget); got.State != want {
 			t.Errorf("State = %q, want %q", got.State, want)
+		}
+		if n := javaUnits(got.State); n > stateSynopsisBudget {
+			t.Errorf("State length %d exceeds %d: %q", n, stateSynopsisBudget, got.State)
 		}
 		if n := javaUnits(got.State); n > 128 {
 			t.Errorf("State length %d exceeds 128: %q", n, got.State)
@@ -778,4 +783,250 @@ func TestBuildActivityResolvedButtons(t *testing.T) {
 			t.Errorf("BuildActivity.Buttons = %+v, want empty", got.Buttons)
 		}
 	})
+}
+
+func TestSmartTrimSynopsisSentenceNoEllipsis(t *testing.T) {
+	s := "Intro filler words to push length out a bit. Second sentence continues long enough to exceed the seventy two unit budget for sure and more."
+	got := smartTrimSynopsis(s, stateSynopsisBudget)
+	want := "Intro filler words to push length out a bit."
+	if got != want {
+		t.Fatalf("sentence cut = %q, want %q", got, want)
+	}
+	if strings.Contains(got, "\u2026") {
+		t.Fatalf("complete sentence needs no ellipsis: %q", got)
+	}
+	if strings.Contains(got, "...") {
+		t.Fatalf("never three dots: %q", got)
+	}
+	if n := javaUnits(got); n > stateSynopsisBudget {
+		t.Fatalf("length %d exceeds %d: %q", n, stateSynopsisBudget, got)
+	}
+}
+
+func TestSmartTrimSynopsisClauseEllipsis(t *testing.T) {
+	s := strings.Repeat("word ", 10) + "first, " + strings.Repeat("second ", 20)
+	got := smartTrimSynopsis(s, stateSynopsisBudget)
+	if !strings.HasSuffix(got, "\u2026") {
+		t.Fatalf("clause cut should end with U+2026: %q", got)
+	}
+	if strings.Contains(got, "...") {
+		t.Fatalf("never three dots: %q", got)
+	}
+	if !strings.Contains(got, ",") {
+		t.Fatalf("clause cut should keep the comma: %q", got)
+	}
+	if n := javaUnits(got); n > stateSynopsisBudget {
+		t.Fatalf("length %d exceeds %d: %q", n, stateSynopsisBudget, got)
+	}
+	// No sentence end in this input, so the comma path must win.
+	if strings.Contains(strings.TrimSuffix(got, "\u2026"), ".") {
+		t.Fatalf("unexpected sentence cut: %q", got)
+	}
+}
+
+func TestSmartTrimSynopsisWordEllipsis(t *testing.T) {
+	s := strings.Repeat("epic ", 30) + "finale"
+	got := smartTrimSynopsis(s, stateSynopsisBudget)
+	if !strings.HasSuffix(got, "\u2026") {
+		t.Fatalf("word cut should end with U+2026: %q", got)
+	}
+	if strings.Contains(got, "...") {
+		t.Fatalf("never three dots: %q", got)
+	}
+	body := strings.TrimSuffix(got, "\u2026")
+	if !strings.HasSuffix(body, "epic") {
+		t.Fatalf("should land on a whole word: %q", got)
+	}
+	if n := javaUnits(got); n > stateSynopsisBudget {
+		t.Fatalf("length %d exceeds %d: %q", n, stateSynopsisBudget, got)
+	}
+}
+
+func TestSmartTrimSynopsisStripsConnector(t *testing.T) {
+	s := strings.Repeat("word ", 13) + "and " + strings.Repeat("tailword ", 20)
+	got := smartTrimSynopsis(s, stateSynopsisBudget)
+	if !strings.HasSuffix(got, "\u2026") {
+		t.Fatalf("connector cut should end with U+2026: %q", got)
+	}
+	if strings.HasSuffix(got, "and\u2026") || strings.HasSuffix(got, "and \u2026") {
+		t.Fatalf("dangling connector survived: %q", got)
+	}
+	body := strings.TrimSuffix(got, "\u2026")
+	fields := strings.Fields(body)
+	if len(fields) == 0 {
+		t.Fatalf("empty body: %q", got)
+	}
+	last := strings.ToLower(fields[len(fields)-1])
+	for _, c := range []string{"and", "or", "but", "the", "a", "of", "to"} {
+		if last == c {
+			t.Fatalf("last word %q is a dangling connector: %q", last, got)
+		}
+	}
+	if n := javaUnits(got); n > stateSynopsisBudget {
+		t.Fatalf("length %d exceeds %d: %q", n, stateSynopsisBudget, got)
+	}
+}
+
+func TestIdleCardBudget(t *testing.T) {
+	got := BuildActivity("PotPlayer", &Action{})
+	if got.Details != "Browsing" || got.State != "Idle" {
+		t.Fatalf("idle card = %+v, want Browsing/Idle", got)
+	}
+	if n := javaUnits(got.State); n > stateSynopsisBudget {
+		t.Fatalf("idle State length %d exceeds %d", n, stateSynopsisBudget)
+	}
+	t.Logf("IDLE Details=%q State=%q units=%d", got.Details, got.State, javaUnits(got.State))
+}
+
+func TestSynopsisBeforeAfterLongest(t *testing.T) {
+	const movieRaw = "Dune.Part.Two.2024.1080p.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	longSyn := "Paul Atreides unites with the Fremen and wages war against House Harkonnen. As betrayal surrounds him, he faces a choice between the love of his life and the fate of the known universe, striving to prevent a terrible future only he can foresee and more beyond."
+	before := trimWord("Sci-Fi \u00b7 2h 46m \u00b7 "+rpText(longSyn, 1<<28), 128)
+	after := BuildActivityResolved(movieRaw, runAct, Resolved{IsMovie: true, Series: "Dune: Part Two", Year: 2024, Genres: "Sci-Fi", Length: "2h 46m", Synopsis: longSyn}).State
+	t.Logf("BEFORE State=%q units=%d", before, javaUnits(before))
+	t.Logf("AFTER  State=%q units=%d", after, javaUnits(after))
+	if n := javaUnits(after); n > stateSynopsisBudget {
+		t.Fatalf("after length %d exceeds %d: %q", n, stateSynopsisBudget, after)
+	}
+	if javaUnits(before) <= javaUnits(after) {
+		t.Fatalf("expected reduction: before=%d after=%d", javaUnits(before), javaUnits(after))
+	}
+}
+
+func TestSynopsisStateBudget72(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	const movieRaw = "Movie.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	pausedAct := &Action{Paused: true, CT: 1000}
+	longSyn := "A retired operative living quietly is pulled back when a ruthless syndicate burns his home. He crosses continents, gathers old allies, and faces a final choice that will decide everything he loves and more."
+	cases := []struct {
+		name string
+		act  Activity
+	}{
+		{"movie", BuildActivityResolved(movieRaw, runAct, Resolved{IsMovie: true, Genres: "Action, Drama", Length: "2h 19m", Synopsis: longSyn})},
+		{"series tag+synopsis", BuildActivityResolved(tvRaw, runAct, Resolved{Synopsis: longSyn})},
+		{"movie paused", BuildActivityResolved(movieRaw, pausedAct, Resolved{IsMovie: true, Genres: "Sci-Fi", Length: "2h 46m", Synopsis: longSyn})},
+		{"series paused tag+synopsis", BuildActivityResolved(tvRaw, pausedAct, Resolved{Synopsis: longSyn})},
+		{"series synopsis only", BuildActivityResolved(movieRaw, runAct, Resolved{Synopsis: longSyn})},
+	}
+	for _, c := range cases {
+		n := javaUnits(c.act.State)
+		t.Logf("%s State=%q units=%d", c.name, c.act.State, n)
+		if strings.Contains(c.act.State, "...") {
+			t.Errorf("%s: never three dots: %q", c.name, c.act.State)
+		}
+		if n > stateSynopsisBudget {
+			t.Errorf("%s: State length %d exceeds %d: %q", c.name, n, stateSynopsisBudget, c.act.State)
+		}
+		if n > 128 {
+			t.Errorf("%s: State length %d exceeds 128 ceiling: %q", c.name, n, c.act.State)
+		}
+	}
+	// Structured prefixes survive in full.
+	movie := BuildActivityResolved(movieRaw, runAct, Resolved{IsMovie: true, Genres: "Action, Drama", Length: "2h 19m", Synopsis: longSyn})
+	if !strings.Contains(movie.State, "Action, Drama") || !strings.Contains(movie.State, "2h 19m") {
+		t.Errorf("movie prefix lost: %q", movie.State)
+	}
+	series := BuildActivityResolved(tvRaw, runAct, Resolved{Synopsis: longSyn})
+	if !strings.HasPrefix(series.State, "S1 E2") {
+		t.Errorf("episode tag lost: %q", series.State)
+	}
+	paused := BuildActivityResolved(movieRaw, pausedAct, Resolved{IsMovie: true, Genres: "Sci-Fi", Length: "2h 46m", Synopsis: longSyn})
+	if !strings.HasSuffix(paused.State, pausedMarker) {
+		t.Errorf("paused marker lost: %q", paused.State)
+	}
+}
+
+// TestHoverTooltipWholeAndStateBudgetAgree proves the two surfaces agree on
+// one synopsis: the same Resolved input yields a State line within the
+// 72-unit budget and a LargeText hover tooltip within Discord's 128-unit
+// asset-text cap. The mid-length synopsis (~99 units) exceeds the State
+// budget so the card trims it, but fits the tooltip whole.
+func TestHoverTooltipWholeAndStateBudgetAgree(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	const movieRaw = "Movie.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	// ~99 units: over the 72 State budget, under the 128 tooltip cap.
+	midSyn := strings.TrimSpace(strings.Repeat("word ", 20))
+	if n := javaUnits(midSyn); n <= stateSynopsisBudget || n > 128 {
+		t.Fatalf("fixture setup: midSyn units=%d, want 72 < n <= 128", n)
+	}
+	cases := []struct {
+		name string
+		act  Activity
+		syn  string
+	}{
+		{"movie synopsis-only", BuildActivityResolved(movieRaw, runAct, Resolved{IsMovie: true, Series: "Mid Film", Synopsis: midSyn}), midSyn},
+		{"series tag+synopsis", BuildActivityResolved(tvRaw, runAct, Resolved{Series: "Mid Series", Synopsis: midSyn}), midSyn},
+	}
+	for _, c := range cases {
+		t.Logf("%s State=%q units=%d LargeText=%q units=%d", c.name, c.act.State, javaUnits(c.act.State), c.act.LargeText, javaUnits(c.act.LargeText))
+		if n := javaUnits(c.act.State); n > stateSynopsisBudget {
+			t.Errorf("%s: State length %d exceeds %d: %q", c.name, n, stateSynopsisBudget, c.act.State)
+		}
+		if n := javaUnits(c.act.LargeText); n > 128 {
+			t.Errorf("%s: LargeText length %d exceeds 128: %q", c.name, n, c.act.LargeText)
+		}
+		// The tooltip carries the short synopsis whole, not the State trim.
+		if want := rpText(c.syn, 128); c.act.LargeText != want {
+			t.Errorf("%s: LargeText = %q, want whole synopsis %q", c.name, c.act.LargeText, want)
+		}
+		if c.act.LargeText != c.syn {
+			t.Errorf("%s: LargeText should arrive whole (no ellipsis): %q", c.name, c.act.LargeText)
+		}
+		if c.act.LargeText == c.act.State {
+			t.Errorf("%s: tooltip must not equal the trimmed State line", c.name)
+		}
+	}
+	// Over-cap synopsis still respects both ceilings on the same input.
+	overSyn := strings.Repeat("s", 200)
+	over := BuildActivityResolved(movieRaw, runAct, Resolved{IsMovie: true, Series: "Over Film", Synopsis: overSyn})
+	t.Logf("over-cap State=%q units=%d LargeText units=%d", over.State, javaUnits(over.State), javaUnits(over.LargeText))
+	if n := javaUnits(over.State); n > stateSynopsisBudget {
+		t.Errorf("over-cap: State length %d exceeds %d", n, stateSynopsisBudget)
+	}
+	if n := javaUnits(over.LargeText); n > 128 {
+		t.Errorf("over-cap: LargeText length %d exceeds 128", n)
+	}
+	if want := rpText(overSyn, 128); over.LargeText != want {
+		t.Errorf("over-cap: LargeText = %q, want %q", over.LargeText, want)
+	}
+}
+
+// TestHoverTooltipNotSeriesName proves LargeText no longer duplicates the
+// series title (Name, already the card header) when a synopsis exists.
+func TestHoverTooltipNotSeriesName(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	got := BuildActivityResolved(tvRaw, runAct, Resolved{Series: "Canonical Series", Synopsis: "A brave synopsis"})
+	if got.Name != titleclean.Trunc("Canonical Series", 128) {
+		t.Fatalf("Name = %q, want series title", got.Name)
+	}
+	if got.LargeText == got.Name {
+		t.Fatalf("LargeText %q duplicates Name; want the synopsis", got.LargeText)
+	}
+	if want := rpText("A brave synopsis", 128); got.LargeText != want {
+		t.Fatalf("LargeText = %q, want %q", got.LargeText, want)
+	}
+}
+
+// TestHoverTooltipFallbackWithoutSynopsis proves a synopsis-less input keeps
+// today's behaviour: series title when known, else BuildActivity's "PotFlix".
+func TestHoverTooltipFallbackWithoutSynopsis(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	const movieRaw = "Movie.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	withSeries := BuildActivityResolved(tvRaw, runAct, Resolved{Series: "Canonical Show"})
+	if want := titleclean.Trunc("Canonical Show", 128); withSeries.LargeText != want {
+		t.Errorf("series fallback LargeText = %q, want %q", withSeries.LargeText, want)
+	}
+	bare := BuildActivityResolved(movieRaw, runAct, Resolved{})
+	if bare.LargeText != "PotFlix" {
+		t.Errorf("bare fallback LargeText = %q, want %q", bare.LargeText, "PotFlix")
+	}
+	idle := BuildActivityResolved("PotPlayer", &Action{}, Resolved{})
+	if idle.LargeText != "PotFlix" {
+		t.Errorf("idle fallback LargeText = %q, want %q", idle.LargeText, "PotFlix")
+	}
 }
