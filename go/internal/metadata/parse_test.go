@@ -15,10 +15,10 @@ func TestParse(t *testing.T) {
 		{"season episode", "Show", "S1 E2", "", Query{Kind: KindSeries, Title: "Show", Season: 1, Episode: 2}},
 		{"no space lowercase", "Show", "s01e02", "", Query{Kind: KindSeries, Title: "Show", Season: 1, Episode: 2}},
 		{"absolute", "Show", "E12", "", Query{Kind: KindSeries, Title: "Show", Episode: 12, Absolute: true}},
-		{"op theme", "Naruto", "OP 1", "", Query{Kind: KindUnknown, Title: "Naruto"}},
-		{"ed lowercase theme", "Naruto", "ed 12", "", Query{Kind: KindUnknown, Title: "Naruto"}},
+		{"op theme", "Zentaro", "OP 1", "", Query{Kind: KindUnknown, Title: "Zentaro"}},
+		{"ed lowercase theme", "Zentaro", "ed 12", "", Query{Kind: KindUnknown, Title: "Zentaro"}},
 		{"movie", "The Matrix", "", "", Query{Kind: KindMovie, Title: "The Matrix"}},
-		{"year stripped", "Breaking Bad (2008)", "S1 E1", "", Query{Kind: KindSeries, Title: "Breaking Bad", Year: 2008, Season: 1, Episode: 1}},
+		{"year stripped", "Harbor Lights (2008)", "S1 E1", "", Query{Kind: KindSeries, Title: "Harbor Lights", Year: 2008, Season: 1, Episode: 1}},
 		{"movie year", "Inception (2010)", "", "", Query{Kind: KindMovie, Title: "Inception", Year: 2010}},
 		{"no signal", "Show", "Special", "", Query{Kind: KindMovie, Title: "Show"}},
 	}
@@ -72,11 +72,11 @@ func TestParseRaw(t *testing.T) {
 }
 
 // TestParseBonusVariantCoverage is the executable parse table for the 34
-// explicitly observed bonus-variant negative-cache keys. 18 phrase-stem
+// synthetic bonus-variant negative-cache keys. 18 phrase-stem
 // extras are KindUnknown (each saves one ~3000 ms wasted iTunes lookup); the
 // other 16 stay KindMovie because no phrase stem covers them without risking
 // a real title - single common words ("short", "action", "becoming"),
-// locations ("michigan, usa"), and bare chapter numbers ("2) ...") are
+// locations ("cantonia, usa"), and bare chapter numbers ("2) ...") are
 // barred, and lost coverage is worse than a wasted lookup.
 func TestParseBonusVariantCoverage(t *testing.T) {
 	cases := []struct {
@@ -89,34 +89,34 @@ func TestParseBonusVariantCoverage(t *testing.T) {
 		{"tv spots.mkv", KindUnknown},
 		{"extended scenes.mkv", KindUnknown},
 		{"alternate & extended scenes.mkv", KindUnknown},
-		{"behind the story - bangkok tour with chow.mkv", KindUnknown},
-		{"behind the story - the comedy rhythm of todd phillips.mkv", KindUnknown},
-		{"inferno - the making of the expendables.mkv", KindUnknown},
-		{"executing the plan - the making of escape plan.mkv", KindUnknown},
-		{"in search of zombieland.mkv", KindUnknown},
-		{"how to survive the z apocalypse.mkv", KindUnknown},
+		{"behind the story - harbor tour with rex.mkv", KindUnknown},
+		{"behind the story - the quiet cadence of harlan marsh.mkv", KindUnknown},
+		{"cinder - the making of the drifters.mkv", KindUnknown},
+		{"charting the course - the making of harbor run.mkv", KindUnknown},
+		{"in search of driftland.mkv", KindUnknown},
+		{"how to survive the q tempest.mkv", KindUnknown},
 		{"meet the cast.mkv", KindUnknown},
-		{"previz - future concepts.mkv", KindUnknown},
-		{"visual effects progression scenes.mkv", KindUnknown},
-		{"replacing zach - the secret auditions.mkv", KindUnknown},
+		{"previz - distant concepts.mkv", KindUnknown},
+		{"visual effects assembly reels.mkv", KindUnknown},
+		{"replacing milo - the secret auditions.mkv", KindUnknown},
 		{"4) the production design.mkv", KindUnknown},
-		{"5) building mcdonald's - time lapse video.mkv", KindUnknown},
-		{"nonlinear thinking - the editing process.mkv", KindMovie},
-		{"becoming joker.mkv", KindMovie},
-		{"how to draw.mkv", KindMovie},
-		{"map of destruction.mkv", KindMovie},
-		{"pushing the limits.mkv", KindMovie},
-		{"extraction mode.mkv", KindMovie},
-		{"jumpstart - david's story.mkv", KindMovie},
-		{"the fashion of 1969.mkv", KindMovie},
-		{"swarmatron.mkv", KindMovie},
-		{"kung fu talking.mkv", KindMovie},
-		{"michigan, usa.mkv", KindMovie},
-		{"new york, usa.mkv", KindMovie},
-		{"tokyo, japan.mkv", KindMovie},
-		{"the doppelgangers.mkv", KindMovie},
-		{"2) gary announcement.mkv", KindMovie},
-		{"3) the mcdonald brothers.mkv", KindMovie},
+		{"5) building harborline - time lapse video.mkv", KindUnknown},
+		{"lateral thinking - the cutting process.mkv", KindMovie},
+		{"becoming harlow.mkv", KindMovie},
+		{"how to sketch.mkv", KindMovie},
+		{"chart of ruin.mkv", KindMovie},
+		{"testing the bounds.mkv", KindMovie},
+		{"retrieval mode.mkv", KindMovie},
+		{"ignition - harlan's story.mkv", KindMovie},
+		{"the music of 1974.mkv", KindMovie},
+		{"humbucker.mkv", KindMovie},
+		{"tai chi walking.mkv", KindMovie},
+		{"cantonia, usa.mkv", KindMovie},
+		{"porto verro, usa.mkv", KindMovie},
+		{"kestria, japan.mkv", KindMovie},
+		{"the mimickers.mkv", KindMovie},
+		{"2) milo announcement.mkv", KindMovie},
+		{"3) the harbor brothers.mkv", KindMovie},
 	}
 	unknown := 0
 	for _, tc := range cases {
@@ -134,9 +134,9 @@ func TestParseBonusVariantCoverage(t *testing.T) {
 	}
 }
 
-// TestParseExtrasNoRealTitleCollision is the collision guard: the real titles
-// observed in the same cache must still parse as Movie/Series, never Unknown.
-// Escape Plan 2 pins KindSeries: titleclean splits the sequel digit into an
+// TestParseExtrasNoRealTitleCollision is the collision guard: the synthetic
+// representative titles must still parse as Movie/Series, never Unknown.
+// Harbor Run 2 pins KindSeries: titleclean splits the sequel digit into an
 // E2 absolute tag (pre-existing behaviour, unrelated to extraRe) - the point
 // is it is fetched, never skipped.
 func TestParseExtrasNoRealTitleCollision(t *testing.T) {
@@ -144,26 +144,32 @@ func TestParseExtrasNoRealTitleCollision(t *testing.T) {
 		file string
 		want Kind
 	}{
-		{"21.Jump.Street.2012.2160p.mkv", KindMovie},
-		{"Fight.Club.1999.mkv", KindMovie},
-		{"Shutter.Island.2010.mkv", KindMovie},
-		{"The.Revenant.2015.mkv", KindMovie},
-		{"Contagion.2011.mkv", KindMovie},
-		{"Django.Unchained.2012.mkv", KindMovie},
-		{"Drive.2011.1080p.mkv", KindMovie},
-		{"Blade.Runner.2049.2017.mkv", KindMovie},
-		{"The.Hunger.Games.2012.mkv", KindMovie},
-		{"We.re.the.Millers.2013.mkv", KindMovie},
-		{"Kick-Ass.mkv", KindMovie},
-		{"Ratatouille.mkv", KindMovie},
-		{"Pacific.Rim.mkv", KindMovie},
-		{"Lolita.mkv", KindMovie},
-		{"Joker.2019.1080p.mkv", KindMovie},
-		{"Focus.2015.1080p.mkv", KindMovie},
-		{"Zombieland.Double.Tap.2019.mkv", KindMovie},
-		{"Escape.Plan.2.Hades.2018.mkv", KindSeries},
-		{"The.Expendables.3.2014.mkv", KindMovie},
-		{"Welcome.to.Derry.S01E01.mkv", KindSeries},
+		{"22.Warp.Avenue.2013.2160p.mkv", KindMovie},
+		{"Iron.Circle.1999.mkv", KindMovie},
+		{"Harbor.Island.2011.mkv", KindMovie},
+		{"The.Wayfarer.2015.mkv", KindMovie},
+		{"Driftfall.2011.mkv", KindMovie},
+		{"Harlan.Unbound.2012.mkv", KindMovie},
+		{"Drift.2011.1080p.mkv", KindMovie},
+		{"Stone.Rider.2051.2017.mkv", KindMovie},
+		{"The.Harbor.Trials.2012.mkv", KindMovie},
+		{"We.re.the.Harlows.2013.mkv", KindMovie},
+		{"Snap-Back.mkv", KindMovie},
+		{"Quimbly.mkv", KindMovie},
+		{"Atlantic.Edge.mkv", KindMovie},
+		{"Marisol.mkv", KindMovie},
+		{"Mimic.2019.1080p.mkv", KindMovie},
+		{"Pivot.2015.1080p.mkv", KindMovie},
+		{"Driftland.Double.Hit.2019.mkv", KindMovie},
+		{"Harbor.Run.2.Styx.2018.mkv", KindSeries},
+		{"The.Drifters.3.2014.mkv", KindMovie},
+		{"Welcome.to.Harbor.S01E01.mkv", KindSeries},
+		// Time Lapse (2014) is the collision that forced the time-lapse stem
+		// to require a trailing "video": the bare film title must stay
+		// fetched (KindMovie), while the "time lapse video" extras stay
+		// skipped (KindUnknown, covered in the bonus table).
+		{"Time.Lapse.2014.mkv", KindMovie},
+		{"Time.Lapse.2014.1080p.mkv", KindMovie},
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {
@@ -171,6 +177,24 @@ func TestParseExtrasNoRealTitleCollision(t *testing.T) {
 				t.Fatalf("ParseRaw(%q) Kind = %d, want %d (%+v)", tc.file, q.Kind, tc.want, q)
 			}
 		})
+	}
+}
+
+// TestParseTimeLapseStemConstrained pins the time-lapse fix: the bare film
+// "Time Lapse" (2014) is fetched, while the observed "time lapse video"
+// extras phrasing is still skipped. The stem requires a trailing "video",
+// so no plausible release title without that word can collide.
+func TestParseTimeLapseStemConstrained(t *testing.T) {
+	for _, file := range []string{"Time.Lapse.2014.mkv", "Time.Lapse.2014.1080p.mkv"} {
+		if q := ParseRaw(file); q.Kind != KindMovie {
+			t.Fatalf("ParseRaw(%q) Kind = %d, want KindMovie (%+v)", file, q.Kind, q)
+		}
+	}
+	if q := ParseRaw("5) building harborline - time lapse video.mkv"); q.Kind != KindUnknown {
+		t.Fatalf("ParseRaw(time lapse video extras) Kind = %d, want KindUnknown (%+v)", q.Kind, q)
+	}
+	if q := ParseRaw("Time.Lapse.Video.mkv"); q.Kind != KindUnknown {
+		t.Fatalf("ParseRaw(%q) Kind = %d, want KindUnknown (%+v)", "Time.Lapse.Video.mkv", q.Kind, q)
 	}
 }
 
@@ -185,13 +209,13 @@ func TestParseAmbiguousExtras(t *testing.T) {
 	}{
 		// Chapter-styled, but no numeric-prefix stem was adopted: it is
 		// indistinguishable from real chapter-titled content.
-		{"2) michael keaton as ray kroc.mkv", "bare chapter number, no stem"},
+		{"2) harlan marsh as tom vane.mkv", "bare chapter number, no stem"},
 		// "action" alone would nuke real action-genre titles.
-		{"action - the expendables.mkv", "single common word, barred"},
+		{"action - the drifters.mkv", "single common word, barred"},
 		// No phrase stem without collision risk ("within"/"without" are common).
-		{"within and without with tobey maguire.mkv", "no safe phrase stem"},
+		{"within and without with harlan marsh.mkv", "no safe phrase stem"},
 		// "short" alone would kill real short-film titles.
-		{"short - the tunnel.mkv", "single common word, barred"},
+		{"short - the causeway.mkv", "single common word, barred"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.file, func(t *testing.T) {

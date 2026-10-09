@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -488,5 +490,167 @@ func TestWikipediaMovieOrder(t *testing.T) {
 		if s.Name() == "wikipedia" {
 			t.Logf("note: wikipedia present in series chain (self-gates pre-wire)")
 		}
+	}
+}
+
+// TestWikipediaAPIErrorIsTransientNoNegative proves a 200 body carrying
+// the API error envelope is transient, never a definitive miss: both the
+// search and the detail path return ErrLookupUnavailable, and the
+// resolver persists no negative entry for a lookup that never happened.
+func TestWikipediaAPIErrorIsTransientNoNegative(t *testing.T) {
+	const apiErr = `{"error":{"code":"maxlag","info":"Waiting for db"}}`
+	cases := []struct {
+		name   string
+		search string
+		detail string
+	}{
+		{"search error", apiErr, wikiHitDetail},
+		{"detail error", wikiHitSearch, apiErr},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &wikiFake{search: tc.search, detail: tc.detail}
+			srv := httptest.NewServer(f.handler())
+			defer srv.Close()
+			s := &wikipediaSource{base: srv.URL, client: srv.Client()}
+			m, err := s.Find(context.Background(), Query{Kind: KindMovie, Title: "Dune"})
+			if m != nil {
+				t.Fatalf("Find media = %+v, want nil on API error", m)
+			}
+			if !errors.Is(err, ErrLookupUnavailable) {
+				t.Fatalf("Find err = %v, want ErrLookupUnavailable", err)
+			}
+		})
+	}
+
+	// Resolver honesty: an API-error lookup persists nothing.
+	f := &wikiFake{search: apiErr, detail: wikiHitDetail}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	dir := t.TempDir()
+	s := &wikipediaSource{base: srv.URL, client: srv.Client()}
+	r := New(Options{Dir: dir, Sources: []Source{s}, Timeout: 5 * time.Second})
+	q := Query{Kind: KindMovie, Title: "Dune", Year: 2021}
+	res, err := r.LookupNow(context.Background(), q)
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("LookupNow err = %v, want ErrLookupUnavailable", err)
+	}
+	if res.Found {
+		t.Fatalf("LookupNow = %+v, want miss on API error", res)
+	}
+	key := cacheKey(q)
+	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
+		t.Fatalf("API error persisted a file, want nothing (stat err = %v)", statErr)
+	}
+	r.mu.Lock()
+	_, suppressed := r.neg[key]
+	r.mu.Unlock()
+	if suppressed {
+		t.Fatal("API error set in-memory suppression, want none")
+	}
+}
+
+// wikiFailTripper forces a transport failure whose message carries the
+// title via the request URL (natural *url.Error shape).
+type wikiFailTripper struct{}
+
+func (wikiFailTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return nil, errors.New("injected transport boom")
+}
+
+// TestWikipediaTransientOmitsTitle proves a transport failure never leaks
+// the owner title into the error text: the forced failure's URL carries
+// the escaped title, but the wrapped sentinel message must not contain it.
+func TestWikipediaTransientOmitsTitle(t *testing.T) {
+	const secret = "UnlikelySecretTitleXYZ987"
+	s := &wikipediaSource{
+		base:   "https://en.wikipedia.org",
+		client: &http.Client{Transport: wikiFailTripper{}},
+	}
+	_, err := s.Find(context.Background(), Query{Kind: KindMovie, Title: secret})
+	if err == nil {
+		t.Fatal("Find err = nil, want transient sentinel")
+	}
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("Find err = %v, want ErrLookupUnavailable", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("transient err leaks title %q: %q", secret, err.Error())
+	}
+	if strings.Contains(err.Error(), "api.php") || strings.Contains(err.Error(), "srsearch") {
+		t.Fatalf("transient err leaks URL/query: %q", err.Error())
+	}
+}
+
+// TestWikipediaMissingStringIsDefinitiveMiss proves the live string shape
+// {"missing":""} is a definitive miss (nil, nil) - not the transient
+// sentinel - and that the resolver persists the negative.
+func TestWikipediaMissingStringIsDefinitiveMiss(t *testing.T) {
+	const missingStr = `{"query":{"pages":{"-1":{"title":"Dune (2021 film)","missing":""}}}}`
+	f := &wikiFake{search: wikiHitSearch, detail: missingStr}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+	s := &wikipediaSource{base: srv.URL, client: srv.Client()}
+	m, err := s.Find(context.Background(), Query{Kind: KindMovie, Title: "Dune"})
+	if err != nil || m != nil {
+		t.Fatalf("Find = (%v, %v), want (nil, nil) for string missing", m, err)
+	}
+
+	// Resolver honesty: a string-missing lookup IS a definitive miss and
+	// persists exactly one negative.
+	dir := t.TempDir()
+	r := New(Options{Dir: dir, Sources: []Source{s}, Timeout: 5 * time.Second})
+	q := Query{Kind: KindMovie, Title: "Dune", Year: 2021}
+	res, err := r.LookupNow(context.Background(), q)
+	if err != nil {
+		t.Fatalf("LookupNow err = %v, want nil (definitive miss)", err)
+	}
+	if res.Found {
+		t.Fatalf("LookupNow = %+v, want miss", res)
+	}
+	key := cacheKey(q)
+	data, statErr := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
+	if statErr != nil {
+		t.Fatalf("definitive miss persisted no file: %v", statErr)
+	}
+	if !strings.Contains(string(data), "NotFound") && !strings.Contains(string(data), "notfound") {
+		t.Logf("negative entry body: %s", string(data))
+	}
+	e, ok := cacheLoadEntry(dir, key)
+	if !ok || !e.NotFound {
+		t.Fatalf("negative entry = %+v,%v; want NotFound miss", e, ok)
+	}
+}
+
+// TestWikiPickPosterGuidelinesRejected proves the narrowed pick rule: a
+// "poster guidelines" doc never becomes Artwork (empty, never invented),
+// while a genuine theatrical poster is still picked.
+func TestWikiPickPosterGuidelinesRejected(t *testing.T) {
+	if got := wikiPickPoster([]string{"File:Dune poster guidelines.jpg"}); got != "" {
+		t.Fatalf("guidelines pick = %q, want empty (never invent)", got)
+	}
+	if got := wikiPickPoster([]string{"File:Dune theatrical poster.jpg"}); got == "" {
+		t.Fatal("genuine poster pick = empty, want the poster file")
+	}
+	// Blocked-doc variants stay empty even with a photo extension.
+	for _, name := range []string{
+		"File:Dune poster logo.jpg",
+		"File:Dune poster list.jpg",
+		"File:Dune poster sheet.png",
+		"File:Dune film poster style guide.jpg",
+		"File:Posterize.jpg",
+	} {
+		if got := wikiPickPoster([]string{name}); got != "" {
+			t.Fatalf("blocked pick %q = %q, want empty", name, got)
+		}
+	}
+	// Genuine poster still wins over blocked docs (best-extension rule
+	// intact: jpg preferred).
+	got := wikiPickPoster([]string{
+		"File:Dune poster guidelines.jpg",
+		"File:Dune theatrical poster.jpg",
+	})
+	if got != "File:Dune theatrical poster.jpg" {
+		t.Fatalf("mixed pick = %q, want the genuine poster", got)
 	}
 }

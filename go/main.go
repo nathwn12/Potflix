@@ -381,8 +381,9 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 	}
 	log.eventPush(out.Details, out.State, ct, total)
 	// Preview-is-the-payload: record the exact value handed to the pipe, so
-	// the Card view reads what was SENT, never a rebuilt copy.
-	recordPreview(out)
+	// the Card view reads what was SENT, never a rebuilt copy. Recorded only
+	// after a successful send: a failed send leaves the previous SENT card
+	// in place instead of presenting an unsent attempt as sent.
 	if err := dc.SetActivity(discord.Activity{
 		Name:       out.Name,
 		Details:    out.Details,
@@ -397,5 +398,7 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		Buttons:    presenceButtons(out.Buttons),
 	}); err != nil {
 		log.eventSendError(err)
+	} else {
+		recordPreview(out)
 	}
 }

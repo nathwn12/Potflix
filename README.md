@@ -154,7 +154,7 @@ starts an incremental scan so missing keys are fetched online.
 ## Durability
 
 State lives outside the repo under `%LOCALAPPDATA%\Potflix`: `config.json`
-(folders, API keys, scan speed, startup flag), `meta\` (one JSON file per
+(folders, scan speed, startup flag), `meta\` (one JSON file per
 cached title), `scanindex.json` (folder index). All three are written
 atomically (temp file + rename) and loaded tolerantly (missing / corrupt =
 defaults or a cache miss), so an update, a crash, or a restart keeps them.
