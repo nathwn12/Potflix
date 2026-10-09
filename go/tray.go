@@ -190,6 +190,9 @@ func showTrayMenu(hwnd uintptr) {
 	}
 	defer procDestroyMenu.Call(menu)
 
+	openLabel, _ := syscall.UTF16PtrFromString("Open Potflix")
+	procAppendMenuW.Call(menu, mfString, 2, uintptr(unsafe.Pointer(openLabel)))
+
 	label, _ := syscall.UTF16PtrFromString("Exit Potflix")
 	procAppendMenuW.Call(menu, mfString, 1, uintptr(unsafe.Pointer(label)))
 
@@ -202,6 +205,9 @@ func showTrayMenu(hwnd uintptr) {
 		uintptr(p.x), uintptr(p.y), 0, hwnd, 0,
 	)
 	procPostMessageW.Call(hwnd, wmNull, 0, 0)
+	if int(sel) == 2 {
+		showMainWindow()
+	}
 	if int(sel) == 1 {
 		onExit()
 	}

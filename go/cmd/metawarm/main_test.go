@@ -2,32 +2,22 @@ package main
 
 import (
 	"context"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"potflix/internal/metadata"
 )
 
-// seedLib builds a tiny fake library:
-//   - the same episode in two folders (must dedupe to one key)
-//   - a second episode of the same show (distinct key)
-//   - a trailer under Extras (KindUnknown: skipped)
-//   - a movie (distinct key)
-func seedLib(t *testing.T) string {
-	t.Helper()
+func TestDryRunFetchesNothingAndWritesReport(t *testing.T) {
 	root := t.TempDir()
-	files := []string{
+	for _, f := range []string{
 		filepath.Join(root, "A", "Breaking.Bad.S01E01.mkv"),
-		filepath.Join(root, "B", "Breaking.Bad.S01E01.mkv"),
 		filepath.Join(root, "B", "Breaking.Bad.S01E02.mkv"),
-		filepath.Join(root, "ShowName", "Extras", "SomeShow trailer.mkv"),
-		filepath.Join(root, "Movies", "The.Matrix.1999.mkv"),
-	}
-	for _, f := range files {
+	} {
 		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -35,76 +25,6 @@ func seedLib(t *testing.T) string {
 			t.Fatal(err)
 		}
 	}
-	// A non-video file must never be collected.
-	if err := os.WriteFile(filepath.Join(root, "notes.txt"), []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return root
-}
-
-func TestBuildPlanSkipsUnknownAndDedupes(t *testing.T) {
-	root := seedLib(t)
-	files, denied, err := collectFiles([]string{root}, 0)
-	if err != nil {
-		t.Fatalf("collectFiles: %v", err)
-	}
-	if denied != 0 {
-		t.Errorf("denied = %d, want 0 for a readable tree", denied)
-	}
-	if len(files) != 5 {
-		t.Fatalf("files = %d, want 5 (non-video excluded): %v", len(files), files)
-	}
-	plans, groups := buildPlan(files)
-	skipped := 0
-	for _, p := range plans {
-		if p.skipped {
-			skipped++
-			if !strings.HasSuffix(p.path, "SomeShow trailer.mkv") {
-				t.Errorf("skipped unexpected file: %s", p.path)
-			}
-		}
-	}
-	if skipped != 1 {
-		t.Errorf("skipped = %d, want 1", skipped)
-	}
-	// 5 files - 1 skipped = 4 queries, but the S01E01 pair shares a key:
-	// groups = {S01E01, S01E02, movie} = 3.
-	if len(groups) != 3 {
-		t.Fatalf("unique groups = %d, want 3", len(groups))
-		for _, g := range groups {
-			t.Logf("key=%s query=%+v paths=%v", g.key, g.query, g.paths)
-		}
-	}
-	for _, g := range groups {
-		if len(g.paths) == 2 && !strings.Contains(g.paths[0], "S01E01") {
-			t.Errorf("shared group is not the S01E01 pair: %v", g.paths)
-		}
-	}
-}
-
-func TestFetchAllLooksUpOncePerUniqueKey(t *testing.T) {
-	root := seedLib(t)
-	files, _, err := collectFiles([]string{root}, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, groups := buildPlan(files)
-	var calls atomic.Int32
-	stub := func(ctx context.Context, q metadata.Query) (metadata.Resolution, error) {
-		calls.Add(1)
-		return metadata.Resolution{Found: true}, nil
-	}
-	results := fetchAll(groups, stub, 3, nil)
-	if got := calls.Load(); got != int32(len(groups)) {
-		t.Errorf("lookup calls = %d, want %d (once per unique key)", got, len(groups))
-	}
-	if len(results) != len(groups) {
-		t.Errorf("results = %d, want %d", len(results), len(groups))
-	}
-}
-
-func TestDryRunFetchesNothingAndWritesReport(t *testing.T) {
-	root := seedLib(t)
 	local := t.TempDir()
 	t.Setenv("LOCALAPPDATA", local)
 	t.Setenv("OPENCODE_SESSION_ID", "test-session")
@@ -130,8 +50,8 @@ func TestDryRunFetchesNothingAndWritesReport(t *testing.T) {
 		t.Fatalf("read report: %v", err)
 	}
 	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	if len(lines) != 5 {
-		t.Fatalf("report lines = %d, want 5:\n%s", len(lines), string(data))
+	if len(lines) != 2 {
+		t.Fatalf("report lines = %d, want 2:\n%s", len(lines), string(data))
 	}
 	statuses := map[string]int{}
 	for _, ln := range lines {
@@ -145,11 +65,11 @@ func TestDryRunFetchesNothingAndWritesReport(t *testing.T) {
 			t.Errorf("report path escapes the walked root: %q", path)
 		}
 	}
-	if statuses[statusSkipped] != 1 || statuses[statusDry] != 4 {
-		t.Errorf("statuses = %v, want map[dry:4 skipped:1]", statuses)
+	if statuses[statusDry] != 2 {
+		t.Errorf("statuses = %v, want map[dry:2]", statuses)
 	}
 	summary := out.String()
-	for _, want := range []string{"metawarm summary:", "files=5", "skipped(unknown)=1", "unique=3", "denied=0", "report: " + report} {
+	for _, want := range []string{"metawarm summary:", "files=2", "skipped(unknown)=0", "unique=2", "denied=0", "report: " + report} {
 		if !strings.Contains(summary, want) {
 			t.Errorf("summary missing %q:\n%s", want, summary)
 		}
@@ -157,7 +77,11 @@ func TestDryRunFetchesNothingAndWritesReport(t *testing.T) {
 }
 
 func TestOfflineRunIsCacheOnlyAndWritesReport(t *testing.T) {
-	root := seedLib(t)
+	root := t.TempDir()
+	show := filepath.Join(root, "Breaking.Bad.S01E01.mkv")
+	if err := os.WriteFile(show, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	local := t.TempDir()
 	t.Setenv("LOCALAPPDATA", local)
 	t.Setenv("OPENCODE_SESSION_ID", "offline-case")
@@ -172,17 +96,17 @@ func TestOfflineRunIsCacheOnlyAndWritesReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read report: %v", err)
 	}
-	// Empty cache + offline: every fetched file is a miss, never an error.
+	// Empty cache + offline: the fetched file is a miss, never an error.
 	statuses := map[string]int{}
 	for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
 		st, _, _ := strings.Cut(ln, "\t")
 		statuses[st]++
 	}
-	if statuses[statusNotFound] != 4 || statuses[statusSkipped] != 1 || statuses[statusError] != 0 {
-		t.Errorf("statuses = %v, want map[not-found:4 skipped:1]", statuses)
+	if statuses[statusNotFound] != 1 || statuses[statusSkipped] != 0 || statuses[statusError] != 0 {
+		t.Errorf("statuses = %v, want map[not-found:1]", statuses)
 	}
 	summary := out.String()
-	for _, want := range []string{"hits=0", "missing=4", "denied=0"} {
+	for _, want := range []string{"hits=0", "missing=1", "denied=0"} {
 		if !strings.Contains(summary, want) {
 			t.Errorf("summary missing %q:\n%s", want, summary)
 		}
@@ -208,123 +132,22 @@ func TestUnwalkableRootIsFatal(t *testing.T) {
 	}
 }
 
-// fakeEntry is a minimal fs.DirEntry for an injected walker.
-type fakeEntry struct {
-	name string
-	dir  bool
-}
-
-func (e fakeEntry) Name() string { return e.name }
-func (e fakeEntry) IsDir() bool  { return e.dir }
-func (e fakeEntry) Type() fs.FileMode {
-	if e.dir {
-		return fs.ModeDir
-	}
-	return 0
-}
-func (e fakeEntry) Info() (fs.FileInfo, error) { return nil, nil }
-
-// TestCollectFilesSkipsDeniedSubdir proves one unreadable subdirectory is
-// never fatal: the injected walker emits a permission error for a subdir,
-// collectFiles skips it (denied == 1) and still collects the other files.
-func TestCollectFilesSkipsDeniedSubdir(t *testing.T) {
+// TestDeniedRootDrySummaryIncludesDenied proves one unreadable root is never
+// fatal when another root reads fine: denied=1 flows through realMain into
+// the -dry summary (exit 0, fetches nothing).
+func TestDeniedRootDrySummaryIncludesDenied(t *testing.T) {
 	root := t.TempDir()
-	good := filepath.Join(root, "good.mkv")
-	other := filepath.Join(root, "other.mp4")
-	badDir := filepath.Join(root, "bad")
-	inner := filepath.Join(badDir, "hidden.mkv")
-
-	orig := walkDir
-	defer func() { walkDir = orig }()
-	walkDir = func(walkRoot string, fn fs.WalkDirFunc) error {
-		if walkRoot != root {
-			t.Errorf("walkRoot = %q, want %q", walkRoot, root)
-		}
-		if err := fn(walkRoot, fakeEntry{name: filepath.Base(walkRoot), dir: true}, nil); err != nil {
-			return err
-		}
-		if err := fn(good, fakeEntry{name: "good.mkv"}, nil); err != nil {
-			return err
-		}
-		bd := fakeEntry{name: "bad", dir: true}
-		if err := fn(badDir, bd, nil); err != nil {
-			return err
-		}
-		perr := &os.PathError{Op: "open", Path: badDir, Err: os.ErrPermission}
-		if err := fn(badDir, bd, perr); err != nil {
-			if err == filepath.SkipDir {
-				// Skipped: the file under the denied dir must never surface.
-			} else {
-				return err
-			}
-		}
-		_ = inner
-		if err := fn(other, fakeEntry{name: "other.mp4"}, nil); err != nil {
-			return err
-		}
-		return nil
+	if err := os.WriteFile(filepath.Join(root, "good.mkv"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-
-	files, denied, err := collectFiles([]string{root}, 0)
-	if err != nil {
-		t.Fatalf("collectFiles with one denied subdir: %v", err)
-	}
-	if denied != 1 {
-		t.Errorf("denied = %d, want 1", denied)
-	}
-	if len(files) != 2 {
-		t.Fatalf("files = %v, want [good other]", files)
-	}
-	got := map[string]bool{}
-	for _, f := range files {
-		got[f] = true
-	}
-	if !got[good] || !got[other] {
-		t.Errorf("files = %v, want %q and %q collected", files, good, other)
-	}
-	for _, f := range files {
-		if f == inner || strings.HasPrefix(f, badDir+string(os.PathSeparator)) {
-			t.Errorf("collected file under denied dir: %q", f)
-		}
-	}
-}
-
-// TestDeniedSubdirDrySummaryIncludesDenied proves the -dry summary wires the
-// denied count through realMain (denied=1, exit 0, fetches nothing).
-func TestDeniedSubdirDrySummaryIncludesDenied(t *testing.T) {
-	root := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
 	local := t.TempDir()
 	t.Setenv("LOCALAPPDATA", local)
 	t.Setenv("OPENCODE_SESSION_ID", "denied-case")
 	cache := t.TempDir()
 
-	good := filepath.Join(root, "good.mkv")
-	badDir := filepath.Join(root, "bad")
-	orig := walkDir
-	defer func() { walkDir = orig }()
-	walkDir = func(walkRoot string, fn fs.WalkDirFunc) error {
-		if err := fn(walkRoot, fakeEntry{name: filepath.Base(walkRoot), dir: true}, nil); err != nil {
-			return err
-		}
-		if err := fn(good, fakeEntry{name: "good.mkv"}, nil); err != nil {
-			return err
-		}
-		bd := fakeEntry{name: "bad", dir: true}
-		if err := fn(badDir, bd, nil); err != nil {
-			return err
-		}
-		perr := &os.PathError{Op: "open", Path: badDir, Err: os.ErrPermission}
-		if err := fn(badDir, bd, perr); err != nil {
-			if err == filepath.SkipDir {
-				return nil
-			}
-			return err
-		}
-		return nil
-	}
-
 	var out, errb strings.Builder
-	code := realMain([]string{"-dry", "-roots", root, "-cache", cache}, &out, &errb)
+	code := realMain([]string{"-dry", "-roots", root + ";" + missing, "-cache", cache}, &out, &errb)
 	if code != 0 {
 		t.Fatalf("exit = %d, stderr = %s", code, errb.String())
 	}
@@ -337,5 +160,214 @@ func TestDeniedSubdirDrySummaryIncludesDenied(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("cache dir has %d entries after -dry, want 0", len(entries))
+	}
+}
+
+// blockSource is a ctx-aware fake resolver source for cancel tests: the
+// first call signals started, then blocks until ctx is done or release
+// closes.
+type blockSource struct {
+	calls   atomic.Int32
+	started chan struct{}
+	release chan struct{}
+	once    atomic.Bool
+}
+
+func (b *blockSource) Name() string { return "fake" }
+
+func (b *blockSource) Find(ctx context.Context, q metadata.Query) (*metadata.Media, error) {
+	b.calls.Add(1)
+	if b.once.CompareAndSwap(false, true) {
+		close(b.started)
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.release:
+	}
+	return &metadata.Media{Source: "fake", SourceID: "1", Kind: q.Kind, Title: q.Title, Year: q.Year, FetchedAt: time.Now().UTC()}, nil
+}
+
+func seedWarmRoot(t *testing.T, names ...string) string {
+	t.Helper()
+	root := t.TempDir()
+	for _, n := range names {
+		f := filepath.Join(root, n)
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return root
+}
+
+// TestCancelledRunExitsZeroWithCancelledAndKeys proves a cancelled metawarm
+// run exits 0, its summary contains "cancelled", and the key line is present
+// alongside every existing field.
+func TestCancelledRunExitsZeroWithCancelledAndKeys(t *testing.T) {
+	root := seedWarmRoot(t, filepath.Join("A", "ShowA.S01E01.mkv"), filepath.Join("B", "ShowB.S01E01.mkv"))
+	local := t.TempDir()
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("OPENCODE_SESSION_ID", "cancel-case")
+	cache := t.TempDir()
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	blk := &blockSource{started: make(chan struct{}), release: make(chan struct{})}
+	newResolver = func(dir string, offline bool) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Offline: offline, Sources: []metadata.Source{blk}})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var out, errb strings.Builder
+	var code int
+	go func() {
+		defer close(done)
+		code = realMainWithContext(ctx, []string{"-roots", root, "-cache", cache, "-index", index}, &out, &errb)
+	}()
+	select {
+	case <-blk.started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("blocking provider never started")
+	}
+	cancelAt := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled metawarm did not return")
+	}
+	t.Logf("metawarm cancel latency=%dms", time.Since(cancelAt).Milliseconds())
+	if code != 0 {
+		t.Errorf("exit = %d, want 0 for cancelled run (stderr=%s)", code, errb.String())
+	}
+	summary := out.String()
+	for _, want := range []string{"cancelled", "keys:", "files=", "folders:", "report: "} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("summary missing %q:\n%s", want, summary)
+		}
+	}
+}
+
+// TestSummaryGainsKeyLine keeps every existing field while adding the key
+// line, e.g. keys: 2 (1 cached, 1 fetched, 0 not found).
+func TestSummaryGainsKeyLine(t *testing.T) {
+	root := seedWarmRoot(t, filepath.Join("A", "ShowA.S01E01.mkv"))
+	local := t.TempDir()
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("OPENCODE_SESSION_ID", "keys-case")
+	cache := t.TempDir()
+
+	var out, errb strings.Builder
+	code := realMain([]string{"-offline", "-roots", root, "-cache", cache}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errb.String())
+	}
+	summary := out.String()
+	for _, want := range []string{"files=", "folders:", "keys:", "cached", "fetched", "not found"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("summary missing %q:\n%s", want, summary)
+		}
+	}
+}
+
+// TestCancelledWalkRecordsNothingInIndex proves F1 on the metawarm path: a
+// run whose walk is cancelled records NOTHING in the index, so a later scan
+// cannot skip files that were never walked. The context is already
+// cancelled when the walk starts; the run still exits 0 with "cancelled".
+func TestCancelledWalkRecordsNothingInIndex(t *testing.T) {
+	root := seedWarmRoot(t, filepath.Join("A", "ShowA.S01E01.mkv"), filepath.Join("B", "ShowB.S01E01.mkv"))
+	local := t.TempDir()
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("OPENCODE_SESSION_ID", "walk-cancel-case")
+	cache := t.TempDir()
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // walk starts already cancelled: partial results, nothing walked
+	var out, errb strings.Builder
+	code := realMainWithContext(ctx, []string{"-roots", root, "-cache", cache, "-index", index}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 for cancelled run (stderr=%s)", code, errb.String())
+	}
+	if summary := out.String(); !strings.Contains(summary, "cancelled") {
+		t.Errorf("summary missing cancelled:\n%s", summary)
+	}
+	if fi, err := os.Stat(index); !os.IsNotExist(err) {
+		if err == nil {
+			t.Errorf("index file exists (%d bytes) after a cancelled walk, want nothing recorded", fi.Size())
+		} else {
+			t.Errorf("stat index: %v", err)
+		}
+	}
+}
+
+// TestCancelledFetchIsNotAnError proves F5 on the metawarm path: fetches
+// that end because the context was cancelled are incomplete, never
+// failures: the summary reports errors=0 and the per-file report carries no
+// error lines.
+func TestCancelledFetchIsNotAnError(t *testing.T) {
+	root := seedWarmRoot(t, filepath.Join("A", "ShowA.S01E01.mkv"), filepath.Join("B", "ShowB.S01E01.mkv"))
+	local := t.TempDir()
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("OPENCODE_SESSION_ID", "fetch-cancel-case")
+	cache := t.TempDir()
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	blk := &blockSource{started: make(chan struct{}), release: make(chan struct{})}
+	newResolver = func(dir string, offline bool) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Offline: offline, Sources: []metadata.Source{blk}})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	var out, errb strings.Builder
+	var code int
+	go func() {
+		defer close(done)
+		code = realMainWithContext(ctx, []string{"-roots", root, "-cache", cache, "-index", index}, &out, &errb)
+	}()
+	select {
+	case <-blk.started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("blocking provider never started")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled metawarm did not return")
+	}
+	if code != 0 {
+		t.Errorf("exit = %d, want 0 for cancelled run (stderr=%s)", code, errb.String())
+	}
+	summary := out.String()
+	for _, want := range []string{"cancelled", "errors=0"} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("summary missing %q:\n%s", want, summary)
+		}
+	}
+	report := filepath.Join(local, "Potflix", "inventory", "warm-report--hold--fetch-cancel-case.txt")
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	for _, ln := range strings.Split(strings.TrimRight(string(data), "\n"), "\n") {
+		if ln == "" {
+			continue
+		}
+		if st, _, _ := strings.Cut(ln, "\t"); st == statusError {
+			t.Errorf("report marks a cancelled fetch as error: %q (full report:\n%s)", ln, string(data))
+			break
+		}
 	}
 }

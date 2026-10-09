@@ -2,6 +2,10 @@ package metadata
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -325,5 +329,308 @@ func TestResolutionButtonsSeriesAndMovie(t *testing.T) {
 	}
 	if res3.Buttons[0].URL != "https://itunes.apple.com/movie/id123" {
 		t.Fatalf("movie button URL = %q", res3.Buttons[0].URL)
+	}
+}
+
+// TestNegativePersistedAndColdHitNoNetwork proves a not-found lookup
+// persists a negative entry (file exists, parses, NotFound=true) and that
+// a second lookup in a NEW resolver (cold mem) with the same cache dir
+// serves the miss with zero provider calls.
+func TestNegativePersistedAndColdHitNoNetwork(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "No Such Show Ever", Season: 1, Episode: 1}
+	miss := &fakeSource{name: "fake"} // nil media = not found
+	r1 := New(Options{Dir: dir, Sources: []Source{miss}, Timeout: 5 * time.Second})
+	res, err := r1.LookupNow(ctx, q)
+	if err != nil {
+		t.Fatalf("run 1 LookupNow: %v", err)
+	}
+	if res.Found {
+		t.Fatalf("run 1 = %+v, want miss", res)
+	}
+	if n := miss.calls.Load(); n != 1 {
+		t.Fatalf("run 1 provider calls = %d, want 1", n)
+	}
+	// The negative entry is on disk under the same key filename.
+	key := cacheKey(q)
+	data, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
+	if err != nil {
+		t.Fatalf("negative entry missing on disk: %v", err)
+	}
+	var cf cacheFile
+	if err := json.Unmarshal(data, &cf); err != nil {
+		t.Fatalf("negative entry does not parse: %v", err)
+	}
+	if !cf.NotFound {
+		t.Fatalf("negative entry NotFound = false, want true (%s)", string(data))
+	}
+	if cf.Key != key || cf.Schema != cacheSchema {
+		t.Fatalf("negative entry identity = %+v, want key %q schema %d", cf, key, cacheSchema)
+	}
+
+	// Cold mem: a NEW resolver over the same dir must not touch the network.
+	counting := &fakeSource{name: "fake"}
+	r2 := New(Options{Dir: dir, Sources: []Source{counting}, Timeout: 5 * time.Second})
+	res2, err := r2.LookupNow(ctx, q)
+	if err != nil {
+		t.Fatalf("run 2 LookupNow: %v", err)
+	}
+	if res2.Found {
+		t.Fatalf("run 2 = %+v, want cached miss", res2)
+	}
+	if n := counting.calls.Load(); n != 0 {
+		t.Fatalf("run 2 provider calls = %d, want 0 (negative-cache hit, no network)", n)
+	}
+	// The blocking miss reports fromCache=false, like every other miss.
+	if _, fromCache, err := r2.LookupNowForceSrc(ctx, q, false); err != nil || fromCache {
+		t.Fatalf("negative hit fromCache = %t,%v; want false,nil", fromCache, err)
+	}
+	if n := counting.calls.Load(); n != 0 {
+		t.Fatalf("provenance probe provider calls = %d, want still 0", n)
+	}
+}
+
+// TestNegativeForceReattemptsAndReplaces proves force=true bypasses the
+// persisted miss, re-attempts the provider, and replaces the negative
+// entry with the positive one on success.
+func TestNegativeForceReattemptsAndReplaces(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "Late Bloomer", Season: 1, Episode: 2}
+	miss := &fakeSource{name: "fake"}
+	r1 := New(Options{Dir: dir, Sources: []Source{miss}, Timeout: 5 * time.Second})
+	if res, err := r1.LookupNow(ctx, q); err != nil || res.Found {
+		t.Fatalf("seed miss = %+v,%v; want miss", res, err)
+	}
+	key := cacheKey(q)
+	if e, ok := cacheLoadEntry(dir, key); !ok || !e.NotFound {
+		t.Fatalf("seed negative entry = %+v,%v; want negative hit", e, ok)
+	}
+
+	now := &fakeSource{name: "fake", media: seriesMedia()}
+	r2 := New(Options{Dir: dir, Sources: []Source{now}, Timeout: 5 * time.Second})
+	res, err := r2.LookupNowForce(ctx, q, true)
+	if err != nil {
+		t.Fatalf("force LookupNow: %v", err)
+	}
+	if !res.Found || res.Episode != "Pilot" {
+		t.Fatalf("force = %+v, want Pilot found", res)
+	}
+	if n := now.calls.Load(); n != 1 {
+		t.Fatalf("force provider calls = %d, want 1 (re-attempted)", n)
+	}
+	// The negative file is now a positive entry.
+	e, ok := cacheLoadEntry(dir, key)
+	if !ok || e.NotFound || e.Media == nil {
+		t.Fatalf("replaced entry = %+v,%v; want positive hit", e, ok)
+	}
+	if _, ok := cacheLoad(dir, key); !ok {
+		t.Fatal("replaced entry should load as a positive hit")
+	}
+}
+
+// TestNegativeExpiredReattempted proves an expired negative entry is
+// treated as absent: the provider IS called again.
+func TestNegativeExpiredReattempted(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "Stale Miss Show", Season: 1, Episode: 1}
+	key := cacheKey(q)
+	old := time.Now().UTC().Add(-negativeTTL - time.Hour).Truncate(time.Millisecond)
+	data, err := json.Marshal(cacheFile{Key: key, Schema: cacheSchema, NotFound: true, CheckedAt: old})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, cacheFileName(key)), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeSource{name: "fake"}
+	r := New(Options{Dir: dir, Sources: []Source{fake}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(ctx, q)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if res.Found {
+		t.Fatalf("expired-negative lookup = %+v, want miss (re-attempted, still missing)", res)
+	}
+	if n := fake.calls.Load(); n != 1 {
+		t.Fatalf("provider calls = %d, want 1 (expired entry re-attempted)", n)
+	}
+}
+
+// TestProviderErrorPersistsNothing proves a transport error is transient,
+// never a confirmed not-found: it persists no negative file and sets no
+// in-memory suppression, so the next lookup re-attempts the provider.
+func TestProviderErrorPersistsNothing(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "Flaky Show", Season: 1, Episode: 2}
+	key := cacheKey(q)
+	boom := &fakeSource{name: "fake", err: errors.New("boom")}
+	r := New(Options{Dir: dir, Sources: []Source{boom}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(ctx, q)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if res.Found {
+		t.Fatalf("error lookup = %+v, want miss", res)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
+		t.Fatalf("provider error persisted a file, want nothing (stat err = %v)", statErr)
+	}
+	if CacheLive(dir, key) {
+		t.Fatal("CacheLive after provider error = true, want false")
+	}
+	r.mu.Lock()
+	_, suppressed := r.neg[key]
+	r.mu.Unlock()
+	if suppressed {
+		t.Fatal("provider error set in-memory suppression, want none")
+	}
+	// A second lookup must re-attempt (no suppression anywhere).
+	if _, err := r.LookupNow(ctx, q); err != nil {
+		t.Fatalf("second LookupNow: %v", err)
+	}
+	if n := boom.calls.Load(); n != 2 {
+		t.Fatalf("provider calls = %d, want 2 (no negative cached)", n)
+	}
+}
+
+// TestProviderTimeoutPersistsNothing proves a timed-out fetch persists
+// nothing: the file is absent and the next lookup re-attempts.
+func TestProviderTimeoutPersistsNothing(t *testing.T) {
+	dir := t.TempDir()
+	q := Query{Kind: KindSeries, Title: "Slow Show", Season: 1, Episode: 2}
+	key := cacheKey(q)
+	slow := &fakeSource{name: "fake", delay: 500 * time.Millisecond}
+	r := New(Options{Dir: dir, Sources: []Source{slow}, Timeout: 5 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err := r.LookupNow(ctx, q)
+	if err == nil {
+		t.Fatal("timed-out LookupNow err = nil, want ctx error")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
+		t.Fatalf("timed-out fetch persisted a file, want nothing (stat err = %v)", statErr)
+	}
+	if CacheLive(dir, key) {
+		t.Fatal("CacheLive after timeout = true, want false")
+	}
+}
+
+// TestFailedForcedRefreshPreservesPositive proves a failed forced refresh
+// (provider error) leaves an existing positive file byte-identical and the
+// positive still serves afterwards.
+func TestFailedForcedRefreshPreservesPositive(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "Keep Me", Season: 1, Episode: 2}
+	key := cacheKey(q)
+	media := seriesMedia()
+	if err := cacheStore(dir, key, media); err != nil {
+		t.Fatalf("seed cacheStore: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
+	if err != nil {
+		t.Fatalf("seed read: %v", err)
+	}
+	boom := &fakeSource{name: "fake", err: errors.New("transport down")}
+	r := New(Options{Dir: dir, Sources: []Source{boom}, Timeout: 5 * time.Second})
+	// Warm the in-memory positive from disk (no provider call).
+	if res, err := r.LookupNow(ctx, q); err != nil || !res.Found {
+		t.Fatalf("warm LookupNow = %+v,%v; want found (from disk)", res, err)
+	}
+	// Failed forced refresh: transient, must write nothing.
+	res, err := r.LookupNowForce(ctx, q, true)
+	if err != nil {
+		t.Fatalf("force LookupNow: %v", err)
+	}
+	if res.Found {
+		t.Fatalf("failed force = %+v, want miss", res)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
+	if err != nil {
+		t.Fatalf("post-force read: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("positive file clobbered by failed refresh:\nbefore %s\nafter  %s", string(before), string(after))
+	}
+	if !CacheLive(dir, key) {
+		t.Fatal("CacheLive after failed force = false, want true (positive intact)")
+	}
+	// The positive still serves (memory restored/intact).
+	res2, err := r.LookupNow(ctx, q)
+	if err != nil || !res2.Found || res2.Episode != "Pilot" {
+		t.Fatalf("post-force LookupNow = %+v,%v; want Pilot found", res2, err)
+	}
+}
+
+// TestCancelledBackgroundFetchStoresNothing proves a cancelled/timed-out
+// background fetch persists no negative file and sets no suppression.
+func TestCancelledBackgroundFetchStoresNothing(t *testing.T) {
+	dir := t.TempDir()
+	q := Query{Kind: KindSeries, Title: "Bg Cancel", Season: 1, Episode: 2}
+	key := cacheKey(q)
+	slow := &fakeSource{name: "fake", delay: 500 * time.Millisecond}
+	// fetchCtx timeout = timeout*4 = 80ms, well under the 500ms delay.
+	r := New(Options{Dir: dir, Sources: []Source{slow}, Timeout: 20 * time.Millisecond})
+	done := make(chan struct{})
+	r.mu.Lock()
+	r.inflight[key] = done
+	r.mu.Unlock()
+	go r.backgroundFetch(q, key, done)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("backgroundFetch never finished")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
+		t.Fatalf("cancelled backgroundFetch persisted a file, want nothing (stat err = %v)", statErr)
+	}
+	r.mu.Lock()
+	_, suppressed := r.neg[key]
+	r.mu.Unlock()
+	if suppressed {
+		t.Fatal("cancelled backgroundFetch set suppression, want none")
+	}
+}
+
+// TestNegativeBackoffBoundedByTTL proves the in-memory suppression never
+// outlives the stored TTL expiry: a near-expiry miss repopulates mem only
+// to CheckedAt+TTL, not now+backoff.
+func TestNegativeBackoffBoundedByTTL(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "Near Expiry", Season: 1, Episode: 1}
+	key := cacheKey(q)
+	checkedAt := time.Now().UTC().Add(-negativeTTL + 2*time.Minute).Truncate(time.Millisecond)
+	data, err := json.Marshal(cacheFile{Key: key, Schema: cacheSchema, NotFound: true, CheckedAt: checkedAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, cacheFileName(key)), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	counting := &fakeSource{name: "fake"}
+	r := New(Options{Dir: dir, Sources: []Source{counting}, Timeout: 5 * time.Second})
+	if res, err := r.LookupNow(ctx, q); err != nil || res.Found {
+		t.Fatalf("near-expiry LookupNow = %+v,%v; want cached miss", res, err)
+	}
+	if n := counting.calls.Load(); n != 0 {
+		t.Fatalf("provider calls = %d, want 0 (fresh negative, no network)", n)
+	}
+	r.mu.Lock()
+	exp, ok := r.neg[key]
+	r.mu.Unlock()
+	if !ok {
+		t.Fatal("near-expiry miss set no in-memory suppression, want bounded one")
+	}
+	ttlExp := checkedAt.Add(negativeTTL)
+	if exp.After(ttlExp.Add(5 * time.Second)) {
+		t.Fatalf("in-memory expiry %v outlives TTL expiry %v", exp, ttlExp)
+	}
+	if !exp.Before(time.Now().Add(negativeBackoff)) {
+		t.Fatalf("in-memory expiry %v not bounded (want well under now+10m)", exp)
 	}
 }

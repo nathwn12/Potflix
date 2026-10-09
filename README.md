@@ -1,7 +1,8 @@
 # Potflix - Discord presence for PotPlayer
 
 Netflix-styled fork of `ayunami2000/PotPlayer-DiscordRPC`. The app is a
-headless Windows tray program that shows the media currently playing in
+Windows tray program (a window opens on launch; `--selftest` stays
+headless) that shows the media currently playing in
 PotPlayer as a Discord Rich Presence card.
 
 - **Clean titles always** - `Breaking.Bad.S01E02.1080p.WEB-DL.DD5.1.x264-CtrlHD.mkv`
@@ -12,7 +13,7 @@ PotPlayer as a Discord Rich Presence card.
   tag (unless already the details line; ` - Paused` appended while paused,
   `Browsing` / `Idle` when idle); tooltips `PotFlix` + `Playing` / `Paused` /
   `Stopped` (`Idle` when idle).
-- **Netflix look** - red-on-black tray icon; right-click it for **Exit Potflix**.
+- **Netflix look** - red-on-black tray icon; right-click it for **Open Potflix** / **Exit Potflix**.
 - **Your own app name/logo (optional)** - without this, presence uses the
   upstream Discord app (works out of the box, art keys `logo`/`play`/`pause`/`stop`).
 
@@ -54,17 +55,164 @@ reference implementation the Go port was proven against; see `DECISION.md`.
 
 The card shows canonical series and episode titles resolved from free,
 keyless sources: TVmaze for TV, AniList + Jikan for anime, iTunes for movies.
-Each season is fetched once and cached permanently under
-`%LOCALAPPDATA%\Potflix\meta`, so repeat plays never hit the network; with no
-cache entry and no connection the card simply shows the clean filename-based
-title. No credentials, no account, nothing personal: the cache holds public
+Each season is fetched once and cached under
+`%LOCALAPPDATA%\Potflix\meta`: found titles permanently, not-found titles as
+negative entries for 30 days under the same key filename, so a later scan
+costs zero network for either; `Refresh` (force) bypasses and re-attempts.
+With no cache entry and no connection the card simply shows the clean
+filename-based title. No credentials, no account, nothing personal: the cache holds public
 episode titles only, lives outside the repo, and is never committed.
 
 Data sources and attribution: [TVmaze](https://www.tvmaze.com/) (data under
 CC BY-SA), [AniList](https://anilist.co/), [Jikan](https://jikan.moe/) (an
-unofficial MyAnimeList API), and the Apple
-[iTunes Search API](https://performance-partners.apple.com/search-api).
+unofficial MyAnimeList API), the Apple
+[iTunes Search API](https://performance-partners.apple.com/search-api), and
+[TMDB](https://www.themoviedb.org/) (keyed lookups only, when you add a key).
+This product uses the TMDB API but is not endorsed or certified by TMDB.
 Artwork and synopses are linked to, not stored.
+
+## Library window
+
+Normal launch shows the `Potflix` window (the tray icon stays; closing the
+window parks it back to the tray). `--selftest` never creates it.
+
+Main view (`MEDIA FOLDERS` + count): the watched DIR list, one row per
+folder. `Add folder` (native folder picker) / `Remove` edit the list. `Scan`
+resolves metadata incrementally through the folder index: unchanged folders
+are skipped (no re-walk, no re-parse) and cached titles are served from
+disk, never re-fetched; `Refresh` walks everything and force-refetches
+every cached entry while rewriting index records. `Close to tray` hides
+the window. Tray menu: `Open Potflix` / `Exit Potflix`.
+
+Live status line while scanning:
+
+```text
+Scanning <done>/<total> keys | <fetched> fetched - <cached> cached | folders: <S> scanned, <K> skipped
+```
+
+Completion line (`Scan` or `Refresh` prefix):
+
+```text
+<Scan|Refresh> complete: <keys> keys - <cached> cached - <fetched> fetched - <notfound> not found | <files> files - folders: <S> scanned, <K> skipped
+```
+
+When there is nothing to fetch:
+
+```text
+<Scan|Refresh> complete: nothing to fetch (<cached> cached) - <K> folders skipped
+```
+
+(Huge counts elide to `k` / `M` / ...; the string is capped at 160 chars
+with the `folders:` suffix preserved.)
+
+`Settings` view:
+
+- `API KEYS` - optional TMDB key (see below). `Show` / `Hide`, `Get a key`
+  (opens the TMDB API page), `Test` (one authenticated call; reports
+  `TMDB key OK` / `TMDB key rejected` / failure reason), `Save` (empty
+  clears). The OMDb / TheTVDB / Trakt rows are planned links, no input.
+- `LIBRARY` - `Clear cache` (native confirm; deletes cached titles plus the
+  folder index; folders and API keys are kept), `Export...` / `Import...`
+  (native Save-As / Open dialogs over `*.json`; Save-As defaults to
+  `~/Desktop/potflix-metadata-YYYY-MM-DD.json`).
+- `STARTUP` - `[x] Start with Windows` toggle (HKCU `...\Run` value
+  `Potflix`; it shows the actual registry state), `Open log folder` (the
+  exe's directory, where `potflix-debug.log` lives).
+- `SCAN` - speed profile: `Turbo` (default) / `Balanced` / `Gentle`,
+  applied immediately without a restart. Turbo = each provider's published
+  limit, Balanced = half speed, Gentle = quarter speed - pick one if you
+  want to be gentler on the services.
+
+## Optional TMDB key
+
+Keyless by default (TVmaze, AniList, Jikan, iTunes stay the default). With a
+TMDB key saved, TMDB is tried first for every query; any miss or error falls
+through to the keyless chain, so a bad key never breaks a lookup. The key is
+stored in `%LOCALAPPDATA%\Potflix\config.json` (`api_keys`) and never logged
+(logs record presence only; request errors are redacted).
+
+## Folder scan index
+
+Per-directory scan accelerator at `%LOCALAPPDATA%\Potflix\scanindex.json`
+(exe-dir fallback). Each record holds the tier-2 fingerprint, the tier-1
+names hash, the metadata schema, the cache keys found beneath the folder,
+and the video file count.
+
+An unchanged folder is skipped without a walk: tier 1 compares dir mtime +
+entry count + sorted entry names (no child stat); on mismatch, tier 2
+compares the full fingerprint (name + size + mtime per child, subdirectories
+included, so a change inside a subfolder invalidates the parent). The skip
+guard then requires every recorded key to still verify against the metadata
+cache. The guard is stat-based, so negative entries count: a folder whose
+recorded keys are all not-found is still skipped. Anything that invalidates - schema bump, a missing key, a
+corrupt/absent index file, or `Refresh` / force - falls back to a full walk.
+Any hash doubt (stat/read error) also walks normally: the index only ever
+skips, never resolves.
+
+The window's `Scan` consults the index: unchanged folders are skipped (no
+re-walk, no re-parse). `Refresh` (force) bypasses skipping - it walks
+everything and re-fetches every cached title - while still rewriting index
+records. The index is therefore not `metawarm -index`-only: `-index <file>`
+remains the CLI opt-in, and `library.ScanWithOptions` (with `UseIndex`) is
+the API.
+
+## Export / Import / Clear
+
+`Export...` writes one JSON bundle of the whole metadata cache. A bundle
+holds metadata only: titles, synopsis, genres, length, button + poster URLs;
+no media files, no library paths, no credentials. `Import...` merges a
+bundle fill-missing-only (existing entries are never overwritten;
+schema-mismatched and invalid entries are counted as skipped) and then
+starts an incremental scan so missing keys are fetched online.
+
+## Durability
+
+State lives outside the repo under `%LOCALAPPDATA%\Potflix`: `config.json`
+(folders, API keys, scan speed, startup flag), `meta\` (one JSON file per
+cached title), `scanindex.json` (folder index). All three are written
+atomically (temp file + rename) and loaded tolerantly (missing / corrupt =
+defaults or a cache miss), so an update, a crash, or a restart keeps them.
+The debug log beside the exe rotates at 5 MB x 3 files.
+
+## Performance (measured 2026-10-09)
+
+Benchmarks on `go1.27.0 windows/amd64` (AMD Ryzen 7 5800X); before/after
+recorded in `go/internal/library/BENCH.md` (raw `count=3` tails in the
+gitignored `go/bench-baseline.txt`):
+
+- warm re-scan of 50 cached keys: 19.6 s -> ~20 ms (~962x), after rate
+  limiting moved out of the scan loop into the per-host HTTP limiter
+  (unknown hosts ungated);
+- cold fake-provider scan of 20 keys: 7.6 s -> ~26 ms (~290x);
+- parsing 7,847 filenames: ~830 ms, unchanged (~-1%, noise).
+- indexed warm re-scan of 50 cached files: ~17.1 ms without the index ->
+  ~11.7 ms with a populated index (~1.5x; the second pass skips every
+  subtree while the skip guard still verifies cached keys). Table + raw
+  `count=3` output in `go/internal/library/BENCH.md`
+  (`BenchmarkScanIndexSecondPass`):
+
+```powershell
+go test -run '^$' -bench BenchmarkScanIndexSecondPass -benchmem -count=3 ./internal/library/
+```
+
+Command (from `go\`):
+
+```powershell
+go test -run '^$' -bench . -benchmem -count=3 ./internal/metadata/ ./internal/library/
+```
+
+## Library CLIs
+
+`metawarm` pre-warms the cache (its usage line is the source of truth):
+
+```powershell
+metawarm -roots "D:\Movies;D:\Shows" [-cache <dir>] [-dry] [-offline] [-limit N] [-concurrency N] [-gate <dur>] [-index <file>]
+```
+
+`-index <file>` opts into folder skips via the scan index (empty = full
+walk; the summary ends with `folders: N scanned, M skipped`). `-gate <dur>`
+adds an extra global spacing between fetches (`0` = per-host limiter only).
+`metacheck` is unchanged this session.
 
 ## Use your own Discord app (2 min, for custom name + logo)
 
@@ -78,6 +226,21 @@ Artwork and synopses are linked to, not stored.
 
 Recorded deliberately; each is a behaviour change, not a parity claim.
 
+- **The app shows a window on launch.** The Java app was headless (tray
+  only). The Go app creates the `Potflix` settings window hidden and shows
+  it on normal launch; closing it parks back to the tray, and `--selftest`
+  stays headless.
+- **Folder scan index.** No Java equivalent: a per-directory skip
+  index (`scanindex.json`; tier-1 names hash, tier-2 fingerprint, cache-key
+  guard) consulted by the window's `Scan` (`Refresh` walks everything and
+  rewrites it), opt-in elsewhere via `library.ScanWithOptions` /
+  `metawarm -index`. Any doubt falls back to a full walk.
+- **Export / import bundle.** No Java equivalent: the metadata cache can be
+  exported to / imported from one metadata-only JSON bundle
+  (fill-missing-only import, then an incremental scan).
+- **Optional TMDB key.** No Java equivalent: the app is keyless by default
+  and a stored TMDB key is tried first, with miss/error fallthrough to the
+  keyless chain.
 - **Empty asset text is omitted on the wire.** The Java app set
   `large_text=""` / `small_text=""`, but the Discord GameSDK dropped empty
   fields, and a present-but-empty `assets.large_text` is rejected by Discord

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"potflix/internal/discord"
@@ -35,6 +36,12 @@ const alreadyRunningMsg = "Potflix is already running."
 // clean card). Resolve never blocks, so the poll loop never stalls on it;
 // a miss or error falls back to today's clean card (zero Resolved).
 var metaResolver *metadata.Resolver
+
+// liveConfig is the current settings store for keyed metadata sources. It
+// is loaded once at startup and refreshed on every Settings save, so a key
+// takes effect without a restart. Key VALUES never reach the log; the
+// KeyProvider below only hands them to the resolver, which never logs them.
+var liveConfig atomic.Pointer[Config]
 
 // metaTitleCache remembers the folder-aware query for the current raw title so
 // player.CurrentFile (bounded ~800ms inside) runs at most once per title
@@ -136,10 +143,23 @@ func runUI(log *logger) {
 		OnDrop:       func(err error) { log.eventSessionDropped(err) },
 	})
 	dc.Start()
+	cfg := loadConfig()
+	liveConfig.Store(&cfg)
+	metadata.SetRateProfile(cfg.EffectiveScanSpeed())
+	log.logf("scan speed profile: %s", cfg.EffectiveScanSpeed())
 	metaResolver = metadata.New(metadata.Options{
 		// Default cache dir + sources; Logf carries source names/timeouts
-		// only, never secrets (the resolver never sees any).
+		// only, never secrets (the resolver never sees any key VALUE in a
+		// log line - tmdbSource redacts its errors, and this provider only
+		// reads the stored key).
 		Logf: func(format string, args ...any) { log.logf(format, args...) },
+		KeyProvider: func(p string) string {
+			c := liveConfig.Load()
+			if c == nil {
+				return ""
+			}
+			return c.GetAPIKey(p)
+		},
 	})
 	go pollLoop(log, dc)
 
@@ -147,6 +167,14 @@ func runUI(log *logger) {
 	clearActivity = func() {
 		dc.ClearActivity()
 		log.logf("cleared (exit)")
+	}
+
+	// Settings window: created hidden, shown on normal launch. --selftest
+	// never reaches here (runSelfTest returns earlier), so it stays headless.
+	if err := createMainWindow(); err != nil {
+		log.logf("main window init failed: %s", err)
+	} else {
+		showMainWindow()
 	}
 
 	messageLoop()

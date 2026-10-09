@@ -3,7 +3,12 @@
 //
 // Usage:
 //
-//	metawarm [-roots "D:\Movies;D:\Shows"] [-cache <dir>] [-dry] [-offline] [-limit N] [-concurrency N]
+//	metawarm [-roots "D:\Movies;D:\Shows"] [-cache <dir>] [-dry] [-offline] [-limit N] [-concurrency N] [-gate <dur>] [-index <file>]
+//
+// -index <file> is opt-in: unchanged folders skip re-walk/re-fetch via the
+// scan index (two-tier FolderNamesHash/FolderFingerprint guarded by the
+// metadata cache). Empty (default) is a full walk; the summary always ends
+// with "folders: N scanned, M skipped".
 //
 // Default roots come from -roots; if empty the command errors with usage.
 // Each root is walked recursively for video files. For each file the query
@@ -17,6 +22,10 @@
 // %LOCALAPPDATA%\Potflix\inventory\warm-report--hold--<sessionId>.txt and a
 // one-block summary is printed to stdout. Exit 0 unless fatal (bad args or
 // an unwalkable root); a single file's error never aborts the run.
+//
+// The walk + resolve loop lives in potflix/internal/library (shared with the
+// tray window's Scan/Refresh); this command adds only flag parsing, the
+// per-file report, and the summary lines.
 package main
 
 import (
@@ -26,22 +35,22 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"potflix/internal/library"
 	"potflix/internal/metadata"
 )
 
 const (
-	// rateInterval spaces network fetches (~1 request / 400ms): TVmaze is
-	// ~20/10s and AniList ~30/min, and the metadata http client already
-	// honors 429/Retry-After with one retry.
+	// rateInterval is the historical global fetch spacing (~1 request /
+	// 400ms). Provider throttling now lives in metadata's per-host
+	// limiter, so online runs default to no extra global gate; -gate opts
+	// back into one. Retained for documentation and for -gate callers.
 	rateInterval = 400 * time.Millisecond
-	// lookupTimeout bounds a single unique-key fetch so one slow key
-	// cannot stall the run; other keys proceed regardless.
-	lookupTimeout = 120 * time.Second
 )
 
 // Report statuses, one per walked file.
@@ -51,16 +60,11 @@ const (
 	statusResolved = "resolved"  // LookupNow found (offline: cache hit)
 	statusNotFound = "not-found" // LookupNow missed (offline: cache miss)
 	statusError    = "error"     // LookupNow returned an error
+	// statusCancelled marks a key whose fetch never ran or failed only
+	// because the context was cancelled: incomplete, never a failure, and
+	// never counted toward the error tally.
+	statusCancelled = "cancelled"
 )
-
-var videoExts = map[string]bool{
-	".mkv": true, ".mp4": true, ".avi": true, ".m4v": true,
-	".mov": true, ".wmv": true, ".ts": true, ".flv": true,
-	".webm": true, ".mpg": true, ".mpeg": true,
-}
-
-// walkDir is filepath.WalkDir by default but injectable for tests.
-var walkDir = filepath.WalkDir
 
 type config struct {
 	roots       []string
@@ -69,6 +73,8 @@ type config struct {
 	offline     bool
 	limit       int
 	concurrency int
+	gate        time.Duration
+	indexPath   string
 }
 
 func parseArgs(args []string, stderr io.Writer) (config, error) {
@@ -81,8 +87,10 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 	fs.BoolVar(&c.offline, "offline", false, "cache-only: never touch the network")
 	fs.IntVar(&c.limit, "limit", 0, "max files to process (0 = no limit)")
 	fs.IntVar(&c.concurrency, "concurrency", 3, "bounded concurrent fetches")
+	fs.DurationVar(&c.gate, "gate", 0, "extra global spacing between fetches (0 = per-host limiter only)")
+	fs.StringVar(&c.indexPath, "index", "", "opt-in scan-index file for folder skips (empty = off, full walk)")
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "usage: metawarm -roots \"D:\\Movies;D:\\Shows\" [-cache <dir>] [-dry] [-offline] [-limit N] [-concurrency N]\n")
+		fmt.Fprintf(stderr, "usage: metawarm -roots \"D:\\Movies;D:\\Shows\" [-cache <dir>] [-dry] [-offline] [-limit N] [-concurrency N] [-gate <dur>] [-index <file>]\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -103,168 +111,10 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 	if c.concurrency < 1 {
 		return config{}, fmt.Errorf("bad -concurrency %d: must be >= 1", c.concurrency)
 	}
+	if c.gate < 0 {
+		return config{}, fmt.Errorf("bad -gate %v: must be >= 0", c.gate)
+	}
 	return c, nil
-}
-
-// collectFiles walks each root recursively (lexical walk order) for video
-// files. limit > 0 truncates the result. A subdirectory or file that cannot
-// be opened (permission or any walk error on a non-root entry) is logged
-// once, counted as denied, and skipped; only an unreadable ROOT (or no
-// readable roots at all) is a fatal error.
-func collectFiles(roots []string, limit int) ([]string, int, error) {
-	var files []string
-	var denied int
-	var okRoots int
-	var firstErr error
-	for _, root := range roots {
-		fi, err := os.Stat(root)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: %v\n", root, err)
-			denied++
-			if firstErr == nil {
-				firstErr = fmt.Errorf("unwalkable root %q: %w", root, err)
-			}
-			continue
-		}
-		if !fi.IsDir() {
-			fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: not a directory\n", root)
-			denied++
-			if firstErr == nil {
-				firstErr = fmt.Errorf("unwalkable root %q: not a directory", root)
-			}
-			continue
-		}
-		if err := walkDir(root, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				if path == root {
-					return err
-				}
-				fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: %v\n", path, err)
-				denied++
-				if d != nil && d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-			if videoExts[strings.ToLower(filepath.Ext(path))] {
-				files = append(files, path)
-			}
-			return nil
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: %v\n", root, err)
-			denied++
-			if firstErr == nil {
-				firstErr = fmt.Errorf("unwalkable root %q: %w", root, err)
-			}
-			continue
-		}
-		okRoots++
-	}
-	if okRoots == 0 && firstErr != nil {
-		return nil, denied, firstErr
-	}
-	if limit > 0 && len(files) > limit {
-		files = files[:limit]
-	}
-	return files, denied, nil
-}
-
-// dedupeKey is the resolver's cache identity for one query.
-func dedupeKey(q metadata.Query) string {
-	return fmt.Sprintf("%d|%s|%d|%d|%t|%d",
-		int(q.Kind), strings.ToLower(q.Title), q.Year, q.Season, q.Absolute, q.Episode)
-}
-
-type filePlan struct {
-	path    string
-	query   metadata.Query
-	key     string
-	skipped bool
-}
-
-type group struct {
-	key   string
-	query metadata.Query
-	paths []string
-}
-
-// buildPlan parses every file and dedupes non-Unknown queries into groups,
-// preserving walk order for the report.
-func buildPlan(files []string) (plans []filePlan, groups []*group) {
-	byKey := make(map[string]*group)
-	for _, path := range files {
-		q := metadata.ResolveQuery(filepath.Base(path), path)
-		if q.Kind == metadata.KindUnknown {
-			plans = append(plans, filePlan{path: path, query: q, skipped: true})
-			continue
-		}
-		key := dedupeKey(q)
-		g, ok := byKey[key]
-		if !ok {
-			g = &group{key: key, query: q}
-			byKey[key] = g
-			groups = append(groups, g)
-		}
-		g.paths = append(g.paths, path)
-		plans = append(plans, filePlan{path: path, query: q, key: key})
-	}
-	return plans, groups
-}
-
-type lookupFunc func(ctx context.Context, q metadata.Query) (metadata.Resolution, error)
-
-type fetchResult struct {
-	res metadata.Resolution
-	err error
-}
-
-// rateGate spaces calls ~1 per interval; the first call goes immediately.
-type rateGate struct {
-	mu       sync.Mutex
-	last     time.Time
-	interval time.Duration
-}
-
-func (g *rateGate) wait() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if !g.last.IsZero() {
-		if d := time.Until(g.last.Add(g.interval)); d > 0 {
-			time.Sleep(d)
-		}
-	}
-	g.last = time.Now()
-}
-
-// fetchAll calls lookup once per unique group with bounded concurrency.
-// A single key's error is recorded, never fatal.
-func fetchAll(groups []*group, lookup lookupFunc, concurrency int, gate *rateGate) map[string]fetchResult {
-	out := make(map[string]fetchResult, len(groups))
-	var mu sync.Mutex
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-	for _, g := range groups {
-		wg.Add(1)
-		go func(g *group) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if gate != nil {
-				gate.wait()
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), lookupTimeout)
-			defer cancel()
-			res, err := lookup(ctx, g.query)
-			mu.Lock()
-			out[g.key] = fetchResult{res: res, err: err}
-			mu.Unlock()
-		}(g)
-	}
-	wg.Wait()
-	return out
 }
 
 func sessionID() string {
@@ -298,7 +148,7 @@ func reportPath() (string, error) {
 		"warm-report--hold--"+sessionID()+".txt"), nil
 }
 
-func writeReport(path string, plans []filePlan, statusOf func(filePlan) string) error {
+func writeReport(path string, plans []library.FilePlan, statusOf func(library.FilePlan) string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create report dir: %w", err)
 	}
@@ -308,7 +158,7 @@ func writeReport(path string, plans []filePlan, statusOf func(filePlan) string) 
 	}
 	w := bufio.NewWriter(f)
 	for _, p := range plans {
-		if _, err := w.WriteString(statusOf(p) + "\t" + p.path + "\n"); err != nil {
+		if _, err := w.WriteString(statusOf(p) + "\t" + p.Path + "\n"); err != nil {
 			f.Close()
 			return fmt.Errorf("write report: %w", err)
 		}
@@ -324,59 +174,176 @@ func writeReport(path string, plans []filePlan, statusOf func(filePlan) string) 
 }
 
 type counts struct {
-	files    int
-	skipped  int
-	unique   int
-	dry      int
-	resolved int
-	notFound int
-	errors   int
-	denied   int
+	files          int
+	skipped        int
+	unique         int
+	dry            int
+	resolved       int
+	notFound       int
+	errors         int
+	denied         int
+	foldersScanned int
+	foldersSkipped int
+	keys           int
+	keysCached     int
+	keysFetched    int
+	keysNotFound   int
+	cancelled      bool
+}
+
+// newResolver builds the metadata resolver for a run; tests override it to
+// inject fake sources (including slow/blocking ones) without touching the
+// network.
+var newResolver = func(cacheDir string, offline bool) *metadata.Resolver {
+	return metadata.New(metadata.Options{Dir: cacheDir, Offline: offline})
 }
 
 func realMain(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	return realMainWithContext(ctx, args, stdout, stderr)
+}
+
+func realMainWithContext(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	cfg, err := parseArgs(args, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "metawarm: %v\n", err)
 		return 2
 	}
-	files, denied, err := collectFiles(cfg.roots, cfg.limit)
-	if err != nil {
-		fmt.Fprintf(stderr, "metawarm: %v\n", err)
-		return 1
-	}
-	plans, groups := buildPlan(files)
-
-	c := counts{files: len(plans), unique: len(groups), denied: denied}
-	statusByKey := make(map[string]string, len(groups))
-	if cfg.dry {
-		for _, g := range groups {
-			statusByKey[g.key] = statusDry
+	useIndex := cfg.indexPath != ""
+	var files []string
+	var denied int
+	var fScanned, fSkipped int
+	var visited []string
+	var skipped map[string]library.FolderRecord
+	cancelled := false
+	if useIndex && !cfg.dry {
+		cr, walkCancelled, err := library.CollectIndexedWithContext(ctx, cfg.roots, cfg.cacheDir, cfg.indexPath, true, false)
+		if err != nil {
+			fmt.Fprintf(stderr, "metawarm: %v\n", err)
+			return 1
+		}
+		if walkCancelled || ctx.Err() != nil {
+			cancelled = true
+		}
+		files, denied, fScanned, fSkipped = cr.Files, cr.Denied, cr.FoldersScanned, cr.FoldersSkipped
+		visited, skipped = cr.Visited, cr.Skipped
+		if cfg.limit > 0 && len(files) > cfg.limit {
+			files = files[:cfg.limit]
+			// Partial walk: don't poison the index with truncated totals.
+			visited, skipped = nil, nil
 		}
 	} else {
-		resolver := metadata.New(metadata.Options{Dir: cfg.cacheDir, Offline: cfg.offline})
-		var gate *rateGate
-		if !cfg.offline {
-			gate = &rateGate{interval: rateInterval}
+		var err error
+		var walkCancelled bool
+		files, denied, walkCancelled, err = library.CollectFilesWithContext(ctx, cfg.roots, cfg.limit)
+		if err != nil {
+			fmt.Fprintf(stderr, "metawarm: %v\n", err)
+			return 1
 		}
-		results := fetchAll(groups, resolver.LookupNow, cfg.concurrency, gate)
+		if walkCancelled || ctx.Err() != nil {
+			cancelled = true
+		}
+	}
+	plans, groups := library.BuildPlan(files)
+
+	c := counts{files: len(plans), unique: len(groups), denied: denied, foldersScanned: fScanned, foldersSkipped: fSkipped}
+	c.keys = len(groups)
+	preCached := make(map[string]bool, len(groups))
+	if !cfg.dry {
 		for _, g := range groups {
-			r, ok := results[g.key]
-			switch {
-			case !ok || r.err != nil:
-				statusByKey[g.key] = statusError
-			case r.res.Found:
-				statusByKey[g.key] = statusResolved
-			default:
-				statusByKey[g.key] = statusNotFound
+			// Cache-identity for skip/key accounting (not the finer dedupe key).
+			// Live only: an expired negative or corrupt entry must not
+			// pre-credit, or progress would claim cached work that still
+			// needs a fetch.
+			if metadata.CacheLive(cfg.cacheDir, metadata.CacheKeyFor(g.Query)) {
+				c.keysCached++
+				preCached[g.Key] = true
 			}
 		}
 	}
-	statusOf := func(p filePlan) string {
-		if p.skipped {
+	// Pre-fetch checkpoint so the index file exists before the fetch phase
+	// completes (blocking provider test).
+	if useIndex && !cfg.dry && visited != nil && !cancelled && ctx.Err() == nil {
+		library.RecordScan(cfg.indexPath, visited, skipped, plans)
+	}
+	statusByKey := make(map[string]string, len(groups))
+	if cfg.dry {
+		for _, g := range groups {
+			statusByKey[g.Key] = statusDry
+		}
+	} else {
+		resolver := newResolver(cfg.cacheDir, cfg.offline)
+		var gateInterval time.Duration
+		if !cfg.offline {
+			gateInterval = cfg.gate
+		}
+		var ckptMu sync.Mutex
+		lastCkpt := time.Now()
+		results := library.FetchAll(ctx, groups, resolver.LookupNow, cfg.concurrency, gateInterval,
+			func(g *library.Group, _ library.FetchResult) {
+				if !useIndex || cfg.dry || visited == nil || ctx.Err() != nil {
+					return
+				}
+				ckptMu.Lock()
+				defer ckptMu.Unlock()
+				if time.Since(lastCkpt) < 2*time.Second {
+					return
+				}
+				lastCkpt = time.Now()
+				library.RecordScan(cfg.indexPath, visited, skipped, plans)
+			})
+		// Key accounting from results: cached = pre-credited hits that resolved,
+		// fetched = uncached resolved, notfound = missed/errored uncached.
+		for _, g := range groups {
+			r, ok := results[g.Key]
+			switch {
+			case !ok || r.Err != nil:
+				// A fetch that never ran (!ok) or failed only because
+				// the context was cancelled is incomplete, never an
+				// error: it must not feed the error tally.
+				if ctx.Err() != nil {
+					statusByKey[g.Key] = statusCancelled
+				} else {
+					statusByKey[g.Key] = statusError
+				}
+			case r.Res.Found:
+				statusByKey[g.Key] = statusResolved
+			default:
+				statusByKey[g.Key] = statusNotFound
+			}
+		}
+		// Split resolved keys into cached vs fetched using the pre-fetch
+		// snapshot: a resolved key that was pre-credited stays cached, else
+		// fetched. Unresolved uncached keys count as not found. The snapshot
+		// must predate the fetch: fetched keys are cached by now.
+		for _, g := range groups {
+			st := statusByKey[g.Key]
+			switch st {
+			case statusResolved:
+				if !preCached[g.Key] {
+					c.keysFetched++
+				}
+			case statusNotFound, statusError:
+				if !preCached[g.Key] {
+					c.keysNotFound++
+				}
+			}
+		}
+		if ctx.Err() != nil {
+			cancelled = true
+		}
+		c.cancelled = cancelled
+	}
+	if ctx.Err() != nil {
+		cancelled = true
+		c.cancelled = true
+	}
+	statusOf := func(p library.FilePlan) string {
+		if p.Skipped {
 			return statusSkipped
 		}
-		return statusByKey[p.key]
+		return statusByKey[p.Key]
 	}
 	for _, p := range plans {
 		switch statusOf(p) {
@@ -403,9 +370,17 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// A cancelled walk records nothing: stamping partial key lists would let
+	// the next scan skip files that were never walked.
+	if useIndex && !cfg.dry && visited != nil && !cancelled && ctx.Err() == nil {
+		library.RecordScan(cfg.indexPath, visited, skipped, plans)
+	}
+
 	var b strings.Builder
 	fmt.Fprintf(&b, "metawarm summary: roots=%d files=%d skipped(unknown)=%d unique=%d denied=%d",
 		len(cfg.roots), c.files, c.skipped, c.unique, c.denied)
+	fmt.Fprintf(&b, " folders: %d scanned, %d skipped", c.foldersScanned, c.foldersSkipped)
+	fmt.Fprintf(&b, " keys: %d (%d cached, %d fetched, %d not found)", c.keys, c.keysCached, c.keysFetched, c.keysNotFound)
 	switch {
 	case cfg.dry:
 		fmt.Fprintf(&b, " dry=%d", c.dry)
@@ -414,7 +389,11 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 	default:
 		fmt.Fprintf(&b, " resolved=%d not-found=%d", c.resolved, c.notFound)
 	}
-	fmt.Fprintf(&b, " errors=%d dry=%t offline=%t\nreport: %s\n", c.errors, cfg.dry, cfg.offline, report)
+	fmt.Fprintf(&b, " errors=%d dry=%t offline=%t", c.errors, cfg.dry, cfg.offline)
+	if cancelled {
+		fmt.Fprintf(&b, " cancelled")
+	}
+	fmt.Fprintf(&b, "\nreport: %s\n", report)
 	fmt.Fprint(stdout, b.String())
 	return 0
 }
