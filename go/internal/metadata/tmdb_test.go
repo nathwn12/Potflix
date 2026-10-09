@@ -12,7 +12,7 @@ import (
 
 const (
 	tmdbTestKey = "test-key-123"
-	tmdbLeakKey = "SECRET-KEY-abc123xyz"
+	tmdbLeakKey = "canary-value-not-a-secret-0000"
 )
 
 const (

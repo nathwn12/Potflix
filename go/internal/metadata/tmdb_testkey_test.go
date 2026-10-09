@@ -14,7 +14,7 @@ import (
 // rejected sentinel, a dead server is a network error, and no error string
 // carries the key.
 func TestTestTMDBKey(t *testing.T) {
-	const key = "SECRET-KEY-abc123xyz"
+	const key = "canary-value-not-a-secret-0000"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
