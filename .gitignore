@@ -24,3 +24,6 @@ dist/
 ARTWORK-PHASE.md
 UI-PHASE.md
 .serena/
+
+# benchmark baseline (local measurement record, not published)
+go/bench-baseline.txt

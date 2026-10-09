@@ -156,6 +156,10 @@ type Options struct {
 	Timeout time.Duration // per HTTP request; 0 -> 8s
 	Sources []Source      // nil -> DefaultSources()
 	Logf    func(format string, args ...any)
+	// KeyProvider yields the stored API key for a provider name ("tmdb");
+	// nil (or a blank return) means keyless, exactly today's behaviour: no
+	// keyed source is built and the provider order is unchanged.
+	KeyProvider func(provider string) string
 	// Offline, when true, serves the memory/disk cache only: Resolve and
 	// LookupNow never touch the network and never spawn a background fetch.
 	Offline bool

@@ -16,6 +16,10 @@ const (
 	metadataUserAgent = "potflix-metadata/1.0"
 	maxBodyBytes      = 4 << 20
 	maxRetryWait      = 10 * time.Second
+	// drainBodyCap bounds the post-decode drain that returns a connection
+	// to the pool: a normal small JSON body drains fully (reusable), a
+	// body past the cap is legitimately discarded on Close.
+	drainBodyCap = 512 << 10
 )
 
 func defaultHTTPTimeout() time.Duration { return 8 * time.Second }
@@ -47,10 +51,14 @@ func parseRetryAfter(h string, now time.Time) time.Duration {
 }
 
 // fetchWithRetry runs build+Do once, and on HTTP 429 retries exactly once,
-// honoring Retry-After bounded by maxRetryWait.
+// honoring Retry-After bounded by maxRetryWait. Each Do is spaced by the
+// per-host rate limiter (unknown hosts go ungated).
 func fetchWithRetry(ctx context.Context, client *http.Client, build func(ctx context.Context) (*http.Request, error)) (*http.Response, error) {
 	req, err := build(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := waitForHost(ctx, req.URL.Hostname()); err != nil {
 		return nil, err
 	}
 	resp, err := client.Do(req)
@@ -79,6 +87,9 @@ func fetchWithRetry(ctx context.Context, client *http.Client, build func(ctx con
 	}
 	req2, err := build(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := waitForHost(ctx, req2.URL.Hostname()); err != nil {
 		return nil, err
 	}
 	return client.Do(req2)
@@ -124,7 +135,9 @@ func drainAndClose(resp *http.Response) {
 }
 
 // decodeCapped decodes a JSON body capped at maxBodyBytes. Non-2xx statuses
-// are errors; the body is never logged.
+// are errors; the body is never logged. After decoding, the remainder is
+// drained (bounded by drainBodyCap) before Close so the connection is
+// returned to the pool; a body past the cap is legitimately discarded.
 func decodeCapped(resp *http.Response, v any) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -132,7 +145,9 @@ func decodeCapped(resp *http.Response, v any) error {
 		return fmt.Errorf("metadata: unexpected HTTP status %s", resp.Status)
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBodyBytes)).Decode(v); err != nil {
+		io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
 		return fmt.Errorf("metadata: decode response: %w", err)
 	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
 	return nil
 }
