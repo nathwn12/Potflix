@@ -115,7 +115,8 @@ func TestCacheSchemaMismatchIsMiss(t *testing.T) {
 
 // TestTVMazeArtworkFixture proves a provider fixture yields non-empty
 // Artwork+Synopsis at both show and episode level, and that Resolution
-// carries the episode-preferred pair.
+// carries the SERIES poster (cover rework: episode stills never override)
+// plus the episode-preferred synopsis.
 func TestTVMazeArtworkFixture(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/search/shows", func(w http.ResponseWriter, r *http.Request) {
@@ -162,8 +163,8 @@ func TestTVMazeArtworkFixture(t *testing.T) {
 	if !res.Found {
 		t.Fatalf("resolution = %+v, want found", res)
 	}
-	// Episode art wins over show art; episode summary wins over show summary.
-	if res.Artwork != "https://example.com/ep1-original.jpg" {
+	// Series poster always wins over episode stills; episode summary wins over show summary.
+	if res.Artwork != "https://example.com/show-original.jpg" {
 		t.Fatalf("resolution artwork = %q", res.Artwork)
 	}
 	if !strings.Contains(res.Synopsis, "episode one") {

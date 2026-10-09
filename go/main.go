@@ -262,6 +262,30 @@ func pollLoop(log *logger, dc *discord.Client) {
 	}
 }
 
+// metadataButtons maps resolver page buttons onto presence card buttons.
+func metadataButtons(in []metadata.Button) []presence.Button {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]presence.Button, 0, len(in))
+	for _, b := range in {
+		out = append(out, presence.Button{Label: b.Label, URL: b.URL})
+	}
+	return out
+}
+
+// presenceButtons maps presence card buttons onto Discord wire buttons.
+func presenceButtons(in []presence.Button) []discord.ActivityButton {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]discord.ActivityButton, 0, len(in))
+	for _, b := range in {
+		out = append(out, discord.ActivityButton{Label: b.Label, URL: b.URL})
+	}
+	return out
+}
+
 // pushActivity builds the card, asks the gate whether it must go out, logs the
 // attempt (the observation boundary), and sends only when the gate says so. A
 // failed send is not fatal - the client's supervisor reconnects and a later
@@ -276,7 +300,11 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		// Unknown kinds (themes, extras, bare names) never fetch or cache.
 		if q := metaQueryFor(rawTitle); q.Kind != metadata.KindUnknown {
 			if r, err := metaResolver.Resolve(context.Background(), q); err == nil && r.Found {
-				card = presence.BuildActivityResolved(rawTitle, a, presence.Resolved{Series: r.Series, EpisodeName: r.Episode, Artwork: r.Artwork, Synopsis: r.Synopsis})
+				card = presence.BuildActivityResolved(rawTitle, a, presence.Resolved{
+					Series: r.Series, EpisodeName: r.Episode, Artwork: r.Artwork, Synopsis: r.Synopsis,
+					Genres: r.Genres, Length: r.Length, Year: r.Year, IsMovie: r.IsMovie,
+					Buttons: metadataButtons(r.Buttons),
+				})
 			}
 		}
 	}
@@ -309,6 +337,7 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		HasStart:   out.HasStart,
 		Start:      out.Start,
 		End:        out.End,
+		Buttons:    presenceButtons(out.Buttons),
 	}); err != nil {
 		log.eventSendError(err)
 	}

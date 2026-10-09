@@ -151,3 +151,68 @@ func TestTVMazeLowConfidenceFallsThrough(t *testing.T) {
 		t.Fatalf("low-confidence = %+v, %v; want nil, nil", m, err)
 	}
 }
+
+// TestTVMazeEnrichment proves the fixture yields genres/length/urls and the
+// resolver carries them plus View-Episode/View-Show buttons.
+func TestTVMazeEnrichment(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/search/shows", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"score":1.0,"show":{"id":169,"name":"Breaking Bad","premiered":"2008-01-20","weight":99,"genres":["Drama","Crime"],"averageRuntime":45,"runtime":60,"url":"http://www.tvmaze.com/shows/169/breaking-bad"}}]`))
+	})
+	mux.HandleFunc("/shows/169/seasons", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":753,"number":1}]`))
+	})
+	mux.HandleFunc("/seasons/753/episodes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[{"id":12192,"name":"Pilot","season":1,"number":1,"url":"http://www.tvmaze.com/episodes/12192/breaking-bad-1x01-pilot","runtime":45}]`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s := &tvmazeSource{base: srv.URL, client: srv.Client()}
+	q := Query{Kind: KindSeries, Title: "Breaking Bad", Season: 1, Episode: 1}
+	m, err := s.Find(context.Background(), q)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected media, got nil")
+	}
+	if m.Genres != "Drama "+string(rune(0xb7))+" Crime" {
+		t.Fatalf("genres = %q, want %q", m.Genres, "Drama "+string(rune(0xb7))+" Crime")
+	}
+	if m.Length != "45 min" {
+		t.Fatalf("length = %q, want 45 min", m.Length)
+	}
+	if m.ShowURL != "https://www.tvmaze.com/shows/169/breaking-bad" {
+		t.Fatalf("showURL = %q", m.ShowURL)
+	}
+	if len(m.Episodes) != 1 || m.Episodes[0].URL != "https://www.tvmaze.com/episodes/12192/breaking-bad-1x01-pilot" {
+		t.Fatalf("episode URL = %+v", m.Episodes)
+	}
+	if m.Episodes[0].Length != "45 min" {
+		t.Fatalf("episode length = %q", m.Episodes[0].Length)
+	}
+	if m.EpisodeURL != "https://www.tvmaze.com/episodes/12192/breaking-bad-1x01-pilot" {
+		t.Fatalf("media episodeURL = %q", m.EpisodeURL)
+	}
+
+	r := New(Options{Dir: t.TempDir(), Sources: []Source{s}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(context.Background(), q)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if !res.Found || res.Genres != "Drama "+string(rune(0xb7))+" Crime" || res.Length != "45 min" || res.Year != 2008 || res.IsMovie {
+		t.Fatalf("resolution = %+v, want genres/length/year", res)
+	}
+	if len(res.Buttons) != 2 || res.Buttons[0].Label != "View Episode" || res.Buttons[1].Label != "View Show" {
+		t.Fatalf("buttons = %+v, want [View Episode View Show]", res.Buttons)
+	}
+	for _, b := range res.Buttons {
+		if !strings.HasPrefix(b.URL, "https://") {
+			t.Fatalf("button not https: %+v", b)
+		}
+	}
+}

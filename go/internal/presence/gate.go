@@ -95,6 +95,20 @@ func (c *intervalClock) tick(now int64) int64 {
 	return c.value
 }
 
+// buttonsEqual reports whether two card button lists carry the same ordered
+// label+URL pairs. Order matters: the wire serializes buttons in order.
+func buttonsEqual(a, b []Button) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Label != b[i].Label || a[i].URL != b[i].URL {
+			return false
+		}
+	}
+	return true
+}
+
 // Gate remembers what was last sent so it can decide whether the current card
 // needs to go out. The zero value is ready to use.
 type Gate struct {
@@ -146,7 +160,9 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	if out.SmallImage == "pause" {
 		if g.hasSent && g.last.SmallImage == "pause" &&
 			g.last.Name == out.Name &&
-			g.last.Details == out.Details && g.last.State == out.State {
+			g.last.Details == out.Details && g.last.State == out.State &&
+			g.last.LargeImage == out.LargeImage &&
+			buttonsEqual(g.last.Buttons, out.Buttons) {
 			// Already showing the parked paused card for this content: stay
 			// quiet, so the pause timer is not restarted and Discord is not
 			// spammed. Not even the heartbeat re-pushes while paused. A content
@@ -173,6 +189,8 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 		out.Details != g.last.Details ||
 		out.State != g.last.State ||
 		out.SmallImage != g.last.SmallImage ||
+		out.LargeImage != g.last.LargeImage ||
+		!buttonsEqual(g.last.Buttons, out.Buttons) ||
 		out.HasStart != g.last.HasStart
 	anchorMoved := out.HasStart && out.Start != g.lastStart
 

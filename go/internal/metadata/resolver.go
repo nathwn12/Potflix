@@ -167,25 +167,28 @@ func matchEpisode(eps []Episode, q Query) (Episode, bool) {
 }
 
 func resolveFromMedia(m *Media, q Query) Resolution {
-	res := Resolution{Series: m.Title, Season: q.Season, Number: q.Episode, Artwork: m.Artwork, Synopsis: capSynopsis(stripHTML(m.Synopsis))}
-	if m.Kind == KindMovie || q.Kind == KindMovie {
+	isMovie := m.Kind == KindMovie || q.Kind == KindMovie
+	res := Resolution{Series: m.Title, Season: q.Season, Number: q.Episode, Artwork: m.Artwork, Synopsis: capSynopsis(stripHTML(m.Synopsis)), Genres: m.Genres, Length: m.Length, Year: m.Year, IsMovie: isMovie}
+	if isMovie {
 		res.Season = 0
 		res.Number = 0
 		res.Found = true
+		res.Buttons = resolutionButtons(m, Episode{}, false, true)
 		return res
 	}
 	if ep, ok := matchEpisode(m.Episodes, q); ok {
 		res.Season = ep.Season
 		res.Number = ep.Number
 		res.Episode = ep.Title
-		// Episode art/summary win when present, else the series-level ones
-		// already on res.
-		if strings.TrimSpace(ep.Artwork) != "" {
-			res.Artwork = strings.TrimSpace(ep.Artwork)
-		}
+		// Artwork is ALWAYS the series poster: episode stills never override
+		// (cover rework - stills look awkward/unofficial).
 		if s := firstNonEmpty(ep.Synopsis, m.Synopsis); s != "" {
 			res.Synopsis = capSynopsis(stripHTML(s))
 		}
+		if strings.TrimSpace(ep.Length) != "" {
+			res.Length = strings.TrimSpace(ep.Length)
+		}
+		res.Buttons = resolutionButtons(m, ep, true, false)
 		res.Found = true
 		return res
 	}
@@ -193,6 +196,66 @@ func resolveFromMedia(m *Media, q Query) Resolution {
 	// path falls back to today's clean card. Never report a wrong title.
 	res.Found = false
 	return res
+}
+
+// buttonOK validates one card button: non-empty label (<=32 runes) plus an
+// http(s) URL forced to https. Invalid pairs are dropped.
+func buttonOK(label, rawURL string) (Button, bool) {
+	label = strings.TrimSpace(label)
+	if label == "" || len([]rune(label)) > 32 {
+		return Button{}, false
+	}
+	u := normalizeURL(rawURL)
+	if u == "" {
+		return Button{}, false
+	}
+	return Button{Label: label, URL: u}, true
+}
+
+// resolutionButtons builds the max-2 card buttons:
+//   - movie: [{View Movie, MovieURL}] + [{View Trailer, TrailerURL}]
+//   - anime (anilist/jikan): [{View Episode, streaming URL if any}] + [{View Anime, ShowURL}]
+//   - series (tvmaze + others): [{View Episode, episode URL}] + [{View Show, show URL}]
+func resolutionButtons(m *Media, ep Episode, hasEp, isMovie bool) []Button {
+	var cands [][2]string
+	switch {
+	case isMovie:
+		cands = [][2]string{
+			{"View Movie", m.MovieURL},
+			{"View Trailer", m.TrailerURL},
+		}
+	case m.Source == "anilist" || m.Source == "jikan":
+		epURL := ""
+		if hasEp {
+			epURL = ep.URL
+		}
+		cands = [][2]string{
+			{"View Episode", epURL},
+			{"View Anime", m.ShowURL},
+		}
+	default:
+		epURL := m.EpisodeURL
+		if hasEp && strings.TrimSpace(ep.URL) != "" {
+			epURL = ep.URL
+		}
+		cands = [][2]string{
+			{"View Episode", epURL},
+			{"View Show", m.ShowURL},
+		}
+	}
+	out := make([]Button, 0, 2)
+	for _, c := range cands {
+		if b, ok := buttonOK(c[0], c[1]); ok {
+			out = append(out, b)
+			if len(out) == 2 {
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Resolve NEVER blocks on network: it returns from the memory/disk cache

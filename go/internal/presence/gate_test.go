@@ -45,6 +45,52 @@ func TestGateChangedStateSent(t *testing.T) {
 	}
 }
 
+func TestGateChangedLargeImageSent(t *testing.T) {
+	g := &Gate{}
+	base := runningCard("Show", "S1 E1")
+	base.LargeImage = "logo"
+	g.Decide(base, 1000, 60000, 100000, false, false)
+	// Late metadata resolves only the cover: Name/Details/State identical.
+	next := runningCard("Show", "S1 E1")
+	next.LargeImage = "https://example.example/cover.jpg"
+	if _, v := g.Decide(next, 2000, 60000, 101000, false, false); !v.Send {
+		t.Fatalf("changed LargeImage should send, got %s", v)
+	}
+}
+
+func TestGateChangedButtonsSent(t *testing.T) {
+	g := &Gate{}
+	base := runningCard("Show", "S1 E1")
+	base.LargeImage = "logo"
+	g.Decide(base, 1000, 60000, 100000, false, false)
+	// Late metadata resolves only the buttons: Name/Details/State identical.
+	next := runningCard("Show", "S1 E1")
+	next.LargeImage = "logo"
+	next.Buttons = []Button{{Label: "Info", URL: "https://example.example/info"}}
+	if _, v := g.Decide(next, 2000, 60000, 101000, false, false); !v.Send {
+		t.Fatalf("changed Buttons should send, got %s", v)
+	}
+}
+
+func TestGateIdenticalArtAndButtonsSuppressed(t *testing.T) {
+	g := &Gate{}
+	card := func() Activity {
+		c := runningCard("Show", "S1 E1")
+		c.LargeImage = "https://example.example/cover.jpg"
+		c.Buttons = []Button{{Label: "Info", URL: "https://example.example/info"}}
+		return c
+	}
+	g.Decide(card(), 1000, 60000, 100000, false, false)
+	// Truly identical repeat (same art + same ordered buttons) stays quiet.
+	_, v := g.Decide(card(), 2000, 60000, 101000, false, false)
+	if v.Send {
+		t.Fatalf("identical art+buttons repeat should be suppressed, got %s", v)
+	}
+	if v.Reason != ReasonHeartbeatNotDue {
+		t.Fatalf("identical suppression reason = %q, want %q", v.Reason, ReasonHeartbeatNotDue)
+	}
+}
+
 func TestGateHeartbeatDueSent(t *testing.T) {
 	g := &Gate{}
 	g.Decide(runningCard("Show", "S1 E1"), 1000, 60000, 100000, false, false)

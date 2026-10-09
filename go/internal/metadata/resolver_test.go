@@ -253,3 +253,77 @@ func TestOrderedSourcesTVMazeFirst(t *testing.T) {
 		}
 	}
 }
+
+// TestResolutionButtonsSeriesAndMovie proves button labels, https forcing,
+// the <=2 cap, and anime/movie variants.
+func TestResolutionButtonsSeriesAndMovie(t *testing.T) {
+	series := &fakeSource{name: "tvmaze", media: &Media{
+		Source: "tvmaze", SourceID: "1",
+		Kind: KindSeries, Title: "Show", Year: 2008,
+		Genres: "Drama " + string(rune(0xb7)) + " Crime", Length: "45 min",
+		ShowURL: "http://example.com/show", EpisodeURL: "http://example.com/ep1",
+		Artwork:   "https://example.com/poster.jpg",
+		Episodes:  []Episode{{Season: 1, Number: 1, Title: "Pilot", URL: "http://example.com/ep1", Length: "45 min", Artwork: "https://example.com/still.jpg"}},
+		FetchedAt: time.Now().UTC(),
+	}}
+	r := New(Options{Dir: t.TempDir(), Sources: []Source{series}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(context.Background(), Query{Kind: KindSeries, Title: "Show", Season: 1, Episode: 1})
+	if err != nil || !res.Found {
+		t.Fatalf("series LookupNow = %+v, %v", res, err)
+	}
+	if res.Genres != "Drama "+string(rune(0xb7))+" Crime" || res.Length != "45 min" || res.Year != 2008 || res.IsMovie {
+		t.Fatalf("series fields = %+v", res)
+	}
+	if len(res.Buttons) != 2 || res.Buttons[0].Label != "View Episode" || res.Buttons[1].Label != "View Show" {
+		t.Fatalf("series buttons = %+v", res.Buttons)
+	}
+	for _, b := range res.Buttons {
+		if len(b.URL) < len("https://") || b.URL[:len("https://")] != "https://" {
+			t.Fatalf("series button not https: %+v", b)
+		}
+	}
+	// Cover rework: series poster wins, episode still never overrides.
+	if res.Artwork != "https://example.com/poster.jpg" {
+		t.Fatalf("series artwork = %q, want poster", res.Artwork)
+	}
+
+	anime := &fakeSource{name: "anilist", media: &Media{
+		Source: "anilist", SourceID: "21",
+		Kind: KindSeries, Title: "Anime", Year: 2016,
+		Genres: "Action", Length: "24 min", ShowURL: "https://myanimelist.net/anime/21",
+		Episodes:  []Episode{{Number: 1, Title: "First", URL: "http://example.com/stream1"}},
+		FetchedAt: time.Now().UTC(),
+	}}
+	r2 := New(Options{Dir: t.TempDir(), Sources: []Source{anime}, Timeout: 5 * time.Second})
+	res2, err := r2.LookupNow(context.Background(), Query{Kind: KindSeries, Title: "Anime", Episode: 1, Absolute: true})
+	if err != nil || !res2.Found {
+		t.Fatalf("anime LookupNow = %+v, %v", res2, err)
+	}
+	if len(res2.Buttons) != 2 || res2.Buttons[0].Label != "View Episode" || res2.Buttons[1].Label != "View Anime" {
+		t.Fatalf("anime buttons = %+v", res2.Buttons)
+	}
+
+	movie := &fakeSource{name: "itunes", media: &Media{
+		Source: "itunes", SourceID: "Blade Runner 2049",
+		Kind: KindMovie, Title: "Blade Runner 2049", Year: 2017,
+		Genres: "Sci-Fi", Length: "2h 19m",
+		MovieURL: "http://itunes.apple.com/movie/id123", TrailerURL: "ftp://example.com/trailer",
+		Artwork:   "https://example.com/movie.jpg",
+		FetchedAt: time.Now().UTC(),
+	}}
+	r3 := New(Options{Dir: t.TempDir(), Sources: []Source{movie}, Timeout: 5 * time.Second})
+	res3, err := r3.LookupNow(context.Background(), Query{Kind: KindMovie, Title: "Blade Runner 2049", Year: 2017})
+	if err != nil || !res3.Found {
+		t.Fatalf("movie LookupNow = %+v, %v", res3, err)
+	}
+	if !res3.IsMovie || res3.Year != 2017 {
+		t.Fatalf("movie fields = %+v", res3)
+	}
+	// ftp trailer drops: only the https-forced movie button remains.
+	if len(res3.Buttons) != 1 || res3.Buttons[0].Label != "View Movie" {
+		t.Fatalf("movie buttons = %+v, want single View Movie", res3.Buttons)
+	}
+	if res3.Buttons[0].URL != "https://itunes.apple.com/movie/id123" {
+		t.Fatalf("movie button URL = %q", res3.Buttons[0].URL)
+	}
+}

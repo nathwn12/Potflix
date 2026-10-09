@@ -316,3 +316,54 @@ func TestClearActivityIsNull(t *testing.T) {
 		t.Fatalf("activity = %v, want null", args["activity"])
 	}
 }
+
+func TestWireJSONButtonsPresent(t *testing.T) {
+	// Valid buttons ride the wire as {"label":..,"url":..} entries.
+	got := WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play",
+		Buttons: []ActivityButton{{Label: "View Episode", URL: "https://example.com/ep/1"}}})
+	want := `{"type":3,"details":"Show","state":"S1 E2","assets":{"large_image":"logo","small_image":"play"},"buttons":[{"label":"View Episode","url":"https://example.com/ep/1"}]}`
+	if got != want {
+		t.Fatalf("WireJSON = %s, want %s", got, want)
+	}
+}
+
+func TestWireJSONButtonsOmittedWhenEmpty(t *testing.T) {
+	// No buttons: the field is omitted, not sent as null or [].
+	for _, btns := range [][]ActivityButton{nil, {}} {
+		got := WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", Buttons: btns})
+		if strings.Contains(got, `"buttons"`) {
+			t.Fatalf("Buttons %#v: buttons present, want omitted: %s", btns, got)
+		}
+	}
+}
+
+func TestWireJSONButtonsInvalidDropped(t *testing.T) {
+	// Entries with an empty label or a non-http(s) URL are dropped; when
+	// nothing valid remains the field is omitted.
+	got := WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", Buttons: []ActivityButton{
+		{Label: "", URL: "https://example.com/no-label"},
+		{Label: "No URL", URL: ""},
+		{Label: "FTP", URL: "ftp://example.com/x"},
+		{Label: "Data", URL: "data:image/png;base64,xx"},
+	}})
+	if strings.Contains(got, `"buttons"`) {
+		t.Fatalf("all-invalid buttons present, want omitted: %s", got)
+	}
+
+	// Mixed: only the valid entry survives.
+	got = WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", Buttons: []ActivityButton{
+		{Label: "", URL: "https://example.com/no-label"},
+		{Label: "View Episode", URL: "https://example.com/ep/1"},
+		{Label: "No URL", URL: ""},
+	}})
+	a := decodeFrame(t, []byte(got))
+	btns, ok := a["buttons"].([]any)
+	if !ok || len(btns) != 1 {
+		t.Fatalf("buttons = %v, want exactly one entry in %s", a["buttons"], got)
+	}
+	b := asMap(t, btns[0], "buttons[0]")
+	wantKeys(t, "buttons[0]", b, "label", "url")
+	if b["label"] != "View Episode" || b["url"] != "https://example.com/ep/1" {
+		t.Fatalf("buttons[0] = %v", b)
+	}
+}

@@ -34,8 +34,11 @@ import (
 // timestamps.start and (when the duration is known) timestamps.end, so the
 // client renders the time bar against the real media position. While paused it
 // carries timestamps.start only, anchored at the pause moment, so the client
-// counts the pause UP ("paused for M:SS"). Deliberately NOT set: party, secrets,
-// instance, buttons, application_id/name.
+// counts the pause UP ("paused for M:SS"). Buttons carry up to two
+// {"label","url"} links when the caller supplies valid entries (non-empty
+// label plus an http(s) URL); invalid entries are dropped, and the field is
+// omitted when none remain. Deliberately NOT set: party, secrets,
+// instance, application_id/name.
 //
 // Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
 // whose assets carry a present-but-empty large_text/small_text (code 4000:
@@ -58,6 +61,16 @@ type Activity struct {
 	HasStart   bool
 	Start      int64 // epoch ms, set while running and paused
 	End        int64 // epoch ms, projected end from the gate; serialized while playing (deviation)
+	// Buttons are the card's click-through links; invalid entries (empty
+	// label or non-http(s) URL) are dropped on the wire, and the field is
+	// omitted when none remain.
+	Buttons []ActivityButton
+}
+
+// ActivityButton is one card click-through link.
+type ActivityButton struct {
+	Label string
+	URL   string
 }
 
 // activityTypeWatching is Discord's ActivityType "Watching" (3). The Java
@@ -67,14 +80,22 @@ type Activity struct {
 const activityTypeWatching = 3
 
 // activityPayload is the wire activity object. Every empty string field is
-// omitted (`omitempty`) so Discord never sees `"large_text":""`.
+// omitted (`omitempty`) so Discord never sees `"large_text":""`; buttons are
+// omitted the same way when no valid entry remains.
 type activityPayload struct {
-	Type       int          `json:"type"`
-	Name       string       `json:"name,omitempty"`
-	Details    string       `json:"details,omitempty"`
-	State      string       `json:"state,omitempty"`
-	Timestamps *timestamps  `json:"timestamps,omitempty"`
-	Assets     activityAsst `json:"assets"`
+	Type       int             `json:"type"`
+	Name       string          `json:"name,omitempty"`
+	Details    string          `json:"details,omitempty"`
+	State      string          `json:"state,omitempty"`
+	Timestamps *timestamps     `json:"timestamps,omitempty"`
+	Assets     activityAsst    `json:"assets"`
+	Buttons    []buttonPayload `json:"buttons,omitempty"`
+}
+
+// buttonPayload is one wire button: {"label":..,"url":..}.
+type buttonPayload struct {
+	Label string `json:"label"`
+	URL   string `json:"url"`
 }
 
 // timestamps carries the elapsed anchor and, while playing, the projected end.
@@ -138,6 +159,22 @@ func newActivity(a Activity) *activityPayload {
 			ts.End = a.End
 		}
 		p.Timestamps = ts
+	}
+	// Buttons go out only when at least one valid entry exists: a non-empty
+	// label AND an http(s) URL. Anything else is dropped; an empty remainder
+	// stays nil so `omitempty` omits the field entirely.
+	var btns []buttonPayload
+	for _, b := range a.Buttons {
+		if strings.TrimSpace(b.Label) == "" {
+			continue
+		}
+		if !strings.HasPrefix(b.URL, "http://") && !strings.HasPrefix(b.URL, "https://") {
+			continue
+		}
+		btns = append(btns, buttonPayload{Label: b.Label, URL: b.URL})
+	}
+	if len(btns) > 0 {
+		p.Buttons = btns
 	}
 	return p
 }

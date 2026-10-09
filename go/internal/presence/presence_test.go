@@ -2,6 +2,7 @@ package presence
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf16"
@@ -419,7 +420,7 @@ func TestBuildActivity(t *testing.T) {
 		got := BuildActivity(c.raw, c.act)
 		want := c.want
 		want.Start = c.start
-		if got != want {
+		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: card = %+v, want %+v", c.name, got, want)
 		}
 	}
@@ -445,7 +446,7 @@ func TestBuildActivityResolved(t *testing.T) {
 	act := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
 
 	t.Run("zero overrides match BuildActivity", func(t *testing.T) {
-		if got, want := BuildActivityResolved(tvRaw, act, Resolved{}), BuildActivity(tvRaw, act); got != want {
+		if got, want := BuildActivityResolved(tvRaw, act, Resolved{}), BuildActivity(tvRaw, act); !reflect.DeepEqual(got, want) {
 			t.Errorf("Resolved{} card = %+v, want %+v", got, want)
 		}
 	})
@@ -461,7 +462,7 @@ func TestBuildActivityResolved(t *testing.T) {
 		}
 		base.Name = got.Name
 		base.LargeText = got.LargeText
-		if got != base {
+		if !reflect.DeepEqual(got, base) {
 			t.Errorf("only Name and LargeText should change: got %+v, want %+v", got, base)
 		}
 	})
@@ -479,7 +480,7 @@ func TestBuildActivityResolved(t *testing.T) {
 			t.Errorf("base State = %q, want tag %q", base.State, "S1 E2")
 		}
 		base.Details = got.Details
-		if got != base {
+		if !reflect.DeepEqual(got, base) {
 			t.Errorf("only Details should change: got %+v, want %+v", got, base)
 		}
 	})
@@ -591,4 +592,190 @@ func TestRpText(t *testing.T) {
 	if got := rpText(long, 128); got != titleclean.Trunc(long, 128) {
 		t.Errorf("rpText trunc = %q, want %q", got, titleclean.Trunc(long, 128))
 	}
+}
+
+func TestTrimWord(t *testing.T) {
+	if got := trimWord("hello world", 128); got != "hello world" {
+		t.Errorf("trimWord fits = %q, want %q", got, "hello world")
+	}
+	// A long synopsis of whole words must end on "..." at a word boundary,
+	// never mid-word: the hard cut would leave a dangling "wo...".
+	syn := strings.Repeat("word ", 40) + "tail"
+	got := trimWord(syn, 128)
+	if !strings.HasSuffix(got, "\u2026") {
+		t.Fatalf("trimWord long = %q, want trailing ellipsis", got)
+	}
+	if strings.HasSuffix(strings.TrimSuffix(got, "\u2026"), "wo") {
+		t.Errorf("trimWord ended mid-word: %q", got)
+	}
+	if !strings.HasSuffix(strings.TrimSuffix(got, "\u2026"), "word") {
+		t.Errorf("trimWord should end on a whole word: %q", got)
+	}
+	if n := javaUnits(got); n > 128 {
+		t.Errorf("trimWord length %d exceeds 128: %q", n, got)
+	}
+	// No spaces: fall back to the hard cut.
+	nospace := strings.Repeat("s", 200)
+	if got, want := trimWord(nospace, 128), rpText(nospace, 128); got != want {
+		t.Errorf("trimWord nospace = %q, want %q", got, want)
+	}
+	if got := trimWord("", 128); got != "" {
+		t.Errorf("trimWord empty = %q, want empty", got)
+	}
+}
+
+func TestBuildActivityResolvedMovie(t *testing.T) {
+	const movieRaw = "Dune.Part.Two.2024.1080p.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+
+	t.Run("details carry Title (Year)", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Series: "Dune: Part Two", Year: 2024, IsMovie: true,
+		})
+		if want := titleclean.Trunc("Dune: Part Two (2024)", 128); got.Details != want {
+			t.Errorf("Details = %q, want %q", got.Details, want)
+		}
+		if want := titleclean.Trunc("Dune: Part Two", 128); got.Name != want {
+			t.Errorf("Name = %q, want %q", got.Name, want)
+		}
+	})
+
+	t.Run("details without year are the bare title", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Series: "Dune: Part Two", IsMovie: true,
+		})
+		if want := titleclean.Trunc("Dune: Part Two", 128); got.Details != want {
+			t.Errorf("Details = %q, want %q", got.Details, want)
+		}
+	})
+
+	t.Run("state joins Genre Length synopsis", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Series: "Dune: Part Two", Year: 2024, IsMovie: true,
+			Genres: "Sci-Fi", Length: "2h 46m", Synopsis: "Paul unites the Fremen",
+		})
+		if want := "Sci-Fi \u00b7 2h 46m \u00b7 Paul unites the Fremen"; got.State != want {
+			t.Errorf("State = %q, want %q", got.State, want)
+		}
+	})
+
+	t.Run("state skips empties", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Series: "Dune", IsMovie: true, Length: "2h 19m", Synopsis: "A quest",
+		})
+		if want := "2h 19m \u00b7 A quest"; got.State != want {
+			t.Errorf("State = %q, want %q", got.State, want)
+		}
+	})
+
+	t.Run("long movie state ends on ellipsis at a word boundary", func(t *testing.T) {
+		syn := strings.Repeat("epic ", 40) + "finale"
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Series: "Dune", IsMovie: true, Genres: "Adventure", Length: "2h 46m", Synopsis: syn,
+		})
+		if !strings.HasSuffix(got.State, "\u2026") {
+			t.Fatalf("State = %q, want trailing ellipsis", got.State)
+		}
+		if n := javaUnits(got.State); n > 128 {
+			t.Fatalf("State length %d exceeds 128: %q", n, got.State)
+		}
+		body := strings.TrimSuffix(got.State, "\u2026")
+		if tail := body[strings.LastIndex(body, "\u00b7 ")+len("\u00b7 "):]; strings.Contains(tail, " ") {
+			// The synopsis tail after the last separator still ends mid-list;
+			// the key invariant is no partial word: last char before ellipsis
+			// must not be a word prefix fragment. "epic" words are whole.
+			if !strings.HasSuffix(body, "epic") && !strings.HasSuffix(body, "finale") {
+				t.Errorf("State ends mid-word: %q", got.State)
+			}
+		}
+	})
+
+	t.Run("paused movie keeps the Paused marker", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, &Action{Paused: true, CT: 1000}, Resolved{
+			Series: "Dune", Year: 2024, IsMovie: true,
+			Genres: "Sci-Fi", Length: "2h 46m", Synopsis: "Paul unites the Fremen",
+		})
+		if !strings.HasSuffix(got.State, pausedMarker) {
+			t.Fatalf("paused State = %q, want suffix %q", got.State, pausedMarker)
+		}
+		if n := javaUnits(got.State); n > 128 {
+			t.Fatalf("paused State length %d exceeds 128: %q", n, got.State)
+		}
+	})
+
+	t.Run("empty artwork stays logo", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{Series: "Dune", IsMovie: true})
+		if got.LargeImage != "logo" {
+			t.Errorf("LargeImage = %q, want %q", got.LargeImage, "logo")
+		}
+	})
+}
+
+func TestBuildActivityResolvedSeriesState(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	got := BuildActivityResolved(tvRaw, runAct, Resolved{
+		Series: "Canonical Series", EpisodeName: "Canonical Episode",
+		Synopsis: "A brave new world unfolds",
+	})
+	if want := "S1 E2 \u00b7 A brave new world unfolds"; got.State != want {
+		t.Errorf("State = %q, want %q", got.State, want)
+	}
+}
+
+func TestBuildActivityResolvedButtons(t *testing.T) {
+	const movieRaw = "Movie.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+
+	t.Run("capped at two", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Buttons: []Button{
+				{Label: "Trailer", URL: "https://example.com/trailer"},
+				{Label: "IMDb", URL: "https://example.com/imdb"},
+				{Label: "Extra", URL: "https://example.com/extra"},
+			},
+		})
+		if len(got.Buttons) != 2 {
+			t.Fatalf("Buttons = %+v, want 2 kept", got.Buttons)
+		}
+		if got.Buttons[0].Label != "Trailer" || got.Buttons[1].Label != "IMDb" {
+			t.Errorf("Buttons = %+v, want first two kept", got.Buttons)
+		}
+	})
+
+	t.Run("http kept ftp and empty dropped", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Buttons: []Button{
+				{Label: "", URL: "https://example.com/x"},
+				{Label: "NoURL", URL: "ftp://example.com/x"},
+				{Label: "Bare", URL: "example.com/x"},
+				{Label: "OK", URL: "http://example.com/ok"},
+			},
+		})
+		if len(got.Buttons) != 1 || got.Buttons[0].Label != "OK" {
+			t.Fatalf("Buttons = %+v, want only the http one", got.Buttons)
+		}
+		if got.Buttons[0].URL != "http://example.com/ok" {
+			t.Errorf("URL = %q, want kept verbatim", got.Buttons[0].URL)
+		}
+	})
+
+	t.Run("label capped at 32", func(t *testing.T) {
+		long := strings.Repeat("l", 100)
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{
+			Buttons: []Button{{Label: long, URL: "https://example.com/x"}},
+		})
+		if len(got.Buttons) != 1 {
+			t.Fatalf("Buttons = %+v, want 1", got.Buttons)
+		}
+		if n := javaUnits(got.Buttons[0].Label); n > 32 {
+			t.Errorf("label length %d exceeds 32: %q", n, got.Buttons[0].Label)
+		}
+	})
+
+	t.Run("BuildActivity carries no buttons", func(t *testing.T) {
+		if got := BuildActivity(movieRaw, runAct); len(got.Buttons) != 0 {
+			t.Errorf("BuildActivity.Buttons = %+v, want empty", got.Buttons)
+		}
+	})
 }

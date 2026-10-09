@@ -40,7 +40,12 @@ type jikanSearchResp struct {
 		Title        string  `json:"title"`
 		TitleEnglish *string `json:"title_english"`
 		Synopsis     string  `json:"synopsis"`
-		Images       *struct {
+		Duration     string  `json:"duration"`
+		URL          string  `json:"url"`
+		Genres       []struct {
+			Name string `json:"name"`
+		} `json:"genres"`
+		Images *struct {
 			JPG struct {
 				ImageURL      string `json:"image_url"`
 				LargeImageURL string `json:"large_image_url"`
@@ -94,6 +99,12 @@ func (s *jikanSource) Find(ctx context.Context, q Query) (*Media, error) {
 	} else if top.Aired != nil && top.Aired.From != nil {
 		year = dateYear(*top.Aired.From)
 	}
+	genreNames := make([]string, 0, len(top.Genres))
+	for _, g := range top.Genres {
+		if t := strings.TrimSpace(g.Name); t != "" {
+			genreNames = append(genreNames, t)
+		}
+	}
 
 	eps := make([]Episode, 0, 64)
 	lastPage := 1
@@ -131,6 +142,7 @@ func (s *jikanSource) Find(ctx context.Context, q Query) (*Media, error) {
 		Source: "jikan", SourceID: strconv.Itoa(top.MalID),
 		Kind: KindSeries, Title: title, Year: year,
 		Artwork: artwork, Synopsis: capSynopsis(stripHTML(top.Synopsis)),
+		Genres: joinGenres(genreNames), Length: strings.TrimSpace(top.Duration), ShowURL: normalizeURL(top.URL),
 		Episodes: eps, FetchedAt: time.Now().UTC(),
 	}, nil
 }

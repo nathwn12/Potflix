@@ -48,10 +48,10 @@ func TestAniList(t *testing.T) {
 	if len(m.Episodes) != 2 {
 		t.Fatalf("episodes = %+v", m.Episodes)
 	}
-	if m.Episodes[0] != (Episode{Number: 1, Title: "Enter: Naruto Uzumaki!"}) {
+	if m.Episodes[0] != (Episode{Number: 1, Title: "Enter: Naruto Uzumaki!", URL: "https://x"}) {
 		t.Fatalf("ep0 = %+v", m.Episodes[0])
 	}
-	if m.Episodes[1] != (Episode{Number: 2, Title: "Second"}) {
+	if m.Episodes[1] != (Episode{Number: 2, Title: "Second", URL: "https://y"}) {
 		t.Fatalf("ep1 = %+v", m.Episodes[1])
 	}
 
@@ -175,5 +175,45 @@ func TestAniListNumberParsing(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAniListShowURL proves idMal present -> myanimelist.net ShowURL (with
+// genres/duration/streaming URL), and absent -> AniList siteUrl fallback.
+func TestAniListShowURL(t *testing.T) {
+	mk := func(body string) *anilistSource {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		t.Cleanup(srv.Close)
+		return &anilistSource{base: srv.URL, client: srv.Client()}
+	}
+
+	withMal := mk(`{"data":{"Media":{"id":21355,"idMal":12189,"title":{"romaji":"Re Zero","english":"Re:ZERO"},"seasonYear":2016,"genres":["Action","Adventure"],"duration":24,"siteUrl":"https://anilist.co/anime/21355","streamingEpisodes":[{"title":"Episode 1 - Pilot","url":"http://example.com/ep1","site":"Crunchyroll","thumbnail":""}]}}}`)
+	m, err := withMal.Find(context.Background(), Query{Kind: KindSeries, Title: "Re Zero", Episode: 1, Absolute: true})
+	if err != nil || m == nil {
+		t.Fatalf("Find idMal = %+v, %v", m, err)
+	}
+	if m.ShowURL != "https://myanimelist.net/anime/12189" {
+		t.Fatalf("showURL = %q, want MAL idMal URL", m.ShowURL)
+	}
+	if m.Genres != "Action "+string(rune(0xb7))+" Adventure" {
+		t.Fatalf("genres = %q", m.Genres)
+	}
+	if m.Length != "24 min" {
+		t.Fatalf("length = %q, want 24 min", m.Length)
+	}
+	if len(m.Episodes) != 1 || m.Episodes[0].URL != "https://example.com/ep1" {
+		t.Fatalf("episode URL = %+v, want https normalized", m.Episodes)
+	}
+
+	withoutMal := mk(`{"data":{"Media":{"id":1,"title":{"romaji":"Show","english":"Show"},"seasonYear":2020,"genres":["Drama"],"siteUrl":"http://anilist.co/anime/1","streamingEpisodes":[]}}}`)
+	m2, err := withoutMal.Find(context.Background(), Query{Kind: KindSeries, Title: "Show", Episode: 1, Absolute: true})
+	if err != nil || m2 == nil {
+		t.Fatalf("Find no-idMal = %+v, %v", m2, err)
+	}
+	if m2.ShowURL != "https://anilist.co/anime/1" {
+		t.Fatalf("fallback showURL = %q, want https siteUrl", m2.ShowURL)
 	}
 }

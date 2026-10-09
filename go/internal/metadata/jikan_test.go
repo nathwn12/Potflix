@@ -96,3 +96,46 @@ func TestJikanUsesEpisodeField(t *testing.T) {
 		}
 	}
 }
+
+// TestJikanEnrichment proves genres/duration/url populate Media plus the
+// View-Anime button path.
+func TestJikanEnrichment(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/anime", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"mal_id":21,"title":"One Piece","title_english":"One Piece","year":1999,"duration":"24 min per ep","url":"http://myanimelist.net/anime/21/One_Piece","genres":[{"name":"Action"},{"name":"Adventure"}]}]}`))
+	})
+	mux.HandleFunc("/anime/21/episodes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"episode":1,"title":"First"}],"pagination":{"last_visible_page":1}}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	s := &jikanSource{base: srv.URL, client: srv.Client()}
+	m, err := s.Find(context.Background(), Query{Kind: KindSeries, Title: "One Piece", Episode: 1, Absolute: true})
+	if err != nil || m == nil {
+		t.Fatalf("Find = %+v, %v", m, err)
+	}
+	if m.Genres != "Action "+string(rune(0xb7))+" Adventure" {
+		t.Fatalf("genres = %q", m.Genres)
+	}
+	if m.Length != "24 min per ep" {
+		t.Fatalf("length = %q", m.Length)
+	}
+	if m.ShowURL != "https://myanimelist.net/anime/21/One_Piece" {
+		t.Fatalf("showURL = %q", m.ShowURL)
+	}
+
+	r := New(Options{Dir: t.TempDir(), Sources: []Source{s}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(context.Background(), Query{Kind: KindSeries, Title: "One Piece", Episode: 1, Absolute: true})
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if !res.Found {
+		t.Fatalf("resolution = %+v, want found", res)
+	}
+	if len(res.Buttons) == 0 || res.Buttons[len(res.Buttons)-1].Label != "View Anime" {
+		t.Fatalf("buttons = %+v, want trailing View Anime", res.Buttons)
+	}
+}

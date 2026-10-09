@@ -46,3 +46,43 @@ func TestITunes(t *testing.T) {
 		t.Fatalf("resolution = %+v", res)
 	}
 }
+
+// TestITunesEnrichment proves trackTimeMillis -> "2h 19m" plus genre and
+// movie/trailer URLs, with View-Movie/View-Trailer buttons.
+func TestITunesEnrichment(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"resultCount":1,"results":[{"kind":"feature-movie","trackName":"Blade Runner 2049","releaseDate":"2017-10-06T07:00:00Z","primaryGenreName":"Sci-Fi","trackTimeMillis":8340000,"trackViewUrl":"http://itunes.apple.com/movie/id123","previewUrl":"http://example.com/trailer.mov"}]}`))
+	}))
+	defer srv.Close()
+
+	s := &itunesSource{base: srv.URL, client: srv.Client()}
+	m, err := s.Find(context.Background(), Query{Kind: KindMovie, Title: "Blade Runner 2049", Year: 2017})
+	if err != nil || m == nil {
+		t.Fatalf("Find = %+v, %v", m, err)
+	}
+	if m.Genres != "Sci-Fi" {
+		t.Fatalf("genres = %q", m.Genres)
+	}
+	if m.Length != "2h 19m" {
+		t.Fatalf("length = %q, want 2h 19m", m.Length)
+	}
+	if m.MovieURL != "https://itunes.apple.com/movie/id123" {
+		t.Fatalf("movieURL = %q", m.MovieURL)
+	}
+	if m.TrailerURL != "https://example.com/trailer.mov" {
+		t.Fatalf("trailerURL = %q", m.TrailerURL)
+	}
+
+	r := New(Options{Dir: t.TempDir(), Sources: []Source{s}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(context.Background(), Query{Kind: KindMovie, Title: "Blade Runner 2049", Year: 2017})
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if !res.Found || !res.IsMovie || res.Year != 2017 || res.Length != "2h 19m" {
+		t.Fatalf("resolution = %+v", res)
+	}
+	if len(res.Buttons) != 2 || res.Buttons[0].Label != "View Movie" || res.Buttons[1].Label != "View Trailer" {
+		t.Fatalf("buttons = %+v", res.Buttons)
+	}
+}

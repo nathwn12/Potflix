@@ -147,6 +147,14 @@ func main() {
 }
 
 func printLine(raw string, res metadata.Resolution, source, cache, dir string) {
-	fmt.Printf("input=%s series=%s season=%d episode=%d title=%s source=%s cache=%s dir=%s art=%s synopsis=%s\n",
-		raw, res.Series, res.Season, res.Number, res.Episode, source, cache, dir, res.Artwork, res.Synopsis)
+	buttons := ""
+	if len(res.Buttons) > 0 {
+		parts := make([]string, 0, len(res.Buttons))
+		for _, b := range res.Buttons {
+			parts = append(parts, b.Label+"|"+b.URL)
+		}
+		buttons = strings.Join(parts, ",")
+	}
+	fmt.Printf("input=%s series=%s season=%d episode=%d title=%s source=%s cache=%s dir=%s genres=%s length=%s year=%d buttons=%s art=%s synopsis=%s\n",
+		raw, res.Series, res.Season, res.Number, res.Episode, source, cache, dir, res.Genres, res.Length, res.Year, buttons, res.Artwork, res.Synopsis)
 }

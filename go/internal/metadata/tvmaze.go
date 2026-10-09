@@ -46,12 +46,16 @@ func tvmazeArt(img *tvmazeImage) string {
 }
 
 type tvmazeShow struct {
-	ID        int          `json:"id"`
-	Name      string       `json:"name"`
-	Premiered string       `json:"premiered"`
-	Weight    int          `json:"weight"`
-	Image     *tvmazeImage `json:"image"`
-	Summary   string       `json:"summary"`
+	ID             int          `json:"id"`
+	Name           string       `json:"name"`
+	Premiered      string       `json:"premiered"`
+	Weight         int          `json:"weight"`
+	Image          *tvmazeImage `json:"image"`
+	Summary        string       `json:"summary"`
+	Genres         []string     `json:"genres"`
+	Runtime        *int         `json:"runtime"`
+	AverageRuntime *int         `json:"averageRuntime"`
+	URL            string       `json:"url"`
 }
 
 // tvmazeSearchResult is one entry of GET /search/shows?q=...; the show
@@ -73,6 +77,36 @@ type tvmazeEpisode struct {
 	Number  *int         `json:"number"`
 	Image   *tvmazeImage `json:"image"`
 	Summary string       `json:"summary"`
+	URL     string       `json:"url"`
+	Runtime *int         `json:"runtime"`
+}
+
+// tvmazeShowLength prefers averageRuntime, else runtime.
+func tvmazeShowLength(show tvmazeShow) string {
+	if show.AverageRuntime != nil && *show.AverageRuntime > 0 {
+		return runtimeLength(*show.AverageRuntime)
+	}
+	if show.Runtime != nil && *show.Runtime > 0 {
+		return runtimeLength(*show.Runtime)
+	}
+	return ""
+}
+
+func tvmazeEpLength(runtime *int) string {
+	if runtime == nil {
+		return ""
+	}
+	return runtimeLength(*runtime)
+}
+
+// tvmazeMatchedURL returns the matched episode's page URL for q, "" when
+// the table lacks it. Stored on Media.EpisodeURL so the resolver can build
+// the View-Episode button even from cache.
+func tvmazeMatchedURL(out []Episode, q Query) string {
+	if ep, ok := matchEpisode(out, q); ok {
+		return ep.URL
+	}
+	return ""
 }
 
 // Find resolves one season (Season>0) via /shows/<id>/seasons +
@@ -135,6 +169,9 @@ func (s *tvmazeSource) Find(ctx context.Context, q Query) (*Media, error) {
 		return nil, nil
 	}
 	year := dateYear(show.Premiered)
+	genres := joinGenres(show.Genres)
+	length := tvmazeShowLength(show)
+	showURL := normalizeURL(show.URL)
 
 	if q.Season > 0 && !q.Absolute {
 		seasonsURL := fmt.Sprintf("%s/shows/%d/seasons", base, show.ID)
@@ -170,7 +207,7 @@ func (s *tvmazeSource) Find(ctx context.Context, q Query) (*Media, error) {
 			if e.Number == nil {
 				continue
 			}
-			out = append(out, Episode{Season: e.Season, Number: *e.Number, Title: e.Name, Artwork: tvmazeArt(e.Image), Synopsis: capSynopsis(stripHTML(e.Summary))})
+			out = append(out, Episode{Season: e.Season, Number: *e.Number, Title: e.Name, Artwork: tvmazeArt(e.Image), Synopsis: capSynopsis(stripHTML(e.Summary)), URL: normalizeURL(e.URL), Length: tvmazeEpLength(e.Runtime)})
 		}
 		sort.Slice(out, func(i, j int) bool {
 			if out[i].Season != out[j].Season {
@@ -182,6 +219,7 @@ func (s *tvmazeSource) Find(ctx context.Context, q Query) (*Media, error) {
 			Source: "tvmaze", SourceID: strconv.Itoa(show.ID),
 			Kind: KindSeries, Title: show.Name, Year: year,
 			Artwork: tvmazeArt(show.Image), Synopsis: capSynopsis(stripHTML(show.Summary)),
+			Genres: genres, Length: length, ShowURL: showURL, EpisodeURL: tvmazeMatchedURL(out, q),
 			Episodes: out, FetchedAt: time.Now().UTC(),
 		}, nil
 	}
@@ -213,7 +251,7 @@ func (s *tvmazeSource) Find(ctx context.Context, q Query) (*Media, error) {
 		if e.Number == nil {
 			continue
 		}
-		out = append(out, Episode{Season: e.Season, Number: *e.Number, Title: e.Name, Artwork: tvmazeArt(e.Image), Synopsis: capSynopsis(stripHTML(e.Summary))})
+		out = append(out, Episode{Season: e.Season, Number: *e.Number, Title: e.Name, Artwork: tvmazeArt(e.Image), Synopsis: capSynopsis(stripHTML(e.Summary)), URL: normalizeURL(e.URL), Length: tvmazeEpLength(e.Runtime)})
 	}
 	if q.Absolute {
 		// Absolute N maps to the Nth episode in (season, number) air order:
@@ -228,6 +266,7 @@ func (s *tvmazeSource) Find(ctx context.Context, q Query) (*Media, error) {
 		Source: "tvmaze", SourceID: strconv.Itoa(show.ID),
 		Kind: KindSeries, Title: show.Name, Year: year,
 		Artwork: tvmazeArt(show.Image), Synopsis: capSynopsis(stripHTML(show.Summary)),
+		Genres: genres, Length: length, ShowURL: showURL, EpisodeURL: tvmazeMatchedURL(out, q),
 		Episodes: out, FetchedAt: time.Now().UTC(),
 	}, nil
 }

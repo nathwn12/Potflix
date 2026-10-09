@@ -37,6 +37,10 @@ type itunesSearchResp struct {
 		ArtworkURL100    string `json:"artworkUrl100"`
 		ShortDescription string `json:"shortDescription"`
 		LongDescription  string `json:"longDescription"`
+		PrimaryGenreName string `json:"primaryGenreName"`
+		TrackTimeMillis  int64  `json:"trackTimeMillis"`
+		TrackViewURL     string `json:"trackViewUrl"`
+		PreviewURL       string `json:"previewUrl"`
 	} `json:"results"`
 }
 
@@ -75,9 +79,13 @@ func (s *itunesSource) Find(ctx context.Context, q Query) (*Media, error) {
 		return &Media{
 			Source: "itunes", SourceID: title,
 			Kind: KindMovie, Title: title, Year: dateYear(r.ReleaseDate),
-			Artwork:   itunesArt(r.ArtworkURL100),
-			Synopsis:  capSynopsis(stripHTML(firstNonEmpty(r.LongDescription, r.ShortDescription))),
-			FetchedAt: time.Now().UTC(),
+			Artwork:    itunesArt(r.ArtworkURL100),
+			Synopsis:   capSynopsis(stripHTML(firstNonEmpty(r.LongDescription, r.ShortDescription))),
+			Genres:     strings.TrimSpace(r.PrimaryGenreName),
+			Length:     millisLength(r.TrackTimeMillis),
+			MovieURL:   normalizeURL(r.TrackViewURL),
+			TrailerURL: normalizeURL(r.PreviewURL),
+			FetchedAt:  time.Now().UTC(),
 		}, nil
 	}
 	return nil, nil

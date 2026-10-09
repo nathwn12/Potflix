@@ -31,18 +31,22 @@ func (s *anilistSource) httpClient() *http.Client {
 	return newHTTPClient(0)
 }
 
-const anilistQuery = `query ($search:String){Media(search:$search,type:ANIME){id title{romaji english} season seasonYear episodes description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}`
+const anilistQuery = `query ($search:String){Media(search:$search,type:ANIME){id idMal title{romaji english} season seasonYear episodes genres duration siteUrl description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}`
 
 type anilistResp struct {
 	Data *struct {
 		Media *struct {
 			ID    int `json:"id"`
+			IdMal int `json:"idMal"`
 			Title struct {
 				Romaji  string `json:"romaji"`
 				English string `json:"english"`
 			} `json:"title"`
-			SeasonYear  *int   `json:"seasonYear"`
-			Description string `json:"description"`
+			SeasonYear  *int     `json:"seasonYear"`
+			Genres      []string `json:"genres"`
+			Duration    *int     `json:"duration"`
+			SiteURL     string   `json:"siteUrl"`
+			Description string   `json:"description"`
 			CoverImage  *struct {
 				ExtraLarge string `json:"extraLarge"`
 				Large      string `json:"large"`
@@ -50,6 +54,8 @@ type anilistResp struct {
 			BannerImage string `json:"bannerImage"`
 			Streaming   []struct {
 				Title     string `json:"title"`
+				URL       string `json:"url"`
+				Site      string `json:"site"`
 				Thumbnail string `json:"thumbnail"`
 			} `json:"streamingEpisodes"`
 		} `json:"Media"`
@@ -134,10 +140,21 @@ func (s *anilistSource) Find(ctx context.Context, q Query) (*Media, error) {
 	if m.SeasonYear != nil {
 		year = *m.SeasonYear
 	}
+	genres := joinGenres(m.Genres)
+	length := ""
+	if m.Duration != nil {
+		length = runtimeLength(*m.Duration)
+	}
+	showURL := ""
+	if m.IdMal > 0 {
+		showURL = "https://myanimelist.net/anime/" + strconv.Itoa(m.IdMal)
+	} else {
+		showURL = normalizeURL(m.SiteURL)
+	}
 	eps := make([]Episode, 0, len(m.Streaming))
 	for i, se := range m.Streaming {
 		num, title := parseAnilistEpisode(se.Title, i+1)
-		eps = append(eps, Episode{Season: 0, Number: num, Title: title, Artwork: strings.TrimSpace(se.Thumbnail)})
+		eps = append(eps, Episode{Season: 0, Number: num, Title: title, Artwork: strings.TrimSpace(se.Thumbnail), URL: normalizeURL(se.URL)})
 	}
 	sort.SliceStable(eps, func(a, b int) bool { return eps[a].Number < eps[b].Number })
 	artwork := m.BannerImage
@@ -150,6 +167,7 @@ func (s *anilistSource) Find(ctx context.Context, q Query) (*Media, error) {
 		Source: "anilist", SourceID: strconv.Itoa(m.ID),
 		Kind: KindSeries, Title: title, Year: year,
 		Artwork: artwork, Synopsis: capSynopsis(stripHTML(m.Description)),
+		Genres: genres, Length: length, ShowURL: showURL,
 		Episodes: eps, FetchedAt: time.Now().UTC(),
 	}, nil
 }

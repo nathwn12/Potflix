@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode/utf16"
 
 	"potflix/internal/player"
 	"potflix/internal/titleclean"
@@ -314,6 +315,9 @@ type Activity struct {
 	// and the duration is known. Serialized as timestamps.end while playing so
 	// Discord renders the remaining-time bar; zero (and omitted) while paused.
 	End int64
+	// Buttons are the card's click-through links (max 2), populated only by
+	// BuildActivityResolved; BuildActivity leaves them nil.
+	Buttons []Button
 }
 
 // BuildActivity composes the payload for one action from the raw window title
@@ -391,12 +395,23 @@ func BuildActivity(rawTitle string, a *Action) Activity {
 	return act
 }
 
+// Button is one presence-local card link.
+type Button struct {
+	Label string
+	URL   string
+}
+
 // Resolved carries canonical titles from a metadata lookup; a zero field is ignored.
 type Resolved struct {
 	Series      string // canonical series or movie title
 	EpisodeName string // canonical episode title
 	Artwork     string // cover/poster URL (https); zero value = absent
 	Synopsis    string // one-line plain text; zero value = absent
+	Genres      string // movie genres, e.g. "Action, Drama"; zero value = absent
+	Length      string // movie runtime, e.g. "2h 19m"; zero value = absent
+	Year        int    // movie release year; <=0 = absent
+	IsMovie     bool   // true: movie card lines; false: series card lines
+	Buttons     []Button
 }
 
 // rpText sanitizes free text for the RPC card: trim, collapse runs of
@@ -414,50 +429,144 @@ func rpText(s string, max int) string {
 	return titleclean.Trunc(s, max)
 }
 
+// trimWord sanitizes s via rpText, then caps it at max UTF-16 units at a word
+// boundary: when the sanitized text fits it is returned as-is; otherwise the
+// prefix fitting in max-1 units is cut at its last space and a single U+2026
+// is appended, so a synopsis never ends mid-word. With no space in the
+// prefix it falls back to rpText's hard cut.
+func trimWord(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	const huge = 1 << 28
+	full := rpText(s, huge)
+	if len(utf16.Encode([]rune(full))) <= max {
+		return full
+	}
+	if max == 1 {
+		return "\u2026"
+	}
+	runes := []rune(full)
+	used := 0
+	end := 0
+	for i, r := range runes {
+		sz := 1
+		if r >= 0x10000 {
+			sz = 2
+		}
+		if used+sz > max-1 {
+			break
+		}
+		used += sz
+		end = i + 1
+	}
+	if prefix := string(runes[:end]); prefix != "" {
+		if idx := strings.LastIndex(prefix, " "); idx > 0 {
+			return prefix[:idx] + "\u2026"
+		}
+	}
+	return rpText(s, max)
+}
+
+// filterButtons keeps at most two buttons with a non-empty label and an
+// http(s) URL; labels are sanitized and capped at 32 units.
+func filterButtons(in []Button) []Button {
+	var out []Button
+	for _, b := range in {
+		if len(out) >= 2 {
+			break
+		}
+		lbl := rpText(b.Label, 32)
+		if lbl == "" {
+			continue
+		}
+		if !strings.HasPrefix(b.URL, "http://") && !strings.HasPrefix(b.URL, "https://") {
+			continue
+		}
+		out = append(out, Button{Label: lbl, URL: b.URL})
+	}
+	return out
+}
+
 // BuildActivityResolved is BuildActivity with canonical title overrides applied.
+//
+// Movie (r.IsMovie): Details is the canonical title with " (YYYY)" when
+// Year>0; State joins Genres, Length and the synopsis with " \u00b7 ",
+// skipping empties, capped word-aware at 128. Series: Details is the episode
+// override when present (else BuildActivity's filename-derived line); State
+// joins the episode tag and the synopsis the same way, with the synopsis
+// word-capped. The paused " - Paused" marker path is preserved for both.
 func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
 	act := BuildActivity(rawTitle, a)
 	if r.Series != "" {
 		act.Name = titleclean.Trunc(r.Series, 128)
 		act.LargeText = titleclean.Trunc(r.Series, 128)
 	}
-	if r.EpisodeName != "" {
-		act.Details = titleclean.Trunc(r.EpisodeName, 128)
-	}
-	// Episode tag for the state line, derived from the title the same way
-	// BuildActivity derives it.
-	raw := rawTitle
-	if strings.HasSuffix(raw, player.Suffix) {
-		raw = raw[:strings.LastIndex(raw, player.Suffix)]
-	}
-	var tagRaw string
-	if idle := strings.TrimSpace(raw) == "" || raw == player.AppName; !idle {
-		tagRaw = titleclean.Clean(raw).EpisodeTag
-	}
-	tagT := rpText(tagRaw, 128)
-	synT := rpText(r.Synopsis, 128)
-	switch {
-	case tagT == "" && synT == "":
-		// Neither: keep BuildActivity's state (including any Paused marker).
-	case a != nil && a.Paused:
-		var ctx string
-		switch {
-		case tagT != "" && synT != "":
-			ctx = tagT + " \u00b7 " + synT
-		case tagT != "":
-			ctx = tagT
-		default:
-			ctx = synT
+	if r.IsMovie {
+		if r.Series != "" {
+			if r.Year > 0 {
+				act.Details = titleclean.Trunc(fmt.Sprintf("%s (%d)", r.Series, r.Year), 128)
+			} else {
+				act.Details = titleclean.Trunc(r.Series, 128)
+			}
 		}
-		act.State = WithStateTime(ctx, pausedMarker)
-	default:
+		var parts []string
+		if g := rpText(r.Genres, 1<<28); g != "" {
+			parts = append(parts, g)
+		}
+		if l := rpText(r.Length, 1<<28); l != "" {
+			parts = append(parts, l)
+		}
+		if s := rpText(r.Synopsis, 1<<28); s != "" {
+			parts = append(parts, s)
+		}
+		if joined := strings.Join(parts, " \u00b7 "); joined != "" {
+			if a != nil && a.Paused {
+				act.State = WithStateTime(trimWord(joined, 128-len(pausedMarker)), pausedMarker)
+			} else {
+				act.State = trimWord(joined, 128)
+			}
+		}
+		// Empty join: keep BuildActivity's state (including any Paused marker).
+	} else {
+		if r.EpisodeName != "" {
+			act.Details = titleclean.Trunc(r.EpisodeName, 128)
+		}
+		// Episode tag for the state line, derived from the title the same way
+		// BuildActivity derives it.
+		raw := rawTitle
+		if strings.HasSuffix(raw, player.Suffix) {
+			raw = raw[:strings.LastIndex(raw, player.Suffix)]
+		}
+		var tagRaw string
+		if idle := strings.TrimSpace(raw) == "" || raw == player.AppName; !idle {
+			tagRaw = titleclean.Clean(raw).EpisodeTag
+		}
+		tagT := rpText(tagRaw, 128)
+		synFull := rpText(r.Synopsis, 1<<28)
 		switch {
-		case tagT != "" && synT != "":
-			act.State = rpText(tagT+" \u00b7 "+synT, 128)
-		case tagT != "":
-			act.State = tagT
+		case tagT == "" && synFull == "":
+			// Neither: keep BuildActivity's state (including any Paused marker).
+		case a != nil && a.Paused:
+			var joined string
+			switch {
+			case tagT != "" && synFull != "":
+				joined = tagT + " \u00b7 " + synFull
+			case tagT != "":
+				joined = tagT
+			default:
+				joined = synFull
+			}
+			act.State = WithStateTime(trimWord(joined, 128-len(pausedMarker)), pausedMarker)
 		default:
-			act.State = synT
+			switch {
+			case tagT != "" && synFull != "":
+				act.State = trimWord(tagT+" \u00b7 "+synFull, 128)
+			case tagT != "":
+				act.State = tagT
+			default:
+				act.State = trimWord(synFull, 128)
+			}
 		}
 	}
 	if strings.HasPrefix(r.Artwork, "http://") || strings.HasPrefix(r.Artwork, "https://") {
@@ -465,5 +574,8 @@ func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
 	}
 	// Otherwise LargeImage stays as BuildActivity produced it ("logo"): an
 	// empty large image is never emitted.
+	if btns := filterButtons(r.Buttons); len(btns) > 0 {
+		act.Buttons = btns
+	}
 	return act
 }

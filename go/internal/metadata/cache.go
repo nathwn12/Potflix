@@ -53,7 +53,7 @@ func resolveCacheDir(dir string) string {
 // cacheSchema versions the on-disk envelope. cacheLoad treats any entry
 // whose Schema differs as a MISS so art/synopsis are refetched (and stale
 // pre-art entries are naturally replaced on the next fetch).
-const cacheSchema = 2
+const cacheSchema = 3
 
 type cacheFile struct {
 	Key    string `json:"key"`
