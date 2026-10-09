@@ -104,7 +104,7 @@ func TestMetadataDirAndScanIndexPath(t *testing.T) {
 // save -> load, and that old stores without the field load tolerant (false).
 func TestConfigStartWithWindowsRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "Potflix", "config.json")
-	want := Config{Dirs: []string{`C:\Media`}, APIKeys: map[string]string{"tmdb": "k"}, StartWithWindows: true}
+	want := Config{Dirs: []string{`C:\Media`}, StartWithWindows: true}
 	if err := saveConfigTo(path, want); err != nil {
 		t.Fatalf("saveConfigTo: %v", err)
 	}
@@ -115,8 +115,8 @@ func TestConfigStartWithWindowsRoundTrip(t *testing.T) {
 	if !got.StartWithWindows {
 		t.Fatalf("round-trip StartWithWindows = false, want true")
 	}
-	if len(got.Dirs) != 1 || got.GetAPIKey("tmdb") != "k" {
-		t.Fatalf("round-trip lost dirs/keys: %+v", got)
+	if len(got.Dirs) != 1 {
+		t.Fatalf("round-trip lost dirs: %+v", got)
 	}
 
 	legacy := filepath.Join(t.TempDir(), "legacy.json")

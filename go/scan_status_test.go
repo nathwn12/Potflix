@@ -227,6 +227,34 @@ func TestScanResultCancelledNeverFails(t *testing.T) {
 	}
 }
 
+// TestScanFailedSuffix proves the counters-owner patch: the failed count
+// shows ONLY when non-zero (a clean line is unchanged), and a run with
+// failures never reports "nothing to fetch".
+func TestScanFailedSuffix(t *testing.T) {
+	// Clean lines are byte-identical to the pre-patch shape.
+	clean := library.Progress{KeysDone: 12, KeysTotal: 24, KeysFetched: 3, KeysCached: 5, FoldersScanned: 4, FoldersSkipped: 2}
+	if got := scanProgressText(clean); got != "Scanning 12/24 keys | 3 fetched - 5 cached | folders: 4 scanned, 2 skipped" {
+		t.Fatalf("clean progress = %q", got)
+	}
+	// Non-zero failures append before the folders pipe.
+	bad := clean
+	bad.KeysFailed = 2
+	if got := scanProgressText(bad); got != "Scanning 12/24 keys | 3 fetched - 5 cached - 2 failed | folders: 4 scanned, 2 skipped" {
+		t.Fatalf("failed progress = %q", got)
+	}
+	st := library.Stats{Keys: 7, KeysCached: 7, KeysFetched: 0, KeysNotFound: 0, Files: 9, FoldersScanned: 4, FoldersSkipped: 3}
+	if got := scanDoneText("Scan", st); got != "Scan complete: nothing to fetch (7 cached) - 3 folders skipped" {
+		t.Fatalf("clean nothing-to-fetch = %q", got)
+	}
+	stBad := st
+	stBad.KeysFailed = 1
+	if got := scanDoneText("Scan", stBad); strings.Contains(got, "nothing to fetch") {
+		t.Fatalf("failed run reports nothing-to-fetch: %q", got)
+	} else if !strings.Contains(got, "1 failed") {
+		t.Fatalf("failed done lacks the suffix: %q", got)
+	}
+}
+
 // TestScanControlState proves the control-state model: idle shows an
 // enabled Scan, a running scan shows Cancel (Refresh disabled), and after
 // the cancelled run lands the control is back to an enabled Scan.

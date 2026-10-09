@@ -1,13 +1,9 @@
 package main
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -17,7 +13,7 @@ import (
 	"potflix/internal/metadata"
 )
 
-// settings_sections.go - the Settings view's LIBRARY + STARTUP sections.
+// settings_sections.go - the Settings view's LIBRARY + SCAN + STARTUP sections.
 //
 // Same owner-drawn window, palette, fonts, DPI scaling, hover/double-buffering
 // as window.go; this file only adds behaviour behind new rect-table ids:
@@ -46,9 +42,11 @@ func clearCacheStatus(titles, records int) string {
 	return fmt.Sprintf("Cleared %d cached titles - %d folder records", titles, records)
 }
 
-// exportBundleStatus maps an Export outcome to the status line.
+// exportBundleStatus maps an Export outcome to the status line. The dest
+// path is unbounded, so the string is capped like every other status line
+// (the painter also ellipsizes, but the cap keeps the string itself sane).
 func exportBundleStatus(entries int, dest string) string {
-	return fmt.Sprintf("Exported %d titles -> %s", entries, dest)
+	return fitScanStatus(fmt.Sprintf("Exported %d titles -> %s", entries, dest))
 }
 
 // importBundleStatus maps an Import outcome to the status line: "skipped"
@@ -135,6 +133,24 @@ func scanSegmentStyle(seg, current string) int {
 	return btnSubtle
 }
 
+// deadCacheCount is the last-measured CountNegatives value shown in the
+// Settings view. Refreshed from disk each time the view opens
+// (refreshDeadCacheCount, called from enterSettings) and never during
+// paint, so WM_PAINT stays I/O-free. UI thread only, like startupState.
+var deadCacheCount int
+
+// deadCacheLabel renders the count as one muted line under the SCAN hint:
+// "N titles marked dead - Clear cache retries them".
+func deadCacheLabel(n int) string {
+	return fmt.Sprintf("%d titles marked dead - Clear cache retries them", n)
+}
+
+// refreshDeadCacheCount re-reads the not-found entry count from the live
+// metadata cache dir.
+func refreshDeadCacheCount() {
+	deadCacheCount = metadata.CountNegatives(MetadataDir())
+}
+
 // onSelectScanSpeed saves profile AND applies it live via SetRateProfile
 // (no restart). The value is normalised first so a bad value can never
 // reach the limiter. Only presence is logged - there is no secret here.
@@ -152,84 +168,6 @@ func onSelectScanSpeed(profile string) {
 	metadata.SetRateProfile(profile)
 	setStatusText("Scan speed: " + scanSegmentLabel(profile))
 	appLogf("settings: scan speed %s", profile)
-}
-
-// ---------------------------------------------------------------------------
-// TMDB key Test button: runs TestTMDBKey off the UI thread (the same
-// goroutine + PostMessage pattern the Scan button uses) and reports in
-// the status line. Empty field is inert.
-// ---------------------------------------------------------------------------
-
-var (
-	tmdbTestMu     sync.Mutex
-	tmdbTestActive bool
-	tmdbTestErr    error
-)
-
-// tmdbTestStatusMessage maps a TestTMDBKey outcome to the status line:
-// OK / rejected / failed with a short reason. Pure so tests drive it.
-func tmdbTestStatusMessage(err error) string {
-	if err == nil {
-		return "TMDB key OK"
-	}
-	if errors.Is(err, metadata.ErrTMDBKeyRejected) {
-		return "TMDB key rejected"
-	}
-	msg := strings.TrimSpace(err.Error())
-	if msg == "" {
-		return "TMDB test failed"
-	}
-	// Keep the status line to one short reason.
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	const maxTMDBReason = 120
-	if len(msg) > maxTMDBReason {
-		msg = msg[:maxTMDBReason] + "..."
-	}
-	return "TMDB test failed: " + msg
-}
-
-// startTMDBTest validates key off the UI thread. Empty field is inert and
-// says so; a second click while a test runs is ignored.
-func startTMDBTest(hwnd uintptr, key string) {
-	if strings.TrimSpace(key) == "" {
-		setStatusText("Enter a TMDB key first.")
-		return
-	}
-	tmdbTestMu.Lock()
-	if tmdbTestActive {
-		tmdbTestMu.Unlock()
-		return
-	}
-	tmdbTestActive = true
-	tmdbTestMu.Unlock()
-	setStatusText("Testing TMDB key...")
-	go func(k string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		err := metadata.TestTMDBKey(ctx, k)
-		// err is already redacted (never carries the key); log outcome only.
-		if err == nil {
-			appLogf("settings: tmdb test ok")
-		} else if errors.Is(err, metadata.ErrTMDBKeyRejected) {
-			appLogf("settings: tmdb test rejected")
-		} else {
-			appLogf("settings: tmdb test failed: %s", err)
-		}
-		tmdbTestMu.Lock()
-		tmdbTestErr = err
-		tmdbTestMu.Unlock()
-		procPostMessageW.Call(hwnd, wmAppTMDBTestDone, 0, 0)
-	}(key)
-}
-
-// onTMDBTestDone lands the worker's result on the UI thread.
-func onTMDBTestDone() {
-	tmdbTestMu.Lock()
-	err := tmdbTestErr
-	tmdbTestErr = nil
-	tmdbTestActive = false
-	tmdbTestMu.Unlock()
-	setStatusText(tmdbTestStatusMessage(err))
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +299,7 @@ func desktopDir() string {
 // confirmClearCache shows the native warning dialog first: Yes deletes,
 // anything else aborts. Counts are pre-delete (bundle.Count + index Len).
 func confirmClearCache(owner uintptr, titles, records int) bool {
-	text := fmt.Sprintf("Delete %d cached titles and the folder scan index (%d folder records)? They will be fetched again from the internet. Your folders and API keys are kept.",
+	text := fmt.Sprintf("Delete %d cached titles and the folder scan index (%d folder records)? They will be fetched again from the internet. Your folders are kept.",
 		titles, records)
 	t, _ := syscall.UTF16PtrFromString(text)
 	c, _ := syscall.UTF16PtrFromString("Potflix - Clear cache")
@@ -559,7 +497,7 @@ func onClearCache(hwnd uintptr) {
 	got, recs, err := clearLibraryCache(meta, idx)
 	if err != nil {
 		appLogf("library: clear failed: %s", err)
-		setStatusText("Clear failed: " + err.Error())
+		setStatusText(fitScanStatus("Clear failed: " + err.Error()))
 		return
 	}
 	appLogf("library: cleared (titles=%d records=%d)", got, recs)
@@ -577,7 +515,7 @@ func onExportBundle(hwnd uintptr) {
 	n, err := exportBundleTo(MetadataDir(), dest, metadata.CacheSchema(), appVersion)
 	if err != nil {
 		appLogf("library: export failed: %s", err)
-		setStatusText("Export failed: " + err.Error())
+		setStatusText(fitScanStatus("Export failed: " + err.Error()))
 		return
 	}
 	appLogf("library: exported (entries=%d)", n)
@@ -596,7 +534,7 @@ func onImportBundle(hwnd uintptr) {
 	st, err := importBundleFrom(MetadataDir(), src, metadata.CacheSchema())
 	if err != nil {
 		appLogf("library: import failed: %s", err)
-		setStatusText("Import failed: " + err.Error())
+		setStatusText(fitScanStatus("Import failed: " + err.Error()))
 		return
 	}
 	appLogf("library: import (added=%d present=%d skipped-schema=%d invalid=%d total=%d)",
