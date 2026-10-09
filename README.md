@@ -60,6 +60,12 @@ cache entry and no connection the card simply shows the clean filename-based
 title. No credentials, no account, nothing personal: the cache holds public
 episode titles only, lives outside the repo, and is never committed.
 
+Data sources and attribution: [TVmaze](https://www.tvmaze.com/) (data under
+CC BY-SA), [AniList](https://anilist.co/), [Jikan](https://jikan.moe/) (an
+unofficial MyAnimeList API), and the Apple
+[iTunes Search API](https://performance-partners.apple.com/search-api).
+Artwork and synopses are linked to, not stored.
+
 ## Use your own Discord app (2 min, for custom name + logo)
 
 1. https://discord.com/developers/applications -> New Application named **Potflix**
