@@ -1,17 +1,17 @@
 # potflix (Go)
 
 Go module `potflix`. Stdlib only, no external modules, no `go.sum`.
-(The only network use is keyless metadata lookups over stdlib `net/http`
-plus optional keyed TMDB when a key is stored; see "Metadata lookup" below.)
+(The only network use is keyless metadata lookups over stdlib `net/http`;
+see "Metadata lookup" below.)
 
 - root package `main` -- the Potflix tray app: single-instance lock, hidden
   tray window, `--selftest`, the PotPlayer poll loop, and the Discord IPC
   client. Win32 is reached through `syscall.NewLazyDLL` / `NewLazyProc`; the
   tray icon is embedded with `//go:embed assets/icon.ico`.
   `config.go` is the settings store (`%LOCALAPPDATA%\Potflix\config.json`:
-  DIRs, API keys, scan speed, startup flag); `window.go` +
+  DIRs, scan speed, startup flag); `window.go` +
   `settings_sections.go` are the tray-resident settings window (folders
-  list, Scan / Refresh, API keys, library export/import/clear, startup,
+  list, Scan / Refresh, library export/import/clear, startup,
   scan-speed segments). Normal launch shows the window; `--selftest` stays
   headless.
 - `internal/discord` -- local Discord IPC pipe transport (`SET_ACTIVITY`,
@@ -23,10 +23,7 @@ plus optional keyed TMDB when a key is stored; see "Metadata lookup" below.)
 - `internal/metadata` -- canonical series/episode titles from free, keyless
   sources (TVmaze, AniList, Jikan, iTunes) with a permanent on-disk cache;
   the poll loop uses the non-blocking `Resolve`, the CLI the blocking
-  `LookupNow` (`Options.Offline` serves cache-only). `tmdb.go` is the
-  optional keyed TMDB source (tried first when a key is stored; any
-  miss/error falls through to the keyless chain); `tmdb_testkey.go` is the
-  one-call key check behind the Settings `Test` button; `ratelimit.go` is
+  `LookupNow` (`Options.Offline` serves cache-only); `ratelimit.go` is
   the per-host fetch-spacing limiter (Gentle 4x / Balanced 2x / Turbo 1x
   the published intervals; unknown hosts ungated).
 - `internal/library` -- the shared walk + resolve loop behind the tray
@@ -69,10 +66,9 @@ plus optional keyed TMDB when a key is stored; see "Metadata lookup" below.)
   (`connected clientId=<redacted>` then `push ack nonce=...`).
 - This session (on disk; human-facing details in the repo `README.md`):
   settings window (`window.go`, `settings_sections.go`, `config.go`),
-  `internal/bundle`, `internal/library` (scan + `scanindex.go`), keyed TMDB
-  (`tmdb.go`, `tmdb_testkey.go`), per-host limiter + scan profiles
-  (`ratelimit.go`), tray `Open Potflix` item + show-on-launch (`tray.go`,
-  `main.go`), `metawarm -index` / `-gate`.
+  `internal/bundle`, `internal/library` (scan + `scanindex.go`), per-host
+  limiter + scan profiles (`ratelimit.go`), tray `Open Potflix` item + show-on-launch
+  (`tray.go`, `main.go`), `metawarm -index` / `-gate`.
 
 | Module | Scope | Status |
 |---|---|---|
@@ -132,12 +128,9 @@ holds public episode titles only, lives outside the repo, and is never
 committed. Diagnose with `go run ./cmd/metacheck [-offline] [-dir <cacheDir>]
 <rawTitle>` (exit 0 when resolved, 1 when not).
 
-With a TMDB key stored (`config.json` `api_keys`, via the Settings view),
-TMDB is tried first per query and any miss/error falls through to the
-keyless chain; the key value is never logged. Fetches are spaced by the
-per-host limiter (`ratelimit.go`): Turbo 1x (default) / Balanced 2x / Gentle
-4x the published provider intervals, switched live from Settings with no
-restart.
+Fetches are spaced by the per-host limiter (`ratelimit.go`): Turbo 1x (default) /
+Balanced 2x / Gentle 4x the published provider intervals, switched live from
+Settings with no restart.
 
 ## Windows exe icon
 
@@ -155,6 +148,6 @@ rsrc -arch amd64 -ico assets\icon.ico -o go\rsrc_windows_amd64.syso
 (`embed.go` / `tray.go`) is untouched - this only adds the file icon.
 
 The deliberate behaviour deviations from the Java reference (window on
-launch, folder scan index, export/import bundle, optional TMDB key, empty
+launch, folder scan index, export/import bundle, empty
 asset text omitted on the wire, clear-on-exit, capped debug log, `READY`
 handshake requirement) are recorded in the repository `README.md`.

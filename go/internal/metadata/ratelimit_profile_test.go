@@ -18,18 +18,21 @@ func TestRateProfileMapping(t *testing.T) {
 			"graphql.anilist.co": 700 * time.Millisecond,
 			"api.jikan.moe":      350 * time.Millisecond,
 			"itunes.apple.com":   3000 * time.Millisecond,
+			"en.wikipedia.org":   1000 * time.Millisecond,
 		},
 		"balanced": {
 			"api.tvmaze.com":     1000 * time.Millisecond,
 			"graphql.anilist.co": 1400 * time.Millisecond,
 			"api.jikan.moe":      700 * time.Millisecond,
 			"itunes.apple.com":   6000 * time.Millisecond,
+			"en.wikipedia.org":   2000 * time.Millisecond,
 		},
 		"gentle": {
 			"api.tvmaze.com":     2000 * time.Millisecond,
 			"graphql.anilist.co": 2800 * time.Millisecond,
 			"api.jikan.moe":      1400 * time.Millisecond,
 			"itunes.apple.com":   12000 * time.Millisecond,
+			"en.wikipedia.org":   4000 * time.Millisecond,
 		},
 	}
 	for _, profile := range []string{"turbo", "balanced", "gentle"} {

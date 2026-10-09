@@ -29,7 +29,15 @@ var (
 	// while the true range stays in the title: take the FIRST number.
 	episodeRangeRe = regexp.MustCompile(`(?i)(?:^|[\s._\-;:\[])(?:Episode|Ep)\.?\s*(\d{1,4})\s*\+\s*\d{1,4}`)
 	// extraRe lists filename-level extras: KindUnknown, never fetched.
-	extraRe = regexp.MustCompile(`(?i)\b(deleted scenes?|trailers?|gallery|alternate endings?|interviews?|behind the scenes|featurettes?|music videos?|samples?|extras?)\b`)
+	// Phrase stems only (never a single common word): each alternative is a
+	// multi-word bonus-feature phrase observed as a 3000 ms wasted iTunes
+	// lookup in the live negative cache (gag/blooper reels, outtakes, tv
+	// spots, extended scenes, behind-the-story, making-of, meet-the-cast,
+	// visual-effects, in-search-of, how-to-survive, previz, production
+	// design, time lapse, secret auditions). Guarded by
+	// TestParseExtrasNoRealTitleCollision: no real title in the same cache
+	// may match.
+	extraRe = regexp.MustCompile(`(?i)\b(deleted scenes?|extended\s+scenes?|trailers?|gallery|alternate endings?|interviews?|behind the scenes|behind\s+the\s+stor(?:y|ies)|featurettes?|music videos?|samples?|extras?|gag\s+reels?|blooper\s+reels?|outtakes?|tv\s+spots?|making\s+of|meet\s+the\s+cast|visual\s+effects|in\s+search\s+of|how\s+to\s+survive|previz|production\s+design|time[\s\-]*lapse|secret\s+auditions?)\b`)
 	// lettersRe and yearOnlyRe detect titles with no usable show/film name:
 	// bare numbers ("01") are unresolvable, a lone year ("2012") is a film.
 	lettersRe  = regexp.MustCompile(`[A-Za-z]`)

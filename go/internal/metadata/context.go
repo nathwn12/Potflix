@@ -32,8 +32,10 @@ var (
 	// ("Deleted Scenes", "Featurettes 5.1", "Trailer", "NCED"). Substring on
 	// word boundaries, mirroring the filename-level extraRe; bare OP/ED are
 	// deliberately absent here ("Speed" must never match - full-match only
-	// in genericFolderRe above).
-	extrasWordRe = regexp.MustCompile(`(?i)\b(deleted\s+scenes?|trailers?|gallery|alternate\s+endings?|interviews?|behind\s+the\s+scenes|featurettes?|music\s+videos?|samples?|extras?|specials?|ncop|nced|\bnc\b)\b`)
+	// in genericFolderRe above). Bonus-phrase stems mirror extraRe so file
+	// and folder levels stay consistent (gag/blooper reels, outtakes, tv
+	// spots, extended scenes, behind-the-story, making-of, ...).
+	extrasWordRe = regexp.MustCompile(`(?i)\b(deleted\s+scenes?|extended\s+scenes?|trailers?|gallery|alternate\s+endings?|interviews?|behind\s+the\s+scenes|behind\s+the\s+stor(?:y|ies)|featurettes?|music\s+videos?|samples?|extras?|specials?|gag\s+reels?|blooper\s+reels?|outtakes?|tv\s+spots?|making\s+of|meet\s+the\s+cast|visual\s+effects|in\s+search\s+of|how\s+to\s+survive|previz|production\s+design|time[\s\-]*lapse|secret\s+auditions?|ncop|nced|\bnc\b)\b`)
 	// qualityTitleRe rejects cleaned folder titles that are bare
 	// numbers/quality tokens, mirroring the Parse floor.
 	qualityTitleRe = regexp.MustCompile(`(?i)^(\d+|1080p|720p|480p|360p|2160p|4k|uhd|bd|bdrip|brrip|10bit|8bit)$`)

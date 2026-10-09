@@ -152,6 +152,43 @@ func (r *Resolver) CacheLive(key string) bool {
 	return CacheLive(r.dir, key)
 }
 
+// CountNegatives reports how many not-found (dead) entries the cache holds
+// under dir ("" resolves to the default cache dir, mirroring New). Only
+// well-formed current-schema negative entries count; positive entries,
+// corrupt files, temp files, and a missing dir count zero, never an error.
+// The Settings view shows this so the owner knows Clear cache will retry
+// those titles.
+func CountNegatives(dir string) int {
+	d := resolveCacheDir(dir)
+	if d == "" {
+		return 0
+	}
+	entries, err := os.ReadDir(d)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasPrefix(name, ".tmp-") {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(d, name))
+		if err != nil {
+			continue
+		}
+		var cf cacheFile
+		if err := json.Unmarshal(data, &cf); err != nil {
+			continue
+		}
+		if cf.Schema != cacheSchema || !cf.NotFound {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 type cacheFile struct {
 	Key       string    `json:"key"`
 	Schema    int       `json:"schema"`

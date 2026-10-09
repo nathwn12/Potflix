@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -37,11 +38,35 @@ const alreadyRunningMsg = "Potflix is already running."
 // a miss or error falls back to today's clean card (zero Resolved).
 var metaResolver *metadata.Resolver
 
-// liveConfig is the current settings store for keyed metadata sources. It
-// is loaded once at startup and refreshed on every Settings save, so a key
-// takes effect without a restart. Key VALUES never reach the log; the
-// KeyProvider below only hands them to the resolver, which never logs them.
+// liveConfig is the current settings store. It is loaded once at startup
+// and refreshed on every Settings save.
 var liveConfig atomic.Pointer[Config]
+
+// previewMu guards previewCard: the EXACT Activity last handed to the
+// Discord pipe (the gate-anchored output on a Send verdict). The Card view
+// reads this recorded value verbatim - it never rebuilds the payload for
+// display (preview-is-the-payload).
+var (
+	previewMu   sync.Mutex
+	previewCard presence.Activity
+	previewHave bool
+)
+
+// recordPreview stores the exact card handed to SetActivity. It is called
+// only on a Send verdict, with the gate-anchored output.
+func recordPreview(out presence.Activity) {
+	previewMu.Lock()
+	previewCard, previewHave = out, true
+	previewMu.Unlock()
+}
+
+// previewActivity returns the last sent card, or false when nothing was
+// sent yet this run (the Card view then shows its waiting placeholder).
+func previewActivity() (presence.Activity, bool) {
+	previewMu.Lock()
+	defer previewMu.Unlock()
+	return previewCard, previewHave
+}
 
 // metaTitleCache remembers the folder-aware query for the current raw title so
 // player.CurrentFile (bounded ~800ms inside) runs at most once per title
@@ -148,18 +173,9 @@ func runUI(log *logger) {
 	metadata.SetRateProfile(cfg.EffectiveScanSpeed())
 	log.logf("scan speed profile: %s", cfg.EffectiveScanSpeed())
 	metaResolver = metadata.New(metadata.Options{
-		// Default cache dir + sources; Logf carries source names/timeouts
-		// only, never secrets (the resolver never sees any key VALUE in a
-		// log line - tmdbSource redacts its errors, and this provider only
-		// reads the stored key).
+		// Default cache dir + keyless sources; Logf carries source
+		// names/timeouts only, never secrets.
 		Logf: func(format string, args ...any) { log.logf(format, args...) },
-		KeyProvider: func(p string) string {
-			c := liveConfig.Load()
-			if c == nil {
-				return ""
-			}
-			return c.GetAPIKey(p)
-		},
 	})
 	go pollLoop(log, dc)
 
@@ -321,6 +337,7 @@ func presenceButtons(in []presence.Button) []discord.ActivityButton {
 // Discord's own reply (ack or ERROR) is logged by the client's OnReply handler.
 func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle string, a *presence.Action, ct, total, now int64, event, debounced bool) {
 	card := presence.BuildActivity(rawTitle, a)
+	var res presence.Resolved
 	if metaResolver != nil {
 		// Non-blocking: a miss fires at most one background fetch per key
 		// (single-flight inside the resolver) and returns Found=false, so
@@ -328,12 +345,21 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		// Unknown kinds (themes, extras, bare names) never fetch or cache.
 		if q := metaQueryFor(rawTitle); q.Kind != metadata.KindUnknown {
 			if r, err := metaResolver.Resolve(context.Background(), q); err == nil && r.Found {
-				card = presence.BuildActivityResolved(rawTitle, a, presence.Resolved{
+				res = presence.Resolved{
 					Series: r.Series, EpisodeName: r.Episode, Artwork: r.Artwork, Synopsis: r.Synopsis,
 					Genres: r.Genres, Length: r.Length, Year: r.Year, IsMovie: r.IsMovie,
 					Buttons: metadataButtons(r.Buttons),
-				})
+				}
+				card = presence.BuildActivityResolved(rawTitle, a, res)
 			}
+		}
+	}
+	// Card view spec: the owner's Details/State preset choice. The default
+	// spec reproduces BuildActivityResolved byte-for-byte, so a default
+	// store skips the second build entirely and the sent card is unchanged.
+	if cfg := liveConfig.Load(); cfg != nil {
+		if spec := cfg.EffectiveCardSpec(); !spec.IsDefault() {
+			card.Details, card.State = spec.Render(rawTitle, a, res)
 		}
 	}
 	out, verdict := gate.Decide(card, ct, total, now, event, debounced)
@@ -354,6 +380,9 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		return
 	}
 	log.eventPush(out.Details, out.State, ct, total)
+	// Preview-is-the-payload: record the exact value handed to the pipe, so
+	// the Card view reads what was SENT, never a rebuilt copy.
+	recordPreview(out)
 	if err := dc.SetActivity(discord.Activity{
 		Name:       out.Name,
 		Details:    out.Details,

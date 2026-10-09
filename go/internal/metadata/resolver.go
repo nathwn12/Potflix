@@ -2,11 +2,22 @@ package metadata
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// ErrLookupUnavailable is the sentinel for a transient provider failure
+// (timeout, 429, DNS, outage, any source error): the lookup could not be
+// completed, so the outcome is unknown - it is NOT a confirmed miss. A
+// definitive miss (every source answered and none has the title) returns a
+// nil error with Found=false and persists a negative; a transient failure
+// returns this sentinel (wrapping the underlying cause when available) and
+// persists nothing. Callers must never bin it as not-found.
+var ErrLookupUnavailable = errors.New("metadata lookup unavailable")
 
 // negativeBackoff keeps a failed key from being hammered. In-memory only;
 // the on-disk cache stays additive forever.
@@ -33,44 +44,17 @@ func makeDefaultSources(timeout time.Duration) []Source {
 		&anilistSource{base: "https://graphql.anilist.co", client: c},
 		&jikanSource{base: "https://api.jikan.moe/v4", client: c},
 		&itunesSource{base: "https://itunes.apple.com", client: c},
+		&wikipediaSource{base: "https://en.wikipedia.org", client: c},
 	}
 }
 
-// makeDefaultSourcesWithKeys prepends the keyed TMDB source at the FRONT
-// when KeyProvider yields a non-blank tmdb key; with a nil provider or a
-// blank key the list is exactly makeDefaultSources (byte-identical order).
-func makeDefaultSourcesWithKeys(timeout time.Duration, kp func(provider string) string) []Source {
-	key := ""
-	if kp != nil {
-		key = strings.TrimSpace(kp("tmdb"))
-	}
-	if key == "" {
-		return makeDefaultSources(timeout)
-	}
-	c := newHTTPClient(timeout)
-	return []Source{
-		&tmdbSource{base: "https://api.themoviedb.org", key: key, client: c},
-		&tvmazeSource{base: "https://api.tvmaze.com", client: c},
-		&anilistSource{base: "https://graphql.anilist.co", client: c},
-		&jikanSource{base: "https://api.jikan.moe/v4", client: c},
-		&itunesSource{base: "https://itunes.apple.com", client: c},
-	}
+// DefaultSources returns the built-in keyless providers (TVmaze, AniList,
+// Jikan, iTunes, Wikipedia) in their historical order.
+func DefaultSources() []Source {
+	return makeDefaultSources(0)
 }
 
-// DefaultSources returns the built-in providers. Ordering by Kind is handled
-// by the Resolver. An optional KeyProvider prepends the keyed TMDB source
-// when it yields a non-blank tmdb key; without one the list is exactly the
-// historical keyless order.
-func DefaultSources(keyProvider ...func(provider string) string) []Source {
-	var kp func(provider string) string
-	if len(keyProvider) > 0 {
-		kp = keyProvider[0]
-	}
-	return makeDefaultSourcesWithKeys(0, kp)
-}
-
-// New builds a Resolver. A nil Sources list selects DefaultSources() with
-// the Options KeyProvider applied.
+// New builds a Resolver. A nil Sources list selects DefaultSources().
 func New(opts Options) *Resolver {
 	timeout := opts.Timeout
 	if timeout <= 0 {
@@ -78,7 +62,7 @@ func New(opts Options) *Resolver {
 	}
 	srcs := opts.Sources
 	if srcs == nil {
-		srcs = makeDefaultSourcesWithKeys(timeout, opts.KeyProvider)
+		srcs = makeDefaultSources(timeout)
 	}
 	cp := make([]Source, len(srcs))
 	copy(cp, srcs)
@@ -106,17 +90,15 @@ func (r *Resolver) orderedSources(q Query) []Source {
 	var pref map[string]int
 	switch {
 	case q.Kind == KindMovie:
-		// TMDB first when keyed (it is only ever present then); the
-		// keyless order behind it is untouched.
-		pref = map[string]int{"tmdb": 0, "itunes": 1}
+		pref = map[string]int{"itunes": 0, "wikipedia": 1}
 	default:
 		// TVmaze first for every series query: its season/episode tables
 		// are authoritative, while AniList streamingEpisodes are mislabeled
 		// for absolute anime numbering (Re:ZERO media 21355 serves 51-66
 		// for an episode-1 query - a wrong title is worse than no title)
 		// and Jikan is rate-limited. This holds for Absolute and for
-		// !Absolute alike. A keyed TMDB source outranks all of them.
-		pref = map[string]int{"tmdb": 0, "tvmaze": 1, "anilist": 2, "jikan": 3}
+		// !Absolute alike.
+		pref = map[string]int{"tvmaze": 0, "anilist": 1, "jikan": 2}
 	}
 	out := make([]Source, len(r.sources))
 	copy(out, r.sources)
@@ -147,13 +129,17 @@ func mediaAnswers(m *Media, q Query) bool {
 	return ok
 }
 
-func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool) {
+func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool, error) {
 	sawError := false
+	var firstErr error
 	for _, s := range r.orderedSources(q) {
 		m, err := s.Find(ctx, q)
 		if err != nil {
 			r.log("metadata: source %s error: %v", s.Name(), err)
 			sawError = true
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
 		if m == nil {
@@ -163,10 +149,10 @@ func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool) {
 			m.Source = s.Name()
 		}
 		if m.Kind == KindMovie || q.Kind == KindMovie {
-			return m, true
+			return m, true, nil
 		}
 		if _, ok := matchEpisode(m.Episodes, q); ok {
-			return m, true
+			return m, true, nil
 		}
 		// The show matched but its Numbers lack the requested episode:
 		// fall through to the next source rather than caching/returning
@@ -174,12 +160,12 @@ func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool) {
 		r.log("metadata: source %s lacks episode %d for %q, trying next", s.Name(), q.Episode, q.Title)
 	}
 	if sawError {
-		return nil, false
+		return nil, false, firstErr
 	}
 	if ctx.Err() != nil {
-		return nil, false
+		return nil, false, ctx.Err()
 	}
-	return nil, true
+	return nil, true, nil
 }
 
 // matchEpisode is number-exact: only Number == q.Episode (plus
@@ -357,7 +343,7 @@ func (r *Resolver) Resolve(ctx context.Context, q Query) (Resolution, error) {
 func (r *Resolver) backgroundFetch(q Query, key string, done chan struct{}) {
 	fetchCtx, cancel := context.WithTimeout(context.Background(), r.timeout*4)
 	defer cancel()
-	m, definitive := r.fetchMedia(fetchCtx, q)
+	m, definitive, _ := r.fetchMedia(fetchCtx, q)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	defer close(done)
@@ -470,7 +456,15 @@ func (r *Resolver) LookupNowForceSrc(ctx context.Context, q Query, force bool) (
 				// Served by a concurrent fetch, not the cache.
 				return resolveFromMedia(m, q), false, nil
 			}
-			return Resolution{}, false, nil
+			if exp, ok := r.neg[key]; ok && time.Now().Before(exp) {
+				// The owning fetch confirmed the miss (it recorded
+				// suppression before releasing the joiners).
+				return Resolution{}, false, nil
+			}
+			// The owning fetch ended without an answer and without
+			// recording a miss: its outcome was transient, so this
+			// join is transient too - never a confirmed not-found.
+			return Resolution{}, false, fmt.Errorf("metadata: concurrent fetch failed transiently for %q: %w", key, ErrLookupUnavailable)
 		case <-ctx.Done():
 			return Resolution{}, false, ctx.Err()
 		}
@@ -479,7 +473,7 @@ func (r *Resolver) LookupNowForceSrc(ctx context.Context, q Query, force bool) (
 	r.inflight[key] = done
 	r.mu.Unlock()
 
-	m, definitive := r.fetchMedia(ctx, q)
+	m, definitive, fetchErr := r.fetchMedia(ctx, q)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -498,11 +492,15 @@ func (r *Resolver) LookupNowForceSrc(ctx context.Context, q Query, force bool) (
 		if !definitive {
 			// Transient provider error/timeout: not a confirmed
 			// not-found, so persist nothing and suppress nothing.
-			// A valid positive on disk is left intact (F3).
+			// A valid positive on disk is left intact (F3). The
+			// sentinel keeps this distinguishable from a miss.
 			if force && hadPrevNeg {
 				r.neg[key] = prevNeg
 			}
-			return Resolution{}, false, nil
+			if fetchErr != nil {
+				return Resolution{}, false, fmt.Errorf("metadata: transient lookup failure for %q (%v): %w", key, fetchErr, ErrLookupUnavailable)
+			}
+			return Resolution{}, false, fmt.Errorf("metadata: transient lookup failure for %q: %w", key, ErrLookupUnavailable)
 		}
 		r.neg[key] = time.Now().Add(negativeBackoff)
 		if err := cacheStoreNegative(r.dir, key); err != nil {
