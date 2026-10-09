@@ -245,7 +245,7 @@ func createMainWindow() error {
 		return callErr
 	}
 
-	// Fixed 460x580 logical client; grow to a window rect for the frame.
+	// Fixed 460x680 logical client; grow to a window rect for the frame.
 	dpi := systemDpi()
 	cw := scalePx(int32(dpi), mainClientW)
 	ch := scalePx(int32(dpi), mainClientH)
@@ -1018,11 +1018,12 @@ func doSettingsAction(hwnd uintptr, id int) {
 var cardSpecState presence.CardSpec
 
 // cardLayout is the hit-test table for the Card view: the preview card with
-// its five value rows, Back, and the 8 preset buttons. Computed purely from
-// client size + DPI + spec (no syscalls), so tests drive it directly.
+// its value rows (five in rows plus the tooltip pitch slot), Back, and the
+// 8 preset buttons. Computed purely from client size + DPI + spec (no
+// syscalls), so tests drive it directly.
 type cardLayout struct {
 	preview rect
-	rows    []rect // five preview value rows inside preview
+	rows    []rect // five preview value rows inside preview (tooltip is the sixth pitch slot)
 	status  rect
 	btns    []uiButton // Back + 4 Details + 4 State presets
 }
@@ -1107,6 +1108,20 @@ func previewRows(act presence.Activity, have bool) [5]string {
 	}
 }
 
+// previewTooltip renders the recorded payload's poster hover tooltip
+// (presence.Activity.LargeText, the full short synopsis) in the same
+// "Label: value" style as previewRows. Placeholder when nothing was sent
+// yet. Pure so tests drive it without a live pipe.
+func previewTooltip(act presence.Activity, have bool) string {
+	if !have {
+		return "Tooltip: -"
+	}
+	if act.LargeText == "" {
+		return "Tooltip: -"
+	}
+	return "Tooltip: " + act.LargeText
+}
+
 // computeCardLayout builds the Card-view hit-test table for the given
 // client size, DPI, and spec (the spec only flips preset button styles).
 // Sections stack with gaps: Back/title, preview card, LINE 1 row, LINE 2
@@ -1121,9 +1136,10 @@ func computeCardLayout(cw, ch int32, dpi int, spec presence.CardSpec) cardLayout
 	back := rect{left: margin, top: sc(16), right: margin + backW, bottom: sc(16) + backH}
 
 	// Preview region: rows stack from top+pad and must end by bottom-pad.
-	// Short content draws the five fixed single-line rows (l.rows); long
-	// values wrap in boxes measured with the real HDC at paint time (see
-	// paintPreviewRows), so the region is tall enough for real payloads.
+	// Short content draws the fixed single-line rows (l.rows plus the
+	// tooltip slot in cardTextRects); long values wrap in boxes measured
+	// with the real HDC at paint time (see paintPreviewRows), so the
+	// region is tall enough for real payloads.
 	prevTop, prevBottom := sc(100), sc(400)
 	prevPad := sc(10)
 	rowH, rowPitch := sc(20), sc(22)
@@ -1167,8 +1183,9 @@ func computeCardLayout(cw, ch int32, dpi int, spec presence.CardSpec) cardLayout
 }
 
 // cardTextRects returns every text rect the card paint draws: title, preview
-// label, the five value rows, the two line labels, the preset buttons, the
-// hint, and status. Pure (no syscalls) so tests drive it at any DPI.
+// label, the six value rows (five payload rows + tooltip), the two line
+// labels, the preset buttons, the hint, and status. Pure (no syscalls) so
+// tests drive it at any DPI.
 func cardTextRects(cw, ch int32, dpi int, l cardLayout) []namedTextRect {
 	sc := func(v int32) int32 { return scalePx(int32(dpi), v) }
 	out := []namedTextRect{
@@ -1180,6 +1197,17 @@ func cardTextRects(cw, ch int32, dpi int, l cardLayout) []namedTextRect {
 	}
 	for i, r := range l.rows {
 		out = append(out, namedTextRect{id: fmt.Sprintf("card.row-%d", i), rc: r})
+	}
+	// Tooltip row: the sixth pitch slot inside the preview region, in the
+	// same single-line geometry as l.rows (live paint stacks it sixth via
+	// paintPreviewRows, so single-line positions agree exactly).
+	{
+		margin, prevTop, prevPad := sc(mainMargin), sc(100), sc(10)
+		rowH, rowPitch := sc(20), sc(22)
+		tipTop := prevTop + prevPad + 5*rowPitch
+		out = append(out, namedTextRect{id: "card.row-5",
+			rc: rect{left: margin + prevPad, top: tipTop,
+				right: cw - margin - prevPad, bottom: tipTop + rowH}})
 	}
 	for _, b := range l.btns {
 		out = append(out, namedTextRect{id: fmt.Sprintf("card.btn-%d", b.id), rc: b.rc})
@@ -1379,15 +1407,27 @@ func formatScanCount(n int) string {
 	return s
 }
 
-// fitScanStatus caps s to maxScanStatusLen, preserving the "folders:" suffix
-// so the folder counts are never truncated away. Typical compact-count
-// strings never reach the cap; it only bites for pathological inputs.
+// fitScanStatus caps s to maxScanStatusLen, preserving the "folders"
+// suffix so the folder counts are never truncated away. Typical
+// compact-count strings never reach the cap; it only bites for
+// pathological inputs.
 func fitScanStatus(s string) string {
 	if len(s) <= maxScanStatusLen {
 		return s
 	}
-	if i := strings.Index(s, "folders:"); i >= 0 {
-		tail := s[i:]
+	if i := strings.Index(s, "folders"); i >= 0 {
+		// Back up over the "N/M " counts pair so the preserved suffix
+		// keeps the numbers, not just the word (the backup is capped so
+		// a digits-only line cannot swallow the head).
+		j := i
+		for j > 0 && i-j < 24 {
+			c := s[j-1]
+			if c != '/' && c != ' ' && (c < '0' || c > '9') {
+				break
+			}
+			j--
+		}
+		tail := s[j:]
 		keep := maxScanStatusLen - len(tail) - len("...")
 		if keep > 20 {
 			return s[:keep] + "..." + tail
@@ -1396,36 +1436,42 @@ func fitScanStatus(s string) string {
 	return s[:maxScanStatusLen-len("...")] + "..."
 }
 
-// scanProgressText maps a library.Progress to the live status line. Pure so
-// tests drive it without a live window.
+// scanProgressText maps a library.Progress to the live status line: the X/Y
+// key progress first, then the fetched/cached counts, the failed count ONLY
+// when non-zero, then the folders pair (scanned/skipped, in that order).
+// Short separators and the "N/M folders" pair keep the whole line inside
+// the 420 px status rect at 96 DPI. Pure so tests drive it without a live
+// window.
 func scanProgressText(p library.Progress) string {
 	// The failed count shows ONLY when non-zero, so a clean line is unchanged.
 	failed := ""
 	if p.KeysFailed > 0 {
-		failed = fmt.Sprintf(" - %s failed", formatScanCount(p.KeysFailed))
+		failed = fmt.Sprintf(", %s failed", formatScanCount(p.KeysFailed))
 	}
-	return fitScanStatus(fmt.Sprintf("Scanning %s/%s keys | %s fetched - %s cached%s | folders: %s scanned, %s skipped",
+	return fitScanStatus(fmt.Sprintf("Scan %s/%s keys | %s fetched, %s cached%s | %s/%s folders",
 		formatScanCount(p.KeysDone), formatScanCount(p.KeysTotal),
 		formatScanCount(p.KeysFetched), formatScanCount(p.KeysCached), failed,
 		formatScanCount(p.FoldersScanned), formatScanCount(p.FoldersSkipped)))
 }
 
-// scanDoneText maps kind ("Scan"/"Refresh") + stats to the final summary.
-// Pure so tests drive it without a live window.
+// scanDoneText maps kind ("Scan"/"Refresh") + stats to the final summary:
+// total keys, the cached/fetched buckets, the failed count ONLY when
+// non-zero, then the folders pair (scanned/skipped, in that order). The
+// not-found and file counts stay in the debug log line (onScanDone), not on
+// the 420 px status line. Pure so tests drive it without a live window.
 func scanDoneText(kind string, s library.Stats) string {
 	if s.KeysFetched == 0 && s.KeysNotFound == 0 && s.KeysFailed == 0 && s.FoldersSkipped > 0 {
-		return fitScanStatus(fmt.Sprintf("%s complete: nothing to fetch (%s cached) - %s folders skipped",
+		return fitScanStatus(fmt.Sprintf("%s done: nothing to fetch (%s cached) - %s folders skipped",
 			kind, formatScanCount(s.KeysCached), formatScanCount(s.FoldersSkipped)))
 	}
 	// The failed count shows ONLY when non-zero, so a clean line is unchanged.
 	failed := ""
 	if s.KeysFailed > 0 {
-		failed = fmt.Sprintf(" - %s failed", formatScanCount(s.KeysFailed))
+		failed = fmt.Sprintf(", %s failed", formatScanCount(s.KeysFailed))
 	}
-	return fitScanStatus(fmt.Sprintf("%s complete: %s keys - %s cached - %s fetched - %s not found%s | %s files - folders: %s scanned, %s skipped",
+	return fitScanStatus(fmt.Sprintf("%s done: %s keys - %s cached, %s fetched%s - %s/%s folders",
 		kind, formatScanCount(s.Keys), formatScanCount(s.KeysCached), formatScanCount(s.KeysFetched),
-		formatScanCount(s.KeysNotFound), failed, formatScanCount(s.Files),
-		formatScanCount(s.FoldersScanned), formatScanCount(s.FoldersSkipped)))
+		failed, formatScanCount(s.FoldersScanned), formatScanCount(s.FoldersSkipped)))
 }
 
 // scanCancelledText renders the user-cancel summary: done/total unique-key
@@ -1904,6 +1950,7 @@ func paintCardView(hdc uintptr, rc rect, dpi int) {
 	l := computeCardLayout(cw, ch, dpi, cardSpecState)
 	act, have := previewActivity()
 	rows := previewRows(act, have)
+	full := []string{rows[0], rows[1], rows[2], rows[3], rows[4], previewTooltip(act, have)}
 
 	// Title + section labels.
 	drawUIText(hdc, "card.title", "Card",
@@ -1913,11 +1960,12 @@ func paintCardView(hdc uintptr, rc rect, dpi int) {
 		rect{left: sc(20), top: sc(80), right: cw - sc(20), bottom: sc(98)},
 		dtLeft|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, sectionFont, colMuted)
 
-	// Preview card: the five value rows. Short content draws the fixed
-	// single-line geometry (l.rows, matching cardTextRects); long values
-	// wrap in boxes measured with the real HDC (see paintPreviewRows), so
-	// the exact sent strings never overflow or overlap.
-	paintPreviewRows(hdc, dpi, l.preview, rows, sectionFont)
+	// Preview card: the six value rows (five payload rows + tooltip). Short
+	// content draws the fixed single-line geometry (l.rows plus the tooltip
+	// slot, matching cardTextRects); long values wrap in boxes measured with
+	// the real HDC (see paintPreviewRows), so the exact sent strings never
+	// overflow or overlap.
+	paintPreviewRows(hdc, dpi, l.preview, full, sectionFont)
 
 	// Preset rows.
 	drawUIText(hdc, "card.details", "LINE 1 - DETAILS",
@@ -2019,7 +2067,7 @@ func breakRow(hdc uintptr, s string, w int32) string {
 	return strings.Join(lines, "\n")
 }
 
-// paintPreviewRows draws the five preview value rows stacked from the top of
+// paintPreviewRows draws the preview value rows stacked from the top of
 // the preview region, then the card background around the used extent (the
 // background is not a text span, so its size never reaches the audit).
 // Each row is single-line with dtEndEllipsis when its real extent fits, and
@@ -2028,7 +2076,7 @@ func breakRow(hdc uintptr, s string, w int32) string {
 // measurement) and no overlaps (rows stack with gaps inside the region).
 // Rows that would pass the region cap are clamped with an ellipsis and the
 // audit then correctly flags that pathological case.
-func paintPreviewRows(hdc uintptr, dpi int, region rect, rows [5]string, font uintptr) {
+func paintPreviewRows(hdc uintptr, dpi int, region rect, rows []string, font uintptr) {
 	sc := func(v int32) int32 { return scalePx(int32(dpi), v) }
 	pad, rowH, gap := sc(10), sc(20), sc(2)
 	w := region.right - region.left - pad*2
@@ -2208,11 +2256,13 @@ func strokeRoundRect(hdc uintptr, rc rect, color uintptr, radius int32) {
 // drawUIText paints one line of text in the given font/color/alignment.
 // Callers pass a stable audit id (e.g. "main.status"); when the live audit
 // is armed the real-HDC extent is measured and recorded under that id.
+// The draw format rides along so the audit can tell deliberate ellipsis
+// truncation ("trimmed") from a real out-of-bounds draw ("overflow").
 func drawUIText(hdc uintptr, id, s string, rc rect, format uintptr, font uintptr, color uintptr) {
 	procSetTextColor.Call(hdc, color)
 	oldFont, _, _ := procSelectObject.Call(hdc, font)
 	if uiAuditOn {
-		auditSingleLine(hdc, id, s, rc)
+		auditSingleLine(hdc, id, s, rc, format)
 	}
 	p, _ := syscall.UTF16PtrFromString(s)
 	box := rc
@@ -2283,8 +2333,11 @@ func appLogf(format string, args ...any) {
 //
 // During paint, each drawUIText/drawUITextWrapped call records its id, rect,
 // and text; single-line extents come from GetTextExtentPoint32W, wrapped
-// heights from DrawTextW+DT_CALCRECT. Overflows log immediately as
-// "UI-AUDIT <id> overflow need=WxH rect=WxH text=..."; at the end of the
+// heights from DrawTextW+DT_CALCRECT. Single-line draws that exceed their
+// rect log "UI-AUDIT <id> overflow need=WxH rect=WxH text=..." only when
+// drawn WITHOUT an ellipsis flag; deliberately-ellipsized draws log
+// "UI-AUDIT <id> trimmed ..." instead (informational, never a violation).
+// Wrapped-box overflows still log "overflow". At the end of the
 // paint pass every recorded pair is checked for intersection and logs
 // "UI-AUDIT <idA> overlaps <idB> rect=...". Declared here (not win32.go) to
 // keep this change inside window.go.
@@ -2352,9 +2405,28 @@ func rectsIntersect(a, b rect) bool {
 	return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
 }
 
+// auditSingleLineVerdict classifies a measured single-line extent against
+// its rect without any syscalls, so tests drive it directly: "" when the
+// extent fits; "trimmed" when an ellipsis flag lets GDI truncate the text
+// (deliberate, informational, never a violation); "overflow" when no
+// ellipsis flag is set and the text would paint out of bounds (the real
+// violation class the gate must keep catching).
+func auditSingleLineVerdict(needW, needH, rectW, rectH int32, ellipsis bool) string {
+	if needW <= rectW && needH <= rectH {
+		return ""
+	}
+	if ellipsis {
+		return "trimmed"
+	}
+	return "overflow"
+}
+
 // auditSingleLine measures s with the REAL HDC and currently-selected font
-// and logs when the extent exceeds rc. Caller has already selected font.
-func auditSingleLine(hdc uintptr, id, s string, rc rect) {
+// and logs when the extent exceeds rc: "overflow" only when drawn WITHOUT
+// an ellipsis flag (dtEndEllipsis lets GDI truncate instead, so those draws
+// log "trimmed" - informational, never a violation). Caller has already
+// selected font.
+func auditSingleLine(hdc uintptr, id, s string, rc rect, format uintptr) {
 	if s == "" {
 		return
 	}
@@ -2375,7 +2447,10 @@ func auditSingleLine(hdc uintptr, id, s string, rc rect) {
 		return
 	}
 	w, h := rc.right-rc.left, rc.bottom-rc.top
-	if sz.cx > w || sz.cy > h {
+	switch auditSingleLineVerdict(sz.cx, sz.cy, w, h, format&dtEndEllipsis != 0) {
+	case "trimmed":
+		appLogf("UI-AUDIT %s trimmed need=%dx%d rect=%dx%d text=%q", id, sz.cx, sz.cy, w, h, s)
+	case "overflow":
 		appLogf("UI-AUDIT %s overflow need=%dx%d rect=%dx%d text=%q", id, sz.cx, sz.cy, w, h, s)
 	}
 	uiAuditSpans = append(uiAuditSpans, uiAuditSpan{id: id, rc: rc, text: s})

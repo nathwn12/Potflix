@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"potflix/internal/discord"
 	"potflix/internal/metadata"
 	"potflix/internal/presence"
 )
@@ -291,6 +293,258 @@ func TestPreviewRecord(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("previewActivity = %+v, want %+v", got, want)
+	}
+}
+
+type previewWire struct {
+	Cmd  string `json:"cmd"`
+	Args struct {
+		Activity *struct {
+			Name    string `json:"name"`
+			Details string `json:"details"`
+			State   string `json:"state"`
+			Assets  *struct {
+				LargeImage string `json:"large_image"`
+				LargeText  string `json:"large_text"`
+				SmallImage string `json:"small_image"`
+				SmallText  string `json:"small_text"`
+			} `json:"assets"`
+			Timestamps *struct {
+				Start *int64 `json:"start"`
+				End   *int64 `json:"end"`
+			} `json:"timestamps"`
+			Buttons []struct {
+				Label string `json:"label"`
+				URL   string `json:"url"`
+			} `json:"buttons"`
+		} `json:"activity"`
+	} `json:"args"`
+}
+
+// TestPreviewIsPayloadThroughSend is the load-bearing preview-is-the-payload
+// proof (negative control verified, see REPORT): it drives the REAL pushActivity over the in-process fake pipe,
+// captures the actual SET_ACTIVITY frame on the wire, and asserts the
+// previewed presence.Activity equals that wire payload field-for-field.
+// A rebuild-for-display could drift from the sent card; this test fails on
+// any such divergence (verified by negative control: mutating either side
+// breaks it). It covers both the default spec (BuildActivity path) and a
+// non-default spec (Render override path).
+func TestPreviewIsPayloadThroughSend(t *testing.T) {
+	previewMu.Lock()
+	oldCard, oldHave := previewCard, previewHave
+	previewMu.Unlock()
+	defer func() {
+		previewMu.Lock()
+		previewCard, previewHave = oldCard, oldHave
+		previewMu.Unlock()
+	}()
+	oldCfg := liveConfig.Load()
+	oldResolver := metaResolver
+	defer func() {
+		if oldCfg != nil {
+			liveConfig.Store(oldCfg)
+		} else {
+			liveConfig.Store(&Config{})
+		}
+		metaResolver = oldResolver
+	}()
+	metaResolver = nil
+
+	srv := discord.NewFakeServer(0)
+	accept := make(chan *discord.FakeConn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		sc, err := srv.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accept <- sc
+	}()
+	dc := discord.New(discord.Config{
+		ClientID:   "123456789012345678",
+		PipeBase:   srv.Base,
+		RetryDelay: 30 * time.Millisecond,
+	})
+	dc.Start()
+	t.Cleanup(func() { dc.Close() })
+	var sc *discord.FakeConn
+	select {
+	case sc = <-accept:
+	case err := <-acceptErr:
+		t.Fatalf("fake server accept: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("client did not connect to the fake pipe")
+	}
+	defer sc.Close()
+	if op, _, err := sc.ReadFrame(); err != nil || op != discord.OpHandshake {
+		t.Fatalf("handshake: op=%d err=%v", op, err)
+	}
+	if err := sc.WriteFrame(discord.OpFrame, []byte(`{"cmd":"DISPATCH","evt":"READY","data":{"v":1}}`)); err != nil {
+		t.Fatalf("write READY: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for dc.Generation() < 1 {
+		if time.Now().After(deadline) {
+			t.Fatal("client never became ready after READY")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	frames := make(chan []byte, 32)
+	go func() {
+		for {
+			op, payload, err := sc.ReadFrame()
+			if err != nil {
+				return
+			}
+			if op == discord.OpFrame {
+				frames <- payload
+			}
+		}
+	}()
+
+	drive := func(raw string, act *presence.Action, spec presence.CardSpec, ct, total, now int64) (presence.Activity, previewWire) {
+		previewMu.Lock()
+		previewCard, previewHave = presence.Activity{}, false
+		previewMu.Unlock()
+		liveConfig.Store(&Config{Card: spec})
+		lg := newLogger(filepath.Join(t.TempDir(), "preview-payload.log"), 0, 1)
+		defer lg.Close()
+		gate := &presence.Gate{}
+		pushActivity(lg, dc, gate, raw, act, ct, total, now, true, false)
+		select {
+		case payload := <-frames:
+			var w previewWire
+			if err := json.Unmarshal(payload, &w); err != nil {
+				t.Fatalf("decode frame %s: %v", payload, err)
+			}
+			if w.Cmd != "SET_ACTIVITY" || w.Args.Activity == nil {
+				t.Fatalf("unexpected frame: %s", payload)
+			}
+			got, have := previewActivity()
+			if !have {
+				t.Fatalf("preview have=false after successful send, want true")
+			}
+			return got, w
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no SET_ACTIVITY frame for %q", raw)
+			return presence.Activity{}, previewWire{}
+		}
+	}
+	check := func(got presence.Activity, w previewWire) {
+		act := w.Args.Activity
+		if got.Name != act.Name || got.Details != act.Details || got.State != act.State {
+			t.Fatalf("preview (Name=%q Details=%q State=%q) != wire (Name=%q Details=%q State=%q) preview=%+v wire=%+v",
+				got.Name, got.Details, got.State, act.Name, act.Details, act.State, got, act)
+		}
+		if act.Assets == nil {
+			t.Fatalf("wire assets missing: %+v", act)
+		}
+		wantLarge := got.LargeImage
+		if wantLarge != "logo" && len(wantLarge) >= 4 && wantLarge[:4] != "http" {
+			wantLarge = "logo"
+		}
+		if wantLarge == "" {
+			wantLarge = "logo"
+		}
+		if act.Assets.LargeImage != wantLarge || act.Assets.LargeText != got.LargeText ||
+			act.Assets.SmallImage != got.SmallImage || act.Assets.SmallText != got.SmallText {
+			t.Fatalf("preview assets %+v != wire assets %+v", got, act.Assets)
+		}
+		var wantStart, wantEnd *int64
+		if got.HasStart {
+			s, e := got.Start, got.End
+			wantStart = &s
+			if got.End > 0 {
+				wantEnd = &e
+			}
+		}
+		var gotStart, gotEnd *int64
+		if act.Timestamps != nil {
+			gotStart, gotEnd = act.Timestamps.Start, act.Timestamps.End
+		}
+		if (wantStart == nil) != (gotStart == nil) || (wantStart != nil && *wantStart != *gotStart) {
+			t.Fatalf("preview Start=%v HasStart=%t != wire Start=%v (preview=%+v)", wantStart, got.HasStart, gotStart, got)
+		}
+		if (wantEnd == nil) != (gotEnd == nil) || (wantEnd != nil && *wantEnd != *gotEnd) {
+			t.Fatalf("preview End=%v != wire End=%v (preview=%+v)", wantEnd, gotEnd, got)
+		}
+		if len(got.Buttons) != len(act.Buttons) {
+			t.Fatalf("preview buttons %+v != wire buttons %+v", got.Buttons, act.Buttons)
+		}
+		for i := range got.Buttons {
+			if got.Buttons[i].Label != act.Buttons[i].Label || got.Buttons[i].URL != act.Buttons[i].URL {
+				t.Fatalf("preview button %d %+v != wire %+v", i, got.Buttons[i], act.Buttons[i])
+			}
+		}
+	}
+
+	raw := "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	now := int64(1000000000000)
+	t.Run("default", func(t *testing.T) {
+		act := &presence.Action{Running: true, HasStart: true, Start: now - 1000, CT: 1000}
+		got, w := drive(raw, act, presence.DefaultCardSpec(), 1000, 2832979, now)
+		check(got, w)
+	})
+	t.Run("nondefault", func(t *testing.T) {
+		act := &presence.Action{Running: true, HasStart: true, Start: now - 2000, CT: 2000}
+		spec := presence.CardSpec{Details: "title", State: "tag"}
+		got, w := drive(raw, act, spec, 2000, 2832979, now)
+		d, s := spec.Render(raw, act, presence.Resolved{})
+		_ = d
+		_ = s
+		check(got, w)
+		if got.Details == "" || got.State == "" {
+			t.Fatalf("non-default preview has empty lines: %+v", got)
+		}
+	})
+}
+
+// TestPreviewNotRecordedOnSendFailure proves the record-after-success fix:
+// when SetActivity fails, the preview keeps its previous SENT value instead
+// of presenting the failed attempt as sent.
+func TestPreviewNotRecordedOnSendFailure(t *testing.T) {
+	previewMu.Lock()
+	oldCard, oldHave := previewCard, previewHave
+	previewMu.Unlock()
+	defer func() {
+		previewMu.Lock()
+		previewCard, previewHave = oldCard, oldHave
+		previewMu.Unlock()
+	}()
+	oldCfg := liveConfig.Load()
+	oldResolver := metaResolver
+	defer func() {
+		if oldCfg != nil {
+			liveConfig.Store(oldCfg)
+		} else {
+			liveConfig.Store(&Config{})
+		}
+		metaResolver = oldResolver
+	}()
+	metaResolver = nil
+	liveConfig.Store(&Config{})
+
+	previewMu.Lock()
+	previewCard, previewHave = presence.Activity{}, false
+	previewMu.Unlock()
+
+	// A client that can never send: never started, so conn==nil and every
+	// SetActivity returns ErrNotConnected.
+	dc := discord.New(discord.Config{
+		ClientID:   "123456789012345678",
+		PipeBase:   filepath.Join(t.TempDir(), "no-pipe-"),
+		RetryDelay: time.Hour,
+	})
+	// No Start: send must fail.
+	lg := newLogger(filepath.Join(t.TempDir(), "preview-fail.log"), 0, 1)
+	defer lg.Close()
+	gate := &presence.Gate{}
+	raw := "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	act := &presence.Action{Running: true, HasStart: true, Start: 999, CT: 1000}
+	pushActivity(lg, dc, gate, raw, act, 1000, 2832979, 1000000000000, true, false)
+	if _, have := previewActivity(); have {
+		t.Fatalf("preview recorded after failed send, want previous value (none)")
 	}
 }
 

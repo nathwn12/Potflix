@@ -64,6 +64,10 @@ func cardSpecCases() []cardSpecCase {
 // TestCardSpecDefaultEquivalence is the safety gate for the Card view: for a
 // table of inputs, DefaultCardSpec().Render must equal what
 // presence.BuildActivityResolved (presence.go:499) produces today.
+// NOTE: this is a change-detector only (Render calls BuildActivityResolved
+// for the default case), so preview-is-the-payload is proven separately by
+// TestPreviewIsPayloadThroughSend in go/cardview_test.go, which captures the
+// real wire payload through pushActivity and asserts the preview equals it.
 func TestCardSpecDefaultEquivalence(t *testing.T) {
 	def := DefaultCardSpec()
 	for _, c := range cardSpecCases() {
@@ -73,6 +77,33 @@ func TestCardSpecDefaultEquivalence(t *testing.T) {
 			t.Errorf("%s: Render = (%q, %q), want (%q, %q)",
 				c.name, gotD, gotS, want.Details, want.State)
 		}
+	}
+}
+
+// TestCardSpecDefaultGoldenIndependent breaks the tautology: instead of
+// comparing Render to BuildActivityResolved (which Render calls for the
+// default case), it asserts hardcoded golden lines computed independently.
+// If Render drifts from the shipped output, this fails even though the
+// change-detector above would still pass. Negative control verified
+// (changing any golden breaks this test).
+func TestCardSpecDefaultGoldenIndependent(t *testing.T) {
+	def := DefaultCardSpec()
+	// Series filename: Details is the episode name, State is the tag.
+	if d, s := def.Render("Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+		&Action{Running: true, HasStart: true, Start: 12345, CT: 1000}, Resolved{}); d != "Pilot" || s != "S1 E2" {
+		t.Fatalf("series Render = (%q, %q), want (%q, %q)", d, s, "Pilot", "S1 E2")
+	}
+	// Movie with canonical override: Details is "Title (Year)", State joins
+	// genres/length/synopsis with " . ".
+	if d, s := def.Render("Dune.Part.Two.2024.1080p.mkv - PotPlayer",
+		&Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
+		Resolved{Series: "Dune: Part Two", Year: 2024, IsMovie: true,
+			Genres: "Sci-Fi", Length: "2h 46m", Synopsis: "Paul unites the Fremen"}); d != "Dune: Part Two (2024)" || s != "Sci-Fi \u00b7 2h 46m \u00b7 Paul unites the Fremen" {
+		t.Fatalf("movie Render = (%q, %q), want goldens", d, s)
+	}
+	// Idle card keeps its shipped lines.
+	if d, s := def.Render("", &Action{}, Resolved{}); d != "Browsing" || s != "Idle" {
+		t.Fatalf("idle Render = (%q, %q), want (%q, %q)", d, s, "Browsing", "Idle")
 	}
 }
 

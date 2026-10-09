@@ -386,3 +386,32 @@ func TestSettingsEsc(t *testing.T) {
 		t.Fatalf("Esc in main view handled, want ignored")
 	}
 }
+
+// TestAuditSingleLineVerdict proves the audit criterion: a fitting extent
+// is silent, a deliberately-ellipsized draw that does not fit is
+// informational ("trimmed", never a violation), and a draw WITHOUT an
+// ellipsis flag that does not fit is still a violation ("overflow") - the
+// positive control the gate must keep catching.
+func TestAuditSingleLineVerdict(t *testing.T) {
+	if got := auditSingleLineVerdict(100, 15, 420, 20, true); got != "" {
+		t.Fatalf("fitting ellipsized verdict = %q, want silent", got)
+	}
+	if got := auditSingleLineVerdict(100, 15, 420, 20, false); got != "" {
+		t.Fatalf("fitting plain verdict = %q, want silent", got)
+	}
+	// Deliberately ellipsized text that does not fit: informational only.
+	if got := auditSingleLineVerdict(449, 15, 420, 20, true); got != "trimmed" {
+		t.Fatalf("ellipsized overflow verdict = %q, want trimmed", got)
+	}
+	// Positive control: NO ellipsis flag into a too-small rect still fires.
+	if got := auditSingleLineVerdict(449, 15, 420, 20, false); got != "overflow" {
+		t.Fatalf("plain overflow verdict = %q, want overflow (gate must fire)", got)
+	}
+	// Height overflow follows the same split.
+	if got := auditSingleLineVerdict(100, 30, 420, 20, true); got != "trimmed" {
+		t.Fatalf("ellipsized height verdict = %q, want trimmed", got)
+	}
+	if got := auditSingleLineVerdict(100, 30, 420, 20, false); got != "overflow" {
+		t.Fatalf("plain height verdict = %q, want overflow (gate must fire)", got)
+	}
+}
