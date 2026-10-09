@@ -66,9 +66,7 @@ episode titles only, lives outside the repo, and is never committed.
 Data sources and attribution: [TVmaze](https://www.tvmaze.com/) (data under
 CC BY-SA), [AniList](https://anilist.co/), [Jikan](https://jikan.moe/) (an
 unofficial MyAnimeList API), the Apple
-[iTunes Search API](https://performance-partners.apple.com/search-api), and
-[TMDB](https://www.themoviedb.org/) (keyed lookups only, when you add a key).
-This product uses the TMDB API but is not endorsed or certified by TMDB.
+[iTunes Search API](https://performance-partners.apple.com/search-api).
 Artwork and synopses are linked to, not stored.
 
 ## Library window
@@ -107,12 +105,8 @@ with the `folders:` suffix preserved.)
 
 `Settings` view:
 
-- `API KEYS` - optional TMDB key (see below). `Show` / `Hide`, `Get a key`
-  (opens the TMDB API page), `Test` (one authenticated call; reports
-  `TMDB key OK` / `TMDB key rejected` / failure reason), `Save` (empty
-  clears). The OMDb / TheTVDB / Trakt rows are planned links, no input.
 - `LIBRARY` - `Clear cache` (native confirm; deletes cached titles plus the
-  folder index; folders and API keys are kept), `Export...` / `Import...`
+  folder index; folders are kept), `Export...` / `Import...`
   (native Save-As / Open dialogs over `*.json`; Save-As defaults to
   `~/Desktop/potflix-metadata-YYYY-MM-DD.json`).
 - `STARTUP` - `[x] Start with Windows` toggle (HKCU `...\Run` value
@@ -122,14 +116,6 @@ with the `folders:` suffix preserved.)
   applied immediately without a restart. Turbo = each provider's published
   limit, Balanced = half speed, Gentle = quarter speed - pick one if you
   want to be gentler on the services.
-
-## Optional TMDB key
-
-Keyless by default (TVmaze, AniList, Jikan, iTunes stay the default). With a
-TMDB key saved, TMDB is tried first for every query; any miss or error falls
-through to the keyless chain, so a bad key never breaks a lookup. The key is
-stored in `%LOCALAPPDATA%\Potflix\config.json` (`api_keys`) and never logged
-(logs record presence only; request errors are redacted).
 
 ## Folder scan index
 
@@ -238,9 +224,6 @@ Recorded deliberately; each is a behaviour change, not a parity claim.
 - **Export / import bundle.** No Java equivalent: the metadata cache can be
   exported to / imported from one metadata-only JSON bundle
   (fill-missing-only import, then an incremental scan).
-- **Optional TMDB key.** No Java equivalent: the app is keyless by default
-  and a stored TMDB key is tried first, with miss/error fallthrough to the
-  keyless chain.
 - **Empty asset text is omitted on the wire.** The Java app set
   `large_text=""` / `small_text=""`, but the Discord GameSDK dropped empty
   fields, and a present-but-empty `assets.large_text` is rejected by Discord

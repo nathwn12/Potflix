@@ -70,3 +70,135 @@ func TestParseRaw(t *testing.T) {
 		t.Fatalf("ParseRaw bare = %+v, want %+v", q2, want)
 	}
 }
+
+// TestParseBonusVariantCoverage is the executable parse table for the 34
+// explicitly observed bonus-variant negative-cache keys. 18 phrase-stem
+// extras are KindUnknown (each saves one ~3000 ms wasted iTunes lookup); the
+// other 16 stay KindMovie because no phrase stem covers them without risking
+// a real title - single common words ("short", "action", "becoming"),
+// locations ("michigan, usa"), and bare chapter numbers ("2) ...") are
+// barred, and lost coverage is worse than a wasted lookup.
+func TestParseBonusVariantCoverage(t *testing.T) {
+	cases := []struct {
+		file string
+		want Kind
+	}{
+		{"blooper reel.mkv", KindUnknown},
+		{"gag reel.mkv", KindUnknown},
+		{"outtakes.mkv", KindUnknown},
+		{"tv spots.mkv", KindUnknown},
+		{"extended scenes.mkv", KindUnknown},
+		{"alternate & extended scenes.mkv", KindUnknown},
+		{"behind the story - bangkok tour with chow.mkv", KindUnknown},
+		{"behind the story - the comedy rhythm of todd phillips.mkv", KindUnknown},
+		{"inferno - the making of the expendables.mkv", KindUnknown},
+		{"executing the plan - the making of escape plan.mkv", KindUnknown},
+		{"in search of zombieland.mkv", KindUnknown},
+		{"how to survive the z apocalypse.mkv", KindUnknown},
+		{"meet the cast.mkv", KindUnknown},
+		{"previz - future concepts.mkv", KindUnknown},
+		{"visual effects progression scenes.mkv", KindUnknown},
+		{"replacing zach - the secret auditions.mkv", KindUnknown},
+		{"4) the production design.mkv", KindUnknown},
+		{"5) building mcdonald's - time lapse video.mkv", KindUnknown},
+		{"nonlinear thinking - the editing process.mkv", KindMovie},
+		{"becoming joker.mkv", KindMovie},
+		{"how to draw.mkv", KindMovie},
+		{"map of destruction.mkv", KindMovie},
+		{"pushing the limits.mkv", KindMovie},
+		{"extraction mode.mkv", KindMovie},
+		{"jumpstart - david's story.mkv", KindMovie},
+		{"the fashion of 1969.mkv", KindMovie},
+		{"swarmatron.mkv", KindMovie},
+		{"kung fu talking.mkv", KindMovie},
+		{"michigan, usa.mkv", KindMovie},
+		{"new york, usa.mkv", KindMovie},
+		{"tokyo, japan.mkv", KindMovie},
+		{"the doppelgangers.mkv", KindMovie},
+		{"2) gary announcement.mkv", KindMovie},
+		{"3) the mcdonald brothers.mkv", KindMovie},
+	}
+	unknown := 0
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			if q := ParseRaw(tc.file); q.Kind != tc.want {
+				t.Fatalf("ParseRaw(%q) Kind = %d, want %d (%+v)", tc.file, q.Kind, tc.want, q)
+			}
+		})
+		if ParseRaw(tc.file).Kind == KindUnknown {
+			unknown++
+		}
+	}
+	if unknown != 18 {
+		t.Fatalf("Unknown count = %d, want 18 (table drift: a stem or titleclean changed)", unknown)
+	}
+}
+
+// TestParseExtrasNoRealTitleCollision is the collision guard: the real titles
+// observed in the same cache must still parse as Movie/Series, never Unknown.
+// Escape Plan 2 pins KindSeries: titleclean splits the sequel digit into an
+// E2 absolute tag (pre-existing behaviour, unrelated to extraRe) - the point
+// is it is fetched, never skipped.
+func TestParseExtrasNoRealTitleCollision(t *testing.T) {
+	cases := []struct {
+		file string
+		want Kind
+	}{
+		{"21.Jump.Street.2012.2160p.mkv", KindMovie},
+		{"Fight.Club.1999.mkv", KindMovie},
+		{"Shutter.Island.2010.mkv", KindMovie},
+		{"The.Revenant.2015.mkv", KindMovie},
+		{"Contagion.2011.mkv", KindMovie},
+		{"Django.Unchained.2012.mkv", KindMovie},
+		{"Drive.2011.1080p.mkv", KindMovie},
+		{"Blade.Runner.2049.2017.mkv", KindMovie},
+		{"The.Hunger.Games.2012.mkv", KindMovie},
+		{"We.re.the.Millers.2013.mkv", KindMovie},
+		{"Kick-Ass.mkv", KindMovie},
+		{"Ratatouille.mkv", KindMovie},
+		{"Pacific.Rim.mkv", KindMovie},
+		{"Lolita.mkv", KindMovie},
+		{"Joker.2019.1080p.mkv", KindMovie},
+		{"Focus.2015.1080p.mkv", KindMovie},
+		{"Zombieland.Double.Tap.2019.mkv", KindMovie},
+		{"Escape.Plan.2.Hades.2018.mkv", KindSeries},
+		{"The.Expendables.3.2014.mkv", KindMovie},
+		{"Welcome.to.Derry.S01E01.mkv", KindSeries},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			if q := ParseRaw(tc.file); q.Kind != tc.want {
+				t.Fatalf("ParseRaw(%q) Kind = %d, want %d (%+v)", tc.file, q.Kind, tc.want, q)
+			}
+		})
+	}
+}
+
+// TestParseAmbiguousExtras states the four ambiguous classifications and why:
+// each stays fetched because the only stem that would catch it is a single
+// common word or a bare chapter number, both barred (lost coverage beats a
+// wasted lookup).
+func TestParseAmbiguousExtras(t *testing.T) {
+	cases := []struct {
+		file string
+		why  string
+	}{
+		// Chapter-styled, but no numeric-prefix stem was adopted: it is
+		// indistinguishable from real chapter-titled content.
+		{"2) michael keaton as ray kroc.mkv", "bare chapter number, no stem"},
+		// "action" alone would nuke real action-genre titles.
+		{"action - the expendables.mkv", "single common word, barred"},
+		// No phrase stem without collision risk ("within"/"without" are common).
+		{"within and without with tobey maguire.mkv", "no safe phrase stem"},
+		// "short" alone would kill real short-film titles.
+		{"short - the tunnel.mkv", "single common word, barred"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			q := ParseRaw(tc.file)
+			if q.Kind == KindUnknown {
+				t.Fatalf("ParseRaw(%q) = KindUnknown (%s), want fetched (%+v)", tc.file, tc.why, q)
+			}
+		})
+	}
+}

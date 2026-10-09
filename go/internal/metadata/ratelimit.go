@@ -9,8 +9,9 @@ import (
 )
 
 // Per-host fetch spacing, chosen from each provider's published limits:
-// TVmaze ~2/s, AniList ~1.4/s, Jikan ~2.8/s, iTunes Search 20/min, TMDB
-// gated at a 250 ms base. Any host NOT listed here gets NO gate, so
+// TVmaze ~2/s, AniList ~1.4/s, Jikan ~2.8/s, iTunes Search 20/min,
+// Wikipedia anonymous Action API 1/s (see en.wikipedia.org below).
+// Any host NOT listed here gets NO gate, so
 // tests, the loopback fake provider, and any future source are never
 // silently throttled by a wrong guess.
 var defaultHostIntervals = map[string]time.Duration{
@@ -18,7 +19,14 @@ var defaultHostIntervals = map[string]time.Duration{
 	"graphql.anilist.co": 700 * time.Millisecond,
 	"api.jikan.moe":      350 * time.Millisecond,
 	"itunes.apple.com":   3000 * time.Millisecond,
-	"api.themoviedb.org": 250 * time.Millisecond,
+	// MediaWiki API etiquette (mediawiki.org/wiki/API:Etiquette) asks
+	// anonymous clients to send a descriptive User-Agent, make requests
+	// serially (never in parallel), and keep the rate modest. 1 req/s is
+	// the widely-observed courtesy ceiling for anonymous API use; a
+	// Wikipedia movie fallback costs 2 sequential calls (search+detail),
+	// so one fallback takes ~2s worst case - fine for a miss path behind
+	// the 3s iTunes gate. 429s are additionally honored via Retry-After.
+	"en.wikipedia.org": 1000 * time.Millisecond,
 }
 
 var (

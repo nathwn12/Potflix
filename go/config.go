@@ -2,10 +2,11 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"potflix/internal/presence"
 )
 
 // config.go - the settings store for the PotflixMainWnd seam.
@@ -15,20 +16,16 @@ import (
 // errors (see go/internal/metadata/cache.go:36-44). Writes are atomic
 // (temp file + rename), mirroring cache.go:98-115. Loads are tolerant: a
 // missing or corrupt file yields the zero value, never an error to the UI.
-//
-// API keys are optional: the app is keyless-by-default and every metadata
-// source works without one. Stored keys live in APIKeys by provider name
-// (today only "tmdb"); a legacy top-level "apiKey" value is migrated into
-// api_keys["tmdb"] on load and never lost.
-//
-// Secrecy: a key VALUE is NEVER logged anywhere, never appears in an error
-// string, and Config.String redacts to presence only.
+// Unknown fields (including the retired key fields) are ignored.
 
 type Config struct {
-	Dirs             []string          `json:"dirs"`
-	APIKeys          map[string]string `json:"api_keys"`
-	StartWithWindows bool              `json:"start_with_windows"`
-	ScanSpeed        string            `json:"scan_speed"`
+	Dirs             []string `json:"dirs"`
+	StartWithWindows bool     `json:"start_with_windows"`
+	ScanSpeed        string   `json:"scan_speed"`
+	// Card is the Card view's chosen Details/State presets. The zero value
+	// falls back to the default per line (see EffectiveCardSpec), so no
+	// migration is needed for stores written before this field existed.
+	Card presence.CardSpec `json:"card,omitempty"`
 }
 
 // Scan-speed profile names. Turbo (the published provider limits exactly)
@@ -60,6 +57,26 @@ func (c Config) EffectiveScanSpeed() string {
 	return NormalizeScanSpeed(c.ScanSpeed)
 }
 
+// EffectiveCardSpec reports the stored card spec with per-line fallback to
+// the shipped default, so a zero value (pre-card stores) needs no migration
+// and a stored typo can never reach the card.
+func (c Config) EffectiveCardSpec() presence.CardSpec {
+	return c.Card.Normalized()
+}
+
+// SetCardSpec stores the normalised spec; reports whether it changed.
+func (c *Config) SetCardSpec(details, state string) bool {
+	if c == nil {
+		return false
+	}
+	n := presence.CardSpec{Details: details, State: state}.Normalized()
+	if c.Card == n {
+		return false
+	}
+	c.Card = n
+	return true
+}
+
 // SetScanSpeed stores the normalised profile; reports whether it changed.
 func (c *Config) SetScanSpeed(s string) bool {
 	if c == nil {
@@ -73,14 +90,20 @@ func (c *Config) SetScanSpeed(s string) bool {
 	return true
 }
 
-// rawConfig is the load-time shape: the live fields plus the legacy
-// top-level "apiKey", so an old store migrates instead of losing its key.
-type rawConfig struct {
-	Dirs             []string          `json:"dirs"`
-	APIKeys          map[string]string `json:"api_keys"`
-	APIKey           string            `json:"apiKey"`
-	StartWithWindows bool              `json:"start_with_windows"`
-	ScanSpeed        string            `json:"scan_speed"`
+// loadConfigFrom is the explicit-path core of loadConfig, so tests can point
+// at a temp dir instead of the real store. Unknown fields are ignored, so
+// an old store carrying retired key fields loads its dirs without error.
+func loadConfigFrom(path string) (Config, error) {
+	var cfg Config
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return Config{}, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return Config{}, err
+	}
+	cfg.ScanSpeed = NormalizeScanSpeed(cfg.ScanSpeed)
+	return cfg, nil
 }
 
 // configPath is the on-disk store location.
@@ -117,34 +140,6 @@ func ScanIndexPath() string {
 func loadConfig() Config {
 	cfg, _ := loadConfigFrom(configPath())
 	return cfg
-}
-
-// loadConfigFrom is the explicit-path core of loadConfig, so tests can point
-// at a temp dir instead of the real store. A legacy "apiKey" migrates into
-// api_keys["tmdb"] when tmdb has no value yet; an explicitly stored tmdb
-// entry always wins and the legacy value is otherwise dropped (never lost
-// while tmdb is empty).
-func loadConfigFrom(path string) (Config, error) {
-	var cfg Config
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Config{}, err
-	}
-	var raw rawConfig
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return Config{}, err
-	}
-	cfg.Dirs = raw.Dirs
-	cfg.APIKeys = raw.APIKeys
-	cfg.StartWithWindows = raw.StartWithWindows
-	cfg.ScanSpeed = NormalizeScanSpeed(raw.ScanSpeed)
-	if raw.APIKey != "" && cfg.APIKeys["tmdb"] == "" {
-		if cfg.APIKeys == nil {
-			cfg.APIKeys = map[string]string{}
-		}
-		cfg.APIKeys["tmdb"] = raw.APIKey
-	}
-	return cfg, nil
 }
 
 // saveConfig writes cfg atomically.
@@ -184,66 +179,6 @@ func saveConfigTo(path string, cfg Config) error {
 	}
 	return nil
 }
-
-// GetAPIKey returns the stored key for provider ("" when unset). The caller
-// must never log the result.
-func (c Config) GetAPIKey(provider string) string {
-	return c.APIKeys[provider]
-}
-
-// SetAPIKey stores value for provider; an empty value deletes the entry.
-// It never logs, and reports whether the set changed.
-func (c *Config) SetAPIKey(provider, value string) bool {
-	if c == nil {
-		return false
-	}
-	if value == "" {
-		if _, ok := c.APIKeys[provider]; !ok {
-			return false
-		}
-		delete(c.APIKeys, provider)
-		return true
-	}
-	if c.APIKeys == nil {
-		c.APIKeys = map[string]string{}
-	}
-	if c.APIKeys[provider] == value {
-		return false
-	}
-	c.APIKeys[provider] = value
-	return true
-}
-
-// MaskKey renders s safe for the UI: "" stays "", short values become all
-// dots, and len>=8 (runes) becomes 8 dots plus the last 4 runes. The full
-// raw value is never returned for a non-empty input.
-func MaskKey(s string) string {
-	if s == "" {
-		return ""
-	}
-	r := []rune(s)
-	if len(r) < 8 {
-		return strings.Repeat("-", len(r))
-	}
-	return strings.Repeat("-", 8) + string(r[len(r)-4:])
-}
-
-// String redacts: provider names and presence only, never any key value
-// (not even MaskKey's last-4 tail).
-func (c Config) String() string {
-	names := make([]string, 0, len(c.APIKeys))
-	for name, v := range c.APIKeys {
-		if v == "" {
-			continue
-		}
-		names = append(names, name+":set")
-	}
-	return fmt.Sprintf("Config{dirs=%d keys=[%s]}", len(c.Dirs), strings.Join(names, " "))
-}
-
-// GoString redacts exactly like String (provider names and presence only,
-// never a value) so %#v formatting can never leak a stored key.
-func (c Config) GoString() string { return c.String() }
 
 // AddDir appends dir unless blank or already present (case-insensitive: this
 // is a Windows path list). Reports whether the set changed.

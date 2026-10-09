@@ -81,20 +81,3 @@ func TestRateLimiterDisabled(t *testing.T) {
 		t.Errorf("3 disabled acquisitions took %v, want < 100ms", d)
 	}
 }
-
-// TestRateLimiterTMDBHostGated proves api.themoviedb.org is a known gated
-// host in every profile, scaling with the turbo/balanced/gentle multipliers
-// (250/500/1000 ms).
-func TestRateLimiterTMDBHostGated(t *testing.T) {
-	defer SetRateProfile("turbo")
-	for profile, want := range map[string]time.Duration{
-		"turbo":    250 * time.Millisecond,
-		"balanced": 500 * time.Millisecond,
-		"gentle":   1000 * time.Millisecond,
-	} {
-		SetRateProfile(profile)
-		if got := RateIntervalForHost("api.themoviedb.org"); got != want {
-			t.Fatalf("profile %q: api.themoviedb.org = %v, want %v", profile, got, want)
-		}
-	}
-}

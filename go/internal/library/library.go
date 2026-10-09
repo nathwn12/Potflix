@@ -15,6 +15,7 @@ package library
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -74,13 +75,17 @@ var walkDir = filepath.WalkDir
 // Keys progress counters: Keys is the unique-key count (len(groups));
 // KeysCached counts stat-hit keys pre-credited before fetching; KeysFetched
 // counts uncached keys resolved by fetch; KeysNotFound counts uncached keys
-// missed or errored (so every key lands in exactly one bucket).
-// Invariant: KeysDone == KeysCached + KeysFetched + KeysNotFound == Keys.
+// confirmed missing (definitive miss only); KeysFailed counts uncached keys
+// whose fetch failed transiently (metadata.ErrLookupUnavailable - timeout,
+// 429, DNS, outage - unknown outcome, never a miss). A transient failure is
+// never binned as not-found, so every key lands in exactly one bucket.
+// Invariant: KeysDone == KeysCached + KeysFetched + KeysNotFound + KeysFailed == Keys.
 type Stats struct {
 	Keys           int
 	KeysCached     int
 	KeysFetched    int
 	KeysNotFound   int
+	KeysFailed     int
 	KeysDone       int
 	Cancelled      bool
 	Files          int
@@ -100,9 +105,10 @@ type Stats struct {
 // Progress is one live scan update. Done counts finished files against the
 // walked Total; Resolved is the running resolved-file tally (split into
 // running Cached/Fetched tallies); KeysTotal/KeysDone track unique-key work
-// (KeysDone == KeysCached + KeysFetched + KeysNotFound); Last is the most
-// path. FoldersScanned/FoldersSkipped carry the index walk totals so the
-// window status line can print "folders: N scanned, M skipped".
+// (KeysDone == KeysCached + KeysFetched + KeysNotFound + KeysFailed); Last
+// is the most recent path. FoldersScanned/FoldersSkipped carry the index
+// walk totals so the window status line can print
+// "folders: N scanned, M skipped".
 type Progress struct {
 	Done           int
 	Total          int
@@ -114,6 +120,7 @@ type Progress struct {
 	KeysCached     int
 	KeysFetched    int
 	KeysNotFound   int
+	KeysFailed     int
 	Last           string
 	FoldersScanned int
 	FoldersSkipped int
@@ -731,7 +738,7 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 			}
 		}
 	}
-	keysFetched, keysNotFound := 0, 0
+	keysFetched, keysNotFound, keysFailed := 0, 0, 0
 	keysDone := keysCached
 	st.KeysCached = keysCached
 	st.KeysDone = keysDone
@@ -780,7 +787,7 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 		progress := opts.Progress
 		if progress != nil {
 			progress(Progress{Done: done, Total: total, FoldersScanned: foldersScanned, FoldersSkipped: foldersSkipped,
-				KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound})
+				KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound, KeysFailed: keysFailed})
 		}
 		results := FetchAll(ctx, groups, lookup, defaultConcurrency, 0,
 			func(g *Group, fr FetchResult) {
@@ -805,9 +812,16 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 				if !cachedHit[g.Key] {
 					if fr.Err != nil {
 						// A cancelled fetch is incomplete, never a
-						// miss: leave it out of KeysNotFound.
+						// miss: leave it out of every bucket. A
+						// transient provider failure is unknown,
+						// never a miss: it gets its own bucket, never
+						// KeysNotFound.
 						if ctx.Err() == nil {
-							keysNotFound++
+							if errors.Is(fr.Err, metadata.ErrLookupUnavailable) {
+								keysFailed++
+							} else {
+								keysNotFound++
+							}
 						}
 					} else if fr.Res.Found {
 						if !fromCache {
@@ -821,12 +835,12 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 					} else {
 						keysNotFound++
 					}
-					keysDone = keysCached + keysFetched + keysNotFound
+					keysDone = keysCached + keysFetched + keysNotFound + keysFailed
 				} else {
-					keysDone = keysCached + keysFetched + keysNotFound
+					keysDone = keysCached + keysFetched + keysNotFound + keysFailed
 				}
 				p := Progress{Done: done, Total: total, Resolved: resolved, Cached: cached, Fetched: fetched, Last: g.Paths[n-1], FoldersScanned: foldersScanned, FoldersSkipped: foldersSkipped,
-					KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound}
+					KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound, KeysFailed: keysFailed}
 				pmu.Unlock()
 				maybeCheckpoint()
 				if progress == nil {
@@ -886,7 +900,8 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 	st.KeysCached = keysCached
 	st.KeysFetched = keysFetched
 	st.KeysNotFound = keysNotFound
-	st.KeysDone = keysCached + keysFetched + keysNotFound
+	st.KeysFailed = keysFailed
+	st.KeysDone = keysCached + keysFetched + keysNotFound + keysFailed
 	if ctx.Err() != nil {
 		st.Cancelled = true
 	}

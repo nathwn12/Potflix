@@ -3,6 +3,7 @@ package library
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -984,8 +985,8 @@ func TestScanKeysFullyCached(t *testing.T) {
 		t.Errorf("first progress KeysFetched = %d, want 0 (fully cached)", first.KeysFetched)
 	}
 	for i, p := range calls {
-		if p.KeysDone != p.KeysCached+p.KeysFetched+p.KeysNotFound {
-			t.Errorf("callback %d invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d (%+v)", i, p.KeysDone, p.KeysCached, p.KeysFetched, p.KeysNotFound, p)
+		if p.KeysDone != p.KeysCached+p.KeysFetched+p.KeysNotFound+p.KeysFailed {
+			t.Errorf("callback %d invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d + Failed %d (%+v)", i, p.KeysDone, p.KeysCached, p.KeysFetched, p.KeysNotFound, p.KeysFailed, p)
 		}
 		if p.KeysDone != 2 || p.KeysTotal != 2 {
 			t.Errorf("callback %d keys = total %d done %d, want total 2 done 2", i, p.KeysTotal, p.KeysDone)
@@ -994,10 +995,10 @@ func TestScanKeysFullyCached(t *testing.T) {
 	if st.Keys != 2 {
 		t.Errorf("stats Keys = %d, want 2 (%+v)", st.Keys, st)
 	}
-	if st.KeysCached != 2 || st.KeysFetched != 0 || st.KeysNotFound != 0 || st.KeysDone != 2 {
-		t.Errorf("stats keys = cached %d fetched %d notfound %d done %d, want 2/0/0/2 (%+v)", st.KeysCached, st.KeysFetched, st.KeysNotFound, st.KeysDone, st)
+	if st.KeysCached != 2 || st.KeysFetched != 0 || st.KeysNotFound != 0 || st.KeysFailed != 0 || st.KeysDone != 2 {
+		t.Errorf("stats keys = cached %d fetched %d notfound %d failed %d done %d, want 2/0/0/0/2 (%+v)", st.KeysCached, st.KeysFetched, st.KeysNotFound, st.KeysFailed, st.KeysDone, st)
 	}
-	if st.KeysDone != st.KeysCached+st.KeysFetched+st.KeysNotFound || st.KeysDone != st.Keys {
+	if st.KeysDone != st.KeysCached+st.KeysFetched+st.KeysNotFound+st.KeysFailed || st.KeysDone != st.Keys {
 		t.Errorf("stats invariant KeysDone %d != sum / Keys %d (%+v)", st.KeysDone, st.Keys, st)
 	}
 }
@@ -1058,8 +1059,8 @@ func TestScanKeysPartiallyCached(t *testing.T) {
 		t.Errorf("first progress KeysTotal = %d, want 3", first.KeysTotal)
 	}
 	for i, p := range calls {
-		if p.KeysDone != p.KeysCached+p.KeysFetched+p.KeysNotFound {
-			t.Errorf("callback %d invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d (%+v)", i, p.KeysDone, p.KeysCached, p.KeysFetched, p.KeysNotFound, p)
+		if p.KeysDone != p.KeysCached+p.KeysFetched+p.KeysNotFound+p.KeysFailed {
+			t.Errorf("callback %d invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d + Failed %d (%+v)", i, p.KeysDone, p.KeysCached, p.KeysFetched, p.KeysNotFound, p.KeysFailed, p)
 		}
 	}
 	if st.Keys != 3 {
@@ -1068,8 +1069,8 @@ func TestScanKeysPartiallyCached(t *testing.T) {
 	if st.KeysCached != 2 {
 		t.Errorf("stats KeysCached = %d, want 2", st.KeysCached)
 	}
-	if st.KeysDone != st.KeysCached+st.KeysFetched+st.KeysNotFound {
-		t.Errorf("stats invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d (%+v)", st.KeysDone, st.KeysCached, st.KeysFetched, st.KeysNotFound, st)
+	if st.KeysDone != st.KeysCached+st.KeysFetched+st.KeysNotFound+st.KeysFailed {
+		t.Errorf("stats invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d + Failed %d (%+v)", st.KeysDone, st.KeysCached, st.KeysFetched, st.KeysNotFound, st.KeysFailed, st)
 	}
 	if st.KeysDone != st.Keys {
 		t.Errorf("stats KeysDone %d != Keys %d (%+v)", st.KeysDone, st.Keys, st)
@@ -1554,5 +1555,97 @@ func TestScanCancelledFetchCountsNoError(t *testing.T) {
 	}
 	if st.Errors != 0 {
 		t.Errorf("cancelled Scan Errors = %d, want 0 (cancelled fetches are incomplete, not failures) (%+v)", st.Errors, st)
+	}
+}
+
+// honestsSource answers one title, misses another, and fails a third:
+// "Found Show" resolves, "Missing Show" is a definitive miss (nil, nil),
+// "Unreachable Show" fails transiently (provider error).
+type honestSource struct{}
+
+func (honestSource) Name() string { return "honest" }
+
+func (honestSource) Find(ctx context.Context, q metadata.Query) (*metadata.Media, error) {
+	switch {
+	case strings.Contains(q.Title, "Unreachable"):
+		return nil, errors.New("boom")
+	case strings.Contains(q.Title, "Missing"):
+		return nil, nil
+	default:
+		m := &metadata.Media{
+			Source: "honest", SourceID: "1",
+			Kind: q.Kind, Title: q.Title, Year: q.Year,
+			FetchedAt: time.Now().UTC(),
+		}
+		if q.Kind != metadata.KindMovie {
+			m.Episodes = []metadata.Episode{{Season: q.Season, Number: q.Episode, Title: "Found"}}
+		}
+		return m, nil
+	}
+}
+
+// TestScanTransientFailureHonestCounters proves the honest-counters contract
+// end to end: a transient provider failure lands in KeysFailed (never
+// KeysNotFound), a definitive miss still lands in KeysNotFound, the
+// four-bucket invariant holds on every progress callback and the final
+// Stats, and the transient failure persists nothing (exactly the positive
+// plus the negative are on disk).
+func TestScanTransientFailureHonestCounters(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	for _, n := range []string{"Found.S01E01.mkv", "Missing.S01E01.mkv", "Unreachable.S01E01.mkv"} {
+		if err := os.WriteFile(filepath.Join(root, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := t.TempDir()
+
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	newResolver = func(dir string) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{honestSource{}}})
+	}
+
+	var mu sync.Mutex
+	var calls []Progress
+	st, err := Scan(ctx, []string{root}, false, cache, func(p Progress) {
+		mu.Lock()
+		calls = append(calls, p)
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	if st.Keys != 3 {
+		t.Fatalf("stats Keys = %d, want 3 (%+v)", st.Keys, st)
+	}
+	if st.KeysFetched != 1 || st.KeysNotFound != 1 || st.KeysFailed != 1 || st.KeysCached != 0 {
+		t.Errorf("key buckets = fetched %d notfound %d failed %d cached %d, want 1/1/1/0 (%+v)",
+			st.KeysFetched, st.KeysNotFound, st.KeysFailed, st.KeysCached, st)
+	}
+	if st.KeysDone != 3 {
+		t.Errorf("stats KeysDone = %d, want 3 (%+v)", st.KeysDone, st)
+	}
+	if st.KeysDone != st.KeysCached+st.KeysFetched+st.KeysNotFound+st.KeysFailed || st.KeysDone != st.Keys {
+		t.Errorf("stats invariant KeysDone %d != sum / Keys %d (%+v)", st.KeysDone, st.Keys, st)
+	}
+	for i, p := range calls {
+		if p.KeysDone != p.KeysCached+p.KeysFetched+p.KeysNotFound+p.KeysFailed {
+			t.Errorf("callback %d invariant KeysDone %d != Cached %d + Fetched %d + NotFound %d + Failed %d (%+v)",
+				i, p.KeysDone, p.KeysCached, p.KeysFetched, p.KeysNotFound, p.KeysFailed, p)
+		}
+	}
+	// Per-file verdicts stay honest too: 1 resolved, 1 not-found, 1 error.
+	if st.Resolved != 1 || st.NotFound != 1 || st.Errors != 1 {
+		t.Errorf("file verdicts = resolved %d notfound %d errors %d, want 1/1/1 (%+v)", st.Resolved, st.NotFound, st.Errors, st)
+	}
+	// The transient failure persisted nothing: exactly the fetched positive
+	// plus the definitive-miss negative are on disk.
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatalf("read cache dir: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("cache dir has %d entries, want 2 (positive + negative, transient wrote nothing)", len(entries))
 	}
 }

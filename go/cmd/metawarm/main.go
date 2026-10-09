@@ -31,6 +31,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -188,6 +189,7 @@ type counts struct {
 	keysCached     int
 	keysFetched    int
 	keysNotFound   int
+	keysFailed     int
 	cancelled      bool
 }
 
@@ -315,8 +317,10 @@ func realMainWithContext(ctx context.Context, args []string, stdout, stderr io.W
 		}
 		// Split resolved keys into cached vs fetched using the pre-fetch
 		// snapshot: a resolved key that was pre-credited stays cached, else
-		// fetched. Unresolved uncached keys count as not found. The snapshot
-		// must predate the fetch: fetched keys are cached by now.
+		// fetched. Unresolved uncached keys count as not found - except a
+		// transient provider failure (metadata.ErrLookupUnavailable), which
+		// is an unknown outcome with its own bucket, never not-found. The
+		// snapshot must predate the fetch: fetched keys are cached by now.
 		for _, g := range groups {
 			st := statusByKey[g.Key]
 			switch st {
@@ -324,9 +328,17 @@ func realMainWithContext(ctx context.Context, args []string, stdout, stderr io.W
 				if !preCached[g.Key] {
 					c.keysFetched++
 				}
-			case statusNotFound, statusError:
+			case statusNotFound:
 				if !preCached[g.Key] {
 					c.keysNotFound++
+				}
+			case statusError:
+				if !preCached[g.Key] {
+					if r, ok := results[g.Key]; ok && errors.Is(r.Err, metadata.ErrLookupUnavailable) {
+						c.keysFailed++
+					} else {
+						c.keysNotFound++
+					}
 				}
 			}
 		}
@@ -380,7 +392,7 @@ func realMainWithContext(ctx context.Context, args []string, stdout, stderr io.W
 	fmt.Fprintf(&b, "metawarm summary: roots=%d files=%d skipped(unknown)=%d unique=%d denied=%d",
 		len(cfg.roots), c.files, c.skipped, c.unique, c.denied)
 	fmt.Fprintf(&b, " folders: %d scanned, %d skipped", c.foldersScanned, c.foldersSkipped)
-	fmt.Fprintf(&b, " keys: %d (%d cached, %d fetched, %d not found)", c.keys, c.keysCached, c.keysFetched, c.keysNotFound)
+	fmt.Fprintf(&b, " keys: %d (%d cached, %d fetched, %d not found, %d failed)", c.keys, c.keysCached, c.keysFetched, c.keysNotFound, c.keysFailed)
 	switch {
 	case cfg.dry:
 		fmt.Fprintf(&b, " dry=%d", c.dry)

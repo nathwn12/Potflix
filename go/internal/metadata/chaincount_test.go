@@ -72,8 +72,8 @@ func seriesAnswer(q Query) *Media {
 // TestChainCallCounts pins how many provider Find calls one lookup costs
 // per query kind. NOTE: these are Find invocations, not network calls.
 // Each source self-gates ruled-out kinds before touching the wire
-// (itunes.go:59 for series; tvmaze.go:116, anilist.go:114, jikan.go:73
-// for movies), pinned by TestKindGateNoNetwork below. So a series miss
+// (itunes.go:59 and wikipedia.go for series; tvmaze.go:116, anilist.go:114,
+// jikan.go:73 for movies), pinned by TestKindGateNoNetwork below. So a series miss
 // still INVOKES itunes.Find (counted here) but pays no rate-limiter wait;
 // only movie/unknown queries reach the iTunes wire, which is legitimate
 // movie-fallback coverage, not avoidable waste.
@@ -167,6 +167,7 @@ func TestKindGateNoNetwork(t *testing.T) {
 		allowed  Query // must yield an error (wire was attempted)
 	}{
 		{"itunes", &itunesSource{base: deadURL, client: cli}, seriesQ, movieQ},
+		{"wikipedia", &wikipediaSource{base: deadURL, client: cli}, seriesQ, movieQ},
 		{"tvmaze", &tvmazeSource{base: deadURL, client: cli}, movieQ, seriesQ},
 		{"anilist", &anilistSource{base: deadURL, client: cli}, movieQ, seriesQ},
 		{"jikan", &jikanSource{base: deadURL, client: cli}, movieQ, seriesQ},

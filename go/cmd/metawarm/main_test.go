@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -255,7 +256,7 @@ func TestCancelledRunExitsZeroWithCancelledAndKeys(t *testing.T) {
 }
 
 // TestSummaryGainsKeyLine keeps every existing field while adding the key
-// line, e.g. keys: 2 (1 cached, 1 fetched, 0 not found).
+// line, e.g. keys: 2 (1 cached, 1 fetched, 0 not found, 0 failed).
 func TestSummaryGainsKeyLine(t *testing.T) {
 	root := seedWarmRoot(t, filepath.Join("A", "ShowA.S01E01.mkv"))
 	local := t.TempDir()
@@ -369,5 +370,63 @@ func TestCancelledFetchIsNotAnError(t *testing.T) {
 			t.Errorf("report marks a cancelled fetch as error: %q (full report:\n%s)", ln, string(data))
 			break
 		}
+	}
+}
+
+// errSource fails every lookup transiently (provider outage).
+type errSource struct{}
+
+func (errSource) Name() string { return "fake" }
+
+func (errSource) Find(ctx context.Context, q metadata.Query) (*metadata.Media, error) {
+	return nil, errors.New("boom")
+}
+
+// TestSummaryReportsFailedKeysSeparately proves the CLI cannot bin a
+// transient failure as not-found: the summary carries its own failed field,
+// the per-file report marks the file error (not not-found), and nothing is
+// persisted.
+func TestSummaryReportsFailedKeysSeparately(t *testing.T) {
+	root := seedWarmRoot(t, filepath.Join("A", "Gone.S01E01.mkv"))
+	local := t.TempDir()
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("OPENCODE_SESSION_ID", "failed-case")
+	cache := t.TempDir()
+
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	newResolver = func(dir string, offline bool) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Offline: offline, Sources: []metadata.Source{errSource{}}})
+	}
+
+	var out, errb strings.Builder
+	code := realMain([]string{"-roots", root, "-cache", cache}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errb.String())
+	}
+	summary := out.String()
+	for _, want := range []string{
+		"keys: 1 (0 cached, 0 fetched, 0 not found, 1 failed)",
+		"resolved=0 not-found=0",
+		"errors=1",
+	} {
+		if !strings.Contains(summary, want) {
+			t.Errorf("summary missing %q:\n%s", want, summary)
+		}
+	}
+	report := filepath.Join(local, "Potflix", "inventory", "warm-report--hold--failed-case.txt")
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatalf("read report: %v", err)
+	}
+	if st, _, _ := strings.Cut(strings.TrimRight(string(data), "\n"), "\t"); st != statusError {
+		t.Errorf("report status = %q, want %q (full report:\n%s)", st, statusError, string(data))
+	}
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatalf("read cache dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("cache dir has %d entries after transient failure, want 0", len(entries))
 	}
 }

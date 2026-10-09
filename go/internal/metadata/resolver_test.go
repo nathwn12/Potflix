@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -460,8 +461,9 @@ func TestNegativeExpiredReattempted(t *testing.T) {
 }
 
 // TestProviderErrorPersistsNothing proves a transport error is transient,
-// never a confirmed not-found: it persists no negative file and sets no
-// in-memory suppression, so the next lookup re-attempts the provider.
+// never a confirmed not-found: it returns ErrLookupUnavailable (not nil),
+// persists no negative file and sets no in-memory suppression, so the next
+// lookup re-attempts the provider.
 func TestProviderErrorPersistsNothing(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -470,8 +472,8 @@ func TestProviderErrorPersistsNothing(t *testing.T) {
 	boom := &fakeSource{name: "fake", err: errors.New("boom")}
 	r := New(Options{Dir: dir, Sources: []Source{boom}, Timeout: 5 * time.Second})
 	res, err := r.LookupNow(ctx, q)
-	if err != nil {
-		t.Fatalf("LookupNow: %v", err)
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("LookupNow err = %v, want ErrLookupUnavailable", err)
 	}
 	if res.Found {
 		t.Fatalf("error lookup = %+v, want miss", res)
@@ -489,8 +491,8 @@ func TestProviderErrorPersistsNothing(t *testing.T) {
 		t.Fatal("provider error set in-memory suppression, want none")
 	}
 	// A second lookup must re-attempt (no suppression anywhere).
-	if _, err := r.LookupNow(ctx, q); err != nil {
-		t.Fatalf("second LookupNow: %v", err)
+	if _, err := r.LookupNow(ctx, q); !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("second LookupNow err = %v, want ErrLookupUnavailable", err)
 	}
 	if n := boom.calls.Load(); n != 2 {
 		t.Fatalf("provider calls = %d, want 2 (no negative cached)", n)
@@ -541,10 +543,11 @@ func TestFailedForcedRefreshPreservesPositive(t *testing.T) {
 	if res, err := r.LookupNow(ctx, q); err != nil || !res.Found {
 		t.Fatalf("warm LookupNow = %+v,%v; want found (from disk)", res, err)
 	}
-	// Failed forced refresh: transient, must write nothing.
+	// Failed forced refresh: transient, must write nothing. The error is
+	// ErrLookupUnavailable, never a silent miss.
 	res, err := r.LookupNowForce(ctx, q, true)
-	if err != nil {
-		t.Fatalf("force LookupNow: %v", err)
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("force LookupNow err = %v, want ErrLookupUnavailable", err)
 	}
 	if res.Found {
 		t.Fatalf("failed force = %+v, want miss", res)
@@ -632,5 +635,57 @@ func TestNegativeBackoffBoundedByTTL(t *testing.T) {
 	}
 	if !exp.Before(time.Now().Add(negativeBackoff)) {
 		t.Fatalf("in-memory expiry %v not bounded (want well under now+10m)", exp)
+	}
+}
+
+// TestTransientVsDefinitiveMissDistinguishable proves the honest-counters
+// contract at the resolver boundary: a transient provider failure returns
+// ErrLookupUnavailable (wrapping the underlying cause) and persists nothing,
+// while a definitive miss (every source answered, none has the title)
+// returns a nil error and persists exactly one negative.
+func TestTransientVsDefinitiveMissDistinguishable(t *testing.T) {
+	dir := t.TempDir()
+	countFiles := func() int {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("read cache dir: %v", err)
+		}
+		return len(entries)
+	}
+	ctx := context.Background()
+
+	// Transient: the provider errored, so the outcome is unknown.
+	boom := errors.New("boom")
+	flaky := New(Options{Dir: dir, Sources: []Source{&fakeSource{name: "fake", err: boom}}, Timeout: 5 * time.Second})
+	qFlaky := Query{Kind: KindSeries, Title: "Flaky Show", Season: 1, Episode: 2}
+	res, err := flaky.LookupNow(ctx, qFlaky)
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("transient err = %v, want ErrLookupUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Errorf("transient err = %q, want underlying cause propagated", err.Error())
+	}
+	if res.Found {
+		t.Fatalf("transient res = %+v, want miss", res)
+	}
+	if n := countFiles(); n != 0 {
+		t.Fatalf("transient persisted %d files, want 0", n)
+	}
+
+	// Definitive: every source answered and none has the title.
+	empty := New(Options{Dir: dir, Sources: []Source{}, Timeout: 5 * time.Second})
+	qMissing := Query{Kind: KindSeries, Title: "Missing Show", Season: 1, Episode: 2}
+	res, err = empty.LookupNow(ctx, qMissing)
+	if err != nil {
+		t.Fatalf("definitive miss err = %v, want nil", err)
+	}
+	if res.Found {
+		t.Fatalf("definitive miss res = %+v, want miss", res)
+	}
+	if n := countFiles(); n != 1 {
+		t.Fatalf("definitive miss left %d files, want exactly 1 negative", n)
+	}
+	if !CacheLive(dir, cacheKey(qMissing)) {
+		t.Fatal("CacheLive after definitive miss = false, want true")
 	}
 }

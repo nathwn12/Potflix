@@ -19,7 +19,7 @@ func TestRateLimiterInitialProfileIsTurbo(t *testing.T) {
 		"graphql.anilist.co": 700 * time.Millisecond,
 		"api.jikan.moe":      350 * time.Millisecond,
 		"itunes.apple.com":   3000 * time.Millisecond,
-		"api.themoviedb.org": 250 * time.Millisecond,
+		"en.wikipedia.org":   1000 * time.Millisecond,
 	} {
 		if got := RateIntervalForHost(host); got != want {
 			t.Fatalf("initial host %q = %v, want published %v", host, got, want)

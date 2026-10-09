@@ -87,4 +87,21 @@ func TestResolveQuery(t *testing.T) {
 			t.Fatalf("ResolveQuery(05.mkv, S02 path) = %+v, want %+v", q, want)
 		}
 	})
+	t.Run("bonus phrase folder stays unknown", func(t *testing.T) {
+		// Folder-level mirror of the filename extraRe stems: a bare number
+		// under a "Making Of" / "Gag Reel" leaf is bonus content, never
+		// fetched, while the show above the leaf still resolves.
+		for _, leaf := range []string{"Making Of", "Gag Reel", "Behind the Story", "TV Spots"} {
+			path := `D:\Movies\Show\` + leaf + `\01.mkv`
+			if q := ResolveQuery("01.mkv", path); q.Kind != KindUnknown {
+				t.Fatalf("ResolveQuery(01.mkv, %q) = %+v, want KindUnknown", path, q)
+			}
+			if !underExtrasFolder(path) {
+				t.Fatalf("underExtrasFolder(%q) = false, want true", path)
+			}
+		}
+		if show, _ := ContextFromPath(`D:\Movies\Show\Gag Reel\clip.mkv`); show != "Show" {
+			t.Fatalf("ContextFromPath(Gag Reel leaf) show = %q, want %q", show, "Show")
+		}
+	})
 }
