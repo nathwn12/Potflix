@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,9 +44,12 @@ func seedLib(t *testing.T) string {
 
 func TestBuildPlanSkipsUnknownAndDedupes(t *testing.T) {
 	root := seedLib(t)
-	files, err := collectFiles([]string{root}, 0)
+	files, denied, err := collectFiles([]string{root}, 0)
 	if err != nil {
 		t.Fatalf("collectFiles: %v", err)
+	}
+	if denied != 0 {
+		t.Errorf("denied = %d, want 0 for a readable tree", denied)
 	}
 	if len(files) != 5 {
 		t.Fatalf("files = %d, want 5 (non-video excluded): %v", len(files), files)
@@ -80,7 +84,7 @@ func TestBuildPlanSkipsUnknownAndDedupes(t *testing.T) {
 
 func TestFetchAllLooksUpOncePerUniqueKey(t *testing.T) {
 	root := seedLib(t)
-	files, err := collectFiles([]string{root}, 0)
+	files, _, err := collectFiles([]string{root}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +149,7 @@ func TestDryRunFetchesNothingAndWritesReport(t *testing.T) {
 		t.Errorf("statuses = %v, want map[dry:4 skipped:1]", statuses)
 	}
 	summary := out.String()
-	for _, want := range []string{"metawarm summary:", "files=5", "skipped(unknown)=1", "unique=3", "report: " + report} {
+	for _, want := range []string{"metawarm summary:", "files=5", "skipped(unknown)=1", "unique=3", "denied=0", "report: " + report} {
 		if !strings.Contains(summary, want) {
 			t.Errorf("summary missing %q:\n%s", want, summary)
 		}
@@ -178,7 +182,7 @@ func TestOfflineRunIsCacheOnlyAndWritesReport(t *testing.T) {
 		t.Errorf("statuses = %v, want map[not-found:4 skipped:1]", statuses)
 	}
 	summary := out.String()
-	for _, want := range []string{"hits=0", "missing=4"} {
+	for _, want := range []string{"hits=0", "missing=4", "denied=0"} {
 		if !strings.Contains(summary, want) {
 			t.Errorf("summary missing %q:\n%s", want, summary)
 		}
@@ -201,5 +205,137 @@ func TestUnwalkableRootIsFatal(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "no-such-root")
 	if code := realMain([]string{"-roots", missing}, &out, &errb); code == 0 {
 		t.Error("exit = 0 with unwalkable root, want non-zero")
+	}
+}
+
+// fakeEntry is a minimal fs.DirEntry for an injected walker.
+type fakeEntry struct {
+	name string
+	dir  bool
+}
+
+func (e fakeEntry) Name() string { return e.name }
+func (e fakeEntry) IsDir() bool  { return e.dir }
+func (e fakeEntry) Type() fs.FileMode {
+	if e.dir {
+		return fs.ModeDir
+	}
+	return 0
+}
+func (e fakeEntry) Info() (fs.FileInfo, error) { return nil, nil }
+
+// TestCollectFilesSkipsDeniedSubdir proves one unreadable subdirectory is
+// never fatal: the injected walker emits a permission error for a subdir,
+// collectFiles skips it (denied == 1) and still collects the other files.
+func TestCollectFilesSkipsDeniedSubdir(t *testing.T) {
+	root := t.TempDir()
+	good := filepath.Join(root, "good.mkv")
+	other := filepath.Join(root, "other.mp4")
+	badDir := filepath.Join(root, "bad")
+	inner := filepath.Join(badDir, "hidden.mkv")
+
+	orig := walkDir
+	defer func() { walkDir = orig }()
+	walkDir = func(walkRoot string, fn fs.WalkDirFunc) error {
+		if walkRoot != root {
+			t.Errorf("walkRoot = %q, want %q", walkRoot, root)
+		}
+		if err := fn(walkRoot, fakeEntry{name: filepath.Base(walkRoot), dir: true}, nil); err != nil {
+			return err
+		}
+		if err := fn(good, fakeEntry{name: "good.mkv"}, nil); err != nil {
+			return err
+		}
+		bd := fakeEntry{name: "bad", dir: true}
+		if err := fn(badDir, bd, nil); err != nil {
+			return err
+		}
+		perr := &os.PathError{Op: "open", Path: badDir, Err: os.ErrPermission}
+		if err := fn(badDir, bd, perr); err != nil {
+			if err == filepath.SkipDir {
+				// Skipped: the file under the denied dir must never surface.
+			} else {
+				return err
+			}
+		}
+		_ = inner
+		if err := fn(other, fakeEntry{name: "other.mp4"}, nil); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	files, denied, err := collectFiles([]string{root}, 0)
+	if err != nil {
+		t.Fatalf("collectFiles with one denied subdir: %v", err)
+	}
+	if denied != 1 {
+		t.Errorf("denied = %d, want 1", denied)
+	}
+	if len(files) != 2 {
+		t.Fatalf("files = %v, want [good other]", files)
+	}
+	got := map[string]bool{}
+	for _, f := range files {
+		got[f] = true
+	}
+	if !got[good] || !got[other] {
+		t.Errorf("files = %v, want %q and %q collected", files, good, other)
+	}
+	for _, f := range files {
+		if f == inner || strings.HasPrefix(f, badDir+string(os.PathSeparator)) {
+			t.Errorf("collected file under denied dir: %q", f)
+		}
+	}
+}
+
+// TestDeniedSubdirDrySummaryIncludesDenied proves the -dry summary wires the
+// denied count through realMain (denied=1, exit 0, fetches nothing).
+func TestDeniedSubdirDrySummaryIncludesDenied(t *testing.T) {
+	root := t.TempDir()
+	local := t.TempDir()
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("OPENCODE_SESSION_ID", "denied-case")
+	cache := t.TempDir()
+
+	good := filepath.Join(root, "good.mkv")
+	badDir := filepath.Join(root, "bad")
+	orig := walkDir
+	defer func() { walkDir = orig }()
+	walkDir = func(walkRoot string, fn fs.WalkDirFunc) error {
+		if err := fn(walkRoot, fakeEntry{name: filepath.Base(walkRoot), dir: true}, nil); err != nil {
+			return err
+		}
+		if err := fn(good, fakeEntry{name: "good.mkv"}, nil); err != nil {
+			return err
+		}
+		bd := fakeEntry{name: "bad", dir: true}
+		if err := fn(badDir, bd, nil); err != nil {
+			return err
+		}
+		perr := &os.PathError{Op: "open", Path: badDir, Err: os.ErrPermission}
+		if err := fn(badDir, bd, perr); err != nil {
+			if err == filepath.SkipDir {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+
+	var out, errb strings.Builder
+	code := realMain([]string{"-dry", "-roots", root, "-cache", cache}, &out, &errb)
+	if code != 0 {
+		t.Fatalf("exit = %d, stderr = %s", code, errb.String())
+	}
+	if summary := out.String(); !strings.Contains(summary, "denied=1") {
+		t.Errorf("summary missing denied=1:\n%s", summary)
+	}
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatalf("read cache dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("cache dir has %d entries after -dry, want 0", len(entries))
 	}
 }

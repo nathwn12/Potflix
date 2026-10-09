@@ -59,6 +59,9 @@ var videoExts = map[string]bool{
 	".webm": true, ".mpg": true, ".mpeg": true,
 }
 
+// walkDir is filepath.WalkDir by default but injectable for tests.
+var walkDir = filepath.WalkDir
+
 type config struct {
 	roots       []string
 	cacheDir    string
@@ -104,21 +107,44 @@ func parseArgs(args []string, stderr io.Writer) (config, error) {
 }
 
 // collectFiles walks each root recursively (lexical walk order) for video
-// files. limit > 0 truncates the result. An unstatable/unwalkable root is a
-// fatal error.
-func collectFiles(roots []string, limit int) ([]string, error) {
+// files. limit > 0 truncates the result. A subdirectory or file that cannot
+// be opened (permission or any walk error on a non-root entry) is logged
+// once, counted as denied, and skipped; only an unreadable ROOT (or no
+// readable roots at all) is a fatal error.
+func collectFiles(roots []string, limit int) ([]string, int, error) {
 	var files []string
+	var denied int
+	var okRoots int
+	var firstErr error
 	for _, root := range roots {
 		fi, err := os.Stat(root)
 		if err != nil {
-			return nil, fmt.Errorf("unwalkable root %q: %w", root, err)
+			fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: %v\n", root, err)
+			denied++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("unwalkable root %q: %w", root, err)
+			}
+			continue
 		}
 		if !fi.IsDir() {
-			return nil, fmt.Errorf("unwalkable root %q: not a directory", root)
+			fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: not a directory\n", root)
+			denied++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("unwalkable root %q: not a directory", root)
+			}
+			continue
 		}
-		if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err := walkDir(root, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
-				return err
+				if path == root {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: %v\n", path, err)
+				denied++
+				if d != nil && d.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
 			}
 			if d.IsDir() {
 				return nil
@@ -128,13 +154,22 @@ func collectFiles(roots []string, limit int) ([]string, error) {
 			}
 			return nil
 		}); err != nil {
-			return nil, fmt.Errorf("unwalkable root %q: %w", root, err)
+			fmt.Fprintf(os.Stderr, "metawarm: skipping unreadable path %q: %v\n", root, err)
+			denied++
+			if firstErr == nil {
+				firstErr = fmt.Errorf("unwalkable root %q: %w", root, err)
+			}
+			continue
 		}
+		okRoots++
+	}
+	if okRoots == 0 && firstErr != nil {
+		return nil, denied, firstErr
 	}
 	if limit > 0 && len(files) > limit {
 		files = files[:limit]
 	}
-	return files, nil
+	return files, denied, nil
 }
 
 // dedupeKey is the resolver's cache identity for one query.
@@ -296,6 +331,7 @@ type counts struct {
 	resolved int
 	notFound int
 	errors   int
+	denied   int
 }
 
 func realMain(args []string, stdout, stderr io.Writer) int {
@@ -304,14 +340,14 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "metawarm: %v\n", err)
 		return 2
 	}
-	files, err := collectFiles(cfg.roots, cfg.limit)
+	files, denied, err := collectFiles(cfg.roots, cfg.limit)
 	if err != nil {
 		fmt.Fprintf(stderr, "metawarm: %v\n", err)
 		return 1
 	}
 	plans, groups := buildPlan(files)
 
-	c := counts{files: len(plans), unique: len(groups)}
+	c := counts{files: len(plans), unique: len(groups), denied: denied}
 	statusByKey := make(map[string]string, len(groups))
 	if cfg.dry {
 		for _, g := range groups {
@@ -368,8 +404,8 @@ func realMain(args []string, stdout, stderr io.Writer) int {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "metawarm summary: roots=%d files=%d skipped(unknown)=%d unique=%d",
-		len(cfg.roots), c.files, c.skipped, c.unique)
+	fmt.Fprintf(&b, "metawarm summary: roots=%d files=%d skipped(unknown)=%d unique=%d denied=%d",
+		len(cfg.roots), c.files, c.skipped, c.unique, c.denied)
 	switch {
 	case cfg.dry:
 		fmt.Fprintf(&b, " dry=%d", c.dry)
