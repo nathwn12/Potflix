@@ -19,3 +19,8 @@ opencode.jsonc
 Thumbs.db
 desktop.ini
 dist/
+
+# local planning docs / tool state (kept local, not published)
+ARTWORK-PHASE.md
+UI-PHASE.md
+.serena/

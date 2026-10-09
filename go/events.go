@@ -81,6 +81,7 @@ func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
 		Name:       a.Name,
 		Details:    a.Details,
 		State:      a.State,
+		LargeImage: a.LargeImage,
 		LargeText:  a.LargeText,
 		SmallImage: a.SmallImage,
 		SmallText:  a.SmallText,

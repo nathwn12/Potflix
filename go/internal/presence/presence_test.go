@@ -439,3 +439,156 @@ func TestActionTag(t *testing.T) {
 		t.Error("default action should tag STOP")
 	}
 }
+
+func TestBuildActivityResolved(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	act := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+
+	t.Run("zero overrides match BuildActivity", func(t *testing.T) {
+		if got, want := BuildActivityResolved(tvRaw, act, Resolved{}), BuildActivity(tvRaw, act); got != want {
+			t.Errorf("Resolved{} card = %+v, want %+v", got, want)
+		}
+	})
+
+	t.Run("series override changes Name and LargeText", func(t *testing.T) {
+		base := BuildActivity(tvRaw, act)
+		got := BuildActivityResolved(tvRaw, act, Resolved{Series: "Canonical Show"})
+		if got.Name != titleclean.Trunc("Canonical Show", 128) {
+			t.Errorf("Name = %q, want %q", got.Name, titleclean.Trunc("Canonical Show", 128))
+		}
+		if got.LargeText != titleclean.Trunc("Canonical Show", 128) {
+			t.Errorf("LargeText = %q, want %q", got.LargeText, titleclean.Trunc("Canonical Show", 128))
+		}
+		base.Name = got.Name
+		base.LargeText = got.LargeText
+		if got != base {
+			t.Errorf("only Name and LargeText should change: got %+v, want %+v", got, base)
+		}
+	})
+
+	t.Run("episode name override changes only Details and keeps State tag", func(t *testing.T) {
+		base := BuildActivity(tvRaw, act)
+		got := BuildActivityResolved(tvRaw, act, Resolved{EpisodeName: "Canonical Episode"})
+		if got.Details != titleclean.Trunc("Canonical Episode", 128) {
+			t.Errorf("Details = %q, want %q", got.Details, titleclean.Trunc("Canonical Episode", 128))
+		}
+		if got.State != base.State {
+			t.Errorf("State = %q, want tag %q", got.State, base.State)
+		}
+		if base.State != "S1 E2" {
+			t.Errorf("base State = %q, want tag %q", base.State, "S1 E2")
+		}
+		base.Details = got.Details
+		if got != base {
+			t.Errorf("only Details should change: got %+v, want %+v", got, base)
+		}
+	})
+
+	t.Run("overrides truncate at 128", func(t *testing.T) {
+		long := strings.Repeat("y", 200)
+		got := BuildActivityResolved(tvRaw, act, Resolved{Series: long, EpisodeName: long})
+		if want := titleclean.Trunc(long, 128); got.Name != want || got.Details != want {
+			t.Errorf("Name=%q Details=%q, want both %q", got.Name, got.Details, want)
+		}
+		if n := javaUnits(got.Name); n > 128 {
+			t.Errorf("Name length %d exceeds 128: %q", n, got.Name)
+		}
+		if n := javaUnits(got.Details); n > 128 {
+			t.Errorf("Details length %d exceeds 128: %q", n, got.Details)
+		}
+	})
+}
+
+func TestBuildActivityResolvedRich(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	const tvTagOnlyRaw = "Show.S01E02.1080p.mkv - PotPlayer"
+	const movieRaw = "Movie.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+
+	t.Run("artwork https URL becomes LargeImage", func(t *testing.T) {
+		const art = "https://example.com/poster.jpg"
+		got := BuildActivityResolved(tvRaw, runAct, Resolved{Artwork: art})
+		if got.LargeImage != art {
+			t.Errorf("LargeImage = %q, want %q", got.LargeImage, art)
+		}
+	})
+
+	t.Run("artwork empty or invalid keeps logo", func(t *testing.T) {
+		for _, art := range []string{"", "logo", "ftp://example.com/x.jpg", "example.com/x.jpg", " /https://example.com/x.jpg"} {
+			got := BuildActivityResolved(tvRaw, runAct, Resolved{Artwork: art})
+			if got.LargeImage != "logo" {
+				t.Errorf("Artwork %q: LargeImage = %q, want %q", art, got.LargeImage, "logo")
+			}
+			if got.LargeImage == "" {
+				t.Errorf("Artwork %q: LargeImage must never be empty", art)
+			}
+		}
+	})
+
+	t.Run("series episode tag synopsis semantics", func(t *testing.T) {
+		got := BuildActivityResolved(tvRaw, runAct, Resolved{
+			Series:      "Canonical Series",
+			EpisodeName: "Canonical Episode",
+			Synopsis:    "A brave synopsis",
+		})
+		if want := titleclean.Trunc("Canonical Series", 128); got.Name != want {
+			t.Errorf("Name = %q, want %q", got.Name, want)
+		}
+		if want := titleclean.Trunc("Canonical Episode", 128); got.Details != want {
+			t.Errorf("Details = %q, want %q", got.Details, want)
+		}
+		if want := rpText("S1 E2 \u00b7 A brave synopsis", 128); got.State != want {
+			t.Errorf("State = %q, want %q", got.State, want)
+		}
+		if want := "S1 E2 \u00b7 A brave synopsis"; got.State != want {
+			t.Errorf("State = %q, want exact %q", got.State, want)
+		}
+		if want := titleclean.Trunc("Canonical Series", 128); got.LargeText != want {
+			t.Errorf("LargeText = %q, want %q", got.LargeText, want)
+		}
+	})
+
+	t.Run("synopsis only becomes state", func(t *testing.T) {
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{Synopsis: "Just a synopsis"})
+		if got.State != "Just a synopsis" {
+			t.Errorf("State = %q, want %q", got.State, "Just a synopsis")
+		}
+	})
+
+	t.Run("tag only becomes state", func(t *testing.T) {
+		got := BuildActivityResolved(tvTagOnlyRaw, runAct, Resolved{})
+		if got.State != "S1 E2" {
+			t.Errorf("State = %q, want %q", got.State, "S1 E2")
+		}
+	})
+
+	t.Run("long synopsis truncated to 128", func(t *testing.T) {
+		long := strings.Repeat("s", 200)
+		got := BuildActivityResolved(movieRaw, runAct, Resolved{Synopsis: long})
+		if want := rpText(long, 128); got.State != want {
+			t.Errorf("State = %q, want %q", got.State, want)
+		}
+		if n := javaUnits(got.State); n > 128 {
+			t.Errorf("State length %d exceeds 128: %q", n, got.State)
+		}
+	})
+}
+
+func TestRpText(t *testing.T) {
+	if got, want := rpText("a\n\nb  c", 128), "a b c"; got != want {
+		t.Errorf("rpText collapse = %q, want %q", got, want)
+	}
+	if got, want := rpText("eps1.1_ones-and-zer0es.mpeg", 128), "eps1.1_ones-and-zer0es.mpeg"; got != want {
+		t.Errorf("rpText must preserve underscores/dots/dashes: = %q, want %q", got, want)
+	}
+	if got, want := rpText("a\tb\rc", 128), "a b c"; got != want {
+		t.Errorf("rpText tabs/newlines = %q, want %q", got, want)
+	}
+	if got := rpText("a\x00b\x7Fc", 128); got != "abc" {
+		t.Errorf("rpText C0 strip = %q, want %q", got, "abc")
+	}
+	long := strings.Repeat("z", 200)
+	if got := rpText(long, 128); got != titleclean.Trunc(long, 128) {
+		t.Errorf("rpText trunc = %q, want %q", got, titleclean.Trunc(long, 128))
+	}
+}

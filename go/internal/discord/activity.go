@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -50,6 +51,7 @@ type Activity struct {
 	Name       string
 	Details    string
 	State      string
+	LargeImage string // https artwork URL; empty/invalid falls back to "logo"
 	LargeText  string // "PotFlix"; empty is omitted on the wire
 	SmallImage string // "play" running, "pause" paused, "stop" idle/stopped
 	SmallText  string // "Playing"/"Paused"/"Stopped"/"Idle"; empty is omitted
@@ -106,16 +108,21 @@ type command struct {
 }
 
 // newActivity maps one card to the wire payload. type is Watching (3);
-// large_image is always "logo" with the caller's LargeText/SmallText (empty
-// text stays omitted via `omitempty`); name carries the header override.
+// large_image is the caller's LargeImage when it is an http(s) URL, else
+// "logo" (never empty); empty text stays omitted via `omitempty`; name carries
+// the header override.
 func newActivity(a Activity) *activityPayload {
+	largeImage := a.LargeImage
+	if !strings.HasPrefix(largeImage, "http://") && !strings.HasPrefix(largeImage, "https://") {
+		largeImage = "logo"
+	}
 	p := &activityPayload{
 		Type:    activityTypeWatching,
 		Name:    a.Name,
 		Details: a.Details,
 		State:   a.State,
 		Assets: activityAsst{
-			LargeImage: "logo",
+			LargeImage: largeImage,
 			LargeText:  a.LargeText,
 			SmallImage: a.SmallImage,
 			SmallText:  a.SmallText,

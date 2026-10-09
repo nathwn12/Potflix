@@ -131,6 +131,35 @@ func TestSetActivityTextPresentWhenNonEmpty(t *testing.T) {
 	}
 }
 
+func TestLargeImageHTTPSHonoredVerbatim(t *testing.T) {
+	// An https LargeImage is honored verbatim in the wire JSON.
+	const art = "https://static.tvmaze.com/uploads/images/medium_portrait/1/2.jpg"
+	got := WireJSON(Activity{Details: "Show", State: "S1 E2", LargeImage: art, SmallImage: "play"})
+	want := `{"type":3,"details":"Show","state":"S1 E2","assets":{"large_image":"` + art + `","small_image":"play"}}`
+	if got != want {
+		t.Fatalf("WireJSON = %s, want %s", got, want)
+	}
+}
+
+func TestLargeImageFallbackToLogo(t *testing.T) {
+	// Empty or non-http(s) LargeImage falls back to "logo", never empty.
+	for _, img := range []string{"", "logo", "not-a-url", "ftp://example.com/a.jpg", "data:image/png;base64,xx"} {
+		got := WireJSON(Activity{Details: "Show", SmallImage: "play", LargeImage: img})
+		a := decodeFrame(t, []byte(got))
+		assets := asMap(t, a["assets"], "assets")
+		if assets["large_image"] != "logo" {
+			t.Fatalf("LargeImage %q: large_image = %v, want logo", img, assets["large_image"])
+		}
+	}
+	// http (non-s) is also honored verbatim.
+	const httpArt = "http://example.com/cover.jpg"
+	got := WireJSON(Activity{Details: "Show", SmallImage: "play", LargeImage: httpArt})
+	a := decodeFrame(t, []byte(got))
+	if asMap(t, a["assets"], "assets")["large_image"] != httpArt {
+		t.Fatalf("http LargeImage not honored: %s", got)
+	}
+}
+
 func TestSetActivityNoTimer(t *testing.T) {
 	// The idle card: details Browsing / state Idle / small_image stop, and no
 	// timestamps object at all.

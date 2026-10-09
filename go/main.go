@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"potflix/internal/discord"
+	"potflix/internal/metadata"
 	"potflix/internal/player"
 	"potflix/internal/presence"
 )
@@ -27,6 +29,42 @@ const (
 )
 
 const alreadyRunningMsg = "Potflix is already running."
+
+// metaResolver is the single metadata resolver for the poll loop. It is set
+// once in runUI before the loop starts (nil in tests, which then keep the
+// clean card). Resolve never blocks, so the poll loop never stalls on it;
+// a miss or error falls back to today's clean card (zero Resolved).
+var metaResolver *metadata.Resolver
+
+// metaTitleCache remembers the folder-aware query for the current raw title so
+// player.CurrentFile (bounded ~800ms inside) runs at most once per title
+// change instead of on every 250 ms poll. A path error or empty path falls
+// back cleanly to filename-only inside metadata.ResolveQuery. The poll loop is
+// the only writer; the lookup re-resolves PotPlayer via FindFirst because
+// pushActivity's frozen signature (see gate_integration_test.go) cannot take
+// the tracked hwnd.
+var (
+	metaLastTitle string
+	metaLastQuery metadata.Query
+	metaLastSet   bool
+)
+
+// metaQueryFor returns the folder-aware query for rawTitle, querying the
+// playing-file path once per title change and caching by rawTitle.
+func metaQueryFor(rawTitle string) metadata.Query {
+	if metaLastSet && rawTitle == metaLastTitle {
+		return metaLastQuery
+	}
+	path := ""
+	if hwnd, found := player.FindFirst(); found {
+		if p, err := player.CurrentFile(hwnd); err == nil {
+			path = p
+		}
+	}
+	q := metadata.ResolveQuery(rawTitle, path)
+	metaLastTitle, metaLastQuery, metaLastSet = rawTitle, q, true
+	return q
+}
 
 func main() {
 	// argv is ignored except for the M1 test switch.
@@ -98,6 +136,11 @@ func runUI(log *logger) {
 		OnDrop:       func(err error) { log.eventSessionDropped(err) },
 	})
 	dc.Start()
+	metaResolver = metadata.New(metadata.Options{
+		// Default cache dir + sources; Logf carries source names/timeouts
+		// only, never secrets (the resolver never sees any).
+		Logf: func(format string, args ...any) { log.logf(format, args...) },
+	})
 	go pollLoop(log, dc)
 
 	// Fleet decision 6 (deviation): clear the Discord card before exiting.
@@ -226,6 +269,17 @@ func pollLoop(log *logger, dc *discord.Client) {
 // Discord's own reply (ack or ERROR) is logged by the client's OnReply handler.
 func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle string, a *presence.Action, ct, total, now int64, event, debounced bool) {
 	card := presence.BuildActivity(rawTitle, a)
+	if metaResolver != nil {
+		// Non-blocking: a miss fires at most one background fetch per key
+		// (single-flight inside the resolver) and returns Found=false, so
+		// the card below is today's clean card until the fetch lands.
+		// Unknown kinds (themes, extras, bare names) never fetch or cache.
+		if q := metaQueryFor(rawTitle); q.Kind != metadata.KindUnknown {
+			if r, err := metaResolver.Resolve(context.Background(), q); err == nil && r.Found {
+				card = presence.BuildActivityResolved(rawTitle, a, presence.Resolved{Series: r.Series, EpisodeName: r.Episode, Artwork: r.Artwork, Synopsis: r.Synopsis})
+			}
+		}
+	}
 	out, verdict := gate.Decide(card, ct, total, now, event, debounced)
 	log.eventPushAttempt(out, verdict)
 	if !verdict.Send {
@@ -248,6 +302,7 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		Name:       out.Name,
 		Details:    out.Details,
 		State:      out.State,
+		LargeImage: out.LargeImage,
 		LargeText:  out.LargeText,
 		SmallImage: out.SmallImage,
 		SmallText:  out.SmallText,

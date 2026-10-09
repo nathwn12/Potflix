@@ -390,3 +390,80 @@ func BuildActivity(rawTitle string, a *Action) Activity {
 	}
 	return act
 }
+
+// Resolved carries canonical titles from a metadata lookup; a zero field is ignored.
+type Resolved struct {
+	Series      string // canonical series or movie title
+	EpisodeName string // canonical episode title
+	Artwork     string // cover/poster URL (https); zero value = absent
+	Synopsis    string // one-line plain text; zero value = absent
+}
+
+// rpText sanitizes free text for the RPC card: trim, collapse runs of
+// whitespace/newlines/tabs to single spaces, strip C0 control chars, then
+// truncate to max via titleclean.Trunc. Internal underscores and other real
+// title content are preserved.
+func rpText(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7F {
+			return -1
+		}
+		return r
+	}, s)
+	return titleclean.Trunc(s, max)
+}
+
+// BuildActivityResolved is BuildActivity with canonical title overrides applied.
+func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
+	act := BuildActivity(rawTitle, a)
+	if r.Series != "" {
+		act.Name = titleclean.Trunc(r.Series, 128)
+		act.LargeText = titleclean.Trunc(r.Series, 128)
+	}
+	if r.EpisodeName != "" {
+		act.Details = titleclean.Trunc(r.EpisodeName, 128)
+	}
+	// Episode tag for the state line, derived from the title the same way
+	// BuildActivity derives it.
+	raw := rawTitle
+	if strings.HasSuffix(raw, player.Suffix) {
+		raw = raw[:strings.LastIndex(raw, player.Suffix)]
+	}
+	var tagRaw string
+	if idle := strings.TrimSpace(raw) == "" || raw == player.AppName; !idle {
+		tagRaw = titleclean.Clean(raw).EpisodeTag
+	}
+	tagT := rpText(tagRaw, 128)
+	synT := rpText(r.Synopsis, 128)
+	switch {
+	case tagT == "" && synT == "":
+		// Neither: keep BuildActivity's state (including any Paused marker).
+	case a != nil && a.Paused:
+		var ctx string
+		switch {
+		case tagT != "" && synT != "":
+			ctx = tagT + " \u00b7 " + synT
+		case tagT != "":
+			ctx = tagT
+		default:
+			ctx = synT
+		}
+		act.State = WithStateTime(ctx, pausedMarker)
+	default:
+		switch {
+		case tagT != "" && synT != "":
+			act.State = rpText(tagT+" \u00b7 "+synT, 128)
+		case tagT != "":
+			act.State = tagT
+		default:
+			act.State = synT
+		}
+	}
+	if strings.HasPrefix(r.Artwork, "http://") || strings.HasPrefix(r.Artwork, "https://") {
+		act.LargeImage = r.Artwork
+	}
+	// Otherwise LargeImage stays as BuildActivity produced it ("logo"): an
+	// empty large image is never emitted.
+	return act
+}

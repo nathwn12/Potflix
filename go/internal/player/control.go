@@ -16,6 +16,13 @@ const (
 	msgGetPlayStatus  = 20486
 )
 
+// msgGetPlayFileName (24608, 0x6020) is PotPlayer's POT_GET_PLAYFILE_NAME from
+// the ld3l/PotPlayerControl InternalSimpleCmd.h protocol - the same header the
+// app's existing three ids (20482/20484/20486) come from. Unlike those LRESULT
+// queries it answers with WM_COPYDATA carrying the UTF-8 file path, so it is
+// served by CurrentFile in pathquery.go rather than send().
+const msgGetPlayFileName = 24608
+
 // PlayStatus is the decoded player state. The zero value is Stopped, matching
 // Java's enum order (Stopped, Paused, Running, Undefined).
 type PlayStatus int

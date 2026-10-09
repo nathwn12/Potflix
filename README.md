@@ -41,12 +41,24 @@ go build -trimpath -buildvcs=false -ldflags "-H=windowsgui" -o ..\dist\potflix.e
 ```
 
 `-trimpath` and `-buildvcs=false` keep the output identical from any checkout
-directory and at any commit. Requires Go 1.27+; no network access.
+directory and at any commit. Requires Go 1.27+; the build itself needs no
+network (at runtime the app does keyless metadata lookups - see "Metadata
+lookup" below).
 
 The former Java flow - `tools\build.ps1` downloading an upstream fat jar from
 the mutable release tag `v1` and re-packaging it with `javac` - is **retired**
 and is no longer a build path. The Java sources under `src\` stay as the
 reference implementation the Go port was proven against; see `DECISION.md`.
+
+## Metadata lookup
+
+The card shows canonical series and episode titles resolved from free,
+keyless sources: TVmaze for TV, AniList + Jikan for anime, iTunes for movies.
+Each season is fetched once and cached permanently under
+`%LOCALAPPDATA%\Potflix\meta`, so repeat plays never hit the network; with no
+cache entry and no connection the card simply shows the clean filename-based
+title. No credentials, no account, nothing personal: the cache holds public
+episode titles only, lives outside the repo, and is never committed.
 
 ## Use your own Discord app (2 min, for custom name + logo)
 
