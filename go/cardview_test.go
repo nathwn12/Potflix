@@ -403,7 +403,7 @@ func TestPreviewIsPayloadThroughSend(t *testing.T) {
 		}
 	}()
 
-	drive := func(raw string, act *presence.Action, spec presence.CardSpec, ct, total, now int64) (presence.Activity, previewWire) {
+	drive := func(raw string, act *presence.Action, spec presence.CardSpec, ct, total, now int64) (presence.Activity, previewWire, []byte) {
 		previewMu.Lock()
 		previewCard, previewHave = presence.Activity{}, false
 		previewMu.Unlock()
@@ -425,10 +425,10 @@ func TestPreviewIsPayloadThroughSend(t *testing.T) {
 			if !have {
 				t.Fatalf("preview have=false after successful send, want true")
 			}
-			return got, w
+			return got, w, payload
 		case <-time.After(2 * time.Second):
 			t.Fatalf("no SET_ACTIVITY frame for %q", raw)
-			return presence.Activity{}, previewWire{}
+			return presence.Activity{}, previewWire{}, nil
 		}
 	}
 	check := func(got presence.Activity, w previewWire) {
@@ -483,19 +483,43 @@ func TestPreviewIsPayloadThroughSend(t *testing.T) {
 	now := int64(1000000000000)
 	t.Run("default", func(t *testing.T) {
 		act := &presence.Action{Running: true, HasStart: true, Start: now - 1000, CT: 1000}
-		got, w := drive(raw, act, presence.DefaultCardSpec(), 1000, 2832979, now)
+		got, w, _ := drive(raw, act, presence.DefaultCardSpec(), 1000, 2832979, now)
 		check(got, w)
 	})
 	t.Run("nondefault", func(t *testing.T) {
 		act := &presence.Action{Running: true, HasStart: true, Start: now - 2000, CT: 2000}
 		spec := presence.CardSpec{Details: "title", State: "tag"}
-		got, w := drive(raw, act, spec, 2000, 2832979, now)
-		d, s := spec.Render(raw, act, presence.Resolved{})
-		_ = d
-		_ = s
+		got, w, _ := drive(raw, act, spec, 2000, 2832979, now)
 		check(got, w)
 		if got.Details == "" || got.State == "" {
 			t.Fatalf("non-default preview has empty lines: %+v", got)
+		}
+	})
+	// TestPreviewEmptyHide proves auto-hide end to end: a preset whose state
+	// renders "" (Empty on a resolved card) is OMITTED from the wire frame,
+	// not sent as "state":"" (discord omitempty), while details still ride.
+	t.Run("emptyhide", func(t *testing.T) {
+		act := &presence.Action{Running: true, HasStart: true, Start: now - 3000, CT: 3000}
+		spec := presence.CardSpec{Details: "default", State: "none"}
+		got, w, frame := drive(raw, act, spec, 3000, 2832979, now)
+		check(got, w)
+		if got.State != "" {
+			t.Fatalf("Empty-state preview State = %q, want empty", got.State)
+		}
+		var env struct {
+			Args struct {
+				Activity map[string]any `json:"activity"`
+			} `json:"args"`
+		}
+		if err := json.Unmarshal(frame, &env); err != nil {
+			t.Fatalf("decode frame %s: %v", frame, err)
+		}
+		if _, ok := env.Args.Activity["state"]; ok {
+			t.Fatalf("wire activity carries a state key for an empty state: %s", frame)
+		}
+		if env.Args.Activity["details"] != "Pilot" {
+			t.Fatalf("wire details = %v, want %q (frame: %s)",
+				env.Args.Activity["details"], "Pilot", frame)
 		}
 	})
 }

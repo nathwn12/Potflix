@@ -53,6 +53,8 @@ func TestSetActivityPayload(t *testing.T) {
 	c, sc, _ := connectPair(t, 0, Config{})
 	defer sc.Close()
 
+	// SmallImage is caller-compat only: even when set it must not reach the
+	// wire - the pristine card carries no status icon.
 	act := Activity{Details: "Show", State: `S1 E2 "Pilot"`, SmallImage: "play", HasStart: true, Start: 12345}
 	if err := c.SetActivity(act); err != nil {
 		t.Fatalf("SetActivity: %v", err)
@@ -99,43 +101,49 @@ func TestSetActivityPayload(t *testing.T) {
 	}
 
 	// Empty text is OMITTED, not sent as "" (Discord rejects an empty
-	// large_text with code 4000); non-empty asset fields stay present.
+	// large_text with code 4000); the large image always lands. The pristine
+	// card has no small icon: small_image/small_text keys must be absent even
+	// though the caller set SmallImage.
 	assets := asMap(t, a["assets"], "assets")
-	wantKeys(t, "assets", assets, "large_image", "small_image")
-	if assets["large_image"] != "logo" || assets["small_image"] != "play" {
+	wantKeys(t, "assets", assets, "large_image")
+	if assets["large_image"] != "logo" {
 		t.Fatalf("assets = %v", assets)
 	}
 	if _, ok := assets["large_text"]; ok {
 		t.Fatalf("large_text present while empty, want omitted: %v", assets)
 	}
+	if _, ok := assets["small_image"]; ok {
+		t.Fatalf("small_image present, want omitted (pristine card): %v", assets)
+	}
 	if _, ok := assets["small_text"]; ok {
-		t.Fatalf("small_text present while empty, want omitted: %v", assets)
+		t.Fatalf("small_text present, want omitted (pristine card): %v", assets)
 	}
 }
 
 func TestSetActivityTextPresentWhenNonEmpty(t *testing.T) {
-	// The wire object omits empty text but must still carry non-empty text when a
-	// caller sets it.
+	// The wire object omits empty large text but must still carry non-empty
+	// large text when a caller sets it. Small text is never carried, even
+	// when set: the pristine card has no status icon slot.
 	p := newActivity(Activity{Details: "Show", State: "S1 E2", SmallImage: "play"})
 	p.Assets.LargeText = "Potflix"
-	p.Assets.SmallText = "playing"
 	b, err := json.Marshal(p)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
 	a := decodeFrame(t, b)
 	assets := asMap(t, a["assets"], "assets")
-	wantKeys(t, "assets", assets, "large_image", "large_text", "small_image", "small_text")
-	if assets["large_text"] != "Potflix" || assets["small_text"] != "playing" {
+	wantKeys(t, "assets", assets, "large_image", "large_text")
+	if assets["large_text"] != "Potflix" {
 		t.Fatalf("assets = %v", assets)
 	}
 }
 
 func TestLargeImageHTTPSHonoredVerbatim(t *testing.T) {
-	// An https LargeImage is honored verbatim in the wire JSON.
+	// An https LargeImage is honored verbatim in the wire JSON. The caller
+	// also sets SmallImage, which must not appear: no icon keys on the wire.
 	const art = "https://static.tvmaze.com/uploads/images/medium_portrait/1/2.jpg"
 	got := WireJSON(Activity{Details: "Show", State: "S1 E2", LargeImage: art, SmallImage: "play"})
-	want := `{"type":3,"details":"Show","state":"S1 E2","assets":{"large_image":"` + art + `","small_image":"play"}}`
+	want := `{"type":3,"details":"Show","state":"S1 E2","assets":{"large_image":"` + art + `"}}`
 	if got != want {
 		t.Fatalf("WireJSON = %s, want %s", got, want)
 	}
@@ -161,8 +169,8 @@ func TestLargeImageFallbackToLogo(t *testing.T) {
 }
 
 func TestSetActivityNoTimer(t *testing.T) {
-	// The idle card: details Browsing / state Idle / small_image stop, and no
-	// timestamps object at all.
+	// The idle card: details Browsing / state Idle and no timestamps object
+	// at all. No small icon either: the pristine idle card is icon-free.
 	c, sc, _ := connectPair(t, 0, Config{})
 	defer sc.Close()
 
@@ -180,9 +188,9 @@ func TestSetActivityNoTimer(t *testing.T) {
 		t.Fatalf("idle card = %v", a)
 	}
 	assets := asMap(t, a["assets"], "assets")
-	wantKeys(t, "assets", assets, "large_image", "small_image")
-	if assets["small_image"] != "stop" {
-		t.Fatalf("idle small_image = %v, want stop", assets["small_image"])
+	wantKeys(t, "assets", assets, "large_image")
+	if _, ok := assets["small_image"]; ok {
+		t.Fatalf("idle small_image present, want omitted (pristine card): %v", assets)
 	}
 	if _, ok := assets["large_text"]; ok {
 		t.Fatalf("large_text present while empty, want omitted: %v", assets)
@@ -252,7 +260,9 @@ func TestSetActivityPausedStartOnlyNoEnd(t *testing.T) {
 
 func TestWireJSONMapping(t *testing.T) {
 	// The Netflix-style card on the exact wire object: header `name`, two body
-	// lines (`details`, `state`), brand texts, and no buttons/party/secrets.
+	// lines (`details`, `state`), brand text, and no buttons/party/secrets -
+	// and no small icon keys. Callers still set SmallImage/SmallText; the
+	// wire drops them.
 	cases := []struct {
 		name string
 		act  Activity
@@ -261,27 +271,27 @@ func TestWireJSONMapping(t *testing.T) {
 		{
 			name: "movie",
 			act:  Activity{Name: "Movie", Details: "Movie", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing", HasStart: true, Start: 12345, End: 67890},
-			want: `{"type":3,"name":"Movie","details":"Movie","timestamps":{"start":12345,"end":67890},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"play","small_text":"Playing"}}`,
+			want: `{"type":3,"name":"Movie","details":"Movie","timestamps":{"start":12345,"end":67890},"assets":{"large_image":"logo","large_text":"PotFlix"}}`,
 		},
 		{
 			name: "tv with episode name and tag",
 			act:  Activity{Name: "Show", Details: "Pilot", State: "S1 E2", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing", HasStart: true, Start: 111, End: 222},
-			want: `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"play","small_text":"Playing"}}`,
+			want: `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"logo","large_text":"PotFlix"}}`,
 		},
 		{
 			name: "tv with tag only",
 			act:  Activity{Name: "Show", Details: "S1 E2", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing", HasStart: true, Start: 111, End: 222},
-			want: `{"type":3,"name":"Show","details":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"play","small_text":"Playing"}}`,
+			want: `{"type":3,"name":"Show","details":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"logo","large_text":"PotFlix"}}`,
 		},
 		{
 			name: "paused",
 			act:  Activity{Name: "Show", Details: "Pilot", State: "S1 E2 - Paused", LargeText: "PotFlix", SmallImage: "pause", SmallText: "Paused", HasStart: true, Start: 5000},
-			want: `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2 - Paused","timestamps":{"start":5000},"assets":{"large_image":"logo","large_text":"PotFlix","small_image":"pause","small_text":"Paused"}}`,
+			want: `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2 - Paused","timestamps":{"start":5000},"assets":{"large_image":"logo","large_text":"PotFlix"}}`,
 		},
 		{
 			name: "idle",
 			act:  Activity{Details: "Browsing", State: "Idle", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Idle"},
-			want: `{"type":3,"details":"Browsing","state":"Idle","assets":{"large_image":"logo","large_text":"PotFlix","small_image":"stop","small_text":"Idle"}}`,
+			want: `{"type":3,"details":"Browsing","state":"Idle","assets":{"large_image":"logo","large_text":"PotFlix"}}`,
 		},
 	}
 	for _, c := range cases {
@@ -317,18 +327,17 @@ func TestClearActivityIsNull(t *testing.T) {
 	}
 }
 
-func TestWireJSONButtonsPresent(t *testing.T) {
-	// Valid buttons ride the wire as {"label":..,"url":..} entries.
+func TestWireJSONButtonsAlwaysOmitted(t *testing.T) {
+	// Pristine card: even fully valid buttons never reach the wire - the
+	// field is omitted, not sent as null or [].
 	got := WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play",
-		Buttons: []ActivityButton{{Label: "View Episode", URL: "https://example.com/ep/1"}}})
-	want := `{"type":3,"details":"Show","state":"S1 E2","assets":{"large_image":"logo","small_image":"play"},"buttons":[{"label":"View Episode","url":"https://example.com/ep/1"}]}`
-	if got != want {
-		t.Fatalf("WireJSON = %s, want %s", got, want)
+		Buttons: []ActivityButton{
+			{Label: "View Episode", URL: "https://example.com/ep/1"},
+			{Label: "IMDb", URL: "https://example.com/imdb"},
+		}})
+	if strings.Contains(got, `"buttons"`) {
+		t.Fatalf("valid buttons present, want omitted: %s", got)
 	}
-}
-
-func TestWireJSONButtonsOmittedWhenEmpty(t *testing.T) {
-	// No buttons: the field is omitted, not sent as null or [].
 	for _, btns := range [][]ActivityButton{nil, {}} {
 		got := WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", Buttons: btns})
 		if strings.Contains(got, `"buttons"`) {
@@ -337,33 +346,25 @@ func TestWireJSONButtonsOmittedWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestWireJSONButtonsInvalidDropped(t *testing.T) {
-	// Entries with an empty label or a non-http(s) URL are dropped; when
-	// nothing valid remains the field is omitted.
-	got := WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", Buttons: []ActivityButton{
-		{Label: "", URL: "https://example.com/no-label"},
-		{Label: "No URL", URL: ""},
-		{Label: "FTP", URL: "ftp://example.com/x"},
-		{Label: "Data", URL: "data:image/png;base64,xx"},
-	}})
-	if strings.Contains(got, `"buttons"`) {
-		t.Fatalf("all-invalid buttons present, want omitted: %s", got)
+// TestWireJSONPristineGolden is the clean-card proof: a full playing card
+// with every legacy field set (icons, texts, buttons) serializes to exactly
+// the pristine object - header, two body lines, time bar, brand art - with
+// no buttons key and no small_image/small_text keys anywhere.
+func TestWireJSONPristineGolden(t *testing.T) {
+	got := WireJSON(Activity{
+		Name: "Show", Details: "Pilot", State: "S1 E2",
+		LargeImage: "https://example.com/poster.jpg", LargeText: "PotFlix",
+		SmallImage: "play", SmallText: "Playing",
+		HasStart: true, Start: 111, End: 222,
+		Buttons: []ActivityButton{{Label: "Trailer", URL: "https://example.com/trailer"}},
+	})
+	want := `{"type":3,"name":"Show","details":"Pilot","state":"S1 E2","timestamps":{"start":111,"end":222},"assets":{"large_image":"https://example.com/poster.jpg","large_text":"PotFlix"}}`
+	if got != want {
+		t.Fatalf("WireJSON = %s, want %s", got, want)
 	}
-
-	// Mixed: only the valid entry survives.
-	got = WireJSON(Activity{Details: "Show", State: "S1 E2", SmallImage: "play", Buttons: []ActivityButton{
-		{Label: "", URL: "https://example.com/no-label"},
-		{Label: "View Episode", URL: "https://example.com/ep/1"},
-		{Label: "No URL", URL: ""},
-	}})
-	a := decodeFrame(t, []byte(got))
-	btns, ok := a["buttons"].([]any)
-	if !ok || len(btns) != 1 {
-		t.Fatalf("buttons = %v, want exactly one entry in %s", a["buttons"], got)
-	}
-	b := asMap(t, btns[0], "buttons[0]")
-	wantKeys(t, "buttons[0]", b, "label", "url")
-	if b["label"] != "View Episode" || b["url"] != "https://example.com/ep/1" {
-		t.Fatalf("buttons[0] = %v", b)
+	for _, key := range []string{`"buttons"`, `"small_image"`, `"small_text"`} {
+		if strings.Contains(got, key) {
+			t.Fatalf("pristine payload carries %s: %s", key, got)
+		}
 	}
 }
