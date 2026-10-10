@@ -151,3 +151,5 @@ The deliberate behaviour deviations from the Java reference (window on
 launch, folder scan index, export/import bundle, empty
 asset text omitted on the wire, clear-on-exit, capped debug log, `READY`
 handshake requirement) are recorded in the repository `README.md`.
+Headless OP/ED with no episode name (`ED 03.mkv` -> `ED 3`, naming-report
+P12) shows the tag alone; the frozen Java cleaner yields `ED 3 - ED 3`.
