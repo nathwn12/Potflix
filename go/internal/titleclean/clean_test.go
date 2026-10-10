@@ -253,3 +253,274 @@ func TestBoundaryGuards(t *testing.T) {
 		t.Error("yearLead boundary after 2019 fails before a CJK letter")
 	}
 }
+
+// TestCleanSection6 pins every row of tools/naming-report.md section 6.
+// Each expectation was verified byte-identical against the installed JDK
+// (11.0.32) running the frozen Main.clean over the same input; the Go port
+// matched all 26 verification rows (these 10 plus TestCleanEpisodePatterns).
+func TestCleanSection6(t *testing.T) {
+	cases := []struct {
+		in                        string
+		title, tag, name, display string
+	}{
+		{
+			"Breaking.Bad.S02E08.Better.Call.Saul.1080p.BluRay.x265-CtrlHD.mkv",
+			"Breaking Bad", "S2 E8", "Better Call Saul",
+			"Breaking Bad \u2014 S2 E8 \"Better Call Saul\"",
+		},
+		{
+			"S01E03-The Rookie Fire Soldier Games [0CCBF9D4].mkv",
+			"The Rookie Fire Soldier Games", "S1 E3", "",
+			"The Rookie Fire Soldier Games \u2014 S1 E3",
+		},
+		{
+			"The Amazing World of Gumball S02E13E14  The Skull - The Bet.mkv",
+			"The Amazing World of Gumball", "S2 E13-14", "The Skull - The Bet",
+			"The Amazing World of Gumball \u2014 S2 E13-14 \"The Skull - The Bet\"",
+		},
+		{
+			"[Kosaka] Serial Experiments Lain - 01x09 - Layer09 PROTOCOL.mkv",
+			"Serial Experiments Lain", "S1 E9", "Layer09 PROTOCOL",
+			"Serial Experiments Lain \u2014 S1 E9 \"Layer09 PROTOCOL\"",
+		},
+		{
+			"Arcane. Season 01. Episode 05. By Wild_Cat.mkv",
+			"Arcane", "S1 E5", "By Wild Cat",
+			"Arcane \u2014 S1 E5 \"By Wild Cat\"",
+		},
+		{
+			"Monster - Chapter 01 - Herr Dr. Tenma.mkv",
+			"Monster", "E1", "Herr Dr Tenma",
+			"Monster \u2014 E1 \"Herr Dr Tenma\"",
+		},
+		{
+			"[DB]Saiki Kusuo no Psi-nan_-_NCOP01_(10bit_BD1080p_x265).mkv",
+			"Saiki Kusuo no Psi-nan", "OP 1", "",
+			"Saiki Kusuo no Psi-nan \u2014 OP 1",
+		},
+		{
+			"The.Boys.S05E04.1080p.WEB.h264-ETHEL.mkv",
+			"The Boys", "S5 E4", "",
+			"The Boys \u2014 S5 E4",
+		},
+		{
+			"Deleted and Extended Scenes.mkv",
+			"Deleted and Extended Scenes", "", "",
+			"Deleted and Extended Scenes",
+		},
+		{
+			"[2ndfire] Tengen Toppa Gurren Lagann - 26 - Let's Go, Comrades! [145E4A7F].mkv",
+			"Tengen Toppa Gurren Lagann", "E26", "Let's Go, Comrades!",
+			"Tengen Toppa Gurren Lagann \u2014 E26 \"Let's Go, Comrades!\"",
+		},
+	}
+	for _, c := range cases {
+		got := clean(c.in)
+		if got.Title != c.title || got.EpisodeTag != c.tag || got.EpisodeName != c.name || got.Display != c.display {
+			t.Errorf("clean(%q) = %+v, want title=%q tag=%q name=%q display=%q",
+				c.in, got, c.title, c.tag, c.name, c.display)
+		}
+	}
+}
+
+// TestCleanEpisodePatterns covers the P2-P9 episode rules from
+// tools/naming-report.md section 5 in report order: MULTI before SERIES,
+// EPWORD before ALT_EP, and the CHAPTER/TRAIL year guards plus the ALT_EP
+// connector/year guards. Expectations are JDK-verified ground truth, same
+// method as TestCleanSection6.
+func TestCleanEpisodePatterns(t *testing.T) {
+	cases := []struct {
+		in                        string
+		title, tag, name, display string
+	}{
+		// P3 MULTI, second-episode form (MULTI wins over SERIES: E4-5, not E4).
+		{
+			"Show S1950E04E05 Name.mkv",
+			"Show", "S1950 E4-5", "Name",
+			"Show \u2014 S1950 E4-5 \"Name\"",
+		},
+		// P2 SERIES: empty head takes the tag alone; widened 4-digit season.
+		{
+			"Show S1950E04.mkv",
+			"Show", "S1950 E4", "",
+			"Show \u2014 S1950 E4",
+		},
+		{
+			"S02E07.mkv",
+			"S2 E7", "S2 E7", "",
+			"S2 E7",
+		},
+		// P4 EPWORD: headless, headed, and Ep-abbreviation forms.
+		{
+			"Episode 104.mkv",
+			"E104", "E104", "",
+			"E104",
+		},
+		{
+			"BLEACH Kai - Episode 38 - FEAR FOR FIGHT.mkv",
+			"BLEACH Kai", "E38", "FEAR FOR FIGHT",
+			"BLEACH Kai \u2014 E38 \"FEAR FOR FIGHT\"",
+		},
+		{
+			"Show Ep 12 Finale.mkv",
+			"Show", "E12", "Finale",
+			"Show \u2014 E12 \"Finale\"",
+		},
+		// P5 SEASON_EXTRA: numeric tail is an episode; otherwise the
+		// "Season NN -" connector is dropped and no tag is produced.
+		{
+			"Arcane Season 01 05 By Wild Cat.mkv",
+			"Arcane", "S1 E5", "By Wild Cat",
+			"Arcane \u2014 S1 E5 \"By Wild Cat\"",
+		},
+		{
+			"Season 03 - Stop-Motion Lego Intro.mkv",
+			"Stop-Motion Lego Intro", "", "",
+			"Stop-Motion Lego Intro",
+		},
+		// P6 CHAPTER year guard: a dated movie keeps "Chapter 1" as title text.
+		{
+			"John Wick Chapter 1 2014 1080p BluRay HEVC x265 5.1 BONE.mkv",
+			"John Wick Chapter 1 2014 BONE", "", "",
+			"John Wick Chapter 1 2014 BONE",
+		},
+		// P8 TRAIL: zero-prefixed tail is an episode ...
+		{
+			"Podcast 07.mkv",
+			"Podcast", "E7", "",
+			"Podcast \u2014 E7",
+		},
+		// ... but a year tail is not (YEAR suffix still applies).
+		{
+			"Show 05 2019.mkv",
+			"Show 05 (2019)", "", "",
+			"Show 05 (2019)",
+		},
+		// P9 ALT_EP guards: connector-headed head and bare-number tail rejected.
+		{
+			"The Hunger Games Mockingjay Part 2 Extended.mkv",
+			"The Hunger Games Mockingjay Part 2 Extended", "", "",
+			"The Hunger Games Mockingjay Part 2 Extended",
+		},
+		{
+			"Apollo 13.mkv",
+			"Apollo 13", "", "",
+			"Apollo 13",
+		},
+	}
+	for _, c := range cases {
+		got := clean(c.in)
+		if got.Title != c.title || got.EpisodeTag != c.tag || got.EpisodeName != c.name || got.Display != c.display {
+			t.Errorf("clean(%q) = %+v, want title=%q tag=%q name=%q display=%q",
+				c.in, got, c.title, c.tag, c.name, c.display)
+		}
+	}
+}
+
+// TestCleanTagVocabP10P11 pins the P10 TAGS vocab additions/broadenings/
+// removals and the P11 SCENE_HINT additions from tools/naming-report.md
+// section 5 (report section 4 RC2/RC4 rows). The h264-ETHEL row is already
+// covered by TestCleanSection6 row 8; bare "Extended" is covered by its row 9.
+// Each expectation was verified byte-identical against the installed JDK
+// (11.0.32) running the frozen Main.clean over the same input.
+func TestCleanTagVocabP10P11(t *testing.T) {
+	cases := []struct {
+		in                        string
+		title, tag, name, display string
+	}{
+		// P11 opus -> SCENE_HINT drops -RAV1NE; P10 5.1/unrated/av1 tags strip.
+		{
+			"The.Dictator.2012.UNRATED.1080p.BluRay.AV1.Opus.5.1-RAV1NE.mkv",
+			"The Dictator (2012)", "", "",
+			"The Dictator (2012)",
+		},
+		// P10 hdr\d*\+? leaves no bare "+"; nf strips; P11 av1 drops -SomniWare.
+		{
+			"Arcane.S01E03.HDR10+.AV1.WEB-DL.NF-SomniWare.mkv",
+			"Arcane", "S1 E3", "",
+			"Arcane \u2014 S1 E3",
+		},
+		// P10 ddp broaden covers DDP5.1; hdr/atmos/x265 strip.
+		{
+			"Dune.Part.Two.2024.2160p.WEB-DL.HDR.DDP5.1.Atmos.x265.mkv",
+			"Dune Part Two (2024)", "", "",
+			"Dune Part Two (2024)",
+		},
+		// P10 aac broaden covers AAC5.1; -YTS group suffix drops.
+		{
+			"War.Dogs.2016.AAC5.1.BluRay.x264-YTS.mkv",
+			"War Dogs (2016)", "", "",
+			"War Dogs (2016)",
+		},
+		// P10 removed bare final: a real title word survives.
+		{
+			"The Final Battle.mkv",
+			"The Final Battle", "", "",
+			"The Final Battle",
+		},
+		// P10 extended/theatrical strip only in *-cut form.
+		{
+			"Avatar.2009.Extended.Cut.1080p.BluRay.x264.mkv",
+			"Avatar (2009)", "", "",
+			"Avatar (2009)",
+		},
+		{
+			"Avatar.2009.Theatrical.Cut.1080p.BluRay.x264.mkv",
+			"Avatar (2009)", "", "",
+			"Avatar (2009)",
+		},
+		{
+			"Original Japanese Theatrical Trailers.mkv",
+			"Original Japanese Theatrical Trailers", "", "",
+			"Original Japanese Theatrical Trailers",
+		},
+		// No bare ma add: "Ma" survives (report section 5 P10 note).
+		{
+			"Ma.2019.1080p.BluRay.mkv",
+			"Ma (2019)", "", "",
+			"Ma (2019)",
+		},
+	}
+	for _, c := range cases {
+		got := clean(c.in)
+		if got.Title != c.title || got.EpisodeTag != c.tag || got.EpisodeName != c.name || got.Display != c.display {
+			t.Errorf("clean(%q) = %+v, want title=%q tag=%q name=%q display=%q",
+				c.in, got, c.title, c.tag, c.name, c.display)
+		}
+	}
+}
+
+// TestCleanP1P12 pins the naming-report P1 trailing-separator strip and the
+// P12 empty-title fallback. The NCED02 row is JDK-verified ground truth
+// (java 11.0.32 running the frozen Main.clean over the same input); the
+// ED 03 row is the deliberate Go-side deviation -- the frozen cleaner yields
+// title/display "ED 3"/"ED 3 - ED 3" there (harness-verified), the Go port
+// shows the tag alone per the report. The Saiki NCOP01 (`OP 1`) and the
+// S01E03 headless-title rows already live in TestCleanSection6 rows 7 and 2.
+func TestCleanP1P12(t *testing.T) {
+	cases := []struct {
+		in                        string
+		title, tag, name, display string
+	}{
+		// P1: trailing "_" left by the parenthetical removal no longer
+		// blocks NCBOOK, so the season number is not stolen as E2.
+		{
+			"[DB]Saiki Kusuo no Psi-nan 2_-_NCED02_(10bit_BD1080p_x265).mkv",
+			"Saiki Kusuo no Psi-nan 2", "ED 2", "",
+			"Saiki Kusuo no Psi-nan 2 \u2014 ED 2",
+		},
+		// P12: headless tag with no episode name shows the tag alone.
+		{
+			"ED 03.mkv",
+			"ED 3", "ED 3", "",
+			"ED 3",
+		},
+	}
+	for _, c := range cases {
+		got := clean(c.in)
+		if got.Title != c.title || got.EpisodeTag != c.tag || got.EpisodeName != c.name || got.Display != c.display {
+			t.Errorf("clean(%q) = %+v, want title=%q tag=%q name=%q display=%q",
+				c.in, got, c.title, c.tag, c.name, c.display)
+		}
+	}
+}
