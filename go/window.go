@@ -1090,7 +1090,12 @@ func previewRows(act presence.Activity, have bool) [5]string {
 		// presence.go: an empty Name falls back to the Discord app name.
 		header = "(Discord app name)"
 	}
-	images := act.LargeImage + " + " + act.SmallImage
+	// Pristine wire: no small-image slot, so a real card (SmallImage=="")
+	// renders the large image alone instead of a dangling "logo + ".
+	images := act.LargeImage
+	if act.SmallImage != "" {
+		images += " + " + act.SmallImage
+	}
 	buttons := "none"
 	if len(act.Buttons) > 0 {
 		parts := make([]string, 0, len(act.Buttons))

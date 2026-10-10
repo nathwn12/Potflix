@@ -19,7 +19,9 @@ import (
 
 // Potflix (Go port) - M1 app skeleton + M3 transport/poll loop.
 //
-// Headless, no console (built with -ldflags "-H=windowsgui"), argv ignored.
+// Headless, no console (built with -ldflags "-H=windowsgui"). Argv carries
+// only the --selftest switch and the autostart --minimized flag and is
+// otherwise ignored.
 // Lifecycle, in the Java app's order: single-instance lock first, then the tray
 // and the message loop. The poll loop runs beside the tray on its own goroutine.
 
@@ -185,12 +187,16 @@ func runUI(log *logger) {
 		log.logf("cleared (exit)")
 	}
 
-	// Settings window: created hidden, shown on normal launch. --selftest
-	// never reaches here (runSelfTest returns earlier), so it stays headless.
+	// Settings window: created hidden, shown on manual launch, kept hidden
+	// to the tray on the autostart path (Run value carries --minimized).
+	// --selftest never reaches here (runSelfTest returns earlier), so it
+	// stays headless.
 	if err := createMainWindow(); err != nil {
 		log.logf("main window init failed: %s", err)
-	} else {
+	} else if shouldShowMainWindow(os.Args) {
 		showMainWindow()
+	} else {
+		log.logf("autostart launch: window kept hidden (tray only)")
 	}
 
 	messageLoop()
@@ -306,30 +312,6 @@ func pollLoop(log *logger, dc *discord.Client) {
 	}
 }
 
-// metadataButtons maps resolver page buttons onto presence card buttons.
-func metadataButtons(in []metadata.Button) []presence.Button {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]presence.Button, 0, len(in))
-	for _, b := range in {
-		out = append(out, presence.Button{Label: b.Label, URL: b.URL})
-	}
-	return out
-}
-
-// presenceButtons maps presence card buttons onto Discord wire buttons.
-func presenceButtons(in []presence.Button) []discord.ActivityButton {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]discord.ActivityButton, 0, len(in))
-	for _, b := range in {
-		out = append(out, discord.ActivityButton{Label: b.Label, URL: b.URL})
-	}
-	return out
-}
-
 // pushActivity builds the card, asks the gate whether it must go out, logs the
 // attempt (the observation boundary), and sends only when the gate says so. A
 // failed send is not fatal - the client's supervisor reconnects and a later
@@ -348,7 +330,6 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 				res = presence.Resolved{
 					Series: r.Series, EpisodeName: r.Episode, Artwork: r.Artwork, Synopsis: r.Synopsis,
 					Genres: r.Genres, Length: r.Length, Year: r.Year, IsMovie: r.IsMovie,
-					Buttons: metadataButtons(r.Buttons),
 				}
 				card = presence.BuildActivityResolved(rawTitle, a, res)
 			}
@@ -390,12 +371,9 @@ func pushActivity(log *logger, dc *discord.Client, gate *presence.Gate, rawTitle
 		State:      out.State,
 		LargeImage: out.LargeImage,
 		LargeText:  out.LargeText,
-		SmallImage: out.SmallImage,
-		SmallText:  out.SmallText,
 		HasStart:   out.HasStart,
 		Start:      out.Start,
 		End:        out.End,
-		Buttons:    presenceButtons(out.Buttons),
 	}); err != nil {
 		log.eventSendError(err)
 	} else {

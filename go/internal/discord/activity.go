@@ -17,8 +17,7 @@ import (
 //	 "args":{"pid":<os.Getpid()>,
 //	         "activity":{"type":3,"name":...,"details":...,"state":...,
 //	                     "timestamps":{"start":...,"end":...},
-//	                     "assets":{"large_image":"logo","large_text":"PotFlix",
-//	                               "small_image":...,"small_text":...}}},
+//	                     "assets":{"large_image":"logo","large_text":"PotFlix"}}},
 //	 "nonce":"<unique>"}
 //
 // `name` overrides the header line ("Watching <title>"); when absent the header
@@ -34,10 +33,10 @@ import (
 // timestamps.start and (when the duration is known) timestamps.end, so the
 // client renders the time bar against the real media position. While paused it
 // carries timestamps.start only, anchored at the pause moment, so the client
-// counts the pause UP ("paused for M:SS"). Buttons carry up to two
-// {"label","url"} links when the caller supplies valid entries (non-empty
-// label plus an http(s) URL); invalid entries are dropped, and the field is
-// omitted when none remain. Deliberately NOT set: party, secrets,
+// counts the pause UP ("paused for M:SS"). The pristine card carries NO
+// small_image/small_text (no play/pause/stop corner icon) and NO buttons:
+// the caller-side fields are accepted for compatibility but never
+// serialized. Deliberately NOT set: party, secrets,
 // instance, application_id/name.
 //
 // Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
@@ -56,14 +55,15 @@ type Activity struct {
 	State      string
 	LargeImage string // https artwork URL; empty/invalid falls back to "logo"
 	LargeText  string // "PotFlix"; empty is omitted on the wire
-	SmallImage string // "play" running, "pause" paused, "stop" idle/stopped
-	SmallText  string // "Playing"/"Paused"/"Stopped"/"Idle"; empty is omitted
+	// SmallImage/SmallText are legacy: accepted so existing callers keep
+	// compiling, but never serialized - the card carries no status icon.
+	SmallImage string
+	SmallText  string
 	HasStart   bool
 	Start      int64 // epoch ms, set while running and paused
 	End        int64 // epoch ms, projected end from the gate; serialized while playing (deviation)
-	// Buttons are the card's click-through links; invalid entries (empty
-	// label or non-http(s) URL) are dropped on the wire, and the field is
-	// omitted when none remain.
+	// Buttons is legacy: accepted so existing callers keep compiling, but
+	// never serialized - the card carries no click-through links.
 	Buttons []ActivityButton
 }
 
@@ -80,22 +80,16 @@ type ActivityButton struct {
 const activityTypeWatching = 3
 
 // activityPayload is the wire activity object. Every empty string field is
-// omitted (`omitempty`) so Discord never sees `"large_text":""`; buttons are
-// omitted the same way when no valid entry remains.
+// omitted (`omitempty`) so Discord never sees `"large_text":""`. The
+// pristine card has no small image/text and no buttons, so those keys can
+// never appear here.
 type activityPayload struct {
-	Type       int             `json:"type"`
-	Name       string          `json:"name,omitempty"`
-	Details    string          `json:"details,omitempty"`
-	State      string          `json:"state,omitempty"`
-	Timestamps *timestamps     `json:"timestamps,omitempty"`
-	Assets     activityAsst    `json:"assets"`
-	Buttons    []buttonPayload `json:"buttons,omitempty"`
-}
-
-// buttonPayload is one wire button: {"label":..,"url":..}.
-type buttonPayload struct {
-	Label string `json:"label"`
-	URL   string `json:"url"`
+	Type       int          `json:"type"`
+	Name       string       `json:"name,omitempty"`
+	Details    string       `json:"details,omitempty"`
+	State      string       `json:"state,omitempty"`
+	Timestamps *timestamps  `json:"timestamps,omitempty"`
+	Assets     activityAsst `json:"assets"`
 }
 
 // timestamps carries the elapsed anchor and, while playing, the projected end.
@@ -107,12 +101,11 @@ type timestamps struct {
 }
 
 // activityAsst mirrors the contract's asset field names exactly; empty text is
-// omitted on the wire (see the file header).
+// omitted on the wire (see the file header). Only the large image/text ride
+// the wire: the pristine card has no small icon.
 type activityAsst struct {
 	LargeImage string `json:"large_image,omitempty"`
 	LargeText  string `json:"large_text,omitempty"`
-	SmallImage string `json:"small_image,omitempty"`
-	SmallText  string `json:"small_text,omitempty"`
 }
 
 // setActivityArgs is the args object; a nil Activity marshals to null.
@@ -145,8 +138,6 @@ func newActivity(a Activity) *activityPayload {
 		Assets: activityAsst{
 			LargeImage: largeImage,
 			LargeText:  a.LargeText,
-			SmallImage: a.SmallImage,
-			SmallText:  a.SmallText,
 		},
 	}
 	if a.HasStart {
@@ -160,22 +151,8 @@ func newActivity(a Activity) *activityPayload {
 		}
 		p.Timestamps = ts
 	}
-	// Buttons go out only when at least one valid entry exists: a non-empty
-	// label AND an http(s) URL. Anything else is dropped; an empty remainder
-	// stays nil so `omitempty` omits the field entirely.
-	var btns []buttonPayload
-	for _, b := range a.Buttons {
-		if strings.TrimSpace(b.Label) == "" {
-			continue
-		}
-		if !strings.HasPrefix(b.URL, "http://") && !strings.HasPrefix(b.URL, "https://") {
-			continue
-		}
-		btns = append(btns, buttonPayload{Label: b.Label, URL: b.URL})
-	}
-	if len(btns) > 0 {
-		p.Buttons = btns
-	}
+	// Pristine card: a.SmallImage/a.SmallText/a.Buttons are caller-compat
+	// fields only and are never serialized - no icon keys, no buttons key.
 	return p
 }
 

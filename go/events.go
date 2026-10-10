@@ -83,12 +83,9 @@ func (l *logger) eventPushAttempt(a presence.Activity, v presence.Verdict) {
 		State:      a.State,
 		LargeImage: a.LargeImage,
 		LargeText:  a.LargeText,
-		SmallImage: a.SmallImage,
-		SmallText:  a.SmallText,
 		HasStart:   a.HasStart,
 		Start:      a.Start,
 		End:        a.End,
-		Buttons:    presenceButtons(a.Buttons),
 	})
 	if v.Send {
 		l.logf("push attempt gate=sent start=%s payload=%s", start, payload)

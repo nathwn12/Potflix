@@ -388,6 +388,40 @@ var (
 // only.
 var startupState bool
 
+// autostartArg is the argv flag the HKCU Run value appends after the quoted
+// exe path. Windows launches Run values verbatim, so only the autostart path
+// carries it; a manual double-click never does. main.go gates the first
+// showMainWindow on it (hidden to tray on autostart, visible on manual).
+const autostartArg = "--minimized"
+
+// startupCommandFor renders the full Run command for exe: the quoted path
+// plus the autostart flag. startupValueFor keeps rendering the legacy
+// bare-path shape so old values still read as enabled.
+func startupCommandFor(exe string) string {
+	return `"` + exe + `" ` + autostartArg
+}
+
+// startupValueEnabled reports whether a stored Run value enables startup for
+// exe: either the current flagged command or the legacy bare path (a stale
+// value pointing elsewhere counts as off).
+func startupValueEnabled(got, exe string) bool {
+	return got == startupCommandFor(exe) || got == startupValueFor(exe)
+}
+
+// launchedViaAutostart reports whether this process was launched by the
+// autostart Run value (the flag it appends). Pure so tests drive it without
+// touching the registry.
+func launchedViaAutostart(args []string) bool {
+	return hasArg(args, autostartArg)
+}
+
+// shouldShowMainWindow is the first-show policy: hidden to tray only on the
+// autostart path, visible on every manual launch (preserving the first-run
+// Add-folder flow). Pure so tests drive it without a live window.
+func shouldShowMainWindow(args []string) bool {
+	return !launchedViaAutostart(args)
+}
+
 // startupValueFor renders the Run value for exe: the quoted path.
 func startupValueFor(exe string) string {
 	return `"` + exe + `"`
@@ -449,7 +483,7 @@ func queryStartupEnabled() bool {
 		return false
 	}
 	got, ok := readStartupValue()
-	return ok && got == startupValueFor(exe)
+	return ok && startupValueEnabled(got, exe)
 }
 
 // setStartupEnabled writes (on) or deletes (off) the Run value. Deleting a
@@ -472,7 +506,7 @@ func setStartupEnabled(on bool) error {
 	if exe == "" {
 		return fmt.Errorf("startup: cannot resolve exe path")
 	}
-	data := append(syscall.StringToUTF16(startupValueFor(exe)), 0)
+	data := append(syscall.StringToUTF16(startupCommandFor(exe)), 0)
 	r, _, _ := procRegSetValueExW.Call(hk, uintptr(unsafe.Pointer(name)),
 		0, regSZ, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)*2))
 	if r != 0 {

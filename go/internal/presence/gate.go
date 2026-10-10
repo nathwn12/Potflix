@@ -95,6 +95,14 @@ func (c *intervalClock) tick(now int64) int64 {
 	return c.value
 }
 
+// isPausedCard reports whether the card is the parked pause card: the
+// builder's Paused flag, or the legacy SmallImage "pause" marker on cards
+// built before the pristine-card change (kept so previously built cards keep
+// their meaning).
+func isPausedCard(card Activity) bool {
+	return card.Paused || card.SmallImage == "pause"
+}
+
 // buttonsEqual reports whether two card button lists carry the same ordered
 // label+URL pairs. Order matters: the wire serializes buttons in order.
 func buttonsEqual(a, b []Button) bool {
@@ -156,9 +164,12 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	// (timestamps.start = now - pausedElapsedMs, where pausedElapsedMs is 0 at
 	// the transition), so the client reads "paused for M:SS". There is NO
 	// timestamps.end while paused. Decided here, before the suppression paths,
-	// so the pause card is never debounced or throttled.
-	if out.SmallImage == "pause" {
-		if g.hasSent && g.last.SmallImage == "pause" &&
+	// so the pause card is never debounced or throttled. The pause is
+	// detected via isPausedCard (the builder's Paused flag, with the legacy
+	// SmallImage marker honoured); no pause icon rides the wire.
+	if isPausedCard(out) {
+		if g.hasSent && isPausedCard(g.last) &&
+			g.last.Paused == out.Paused &&
 			g.last.Name == out.Name &&
 			g.last.Details == out.Details && g.last.State == out.State &&
 			g.last.LargeImage == out.LargeImage &&
@@ -188,6 +199,7 @@ func (g *Gate) Decide(card Activity, pos, total, now int64, event, debounced boo
 	contentChanged := out.Name != g.last.Name ||
 		out.Details != g.last.Details ||
 		out.State != g.last.State ||
+		out.Paused != g.last.Paused ||
 		out.SmallImage != g.last.SmallImage ||
 		out.LargeImage != g.last.LargeImage ||
 		!buttonsEqual(g.last.Buttons, out.Buttons) ||

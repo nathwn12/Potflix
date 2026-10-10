@@ -346,7 +346,7 @@ func TestBuildActivity(t *testing.T) {
 			raw:  movieRaw,
 			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
 			want: Activity{Type: "PLAYING", Name: "Movie", Details: "Movie", State: "",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				LargeImage: "logo", LargeText: "PotFlix",
 				HasStart: true},
 			start: 12345,
 		},
@@ -355,7 +355,7 @@ func TestBuildActivity(t *testing.T) {
 			raw:  tvRaw,
 			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
 			want: Activity{Type: "PLAYING", Name: "Show", Details: "Pilot", State: "S1 E2",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				LargeImage: "logo", LargeText: "PotFlix",
 				HasStart: true},
 			start: 12345,
 		},
@@ -364,7 +364,7 @@ func TestBuildActivity(t *testing.T) {
 			raw:  tvTagOnlyRaw,
 			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
 			want: Activity{Type: "PLAYING", Name: "Show", Details: "S1 E2", State: "",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				LargeImage: "logo", LargeText: "PotFlix",
 				HasStart: true},
 			start: 12345,
 		},
@@ -373,35 +373,35 @@ func TestBuildActivity(t *testing.T) {
 			raw:  tvRaw,
 			act:  &Action{Paused: true, CT: 83000},
 			want: Activity{Type: "PLAYING", Name: "Show", Details: "Pilot", State: `S1 E2 - Paused`,
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "pause", SmallText: "Paused"},
+				LargeImage: "logo", LargeText: "PotFlix", Paused: true},
 		},
 		{
 			name: "movie paused has marker alone",
 			raw:  movieRaw,
 			act:  &Action{Paused: true, CT: 83000},
 			want: Activity{Type: "PLAYING", Name: "Movie", Details: "Movie", State: "Paused",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "pause", SmallText: "Paused"},
+				LargeImage: "logo", LargeText: "PotFlix", Paused: true},
 		},
 		{
 			name: "tv stopped",
 			raw:  tvRaw,
 			act:  &Action{CT: 0},
 			want: Activity{Type: "PLAYING", Name: "Show", Details: "Pilot", State: "S1 E2",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Stopped"},
+				LargeImage: "logo", LargeText: "PotFlix"},
 		},
 		{
 			name: "idle",
 			raw:  "PotPlayer",
 			act:  &Action{},
 			want: Activity{Type: "PLAYING", Details: "Browsing", State: "Idle",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Idle"},
+				LargeImage: "logo", LargeText: "PotFlix"},
 		},
 		{
 			name: "empty media is idle",
 			raw:  " - PotPlayer",
 			act:  &Action{},
 			want: Activity{Type: "PLAYING", Details: "Browsing", State: "Idle",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "stop", SmallText: "Idle"},
+				LargeImage: "logo", LargeText: "PotFlix"},
 		},
 		{
 			// No episode name, and the over-128-unit title fills the
@@ -411,7 +411,7 @@ func TestBuildActivity(t *testing.T) {
 			raw:  strings.Repeat("A", 200) + ".mkv - PotPlayer",
 			act:  &Action{Running: true, HasStart: true, Start: 12345, CT: 1000},
 			want: Activity{Type: "PLAYING", Name: strings.Repeat("A", 99) + string([]rune{0x2026}), Details: strings.Repeat("A", 99) + string([]rune{0x2026}), State: "",
-				LargeImage: "logo", LargeText: "PotFlix", SmallImage: "play", SmallText: "Playing",
+				LargeImage: "logo", LargeText: "PotFlix",
 				HasStart: true},
 			start: 12345,
 		},
@@ -729,52 +729,19 @@ func TestBuildActivityResolvedSeriesState(t *testing.T) {
 }
 
 func TestBuildActivityResolvedButtons(t *testing.T) {
+	// Pristine card: resolved buttons are always ignored, even valid ones.
 	const movieRaw = "Movie.mkv - PotPlayer"
 	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
 
-	t.Run("capped at two", func(t *testing.T) {
+	t.Run("valid buttons stripped", func(t *testing.T) {
 		got := BuildActivityResolved(movieRaw, runAct, Resolved{
 			Buttons: []Button{
 				{Label: "Trailer", URL: "https://example.com/trailer"},
 				{Label: "IMDb", URL: "https://example.com/imdb"},
-				{Label: "Extra", URL: "https://example.com/extra"},
 			},
 		})
-		if len(got.Buttons) != 2 {
-			t.Fatalf("Buttons = %+v, want 2 kept", got.Buttons)
-		}
-		if got.Buttons[0].Label != "Trailer" || got.Buttons[1].Label != "IMDb" {
-			t.Errorf("Buttons = %+v, want first two kept", got.Buttons)
-		}
-	})
-
-	t.Run("http kept ftp and empty dropped", func(t *testing.T) {
-		got := BuildActivityResolved(movieRaw, runAct, Resolved{
-			Buttons: []Button{
-				{Label: "", URL: "https://example.com/x"},
-				{Label: "NoURL", URL: "ftp://example.com/x"},
-				{Label: "Bare", URL: "example.com/x"},
-				{Label: "OK", URL: "http://example.com/ok"},
-			},
-		})
-		if len(got.Buttons) != 1 || got.Buttons[0].Label != "OK" {
-			t.Fatalf("Buttons = %+v, want only the http one", got.Buttons)
-		}
-		if got.Buttons[0].URL != "http://example.com/ok" {
-			t.Errorf("URL = %q, want kept verbatim", got.Buttons[0].URL)
-		}
-	})
-
-	t.Run("label capped at 32", func(t *testing.T) {
-		long := strings.Repeat("l", 100)
-		got := BuildActivityResolved(movieRaw, runAct, Resolved{
-			Buttons: []Button{{Label: long, URL: "https://example.com/x"}},
-		})
-		if len(got.Buttons) != 1 {
-			t.Fatalf("Buttons = %+v, want 1", got.Buttons)
-		}
-		if n := javaUnits(got.Buttons[0].Label); n > 32 {
-			t.Errorf("label length %d exceeds 32: %q", n, got.Buttons[0].Label)
+		if len(got.Buttons) != 0 {
+			t.Fatalf("Buttons = %+v, want stripped (empty)", got.Buttons)
 		}
 	})
 
@@ -783,6 +750,49 @@ func TestBuildActivityResolvedButtons(t *testing.T) {
 			t.Errorf("BuildActivity.Buttons = %+v, want empty", got.Buttons)
 		}
 	})
+}
+
+// TestPristineCardNoIconsNoButtons is the clean-card proof: across running,
+// paused, stopped and idle (plain and metadata-resolved), the builders emit
+// no SmallImage/SmallText and no Buttons, while Name/Details/State and the
+// timer anchors stay intact.
+func TestPristineCardNoIconsNoButtons(t *testing.T) {
+	const tvRaw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	runAct := &Action{Running: true, HasStart: true, Start: 12345, CT: 1000}
+	pauseAct := &Action{Paused: true, CT: 83000}
+	stopAct := &Action{CT: 0}
+	res := Resolved{
+		Series: "Show", EpisodeName: "Pilot",
+		Artwork: "https://example.com/poster.jpg",
+		Buttons: []Button{{Label: "Trailer", URL: "https://example.com/trailer"}},
+	}
+	cards := []Activity{
+		BuildActivity(tvRaw, runAct),
+		BuildActivity(tvRaw, pauseAct),
+		BuildActivity(tvRaw, stopAct),
+		BuildActivity("PotPlayer", &Action{}),
+		BuildActivityResolved(tvRaw, runAct, res),
+		BuildActivityResolved(tvRaw, pauseAct, res),
+	}
+	for i, got := range cards {
+		if got.SmallImage != "" || got.SmallText != "" {
+			t.Errorf("card %d: SmallImage=%q SmallText=%q, want no icons", i, got.SmallImage, got.SmallText)
+		}
+		if len(got.Buttons) != 0 {
+			t.Errorf("card %d: Buttons=%+v, want none", i, got.Buttons)
+		}
+	}
+	// Spot-check the intact lines: header, body, and the running timer.
+	run := cards[0]
+	if run.Name != "Show" || run.Details != "Pilot" || run.State != "S1 E2" {
+		t.Errorf("running lines = %q/%q/%q, want Show/Pilot/S1 E2", run.Name, run.Details, run.State)
+	}
+	if !run.HasStart || run.Start != 12345 {
+		t.Errorf("running timer HasStart=%t Start=%d, want true/12345", run.HasStart, run.Start)
+	}
+	if !cards[1].Paused {
+		t.Errorf("paused card Paused=false, want true (the gate's park signal)")
+	}
 }
 
 func TestSmartTrimSynopsisSentenceNoEllipsis(t *testing.T) {

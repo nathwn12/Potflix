@@ -190,6 +190,123 @@ func TestCardSpecPresetsCapped(t *testing.T) {
 	}
 }
 
+// TestCardSpecKindAdapt pins kind-driven line selection through the active
+// preset: the movie branch (IsMovie) appends the year on the series preset
+// and keeps the base line on the episode preset (movies have no episodes);
+// the series branch serves episodes; anime (IsMovie=false, even with a Year
+// set) resolves through the series branch, never the movie one.
+func TestCardSpecKindAdapt(t *testing.T) {
+	run := &Action{Running: true, HasStart: true, Start: 1, CT: 2}
+	mRaw := "Dune.Part.Two.2024.1080p.mkv - PotPlayer"
+	movie := Resolved{Series: "Dune: Part Two", Year: 2024, IsMovie: true,
+		Genres: "Sci-Fi", Length: "2h 46m", Synopsis: "Paul unites the Fremen"}
+	sRaw := "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	series := Resolved{Series: "Canonical Series", EpisodeName: "Canonical Episode",
+		Synopsis: "A brave synopsis"}
+	aRaw := "Frieren.S01E01.The.Heros.Rest.1080p.mkv - PotPlayer"
+	anime := Resolved{Series: "Frieren", EpisodeName: "The Hero's Rest",
+		Synopsis: "An elf mourns", Year: 2023}
+	const mid = " \u00b7 "
+	for _, c := range []struct {
+		name  string
+		raw   string
+		res   Resolved
+		spec  CardSpec
+		wantD string
+		wantS string
+	}{
+		{"movie default", mRaw, movie, DefaultCardSpec(),
+			"Dune: Part Two (2024)", "Sci-Fi" + mid + "2h 46m" + mid + "Paul unites the Fremen"},
+		{"movie episode keeps base", mRaw, movie, CardSpec{Details: CardDetailsEpisode, State: CardStateDefault},
+			"Dune: Part Two (2024)", "Sci-Fi" + mid + "2h 46m" + mid + "Paul unites the Fremen"},
+		{"movie series appends year", mRaw, movie, CardSpec{Details: CardDetailsSeries, State: CardStateDefault},
+			"Dune: Part Two (2024)", "Sci-Fi" + mid + "2h 46m" + mid + "Paul unites the Fremen"},
+		{"movie title drops year", mRaw, movie, CardSpec{Details: CardDetailsTitle, State: CardStateTag},
+			"Dune: Part Two", ""},
+		{"movie synopsis", mRaw, movie, CardSpec{Details: CardDetailsDefault, State: CardStateSynopsis},
+			"Dune: Part Two (2024)", "Paul unites the Fremen"},
+		{"series default", sRaw, series, DefaultCardSpec(),
+			"Canonical Episode", "S1 E2" + mid + "A brave synopsis"},
+		{"series episode", sRaw, series, CardSpec{Details: CardDetailsEpisode, State: CardStateTag},
+			"Canonical Episode", "S1 E2"},
+		{"series series keeps title", sRaw, series, CardSpec{Details: CardDetailsSeries, State: CardStateSynopsis},
+			"Canonical Series", "A brave synopsis"},
+		{"anime default is series branch", aRaw, anime, DefaultCardSpec(),
+			"The Hero's Rest", "S1 E1" + mid + "An elf mourns"},
+		{"anime series ignores year", aRaw, anime, CardSpec{Details: CardDetailsSeries, State: CardStateTag},
+			"Frieren", "S1 E1"},
+		{"anime title", aRaw, anime, CardSpec{Details: CardDetailsTitle, State: CardStateSynopsis},
+			"Frieren", "An elf mourns"},
+	} {
+		if d, s := c.spec.Render(c.raw, run, c.res); d != c.wantD || s != c.wantS {
+			t.Errorf("%s: Render = (%q, %q), want (%q, %q)",
+				c.name, d, s, c.wantD, c.wantS)
+		}
+	}
+}
+
+// TestCardSpecEmptyHide pins omitempty honesty: an absent slot renders ""
+// (tag with no episode tag, synopsis with no synopsis, none always) while
+// the Details line never blanks (per-kind fallbacks keep the base line).
+// The paused marker path is preserved: paused-with-content keeps the suffix,
+// paused-with-nothing still reads "Paused" - except none, which hides even
+// when paused. Idle keeps its shipped lines under every preset (covered by
+// TestCardSpecIdleStable).
+func TestCardSpecEmptyHide(t *testing.T) {
+	run := &Action{Running: true, HasStart: true, Start: 1, CT: 2}
+	paused := &Action{Paused: true, CT: 1000}
+	mRaw := "Dune.Part.Two.2024.1080p.mkv - PotPlayer"
+	bareMovie := Resolved{Series: "Dune", IsMovie: true}
+	sRaw := "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
+	for _, c := range []struct {
+		name  string
+		raw   string
+		act   *Action
+		res   Resolved
+		spec  CardSpec
+		wantD string
+		wantS string
+	}{
+		{"movie tag absent hides", mRaw, run, bareMovie,
+			CardSpec{Details: CardDetailsDefault, State: CardStateTag}, "Dune", ""},
+		{"movie synopsis absent hides", mRaw, run, bareMovie,
+			CardSpec{Details: CardDetailsDefault, State: CardStateSynopsis}, "Dune", ""},
+		{"movie none hides", mRaw, run, bareMovie,
+			CardSpec{Details: CardDetailsDefault, State: CardStateNone}, "Dune", ""},
+		{"series preset falls back to base", sRaw, run, Resolved{},
+			CardSpec{Details: CardDetailsSeries, State: CardStateDefault}, "Pilot", "S1 E2"},
+		{"synopsis absent hides", sRaw, run, Resolved{},
+			CardSpec{Details: CardDetailsDefault, State: CardStateSynopsis}, "Pilot", ""},
+		{"none hides with content", sRaw, run,
+			Resolved{Series: "S", EpisodeName: "E", Synopsis: "Syn"},
+			CardSpec{Details: CardDetailsSeries, State: CardStateNone}, "S", ""},
+		{"paused tag absent reads Paused", mRaw, paused, bareMovie,
+			CardSpec{Details: CardDetailsDefault, State: CardStateTag}, "Dune", "Paused"},
+		{"paused synopsis absent reads Paused", mRaw, paused, bareMovie,
+			CardSpec{Details: CardDetailsDefault, State: CardStateSynopsis}, "Dune", "Paused"},
+		{"paused none still hides", mRaw, paused, bareMovie,
+			CardSpec{Details: CardDetailsDefault, State: CardStateNone}, "Dune", ""},
+	} {
+		if d, s := c.spec.Render(c.raw, c.act, c.res); d != c.wantD || s != c.wantS {
+			t.Errorf("%s: Render = (%q, %q), want (%q, %q)",
+				c.name, d, s, c.wantD, c.wantS)
+		}
+	}
+	// Details never blanks: every preset over every corpus input yields a
+	// non-empty Details line (fallbacks keep the base line).
+	dets, states := CardPresets()
+	for _, c := range cardSpecCases() {
+		for _, d := range dets {
+			for _, st := range states {
+				gd, _ := CardSpec{Details: d.ID, State: st.ID}.Render(c.raw, c.act, c.res)
+				if gd == "" {
+					t.Errorf("%s %s/%s: details blank, want fallback to base", c.name, d.ID, st.ID)
+				}
+			}
+		}
+	}
+}
+
 // TestCardSpecIdleStable proves the idle card keeps its shipped lines under
 // any preset.
 func TestCardSpecIdleStable(t *testing.T) {
