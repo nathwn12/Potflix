@@ -159,8 +159,7 @@ func TestGateDebounceReason(t *testing.T) {
 	}
 }
 
-func TestGatePauseSendsParkedCard(t *testing.T) {
-	// Pause sends a parked paused card and does NOT clear the activity. The card
+func TestGatePauseSendsParkedCard(t *testing.T) { // Pause sends a parked paused card and does NOT clear the activity. The card
 	// keeps the cleaned details/state, small_image "pause", and a count-UP start
 	// anchored at the pause moment (now), with no end.
 	g := &Gate{}
@@ -325,5 +324,24 @@ func TestGateBackwardClockStepDoesNotStallHeartbeat(t *testing.T) {
 	// heartbeat self-heals instead of stalling for the 55 s step.
 	if _, v := g.Decide(idle, 0, 0, 75000, false, false); !v.Send {
 		t.Fatalf("heartbeat stalled after a backward step, got %s", v)
+	}
+}
+
+// TestGatePauseFlagParksIconFreeCard proves the pristine-card pause path:
+// a builder-produced paused card (Paused=true, no SmallImage icon) sends
+// once with the count-UP anchor and then stays parked and quiet.
+func TestGatePauseFlagParksIconFreeCard(t *testing.T) {
+	g := &Gate{}
+	paused := Activity{Type: "PLAYING", Name: "Show", Details: "Pilot",
+		State: `S1 E2 - Paused`, LargeImage: "logo", LargeText: "PotFlix", Paused: true}
+	out, v := g.Decide(paused, 1000, 60000, 100000, true, false)
+	if !v.Send || v.Clear {
+		t.Fatalf("pause-flag card should send a parked card, got %s (clear=%t)", v, v.Clear)
+	}
+	if !out.HasStart || out.Start != 100000 || out.End != 0 {
+		t.Fatalf("parked pause card = %+v, want start=100000 end=0", out)
+	}
+	if _, v := g.Decide(paused, 1000, 60000, 200000, false, false); v.Send || v.Reason != ReasonPaused {
+		t.Fatalf("parked pause repeat = %s, want suppressed:%s", v, ReasonPaused)
 	}
 }

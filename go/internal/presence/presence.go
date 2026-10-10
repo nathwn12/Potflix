@@ -303,12 +303,18 @@ func WithStateTime(context, suffix string) string {
 // Activity is the Discord payload (contract section 5). Type is always
 // "PLAYING"; the fields not listed are deliberately unset.
 //
-// Netflix-style mapping (no buttons): the header (Name) is the media title,
-// the first body line (Details) is the episode name when known, else the
-// episode tag, else the title, and the second body line (State) is the episode
-// tag when it adds information, else empty. LargeText names the app
-// ("PotFlix"); SmallText names the playback state. Name is governed by
+// Netflix-style mapping (no buttons, no status icons): the header (Name) is
+// the media title, the first body line (Details) is the episode name when
+// known, else the episode tag, else the title, and the second body line
+// (State) is the episode tag when it adds information, else empty.
+// LargeText names the app ("PotFlix"); Name is governed by
 // activityNameHeader: empty falls back to the Discord app name header.
+// Paused marks the parked pause card for the send gate (the pause timer is
+// carried by timestamps, not by an icon).
+//
+// SmallImage/SmallText/Buttons are retained only so existing callers keep
+// compiling; the builders never populate them and the wire never serializes
+// them, so the card carries no corner icon and no click-through links.
 type Activity struct {
 	Type       string
 	Name       string
@@ -316,6 +322,13 @@ type Activity struct {
 	State      string
 	LargeImage string
 	LargeText  string
+	// Paused is true for the parked pause card. The gate keys its
+	// once-and-park behaviour off this, not off SmallImage.
+	Paused bool
+	// SmallImage/SmallText are legacy: retained only so existing callers
+	// keep compiling. The builders never populate them and the wire never
+	// serializes them. The gate still honours SmallImage=="pause" as a
+	// pause signal so previously built cards keep their meaning.
 	SmallImage string
 	SmallText  string
 	HasStart   bool
@@ -324,8 +337,9 @@ type Activity struct {
 	// and the duration is known. Serialized as timestamps.end while playing so
 	// Discord renders the remaining-time bar; zero (and omitted) while paused.
 	End int64
-	// Buttons are the card's click-through links (max 2), populated only by
-	// BuildActivityResolved; BuildActivity leaves them nil.
+	// Buttons is legacy: retained only so existing callers keep compiling.
+	// The builders never populate it (filterButtons always yields zero) and
+	// the wire never serializes it.
 	Buttons []Button
 }
 
@@ -347,9 +361,8 @@ func BuildActivity(rawTitle string, a *Action) Activity {
 			State:      "Idle",
 			LargeImage: "logo",
 			LargeText:  "PotFlix",
-			SmallImage: "stop",
-			SmallText:  "Idle",
 			// Name intentionally unset: the header falls back to the app name.
+			// No SmallImage/SmallText: the idle card carries no status icon.
 		}
 	}
 
@@ -384,22 +397,17 @@ func BuildActivity(rawTitle string, a *Action) Activity {
 		State:      state,
 		LargeImage: "logo",
 		LargeText:  "PotFlix",
+		Paused:     a.Paused,
 	}
 	if activityNameHeader {
 		act.Name = title
 	}
-	switch {
-	case a.HasStart:
+	// No SmallImage/SmallText on any branch: the card carries no
+	// play/pause/stop corner icon. The pause is signalled by Paused (for
+	// the gate) and the " - Paused" state marker (for the viewer).
+	if a.HasStart {
 		act.HasStart = true
 		act.Start = a.Start
-		act.SmallImage = "play"
-		act.SmallText = "Playing"
-	case a.Paused:
-		act.SmallImage = "pause"
-		act.SmallText = "Paused"
-	default:
-		act.SmallImage = "stop"
-		act.SmallText = "Stopped"
 	}
 	return act
 }
@@ -412,15 +420,15 @@ type Button struct {
 
 // Resolved carries canonical titles from a metadata lookup; a zero field is ignored.
 type Resolved struct {
-	Series      string // canonical series or movie title
-	EpisodeName string // canonical episode title
-	Artwork     string // cover/poster URL (https); zero value = absent
-	Synopsis    string // one-line plain text; zero value = absent
-	Genres      string // movie genres, e.g. "Action, Drama"; zero value = absent
-	Length      string // movie runtime, e.g. "2h 19m"; zero value = absent
-	Year        int    // movie release year; <=0 = absent
-	IsMovie     bool   // true: movie card lines; false: series card lines
-	Buttons     []Button
+	Series      string   // canonical series or movie title
+	EpisodeName string   // canonical episode title
+	Artwork     string   // cover/poster URL (https); zero value = absent
+	Synopsis    string   // one-line plain text; zero value = absent
+	Genres      string   // movie genres, e.g. "Action, Drama"; zero value = absent
+	Length      string   // movie runtime, e.g. "2h 19m"; zero value = absent
+	Year        int      // movie release year; <=0 = absent
+	IsMovie     bool     // true: movie card lines; false: series card lines
+	Buttons     []Button // ignored: the pristine card carries no links
 }
 
 // rpText sanitizes free text for the RPC card: trim, collapse runs of
@@ -635,24 +643,12 @@ func smartTrimSynopsis(s string, max int) string {
 	return rpText(s, max)
 }
 
-// filterButtons keeps at most two buttons with a non-empty label and an
-// http(s) URL; labels are sanitized and capped at 32 units.
+// filterButtons is the pristine-card policy: the card carries no
+// click-through links, so every input filters to zero. Retained (rather than
+// deleted) so the call site documents the decision where buttons used to
+// attach.
 func filterButtons(in []Button) []Button {
-	var out []Button
-	for _, b := range in {
-		if len(out) >= 2 {
-			break
-		}
-		lbl := rpText(b.Label, 32)
-		if lbl == "" {
-			continue
-		}
-		if !strings.HasPrefix(b.URL, "http://") && !strings.HasPrefix(b.URL, "https://") {
-			continue
-		}
-		out = append(out, Button{Label: lbl, URL: b.URL})
-	}
-	return out
+	return nil
 }
 
 // BuildActivityResolved is BuildActivity with canonical title overrides applied.
@@ -797,8 +793,7 @@ func BuildActivityResolved(rawTitle string, a *Action, r Resolved) Activity {
 	}
 	// Otherwise LargeImage stays as BuildActivity produced it ("logo"): an
 	// empty large image is never emitted.
-	if btns := filterButtons(r.Buttons); len(btns) > 0 {
-		act.Buttons = btns
-	}
+	// No buttons: the pristine card carries no click-through links, so
+	// Resolved.Buttons is always ignored (filterButtons yields zero).
 	return act
 }
