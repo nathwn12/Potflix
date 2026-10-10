@@ -198,7 +198,11 @@ func clean(raw string) Cleaned {
 				ntitle = nc.EpisodeName
 				nc.EpisodeName = ""
 			} else {
-				ntitle = nc.EpisodeTag
+				// P12 deliberate deviation: a headless tag with no name
+				// shows the tag alone; frozen Main yields "ED 3 - ED 3".
+				nc.Title = javaTrunc(nc.EpisodeTag, 100)
+				nc.Display = nc.Title
+				return nc
 			}
 		}
 		nc.Title = javaTrunc(ntitle, 100)
