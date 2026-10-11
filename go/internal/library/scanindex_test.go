@@ -85,32 +85,17 @@ func TestScanIndexFingerprint(t *testing.T) {
 			t.Fatal(err)
 		}
 		before := fingerprintOf(t, parent)
-		// Separate the inner create from the subdir create by a tick so
-		// the subdir mtime bump lands on a later timestamp even on
-		// coarse-grained filesystems.
-		time.Sleep(50 * time.Millisecond)
 		inner := filepath.Join(sub, "ep01.mkv")
 		writeScanFile(t, inner, "x")
 		if _, err := os.Stat(inner); err != nil {
 			t.Fatalf("inner file missing after write: %v", err)
 		}
-		// Windows can apply directory mtime updates lazily, so allow a
-		// grace period for the propagation instead of asserting it is
-		// instantaneous. A hash that ignored child-directory mtimes
-		// would never change and still fail here at the deadline.
-		deadline := time.Now().Add(10 * time.Second)
-		for {
-			if after := fingerprintOf(t, parent); after != before {
-				return
-			}
-			if time.Now().After(deadline) {
-				submtime := "<stat failed>"
-				if st, err := os.Stat(sub); err == nil {
-					submtime = st.ModTime().UTC().Format(time.RFC3339Nano)
-				}
-				t.Fatalf("adding a file inside a subfolder did not change the parent fingerprint (before=%s submtime=%s)", before, submtime)
-			}
-			time.Sleep(100 * time.Millisecond)
+		// Deterministic, no grace period: the parent fingerprint folds
+		// in each immediate subdirectory's entry names, so a nested add
+		// changes it on the first read on any filesystem instead of
+		// waiting on a child-directory mtime tick that may never land.
+		if after := fingerprintOf(t, parent); after == before {
+			t.Fatalf("adding a file inside a subfolder did not change the parent fingerprint (before=%s)", before)
 		}
 	})
 
