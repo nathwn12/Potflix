@@ -138,8 +138,8 @@ func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool, error
 	if !ok || ctx.Err() != nil {
 		return nil, definitive, err
 	}
-	// One bounded retry of the SAME source chain under the head-segment
-	// title ("Show - Arc" -> "Show"). The sources match against the
+	// One bounded retry of the SAME source chain under the
+	// separator-normalized title ("Show - Arc" -> "Show: Arc"). The sources match against the
 	// alternate title, while the caller caches and resolves under the
 	// ORIGINAL query key, so the next poll's non-blocking Resolve serves it.
 	m2, definitive2, err2 := r.fetchChain(ctx, alt)
