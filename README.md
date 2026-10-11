@@ -1,152 +1,148 @@
-<div align="center">
+<p align="center">
+  <img src="assets/icon.svg" width="120" height="120" alt="Potflix icon" />
+</p>
+<h1 align="center">Potflix</h1>
+<p align="center"><strong>Mirror whatever plays in PotPlayer on your Discord card — Go.</strong></p>
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/Potflix" alt="License" /></a>
+  <img src="https://img.shields.io/github/languages/top/nathwn12/Potflix" alt="Language" />
+  <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
+  <a href="https://github.com/nathwn12/Potflix/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/Potflix/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+</p>
 
-<img src="assets/appicon.png" width="128" alt="Potflix logo" />
+## What it is
 
-# Potflix
+Potflix is a Windows tray app that watches the PotPlayer window and mirrors
+it as a Discord Rich Presence card (`Watching <title>`). It is stdlib-only Go
+(module `potflix`, Go 1.27, no `go.sum`): no Java runtime, no API keys, no
+account. Filenames are cleaned into real titles (codecs, tags, and release
+groups stripped, years parenthesized, `SxxEyy` parsed), series and episode
+names resolve from free keyless sources, and a settings window holds the
+library folders, scan controls, and card preview.
 
-**Whatever is playing in PotPlayer, on your Discord card.**
-*Netflix-styled presence for PotPlayer - a Windows tray app, no Java, no keys.*
+## Why
 
-[![windows](https://img.shields.io/badge/windows-only-blue)](./go/README.md) [![go 1.27](https://img.shields.io/badge/go-%3E%3D1.27-green)](./go/go.mod) [![stdlib only](https://img.shields.io/badge/deps-stdlib_only-lightgrey)](./go/README.md)
+The retired Java flow compiled against an upstream fat jar downloaded from a
+mutable release tag and needed a Java runtime on every machine. The Go port
+builds to one self-contained `dist\potflix.exe` with nothing to install, keeps
+the title-cleaner byte-identical to the frozen Java reference, and resolves
+canonical names without credentials.
 
-</div>
+## Features
 
----
+- Clean titles always: codecs, tags, and release groups stripped, years
+  parenthesized, `SxxEyy` parsed (a raw filename shows as a real title with
+  its episode tag).
+- A card that tells the truth: episode name when known, else episode tag,
+  else title; ` - Paused` appended while paused with a count-up pause timer;
+  `Browsing` / `Idle` when idle.
+- Quiet while paused: the paused card is sent once and held; not even the
+  30 s heartbeat re-pushes it until resume.
+- Canonical names, keyless: TVmaze for TV, AniList + Jikan for anime, iTunes
+  for movies. Found titles cache permanently, misses cache for 30 days, all
+  under `%LOCALAPPDATA%\Potflix\meta`; offline it shows the clean filename
+  title.
+- Library window: media folders (`Add folder` / `Remove`), incremental
+  `Scan` (unchanged folders skipped, cached titles served from disk),
+  `Refresh` (walks everything, re-fetches every entry), plus export / import
+  of the metadata cache as one JSON bundle (fill-missing-only import).
+- Settings that stick: scan speed (`Turbo` / `Balanced` / `Gentle`, applied
+  immediately), Start-with-Windows toggle, card line presets. State lives
+  outside the repo under `%LOCALAPPDATA%\Potflix`, written atomically and
+  loaded tolerantly.
+- Card preview: the window shows the exact card last handed to Discord
+  (recorded on send, never rebuilt for display).
+- Local only: one instance (second launch prints `Potflix is already
+  running.` and exits 0), capped rotating debug log beside the exe,
+  `--selftest` proves the headless wiring with no live PotPlayer or Discord.
 
-## ⚡ Quick start
+## Install
 
-Needs: **PotPlayer** open and playing, **Discord** desktop open. No Java runtime required.
+1. Needs: **PotPlayer** open and playing, **Discord** desktop open.
+2. Build the exe (requires Go 1.27+):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\build.ps1
+```
+
+3. Run it (double-click `run.bat` works too):
+
+```powershell
 .\dist\potflix.exe
 ```
 
-Double-click `run.bat` works too. Right-click the red-on-black tray icon for **Open Potflix** / **Exit Potflix**; closing the window parks it back to the tray.
-First run: the `Potflix` window opens - `Add folder`, then `Scan`.
-To verify without PotPlayer or Discord (exit a running Potflix first - single-instance lock): `.\dist\potflix.exe --selftest` (see Development).
+4. Right-click the tray icon for **Open Potflix** / **Exit Potflix**; closing
+   the window parks it back to the tray. First run: the `Potflix` window
+   opens — `Add folder`, then `Scan`.
 
----
+## Usage
 
-## 🧰 What it does
-
-Watches the PotPlayer window and mirrors it as a Discord Rich Presence card (`Watching <title>`):
-
-- **Clean titles always** - codecs, tags, and release groups stripped, years parenthesized, `SxxEyy` parsed. A raw filename shows as a real title with its episode tag (e.g. `Show.Name.S02E07.1080p.WEB-DL.x264-GROUP.mkv` becomes **Show Name - S2 E7**).
-- **A card that tells the truth** - episode name when known, else episode tag, else title; ` - Paused` appended while paused (with a count-up pause timer), `Browsing` / `Idle` when idle.
-- **Quiet while paused** - the paused card is sent once and held; not even the 30 s heartbeat re-pushes it until resume.
-- **Canonical names, keyless** - series and episode titles resolved from free sources that need no account: TVmaze for TV, AniList + Jikan for anime, iTunes for movies. Found titles cache permanently, misses cache for 30 days, all under `%LOCALAPPDATA%\Potflix\meta`; offline it simply shows the clean filename title.
-- **Library window** - normal launch shows the `Potflix` settings window: media folders (`Add folder` / `Remove`), incremental `Scan` (unchanged folders skipped, cached titles served from disk), `Refresh` (walks everything, re-fetches every entry), plus export / import of the metadata cache as one JSON bundle (fill-missing-only import). Scan prints a live progress line and a completion summary (keys cached / fetched / not-found, folders scanned / skipped).
-- **Settings that stick** - scan speed (`Turbo` / `Balanced` / `Gentle`, applied immediately; Turbo is each provider's published limit, Gentle a quarter of it), Start-with-Windows toggle, card line presets, log-folder shortcut. State lives outside the repo under `%LOCALAPPDATA%\Potflix` (`config.json`, `meta\`, `scanindex.json`), written atomically and loaded tolerantly.
-- **Card preview** - the window shows the exact card last handed to Discord (recorded on send, never rebuilt for display).
-
-Data sources: TVmaze (CC BY-SA) for TV, AniList + Jikan (unofficial MyAnimeList API) for anime, iTunes Search API for movies. Artwork and synopses are linked to, not stored.
-
-Deep internals (package layout, scan-index tiers, rate limiter, M1-M4 status) live in [`go/README.md`](./go/README.md), not here.
-
----
-
-## ⚙️ Configure
-
-**You don't need any.** Build, run, and the card appears - no config file, no keys.
-
-Two things you may want:
-
-- **Media folders** - open the `Potflix` window, `Add folder`, `Scan`. `Refresh` forces a full re-walk and re-fetch.
-- **Start with Windows** - one toggle in Settings writes the `Potflix` value under `HKCU\...\Run` (it shows the actual registry state).
-
-**Your own Discord app name + logo (optional, ~2 min).** Without this, presence uses the built-in app and works out of the box.
-
-1. [New Application](https://discord.com/developers/applications) named **Potflix**.
-2. Rich Presence -> Art Assets -> upload `assets/discord/logo.png` as `logo`, `play.png` / `pause.png` / `stop.png` with those exact names.
-3. Save the Application ID into `client-id.txt` (digits only) or set env `POTFLIX_CLIENT_ID`, then restart.
-
-Client-id resolution order (`go/clientid.go`): env `POTFLIX_CLIENT_ID` -> `client-id.txt` -> `config.properties` (raw text, first 17-20 digit run) -> built-in default. Only the source is ever logged, never the value. Treat `client-id.txt` as secret-ish: it is gitignored.
-
----
-
-## 🛡️ Safety
-
-**It watches PotPlayer and talks to Discord on your own machine. Nothing else.**
-
-- **Keyless, accountless.** Metadata lookups need no credentials and the cache holds public episode titles only - no media files, no credentials, nothing personal. Export bundles are metadata-only too.
-- **Local only.** State stays under `%LOCALAPPDATA%\Potflix`; the debug log (`potflix-debug.log` beside the exe) rotates at 5 MB * 3 files. Nothing is committed to the repo.
-- **One instance.** The first run binds `127.0.0.1:17843`; a second prints `Potflix is already running.` and exits 0 without touching the log.
-- **Polite on the wire.** Commands wait for Discord's `READY` dispatch, empty asset text is omitted (Discord rejects present-but-empty text), and Exit clears the activity first so no stale card lingers.
-- **`--selftest` is the only argv switch**; everything else on the command line is ignored.
-
----
-
-## 🧹 Uninstall
-
-Right-click the tray icon -> **Exit Potflix**, then:
-
-1. Turn off Start with Windows in Settings first (deletes the `Run` value) - skip if you never enabled it.
-2. Delete the checkout (or just `dist\potflix.exe`).
-3. Optionally delete `%LOCALAPPDATA%\Potflix` (settings, metadata cache, scan index) and `potflix-debug.log*` beside the exe.
-
-No installer wrote anything anywhere else.
-
----
-
-## 🛠️ Development
-
-Stdlib-only Go under `go\` (module `potflix`, Go 1.27, no `go.sum`). Build from the repo root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1   # -> dist\potflix.exe
-```
-
-That runs, from `go\`: `go build -trimpath -buildvcs=false -ldflags "-H=windowsgui" -o ..\dist\potflix.exe .` - reproducible from any directory or commit, console-less tray app. Requires Go 1.27+.
-
-```powershell
-cd go
-go vet ./...
-go test ./... -count=1
-```
-
-Or one gate from the root (exit a running Potflix first - the selftest needs the single-instance lock): `powershell -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest`. Tests are pure logic - no live PotPlayer or Discord needed (Discord transport tests use an in-process fake pipe). If `go env GOTMPDIR` points at a missing directory, create it first or every go command fails.
+Normal launch shows the `Potflix` settings window; the card appears on your
+Discord profile on its own. To verify without PotPlayer or Discord (exit a
+running Potflix first — single-instance lock):
 
 ```powershell
 .\dist\potflix.exe --selftest
 ```
 
-proves the headless wiring (exit a running Potflix first - single-instance lock): hidden window + tray add, log rotation, second-instance lock, full IPC round-trip. Title-cleaner parity CLI (from `go\`): `go build ./cmd/titleclean` gives `titleclean -corpus <in.txt> -out <out.tsv>` (columns: input/title/display/episodeTag/episodeName).
+`--selftest` is the only command-line switch; everything else is ignored.
 
-Diagnose one title: `go run ./cmd/metacheck [-offline] <rawTitle>` (exit 0 when resolved, 1 when not). Package layout, metadata design, and benchmarks: [`go/README.md`](./go/README.md).
+Your own Discord app name + logo (optional, ~2 min): without this, presence
+uses the built-in app and works out of the box. Create an application named
+**Potflix** at the Discord developer portal, upload `assets/discord/logo.png`
+as `logo` plus `play.png` / `pause.png` / `stop.png` under Rich Presence art
+assets, then save the Application ID into `client-id.txt` (digits only,
+gitignored) or set env `POTFLIX_CLIENT_ID` and restart. Resolution order:
+env `POTFLIX_CLIENT_ID` → `client-id.txt` → `config.properties` → built-in
+default. Only the source is ever logged, never the value.
 
----
+## Build from source
 
-## 🧭 Compatibility
+Requires Go 1.27+ on Windows (stdlib only; no modules are downloaded). From
+the repo root:
 
-| | |
-|---|---|
-| OS | Windows only (win32 via `syscall.NewLazyDLL`) |
-| Build | Go 1.27+, stdlib only, no `go.sum` |
-| Needs at runtime | PotPlayer open, Discord desktop open (local IPC pipe) |
-| Needs not | No Java runtime, no API keys, no account |
-| Java under `src\` | Frozen reference only (pinned `540a1d1`), never a build path |
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\build.ps1   # -> dist\potflix.exe
+```
 
----
+That runs, from `go\`:
 
-## Deviations from the Java reference
+```text
+go build -trimpath -buildvcs=false -ldflags "-H=windowsgui" -o ..\dist\potflix.exe .
+```
 
-Deliberate behaviour changes, not parity claims. Upstream: `ayunami2000/PotPlayer-DiscordRPC` (BSD-3, see `THIRD-PARTY-NOTICES.md`).
+Reproducible from any directory or commit, console-less tray app. Then, from
+`go\`:
 
-- **A window on launch.** Java was tray-only; the Go app shows the `Potflix` settings window (closing parks to the tray, `--selftest` stays headless).
-- **Folder scan index.** Per-directory skip index (`scanindex.json`) behind the window's `Scan`; `Refresh` walks everything and rewrites it. Any doubt falls back to a full walk - it only ever skips, never resolves.
-- **Export / import bundle.** One metadata-only JSON bundle, fill-missing-only import followed by an incremental scan.
-- **Empty asset text omitted on the wire** (`omitempty`) - Discord rejects present-but-empty text and discards the whole activity.
-- **Clear activity on exit**, so no stale card lingers.
-- **Capped debug log**: 5 MB per file, 3 files.
-- **`READY`-gated sends** with ack/timeout logging instead of fire-and-forget.
-- **`Watching` (type 3) with `timestamps.start` + `timestamps.end`** anchored to the live position (start-only when duration is unknown); seek debounce, divergence re-anchor, and a 30 s heartbeat live in `internal/presence/gate.go`.
-- **Netflix-style card mapping**: header is the clean title, details/state carry episode name and tag, ` - Paused` parks a count-up pause card that never clears until resume or segment end.
+```powershell
+go vet ./...
+go test ./... -count=1
+```
 
----
+Or one gate from the root: `powershell -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest`. Tests are pure logic — no live PotPlayer or
+Discord needed. Diagnose one title: `go run ./cmd/metacheck [-offline] <rawTitle>` (exit 0 when resolved, 1 when not).
 
-## 📄 License
+## Docs
 
-Fork of [`ayunami2000/PotPlayer-DiscordRPC`](https://github.com/ayunami2000/PotPlayer-DiscordRPC) (BSD 3-Clause) - see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) for the full text and logo-font notices.
+- [`go/README.md`](./go/README.md) — package layout, metadata design, scan-index tiers, rate limiter, M1–M4 status.
+- [`go/internal/titleclean/README.md`](./go/internal/titleclean/README.md) — the title-cleaner port and its parity method.
+- [`DECISION.md`](./DECISION.md) — why the Java flow was retired and what the Go port was proven against.
+- [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) — upstream BSD-3-Clause text and the bundled logo-font notices.
 
-The title-cleaner logic derives from that project; the bundled logo fonts are SIL OFL 1.1 (per-family texts live under `design\fonts\`).
+## Status
+
+**Unverified** — as-is, use at your own risk.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Fork of [`ayunami2000/PotPlayer-DiscordRPC`](https://github.com/ayunami2000/PotPlayer-DiscordRPC) (BSD 3-Clause) — see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) for the full text and logo-font notices. The title-cleaner logic derives from that project; the bundled logo fonts are SIL OFL 1.1.
+
+<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
+<p align="center">
+  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
+</p>
+<p align="center">
+  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
+</p>
