@@ -1,0 +1,27 @@
+# nathwn12 house CI — stack: go (copy to .github/workflows/ci.yml)
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27"
+      - name: Vet
+        working-directory: go
+        run: go vet ./...
+      - name: Test
+        working-directory: go
+        run: go test ./... -count=1
+      - name: Build
+        working-directory: go
+        run: go build ./...
