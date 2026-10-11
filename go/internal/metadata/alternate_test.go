@@ -241,11 +241,14 @@ func TestAlternateTransientMerging(t *testing.T) {
 		wantFile bool
 	}{
 		{
-			name: "both transient",
+			name: "both transient pins primary error",
 			find: func(q Query) (*Media, error) {
+				if q.Title == "Dragon Ball Super - Beerus" {
+					return nil, primaryBoom
+				}
 				return nil, altBoom
 			},
-			wantErr: "alt-boom",
+			wantErr: "primary-boom",
 		},
 		{
 			name: "primary miss alternate transient",
@@ -307,5 +310,154 @@ func TestAlternateTransientMerging(t *testing.T) {
 				t.Errorf("transient lookup persisted a file, want nothing")
 			}
 		})
+	}
+}
+
+// TestAlternatePrimaryHitShortCircuits pins the guard the regression slipped
+// through: when the primary dashed title already resolves, the alternate
+// chain must never be queried (zero calls under the normalized title).
+func TestAlternatePrimaryHitShortCircuits(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	polluted := Query{Kind: KindSeries, Title: "Dragon Ball Super - Beerus", Episode: 1, Absolute: true}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	src := &titleFuncSource{name: "tvmaze", mu: &mu, calls: calls, find: func(q Query) (*Media, error) {
+		if q.Title == "Dragon Ball Super - Beerus" {
+			return &Media{
+				Source: "tvmaze", SourceID: "93969",
+				Kind: KindSeries, Title: "Dragon Ball Super - Beerus",
+				Episodes: []Episode{{Season: 1, Number: 1, Title: "The God Who Destroys"}},
+			}, nil
+		}
+		// The alternate must never be reached; answer loudly if it is so
+		// the assertion below cannot pass by accident.
+		return &Media{
+			Source: "tvmaze", SourceID: "2368",
+			Kind: KindSeries, Title: q.Title,
+			Episodes: []Episode{{Season: 1, Number: 1, Title: "Wrong Show"}},
+		}, nil
+	}}
+	r := New(Options{Dir: dir, Sources: []Source{src}, Timeout: 5 * time.Second})
+
+	res, err := r.LookupNow(ctx, polluted)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if !res.Found || res.Series != "Dragon Ball Super - Beerus" || res.Episode != "The God Who Destroys" {
+		t.Fatalf("resolution = %+v, want the primary hit", res)
+	}
+	mu.Lock()
+	primaryCalls, altCalls := calls["Dragon Ball Super - Beerus"], calls["Dragon Ball Super: Beerus"]
+	mu.Unlock()
+	if primaryCalls != 1 {
+		t.Errorf("primary chain calls = %d, want 1", primaryCalls)
+	}
+	if altCalls != 0 {
+		t.Errorf("alternate chain calls = %d, want 0 (primary hit must short-circuit)", altCalls)
+	}
+}
+
+// TestAlternateNeverSubstitutesUncertainPrimary proves a transient primary
+// outcome is returned as unknown and never papered over with an alternate
+// match: the alternate title is never queried even though it WOULD hit a
+// different catalog entry, the error wraps ErrLookupUnavailable, and
+// nothing is persisted.
+func TestAlternateNeverSubstitutesUncertainPrimary(t *testing.T) {
+	dir := t.TempDir()
+	primaryBoom := errors.New("primary-outage")
+	var mu sync.Mutex
+	calls := map[string]int{}
+	src := &titleFuncSource{name: "tvmaze", mu: &mu, calls: calls, find: func(q Query) (*Media, error) {
+		if q.Title == "Dragon Ball Super - Beerus" {
+			return nil, primaryBoom
+		}
+		// The alternate WOULD match a different show; it must never run.
+		return &Media{
+			Source: "tvmaze", SourceID: "2368",
+			Kind: KindSeries, Title: "Dragon Ball Super",
+			Episodes: []Episode{{Season: 1, Number: 1, Title: "The Peace Prize. Who'll Get the 100 Million Zeny!"}},
+		}, nil
+	}}
+	r := New(Options{Dir: dir, Sources: []Source{src}, Timeout: 5 * time.Second})
+	q := Query{Kind: KindSeries, Title: "Dragon Ball Super - Beerus", Episode: 1, Absolute: true}
+
+	res, err := r.LookupNowForce(context.Background(), q, true)
+	if res.Found {
+		t.Fatalf("resolution = %+v, want no substituted match", res)
+	}
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("err = %v, want ErrLookupUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "primary-outage") {
+		t.Errorf("err = %q, want the primary cause, never the alternate", err.Error())
+	}
+	mu.Lock()
+	altCalls := calls["Dragon Ball Super: Beerus"]
+	mu.Unlock()
+	if altCalls != 0 {
+		t.Errorf("alternate chain calls = %d, want 0 (unknown primary must not retry)", altCalls)
+	}
+	key := cacheKey(q)
+	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
+		t.Errorf("transient lookup persisted %v, want nothing on disk", statErr)
+	}
+}
+
+// TestAlternateFailedRefreshPreservesCachedPositive seeds the on-disk cache
+// with the correct entry under the ORIGINAL key, then runs the forced
+// refresh path while the primary is transient and an eligible alternate
+// WOULD match a different show. The seeded positive must survive on disk
+// byte-identical: an unknown primary outcome must not be replaced by a
+// substituted match that overwrites a correct positive.
+func TestAlternateFailedRefreshPreservesCachedPositive(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	q := Query{Kind: KindSeries, Title: "Dragon Ball Super - Beerus", Episode: 1, Absolute: true}
+	correct := &Media{
+		Source: "tvmaze", SourceID: "93969",
+		Kind: KindSeries, Title: "Dragon Ball Super: Beerus",
+		Artwork:  "https://example.com/beerus.jpg",
+		Episodes: []Episode{{Season: 1, Number: 1, Title: "The God Who Destroys"}},
+	}
+	key := cacheKey(q)
+	if err := cacheStore(dir, key, correct); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
+	if err != nil {
+		t.Fatalf("read seeded cache: %v", err)
+	}
+	primaryBoom := errors.New("primary-outage")
+	src := &titleFuncSource{name: "tvmaze", find: func(q Query) (*Media, error) {
+		if q.Title == "Dragon Ball Super - Beerus" {
+			return nil, primaryBoom
+		}
+		// An eligible alternate that WOULD overwrite the key with a
+		// different catalog entry if the guard were bypassed.
+		return &Media{
+			Source: "tvmaze", SourceID: "2368",
+			Kind: KindSeries, Title: "Dragon Ball Super",
+			Episodes: []Episode{{Season: 1, Number: 1, Title: "The Peace Prize. Who'll Get the 100 Million Zeny!"}},
+		}, nil
+	}}
+	r := New(Options{Dir: dir, Sources: []Source{src}, Timeout: 5 * time.Second})
+
+	res, err := r.LookupNowForce(ctx, q, true)
+	if res.Found {
+		t.Fatalf("resolution = %+v, want no substituted match on transient primary", res)
+	}
+	if !errors.Is(err, ErrLookupUnavailable) {
+		t.Fatalf("err = %v, want ErrLookupUnavailable", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
+	if err != nil {
+		t.Fatalf("read cache after failed refresh: %v", err)
+	}
+	if string(after) != string(before) {
+		t.Errorf("seeded positive changed by failed forced refresh; want it byte-identical")
+	}
+	if e, ok := cacheLoadEntry(dir, key); !ok || e.NotFound || e.Media == nil || e.Media.SourceID != "93969" {
+		t.Errorf("seeded entry = %+v,%v; want the correct SourceID 93969 still on disk", e, ok)
 	}
 }

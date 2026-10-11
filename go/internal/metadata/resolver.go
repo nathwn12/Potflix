@@ -134,6 +134,13 @@ func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool, error
 	if m != nil {
 		return m, true, nil
 	}
+	// An unknown primary outcome (transient failure) must never be replaced
+	// by a substituted alternate match that the caller then persists under
+	// the ORIGINAL key, overwriting a correct cached positive with a
+	// different catalog entry. Only a definitive primary miss may retry.
+	if !definitive {
+		return nil, false, err
+	}
 	alt, ok := alternateQuery(q)
 	if !ok || ctx.Err() != nil {
 		return nil, definitive, err
@@ -146,13 +153,10 @@ func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool, error
 	if m2 != nil {
 		return m2, true, nil
 	}
-	// Both attempts missed: definitive only when BOTH were definitive, so
-	// a transient on either side is never reported as a confirmed
-	// not-found. The primary error surfaces when both fail.
-	if !definitive || !definitive2 {
-		if err != nil {
-			return nil, false, err
-		}
+	// The primary was a definitive miss, so a transient alternate is
+	// still unknown (never a confirmed not-found) and surfaces the
+	// alternate's error; the primary error is nil here.
+	if !definitive2 {
 		return nil, false, err2
 	}
 	return nil, true, nil
