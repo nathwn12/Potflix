@@ -130,6 +130,35 @@ func mediaAnswers(m *Media, q Query) bool {
 }
 
 func (r *Resolver) fetchMedia(ctx context.Context, q Query) (*Media, bool, error) {
+	m, definitive, err := r.fetchChain(ctx, q)
+	if m != nil {
+		return m, true, nil
+	}
+	alt, ok := alternateQuery(q)
+	if !ok || ctx.Err() != nil {
+		return nil, definitive, err
+	}
+	// One bounded retry of the SAME source chain under the head-segment
+	// title ("Show - Arc" -> "Show"). The sources match against the
+	// alternate title, while the caller caches and resolves under the
+	// ORIGINAL query key, so the next poll's non-blocking Resolve serves it.
+	m2, definitive2, err2 := r.fetchChain(ctx, alt)
+	if m2 != nil {
+		return m2, true, nil
+	}
+	// Both attempts missed: definitive only when BOTH were definitive, so
+	// a transient on either side is never reported as a confirmed
+	// not-found. The primary error surfaces when both fail.
+	if !definitive || !definitive2 {
+		if err != nil {
+			return nil, false, err
+		}
+		return nil, false, err2
+	}
+	return nil, true, nil
+}
+
+func (r *Resolver) fetchChain(ctx context.Context, q Query) (*Media, bool, error) {
 	sawError := false
 	var firstErr error
 	for _, s := range r.orderedSources(q) {
