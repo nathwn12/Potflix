@@ -26,12 +26,19 @@ func normalizeScanDir(dir string) string {
 	return c
 }
 
-// FolderFingerprint is a cheap identity for a directory's immediate
-// contents: a hash of the dir's own mtime (unix nanos), the child count, and
-// the sorted child entries (name + size + mtime) for FILES AND DIRECTORIES
-// alike. Including child-directory mtimes is what keeps a recursive
-// short-circuit correct: adding a file inside a subfolder bumps that
-// subfolder's mtime, which changes the parent's fingerprint.
+// FolderFingerprint is a cheap identity for a directory's contents: a hash
+// of the dir's own mtime (unix nanos), the child count, and the sorted
+// child entries (name + size + mtime) for FILES AND DIRECTORIES alike, plus
+// one deterministic level deeper: for each immediate subdirectory, the
+// count and sorted names/sizes of ITS immediate entries. That second level
+// is clock-independent on purpose: child-directory mtimes observed through
+// os.ReadDir/DirEntry.Info can lag a direct os.Stat of the same directory
+// on some Windows volumes (measured: entry channel stale, stat channel
+// fresh, never converging), so a hash that only moves when that clock
+// moves misses real nested changes. Folding grandchildren names/sizes
+// keeps the recursive short-circuit correct: adding a file inside a
+// subfolder changes the parent's fingerprint on the first read on any
+// filesystem.
 func FolderFingerprint(dir string) (string, error) {
 	fi, err := os.Stat(dir)
 	if err != nil {
@@ -53,6 +60,21 @@ func FolderFingerprint(dir string) (string, error) {
 			return "", err
 		}
 		fmt.Fprintf(h, "%s\n%d\n%d\n", e.Name(), info.Size(), info.ModTime().UnixNano())
+		if e.IsDir() {
+			sub, err := os.ReadDir(filepath.Join(dir, e.Name()))
+			if err != nil {
+				return "", err
+			}
+			sort.Slice(sub, func(i, j int) bool { return sub[i].Name() < sub[j].Name() })
+			fmt.Fprintf(h, "%d\n", len(sub))
+			for _, s := range sub {
+				sinfo, err := s.Info()
+				if err != nil {
+					return "", err
+				}
+				fmt.Fprintf(h, "%s\n%d\n", s.Name(), sinfo.Size())
+			}
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
