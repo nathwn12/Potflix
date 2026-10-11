@@ -40,9 +40,21 @@ func TestAlternateQuery(t *testing.T) {
 		wantOK    bool
 	}{
 		{
-			name:      "arc title yields head",
+			name:      "arc title yields colon form",
 			q:         Query{Kind: KindSeries, Title: "Dragon Ball Super - Beerus", Episode: 1, Absolute: true},
-			wantTitle: "Dragon Ball Super",
+			wantTitle: "Dragon Ball Super: Beerus",
+			wantOK:    true,
+		},
+		{
+			name:      "arc suffix with slashes",
+			q:         Query{Kind: KindSeries, Title: "Fate/stay night - Unlimited Blade Works", Episode: 1, Absolute: true},
+			wantTitle: "Fate/stay night: Unlimited Blade Works",
+			wantOK:    true,
+		},
+		{
+			name:      "every separator normalized",
+			q:         Query{Kind: KindSeries, Title: "Show - Arc - Part", Season: 1, Episode: 2},
+			wantTitle: "Show: Arc: Part",
 			wantOK:    true,
 		},
 		{
@@ -61,15 +73,14 @@ func TestAlternateQuery(t *testing.T) {
 			wantOK: false,
 		},
 		{
-			name:   "empty head yields none",
-			q:      Query{Kind: KindSeries, Title: " - Arc", Episode: 1, Absolute: true},
+			name:   "empty title yields none",
+			q:      Query{Kind: KindSeries, Title: "", Episode: 1, Absolute: true},
 			wantOK: false,
 		},
 		{
-			name:      "first separator wins",
-			q:         Query{Kind: KindSeries, Title: "Show - Arc - Part", Season: 1, Episode: 2},
-			wantTitle: "Show",
-			wantOK:    true,
+			name:   "whitespace title yields none",
+			q:      Query{Kind: KindSeries, Title: "   ", Episode: 1, Absolute: true},
+			wantOK: false,
 		},
 	}
 	for _, tc := range cases {
@@ -95,10 +106,11 @@ func TestAlternateQuery(t *testing.T) {
 }
 
 // TestAlternateFallbackReturnsShow proves the retry answers a polluted
-// arc title when the primary title misses: the head-segment query hits the
-// same source chain, the resolution carries the canonical series title and
-// episode, and the media is cached under the ORIGINAL query key so the
-// next poll's non-blocking Resolve serves it without touching the network.
+// dash title when the primary title misses: the separator-normalized query
+// hits the same source chain, the resolution carries the canonical series
+// title and episode, and the media is cached under the ORIGINAL query key
+// so the next poll's non-blocking Resolve serves it without touching the
+// network.
 func TestAlternateFallbackReturnsShow(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -106,12 +118,12 @@ func TestAlternateFallbackReturnsShow(t *testing.T) {
 	var mu sync.Mutex
 	calls := map[string]int{}
 	src := &titleFuncSource{name: "tvmaze", mu: &mu, calls: calls, find: func(q Query) (*Media, error) {
-		if q.Title == "Dragon Ball Super" {
+		if q.Title == "Dragon Ball Super: Beerus" {
 			return &Media{
-				Source: "tvmaze", SourceID: "99",
-				Kind: KindSeries, Title: "Dragon Ball Super",
-				Artwork:  "https://example.com/dbs.jpg",
-				Episodes: []Episode{{Season: 1, Number: 1, Title: "The Peace Prize"}},
+				Source: "tvmaze", SourceID: "93969",
+				Kind: KindSeries, Title: "Dragon Ball Super: Beerus",
+				Artwork:  "https://example.com/beerus.jpg",
+				Episodes: []Episode{{Season: 1, Number: 1, Title: "The God Who Destroys"}},
 			}, nil
 		}
 		return nil, nil
@@ -125,14 +137,14 @@ func TestAlternateFallbackReturnsShow(t *testing.T) {
 	if !res.Found {
 		t.Fatalf("resolution = %+v, want found via alternate", res)
 	}
-	if res.Series != "Dragon Ball Super" {
-		t.Errorf("series = %q, want canonical head title", res.Series)
+	if res.Series != "Dragon Ball Super: Beerus" {
+		t.Errorf("series = %q, want canonical colon title", res.Series)
 	}
-	if res.Number != 1 || res.Episode != "The Peace Prize" {
-		t.Errorf("episode = S%d E%d %q, want S1 E1 %q", res.Season, res.Number, res.Episode, "The Peace Prize")
+	if res.Number != 1 || res.Episode != "The God Who Destroys" {
+		t.Errorf("episode = S%d E%d %q, want S1 E1 %q", res.Season, res.Number, res.Episode, "The God Who Destroys")
 	}
 	mu.Lock()
-	primaryCalls, altCalls := calls["Dragon Ball Super - Beerus"], calls["Dragon Ball Super"]
+	primaryCalls, altCalls := calls["Dragon Ball Super - Beerus"], calls["Dragon Ball Super: Beerus"]
 	mu.Unlock()
 	if primaryCalls != 1 || altCalls != 1 {
 		t.Errorf("chain calls primary=%d alternate=%d, want 1 and 1", primaryCalls, altCalls)
@@ -150,11 +162,65 @@ func TestAlternateFallbackReturnsShow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("cold Resolve: %v", err)
 	}
-	if !got.Found || got.Series != "Dragon Ball Super" || got.Episode != "The Peace Prize" {
+	if !got.Found || got.Series != "Dragon Ball Super: Beerus" || got.Episode != "The God Who Destroys" {
 		t.Fatalf("cold Resolve = %+v, want cached Found", got)
 	}
 	if n := boom.calls.Load(); n != 0 {
 		t.Fatalf("cold Resolve provider calls = %d, want 0 (served from original-key cache)", n)
+	}
+}
+
+// TestAlternateNeverReturnsHeadShow is the regression test for the
+// head-strip fallback defect: with a source that answers the stripped head
+// title "Dragon Ball Super" (the 2015 series) to ANY query and the true
+// "Dragon Ball Super: Beerus" only to the normalized query, the resolver
+// must return the Beerus media and never the 2015 show. The stripped head
+// must never be queried at all.
+func TestAlternateNeverReturnsHeadShow(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	polluted := Query{Kind: KindSeries, Title: "Dragon Ball Super - Beerus", Episode: 1, Absolute: true}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	src := &titleFuncSource{name: "tvmaze", mu: &mu, calls: calls, find: func(q Query) (*Media, error) {
+		if q.Title == "Dragon Ball Super: Beerus" {
+			return &Media{
+				Source: "tvmaze", SourceID: "93969",
+				Kind: KindSeries, Title: "Dragon Ball Super: Beerus",
+				Artwork:  "https://example.com/beerus.jpg",
+				Episodes: []Episode{{Season: 1, Number: 1, Title: "The God Who Destroys"}},
+			}, nil
+		}
+		if q.Title == "Dragon Ball Super" {
+			return &Media{
+				Source: "tvmaze", SourceID: "2368",
+				Kind: KindSeries, Title: "Dragon Ball Super",
+				Artwork:  "https://example.com/dbs-2015.jpg",
+				Episodes: []Episode{{Season: 1, Number: 1, Title: "The Peace Prize. Who'll Get the 100 Million Zeny!"}},
+			}, nil
+		}
+		return nil, nil
+	}}
+	r := New(Options{Dir: dir, Sources: []Source{src}, Timeout: 5 * time.Second})
+
+	res, err := r.LookupNow(ctx, polluted)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if !res.Found {
+		t.Fatalf("resolution = %+v, want found via normalized alternate", res)
+	}
+	if res.Series != "Dragon Ball Super: Beerus" {
+		t.Errorf("series = %q, want the 2026 Beerus show, never the 2015 head title", res.Series)
+	}
+	if res.Episode == "The Peace Prize. Who'll Get the 100 Million Zeny!" {
+		t.Errorf("episode = %q, the 2015 show's episode 1 leaked through", res.Episode)
+	}
+	mu.Lock()
+	headCalls := calls["Dragon Ball Super"]
+	mu.Unlock()
+	if headCalls != 0 {
+		t.Errorf("head-title queries = %d, want 0 (the strip must never be sent)", headCalls)
 	}
 }
 
@@ -184,7 +250,7 @@ func TestAlternateTransientMerging(t *testing.T) {
 		{
 			name: "primary miss alternate transient",
 			find: func(q Query) (*Media, error) {
-				if q.Title == "Dragon Ball Super" {
+				if q.Title == "Dragon Ball Super: Beerus" {
 					return nil, altBoom
 				}
 				return nil, nil
@@ -194,7 +260,7 @@ func TestAlternateTransientMerging(t *testing.T) {
 		{
 			name: "primary transient surfaces primary error",
 			find: func(q Query) (*Media, error) {
-				if q.Title == "Dragon Ball Super" {
+				if q.Title == "Dragon Ball Super: Beerus" {
 					return nil, nil
 				}
 				return nil, primaryBoom
