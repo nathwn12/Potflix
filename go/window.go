@@ -102,6 +102,13 @@ var (
 	haveMouse  bool
 )
 
+// focusID is the keyboard-focused button id, 0 when none. Tab/Shift+Tab and
+// the arrow keys move it over the current view's rect table; Enter and Space
+// activate it through the SAME dispatch as a mouse click. The mouse never
+// needs it: hover/press state stays independent and mouse handling is
+// untouched.
+var focusID int
+
 // View state machine: the same window swaps between the main folders view
 // and the settings view (library, scan, startup). The app is keyless; the
 // main view paints and hit-tests exactly as before plus the Settings link.
@@ -159,6 +166,9 @@ const (
 // change inside window.go: ShellExecute for the log-folder link.
 var (
 	procShellExecuteW = shell32.NewProc("ShellExecuteW")
+	// GetKeyState reads the Shift state for Shift+Tab; kept here (not
+	// win32.go) to keep this change inside window.go.
+	procGetKeyState = user32.NewProc("GetKeyState")
 )
 
 // Settings-view message, key, and text constants.
@@ -169,6 +179,14 @@ const (
 	wmKillFocus = 0x0008
 
 	vkEscape = 0x1B
+	vkTab    = 0x09
+	vkReturn = 0x0D
+	vkSpace  = 0x20
+	vkShift  = 0x10
+	vkLeft   = 0x25
+	vkUp     = 0x26
+	vkRight  = 0x27
+	vkDown   = 0x28
 
 	swShowNormal = 1
 
@@ -782,6 +800,7 @@ func releaseAt(hwnd uintptr, x, y int32) {
 		pressedBtn, pressedX = 0, -1
 		if pb != 0 {
 			if buttonAtPoint(l.btns, x, y) == pb {
+				focusID = pb
 				doCardAction(hwnd, pb)
 			} else {
 				invalidateMain()
@@ -801,6 +820,7 @@ func releaseAt(hwnd uintptr, x, y int32) {
 		pressedBtn, pressedX = 0, -1
 		if pb != 0 {
 			if buttonAtPoint(l.btns, x, y) == pb {
+				focusID = pb
 				doSettingsAction(hwnd, pb)
 			} else {
 				invalidateMain()
@@ -835,6 +855,7 @@ func releaseAt(hwnd uintptr, x, y int32) {
 			return
 		}
 		if buttonAtPoint(l.btns, x, y) == pb {
+			focusID = pb
 			doButtonAction(hwnd, pb)
 		} else {
 			invalidateMain()
@@ -842,6 +863,14 @@ func releaseAt(hwnd uintptr, x, y int32) {
 		return
 	}
 	if px >= 0 {
+		// The run snapshotted the DIRs: a mid-scan row-"x" delete would look
+		// ignored, so it is disabled with the same status reason as
+		// Add/Remove (honoured here because this path bypasses
+		// doButtonAction).
+		if scanActive {
+			setStatusText(scanBusyText)
+			return
+		}
 		if r := rowAtPoint(l.rows, x, y); r == px && r < len(l.xbtns) && ptInRect(l.xbtns[r], x, y) {
 			removeDirAt(r)
 		} else {
@@ -857,6 +886,7 @@ func releaseAt(hwnd uintptr, x, y int32) {
 		return
 	}
 	if id := buttonAtPoint(l.btns, x, y); id != 0 {
+		focusID = id
 		doButtonAction(hwnd, id)
 	}
 }
@@ -906,6 +936,14 @@ func hitTestCode(hwnd uintptr, x, y int32) uintptr {
 // doButtonAction routes an owner-drawn button click into the SAME actions
 // the native buttons used to call.
 func doButtonAction(hwnd uintptr, id int) {
+	// Honour the disabled state AT INPUT: a control dimmed for a running
+	// scan must not act - it says why on the status line instead. This one
+	// guard covers the mouse and keyboard paths alike (keyboard activation
+	// routes here via activateFocused).
+	if reason := scanBlockedReason(id); reason != "" {
+		setStatusText(reason)
+		return
+	}
 	switch id {
 	case btnAdd:
 		onAddDir(hwnd)
@@ -934,6 +972,7 @@ func openSettings() {
 	curView = viewSettings
 	hoverBtn, pressedBtn = 0, 0
 	hoverRow, hoverX, pressedX = -1, false, -1
+	focusID = 0
 	invalidateMain()
 }
 
@@ -941,6 +980,7 @@ func openSettings() {
 func closeSettings() {
 	curView = viewMain
 	hoverBtn, pressedBtn = 0, 0
+	focusID = 0
 	invalidateMain()
 }
 
@@ -959,22 +999,152 @@ func enterMain() {
 	closeSettings()
 }
 
-// onSettingsKeyDown handles WM_KEYDOWN for the settings and card views:
-// Esc returns to the main view. Reports whether a repaint is needed.
+// mainFocusOrder is the Tab order over the main view's rect table: the five
+// rect-table buttons plus the Settings and Card text affordances.
+func mainFocusOrder() []int {
+	return []int{btnAdd, btnRemove, btnScan, btnRefresh, btnClose, btnSettings, btnCard}
+}
+
+// settingsFocusOrder is the Tab order over the settings view's rect table.
+func settingsFocusOrder() []int {
+	return []int{btnBack, btnClearCache, btnExport, btnImport, btnStartup, btnOpenLog,
+		btnScanGentle, btnScanBalanced, btnScanTurbo}
+}
+
+// cardFocusOrder is the Tab order over the Card view's rect table: Back plus
+// the 4 Details and 4 State presets in CardPresets order.
+func cardFocusOrder() []int {
+	order := []int{btnCardBack}
+	for i := 0; i < 4; i++ {
+		order = append(order, cardDetailsButton(i))
+	}
+	for i := 0; i < 4; i++ {
+		order = append(order, cardStateButton(i))
+	}
+	return order
+}
+
+// focusOrderForView returns the Tab order for the visible view.
+func focusOrderForView(v uiView) []int {
+	switch v {
+	case viewSettings:
+		return settingsFocusOrder()
+	case viewCard:
+		return cardFocusOrder()
+	default:
+		return mainFocusOrder()
+	}
+}
+
+// moveFocus steps cur by dir (+1 next, -1 previous) over order with
+// wraparound. A cur outside order starts at the first (dir >= 0) or last
+// (dir < 0) stop. Pure so tests drive it without a live window.
+func moveFocus(cur, dir int, order []int) int {
+	if len(order) == 0 {
+		return 0
+	}
+	for i, id := range order {
+		if id == cur {
+			j := (i + dir) % len(order)
+			if j < 0 {
+				j += len(order)
+			}
+			return order[j]
+		}
+	}
+	if dir < 0 {
+		return order[len(order)-1]
+	}
+	return order[0]
+}
+
+// mainFocusRect resolves a main-view focus id to its painted rect: the
+// rect-table buttons plus the Settings/Card text affordances.
+func mainFocusRect(l uiLayout, id int) (rect, bool) {
+	for _, b := range l.btns {
+		if b.id == id {
+			return b.rc, true
+		}
+	}
+	if id == btnSettings {
+		return l.settings, true
+	}
+	if id == btnCard {
+		return l.cardLink, true
+	}
+	return rect{}, false
+}
+
+// shiftHeld reports whether Shift is down (for Shift+Tab), via GetKeyState.
+func shiftHeld() bool {
+	r, _, _ := procGetKeyState.Call(vkShift)
+	return r&0x8000 != 0
+}
+
+// activateFocused routes keyboard activation through the EXISTING dispatch:
+// the rect-table buttons via doButtonAction/doSettingsAction/doCardAction,
+// the main view's Settings/Card links via the same enterSettings/enterCard
+// the mouse path calls. No second action path.
+func activateFocused(hwnd uintptr, id int) {
+	focusID = id
+	switch curView {
+	case viewSettings:
+		doSettingsAction(hwnd, id)
+	case viewCard:
+		doCardAction(hwnd, id)
+	default:
+		switch id {
+		case btnSettings:
+			enterSettings()
+		case btnCard:
+			enterCard()
+		default:
+			doButtonAction(hwnd, id)
+		}
+	}
+}
+
+// onSettingsKeyDown handles WM_KEYDOWN for every view: Esc keeps its current
+// meaning (settings/card back to main, ignored in main); Tab/Shift+Tab and
+// the arrow keys move the focus index over the current view's rect table;
+// Enter/Space activate through the existing dispatch. Reports whether a
+// repaint is needed. The Ex form takes Shift explicitly so tests drive it
+// without touching GetKeyState.
 func onSettingsKeyDown(hwnd uintptr, vk uintptr) bool {
-	if curView == viewCard {
-		if vk == vkEscape {
+	return onSettingsKeyDownEx(hwnd, vk, shiftHeld())
+}
+
+// onSettingsKeyDownEx is the testable core of onSettingsKeyDown.
+func onSettingsKeyDownEx(hwnd uintptr, vk uintptr, shift bool) bool {
+	switch vk {
+	case vkEscape:
+		if curView == viewCard {
 			closeCard()
 			return true
 		}
-		_ = hwnd
-		return false
-	}
-	if curView != viewSettings {
-		return false
-	}
-	if vk == vkEscape {
+		if curView != viewSettings {
+			return false
+		}
 		enterMain()
+		return true
+	case vkTab:
+		dir := 1
+		if shift {
+			dir = -1
+		}
+		focusID = moveFocus(focusID, dir, focusOrderForView(curView))
+		return true
+	case vkLeft, vkUp:
+		focusID = moveFocus(focusID, -1, focusOrderForView(curView))
+		return true
+	case vkRight, vkDown:
+		focusID = moveFocus(focusID, 1, focusOrderForView(curView))
+		return true
+	case vkReturn, vkSpace:
+		if focusID == 0 {
+			return false
+		}
+		activateFocused(hwnd, focusID)
 		return true
 	}
 	_ = hwnd
@@ -1241,6 +1411,7 @@ func openCard() {
 	curView = viewCard
 	hoverBtn, pressedBtn = 0, 0
 	hoverRow, hoverX, pressedX = -1, false, -1
+	focusID = 0
 	invalidateMain()
 }
 
@@ -1248,6 +1419,7 @@ func openCard() {
 func closeCard() {
 	curView = viewMain
 	hoverBtn, pressedBtn = 0, 0
+	focusID = 0
 	invalidateMain()
 }
 
@@ -1368,10 +1540,12 @@ func onRemoveSelected() {
 	removeDirAt(idx)
 }
 
-// removeDirAt drops uiDirs[idx] through the config helpers; out-of-range is
-// a no-op.
+// removeDirAt drops uiDirs[idx] through the config helpers; out-of-range
+// (Remove with nothing selected) reports on the status line instead of
+// silently no-op-ing.
 func removeDirAt(idx int) {
 	if idx < 0 || idx >= len(uiDirs) {
+		setStatusText("Select a folder first.")
 		return
 	}
 	cfg := loadConfig()
@@ -1502,6 +1676,35 @@ func scanButtonLabel(active bool) string {
 // Cancel). Pure so tests drive the control-state model.
 func scanRefreshEnabled(active bool) bool {
 	return !active
+}
+
+// scanBusyText is the status reason a disabled-during-scan control reports
+// when invoked instead of acting.
+const scanBusyText = "Scan running - Cancel first."
+
+// scanBlockedReason reports why id must not act while a scan runs, or ""
+// when it may. Decision: Add/Remove are DISABLED mid-scan with this reason
+// (the run already snapshotted the DIRs, so edits would look ignored);
+// Refresh is disabled because force=true would start a second run. The Scan
+// rect stays enabled as Cancel. Reads UI-thread scan state, so callers pass
+// no active flag - tests set scanActive directly.
+func scanBlockedReason(id int) string {
+	if !scanActive {
+		return ""
+	}
+	switch id {
+	case btnAdd, btnRemove, btnRefresh:
+		return scanBusyText
+	}
+	return ""
+}
+
+// removeHasTarget reports whether Remove has a row to drop: the selected
+// row, else the hovered one. The Remove button dims (muted text) when false
+// but stays clickable so it can say why ("Select a folder first.").
+func removeHasTarget() bool {
+	return (selRow >= 0 && selRow < len(uiDirs)) ||
+		(hoverRow >= 0 && hoverRow < len(uiDirs))
 }
 
 // scanResultText maps a finished run to its status line. A Cancelled result
@@ -1635,8 +1838,11 @@ func onScanDone(hwnd uintptr) {
 		lname, stats.Files, stats.Skipped, stats.Unique, stats.Resolved, stats.Cached, stats.Fetched, stats.NotFound, stats.Errors, stats.Denied, stats.FoldersScanned, stats.FoldersSkipped, stats.FilesSkipped)
 }
 
-// enableScanButtons repaints so Scan/Refresh flip between active and dimmed;
-// always called on the UI thread via the button handler or the done message.
+// enableScanButtons repaints so the scan-disabled controls flip between
+// active and dimmed; always called on the UI thread via the button handler
+// or the done message. The dim paint is only half the contract - the input
+// guards in doButtonAction (and the row-"x" branch of releaseAt) honour the
+// same disabled set via scanBlockedReason, so a dimmed control never acts.
 func enableScanButtons(_ uintptr, _ bool) {
 	invalidateMain()
 }
@@ -1855,6 +2061,15 @@ func paintMainCard(hdc uintptr, rc rect, dpi int) {
 			dtRight|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, sectionFont, tc)
 	}
 
+	// 4d. Keyboard focus: stroke the focused control's rect so the Tab
+	// position is visible. Paint-only - rect geometry and hit-testing are
+	// untouched.
+	if focusID != 0 {
+		if frc, ok := mainFocusRect(l, focusID); ok {
+			strokeRoundRect(hdc, frc, colText, sc(8))
+		}
+	}
+
 	// 5. Status line.
 	drawUIText(hdc, "main.status", statusText, l.status,
 		dtLeft|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, sectionFont, colMuted)
@@ -1912,6 +2127,16 @@ func paintSettingsCard(hdc uintptr, rc rect, dpi int) {
 	// Buttons: Back + LIBRARY row + STARTUP row + SCAN segments.
 	for _, b := range l.btns {
 		paintButton(hdc, b, dpi, buttonFont, sectionFont)
+	}
+
+	// Keyboard focus ring (paint-only, as in the main view).
+	if focusID != 0 {
+		for _, b := range l.btns {
+			if b.id == focusID {
+				strokeRoundRect(hdc, b.rc, colText, sc(8))
+				break
+			}
+		}
 	}
 
 	// Dead-titles line: how many cache entries are marked not-found (a Clear
@@ -1986,6 +2211,16 @@ func paintCardView(hdc uintptr, rc rect, dpi int) {
 	// Buttons: Back + 4 Details + 4 State presets.
 	for _, b := range l.btns {
 		paintButton(hdc, b, dpi, buttonFont, sectionFont)
+	}
+
+	// Keyboard focus ring (paint-only, as in the main view).
+	if focusID != 0 {
+		for _, b := range l.btns {
+			if b.id == focusID {
+				strokeRoundRect(hdc, b.rc, colText, sc(8))
+				break
+			}
+		}
 	}
 
 	// Status line (shared with the other views).
@@ -2157,14 +2392,15 @@ func drawUITextWrapped(hdc uintptr, id, s string, rc rect, font uintptr, color u
 }
 
 // paintButton draws one rect-table button per its style, honoring hover,
-// pressed, and the scan-disabled state (Refresh dims while a run is in
-// flight; the Scan rect stays enabled as Cancel). Labels ellipsize
+// pressed, and the scan-disabled state (Add/Remove/Refresh dim while a run
+// is in flight; the Scan rect stays enabled as Cancel). Remove also dims
+// (muted text) when it has no row to drop. Labels ellipsize
 // (dtEndEllipsis) so a long caption trims instead of clipping silently.
 func paintButton(hdc uintptr, b uiButton, dpi int, buttonFont, smallFont uintptr) {
 	sc := func(v int32) int32 { return scalePx(int32(dpi), v) }
 	hovered := hoverBtn == b.id
 	pressed := pressedBtn == b.id
-	disabled := scanActive && b.id == btnRefresh
+	disabled := scanBlockedReason(b.id) != ""
 	id := fmt.Sprintf("btn-%d", b.id)
 
 	switch b.style {
@@ -2219,13 +2455,20 @@ func paintButton(hdc uintptr, b uiButton, dpi int, buttonFont, smallFont uintptr
 	default: // btnSubtle
 		fill := colRow
 		switch {
-		case pressed:
+		case pressed && !disabled:
 			fill = colCard
-		case hovered:
+		case hovered && !disabled:
 			fill = colRowHover
 		}
 		fillRoundRect(hdc, b.rc, fill, sc(8))
-		drawUIText(hdc, id, b.label, b.rc, dtCenter|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, buttonFont, colText)
+		// Remove dims (muted text) when it has no row to drop; Add/Remove
+		// dim while a scan runs. Either way the input guards say why
+		// instead of acting.
+		tc := colText
+		if disabled || (b.id == btnRemove && !removeHasTarget()) {
+			tc = colMuted
+		}
+		drawUIText(hdc, id, b.label, b.rc, dtCenter|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, buttonFont, tc)
 	}
 }
 

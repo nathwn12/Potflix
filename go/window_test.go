@@ -387,6 +387,183 @@ func TestSettingsEsc(t *testing.T) {
 	}
 }
 
+// TestFocusOrderCoversRectTable proves each view's keyboard focus order
+// covers exactly its rect table: main = 5 buttons + Settings + Card,
+// settings = 9, card = 9 (Back + 4 Details + 4 State), with no duplicates.
+func TestFocusOrderCoversRectTable(t *testing.T) {
+	orders := map[uiView][]int{
+		viewMain:     mainFocusOrder(),
+		viewSettings: settingsFocusOrder(),
+		viewCard:     cardFocusOrder(),
+	}
+	wantLen := map[uiView]int{viewMain: 7, viewSettings: 9, viewCard: 9}
+	for v, order := range orders {
+		if len(order) != wantLen[v] {
+			t.Fatalf("view %d focus order = %d stops, want %d", v, len(order), wantLen[v])
+		}
+		seen := map[int]bool{}
+		for _, id := range order {
+			if seen[id] {
+				t.Fatalf("view %d focus order duplicates id %d", v, id)
+			}
+			seen[id] = true
+		}
+		if got := focusOrderForView(v); len(got) != len(order) {
+			t.Fatalf("view %d focusOrderForView = %d stops, want %d", v, len(got), len(order))
+		}
+	}
+	for _, id := range []int{btnAdd, btnRemove, btnScan, btnRefresh, btnClose, btnSettings, btnCard} {
+		found := false
+		for _, got := range mainFocusOrder() {
+			if got == id {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("main focus order misses rect-table id %d", id)
+		}
+	}
+}
+
+// TestMoveFocusWraps proves the focus step: an unknown position starts at
+// the first (forward) or last (backward) stop, and stepping wraps both ways.
+func TestMoveFocusWraps(t *testing.T) {
+	order := []int{btnAdd, btnRemove, btnScan}
+	if got := moveFocus(0, 1, order); got != btnAdd {
+		t.Fatalf("moveFocus(none,+1) = %d, want %d (first stop)", got, btnAdd)
+	}
+	if got := moveFocus(0, -1, order); got != btnScan {
+		t.Fatalf("moveFocus(none,-1) = %d, want %d (last stop)", got, btnScan)
+	}
+	if got := moveFocus(btnScan, 1, order); got != btnAdd {
+		t.Fatalf("moveFocus(last,+1) = %d, want %d (wrap)", got, btnAdd)
+	}
+	if got := moveFocus(btnAdd, -1, order); got != btnScan {
+		t.Fatalf("moveFocus(first,-1) = %d, want %d (wrap)", got, btnScan)
+	}
+	if got := moveFocus(btnAdd, 1, order); got != btnRemove {
+		t.Fatalf("moveFocus(Add,+1) = %d, want %d", got, btnRemove)
+	}
+	if got := moveFocus(0, 1, nil); got != 0 {
+		t.Fatalf("moveFocus over empty order = %d, want 0", got)
+	}
+}
+
+// TestFocusTabCycle proves Tab/Shift+Tab walk the main order and the arrows
+// step it, while Esc in the main view stays ignored.
+func TestFocusTabCycle(t *testing.T) {
+	v, f := curView, focusID
+	defer func() { curView, focusID = v, f }()
+
+	curView, focusID = viewMain, 0
+	if !onSettingsKeyDownEx(0, vkTab, false) || focusID != btnAdd {
+		t.Fatalf("Tab: focus = %d, want %d (first stop)", focusID, btnAdd)
+	}
+	if !onSettingsKeyDownEx(0, vkTab, false) || focusID != btnRemove {
+		t.Fatalf("Tab x2: focus = %d, want %d", focusID, btnRemove)
+	}
+	if !onSettingsKeyDownEx(0, vkTab, true) || focusID != btnAdd {
+		t.Fatalf("Shift+Tab: focus = %d, want %d", focusID, btnAdd)
+	}
+	if !onSettingsKeyDownEx(0, vkDown, false) || focusID != btnRemove {
+		t.Fatalf("Down: focus = %d, want %d", focusID, btnRemove)
+	}
+	if !onSettingsKeyDownEx(0, vkUp, false) || focusID != btnAdd {
+		t.Fatalf("Up: focus = %d, want %d", focusID, btnAdd)
+	}
+	if onSettingsKeyDownEx(0, vkEscape, false) {
+		t.Fatalf("Esc in main view handled, want ignored")
+	}
+}
+
+// TestFocusActivateHonoursDisabled proves a disabled control reports instead
+// of acting: Refresh while a scan runs lands the busy reason and the run is
+// untouched (still active, nothing started).
+func TestFocusActivateHonoursDisabled(t *testing.T) {
+	v, f, a, s := curView, focusID, scanActive, statusText
+	defer func() { curView, focusID, scanActive, statusText = v, f, a, s }()
+
+	curView, scanActive, focusID = viewMain, true, btnRefresh
+	if !onSettingsKeyDownEx(0, vkReturn, false) {
+		t.Fatalf("Enter on focused Refresh ignored, want activation")
+	}
+	if statusText != scanBusyText {
+		t.Fatalf("disabled Refresh status = %q, want %q", statusText, scanBusyText)
+	}
+	if !scanActive {
+		t.Fatalf("disabled Refresh disturbed the run, want it still active")
+	}
+}
+
+// TestRemoveWithoutSelectionFeedback proves Remove with nothing selected
+// lands the status hint instead of silently no-op-ing.
+func TestRemoveWithoutSelectionFeedback(t *testing.T) {
+	d, sr, hr, s := uiDirs, selRow, hoverRow, statusText
+	defer func() { uiDirs, selRow, hoverRow, statusText = d, sr, hr, s }()
+
+	uiDirs = []string{`C:\Media\Movies`}
+	selRow, hoverRow = -1, -1
+	removeDirAt(-1)
+	if statusText != "Select a folder first." {
+		t.Fatalf("Remove-without-selection status = %q, want the hint", statusText)
+	}
+	if len(uiDirs) != 1 {
+		t.Fatalf("Remove-without-selection dropped a row, want no change")
+	}
+}
+
+// TestScanBlocksEdits proves the mid-scan disabled set: Add/Remove/Refresh
+// report the busy reason, Scan (Cancel) and Close stay free, and idle blocks
+// nothing.
+func TestScanBlocksEdits(t *testing.T) {
+	a := scanActive
+	defer func() { scanActive = a }()
+
+	scanActive = true
+	for _, id := range []int{btnAdd, btnRemove, btnRefresh} {
+		if got := scanBlockedReason(id); got != scanBusyText {
+			t.Fatalf("mid-scan id %d reason = %q, want %q", id, got, scanBusyText)
+		}
+	}
+	for _, id := range []int{btnScan, btnClose, btnSettings, btnCard} {
+		if got := scanBlockedReason(id); got != "" {
+			t.Fatalf("mid-scan id %d blocked (%q), want free", id, got)
+		}
+	}
+	scanActive = false
+	for _, id := range []int{btnAdd, btnRemove, btnRefresh, btnScan, btnClose} {
+		if got := scanBlockedReason(id); got != "" {
+			t.Fatalf("idle id %d blocked (%q), want free", id, got)
+		}
+	}
+}
+
+// TestRemoveDimNeedsTarget proves the Remove dim model: the selected or
+// hovered row counts as a target, stale indices beyond the list do not.
+func TestRemoveDimNeedsTarget(t *testing.T) {
+	d, sr, hr := uiDirs, selRow, hoverRow
+	defer func() { uiDirs, selRow, hoverRow = d, sr, hr }()
+
+	uiDirs = []string{`C:\Media\Movies`}
+	selRow, hoverRow = -1, -1
+	if removeHasTarget() {
+		t.Fatalf("removeHasTarget with no selection = true, want false (dim)")
+	}
+	selRow = 0
+	if !removeHasTarget() {
+		t.Fatalf("removeHasTarget with row selected = false, want true")
+	}
+	selRow, hoverRow = -1, 0
+	if !removeHasTarget() {
+		t.Fatalf("removeHasTarget with row hovered = false, want true")
+	}
+	uiDirs = nil
+	selRow, hoverRow = 0, 0
+	if removeHasTarget() {
+		t.Fatalf("removeHasTarget with stale indices = true, want false")
+	}
+}
+
 // TestAuditSingleLineVerdict proves the audit criterion: a fitting extent
 // is silent, a deliberately-ellipsized draw that does not fit is
 // informational ("trimmed", never a violation), and a draw WITHOUT an
