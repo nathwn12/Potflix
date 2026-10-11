@@ -144,8 +144,6 @@ Discord needed. Diagnose one title: `go run ./cmd/metacheck [-offline] <rawTitle
 
 MIT — see [LICENSE](LICENSE).
 
-Fork of [`ayunami2000/PotPlayer-DiscordRPC`](https://github.com/ayunami2000/PotPlayer-DiscordRPC) (BSD 3-Clause) — see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) for the full text and logo-font notices. The title-cleaner logic derives from that project; the bundled logo fonts are SIL OFL 1.1.
-
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">
   <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
