@@ -29,3 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache over a library walk), `titleclean` (corpus parity TSV).
 - Inno Setup installer (`tools/potflix.iss`) and embedded exe/tray icon
   resources.
+
+### Fixed
+
+- Arc-suffixed series filenames (`Show - Arc - NN`, e.g. `Dragon Ball
+  Super - Beerus - 01`) now resolve: when the full title matches nothing,
+  the metadata lookup retries the head segment before the first `-`, so the
+  card shows the real series, episode title, and artwork instead of a bare
+  absolute tag.
