@@ -34,6 +34,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Arc-suffixed series filenames (`Show - Arc - NN`, e.g. `Dragon Ball
   Super - Beerus - 01`) now resolve: when the full title matches nothing,
-  the metadata lookup retries the head segment before the first `-`, so the
-  card shows the real series, episode title, and artwork instead of a bare
-  absolute tag.
+  the lookup normalizes the separator (` - ` -> `: `) instead of truncating
+  the name, so the card shows the 2026 series, `The God Who Destroys`, and
+  artwork instead of the 2015 series or a bare absolute tag.
