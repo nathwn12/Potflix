@@ -133,6 +133,13 @@ Discord needed. Diagnose one title: `go run ./cmd/metacheck [-offline] <rawTitle
 
 **Unverified** — as-is, use at your own risk.
 
+## Credits
+
+- Upstream: [`ayunami2000/PotPlayer-DiscordRPC`](https://github.com/ayunami2000/PotPlayer-DiscordRPC) (BSD-3-Clause). The title-cleaner logic in Potflix derives from that project.
+- Logo fonts: the files under `design\fonts\` (Archivo Black, Montserrat, Poppins, Anton, Bebas Neue, Inter), each under the SIL Open Font License 1.1, render the Potflix logo offline via `design\make_logo.py`. They are not the app's typeface and are not redistributed as one.
+- Potflix is not affiliated with or endorsed by the upstream authors or the font authors.
+- See [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) for the full upstream and font notices.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
