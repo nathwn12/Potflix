@@ -100,6 +100,19 @@ type Stats struct {
 	FoldersScanned int
 	FoldersSkipped int
 	FilesSkipped   int
+
+	// Store-backed index counters (zero for a non-indexed run). Unchanged
+	// counts walked files whose (size, mtime) matched their stored record -
+	// the files the fast path never re-parsed; Parsed counts the files it
+	// did re-parse (new, changed, or a forced Refresh); Changed counts
+	// records replaced; Pruned counts records deleted because the file is
+	// gone; Pending/NeedsRepair count the index's metadata states.
+	Unchanged   int
+	Parsed      int
+	Changed     int
+	Pruned      int
+	Pending     int
+	NeedsRepair int
 }
 
 // Progress is one live scan update. Done counts finished files against the
@@ -139,6 +152,12 @@ type Options struct {
 	IndexPath string
 	UseIndex  bool
 	Progress  func(Progress)
+	// SkipCatchUp keeps an indexed run to its index phase: no background
+	// metadata pass is triggered. Tests and benchmarks use it to measure the
+	// walk+diff alone; the app leaves it false.
+	SkipCatchUp bool
+	// AppVersion stamps the needs-repair report the catch-up writes.
+	AppVersion string
 }
 
 // newResolver builds the scan resolver; tests may replace it to inject fake
@@ -453,9 +472,197 @@ func Scan(ctx context.Context, dirs []string, force bool, cacheDir string, progr
 	})
 }
 
+// cachedDir memoizes one os.ReadDir per directory plus one FileInfo per
+// path for the duration of ONE recordIndex pass, so verification and the
+// record-time re-hash share each listing instead of re-reading it. It is
+// deliberately not shared across phases: the walk's skip decisions read
+// fresh (freshNamesHash/freshFingerprint), and each recordIndex pass owns
+// a new cachedDir, because reusing a listing across the traversal, the
+// decision, the pre-fetch record and the final record would let one
+// rewalked directory be decided, verified and stamped from progressively
+// staler enumerations. The duplicate reads across phases are the cost of
+// fail-closed verification (see collectIndexed and recordIndex).
+type cachedDir struct {
+	lists map[string][]os.DirEntry
+	infos map[string]os.FileInfo
+}
+
+// list returns the directory's entries, reading them at most once.
+// Failures are never cached, so a later retry re-reads.
+func (c *cachedDir) list(path string) ([]os.DirEntry, error) {
+	if c.lists != nil {
+		if es, ok := c.lists[path]; ok {
+			return es, nil
+		}
+	} else {
+		c.lists = make(map[string][]os.DirEntry)
+	}
+	es, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	c.lists[path] = es
+	return es, nil
+}
+
+// info returns the FileInfo for path, calling d.Info() (falling back to
+// os.Stat when d is nil or Info fails) at most once per path.
+func (c *cachedDir) info(path string, d os.DirEntry) (os.FileInfo, error) {
+	if c.infos != nil {
+		if fi, ok := c.infos[path]; ok {
+			return fi, nil
+		}
+	} else {
+		c.infos = make(map[string]os.FileInfo)
+	}
+	var fi os.FileInfo
+	if d != nil {
+		if f, err := d.Info(); err == nil {
+			fi = f
+		}
+	}
+	if fi == nil {
+		f, err := os.Stat(path)
+		if err != nil {
+			return nil, err
+		}
+		fi = f
+	}
+	c.infos[path] = fi
+	return fi, nil
+}
+
+// namesHash computes the tier-1 FolderNamesHash identity from the single
+// cached listing (same core, identical record spelling).
+func (c *cachedDir) namesHash(path string, modTime time.Time) (string, error) {
+	es, err := c.list(path)
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(es))
+	for _, e := range es {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return hashNames(modTime.UnixNano(), len(names), names), nil
+}
+
+// fingerprint computes the tier-2 FolderFingerprint identity from the
+// single cached listing (same core, identical record spelling).
+// Sub-directory listings are read through the same cache, so a folder
+// enumerated here as a parent's second level is not re-enumerated when
+// the walk descends into it.
+func (c *cachedDir) fingerprint(path string, modTime time.Time) (string, error) {
+	es, err := c.list(path)
+	if err != nil {
+		return "", err
+	}
+	sorted := append([]os.DirEntry(nil), es...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name() < sorted[j].Name() })
+	fps := make([]fpEntry, 0, len(sorted))
+	for _, e := range sorted {
+		ep := filepath.Join(path, e.Name())
+		fi, err := c.info(ep, e)
+		if err != nil {
+			return "", err
+		}
+		fe := fpEntry{name: e.Name(), size: fi.Size(), mtimeUnixNano: fi.ModTime().UnixNano(), isDir: e.IsDir()}
+		if e.IsDir() {
+			sub, err := c.list(ep)
+			if err != nil {
+				return "", err
+			}
+			ssorted := append([]os.DirEntry(nil), sub...)
+			sort.Slice(ssorted, func(i, j int) bool { return ssorted[i].Name() < ssorted[j].Name() })
+			for _, s := range ssorted {
+				sp := filepath.Join(ep, s.Name())
+				sfi, err := c.info(sp, s)
+				if err != nil {
+					return "", err
+				}
+				fe.sub = append(fe.sub, fpSub{name: s.Name(), size: sfi.Size()})
+			}
+		}
+		fps = append(fps, fe)
+	}
+	return hashFingerprint(modTime.UnixNano(), fps), nil
+}
+
+// freshNamesHash computes the tier-1 identity from one fresh os.ReadDir:
+// a skip decision must never run on a listing cached in an earlier pass
+// (this dir as its parent's fingerprint second level), which can predate a
+// concurrent add and - with the dir mtime restored - still match the
+// record. Same core and spelling as FolderNamesHash.
+func freshNamesHash(path string, modTime time.Time) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+	return hashNames(modTime.UnixNano(), len(names), names), nil
+}
+
+// freshFingerprint computes the tier-2 identity from one fresh os.ReadDir
+// plus fresh stats, mirroring FolderFingerprint exactly (same core, same
+// field order): every input is read now, never from an earlier pass's
+// cache, so a concurrent change between the parent's fingerprint and this
+// dir's decision refuses the skip instead of trusting stale names.
+func freshFingerprint(path string, modTime time.Time) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	fps := make([]fpEntry, 0, len(entries))
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil {
+			return "", err
+		}
+		fe := fpEntry{name: e.Name(), size: info.Size(), mtimeUnixNano: info.ModTime().UnixNano(), isDir: e.IsDir()}
+		if e.IsDir() {
+			sub, err := os.ReadDir(filepath.Join(path, e.Name()))
+			if err != nil {
+				return "", err
+			}
+			sort.Slice(sub, func(i, j int) bool { return sub[i].Name() < sub[j].Name() })
+			for _, s := range sub {
+				sinfo, err := s.Info()
+				if err != nil {
+					return "", err
+				}
+				fe.sub = append(fe.sub, fpSub{name: s.Name(), size: sinfo.Size()})
+			}
+		}
+		fps = append(fps, fe)
+	}
+	return hashFingerprint(modTime.UnixNano(), fps), nil
+}
+
+// walkDirInfo carries one visited directory's walk-time hash identities
+// into recordIndex so recording reuses them instead of re-hashing. Empty
+// hashes mean the dir was never hashed in this pass (force walks, or a
+// hash doubt); recordIndex then hashes it fresh from a single listing
+// instead of a second full walk.
+type walkDirInfo struct {
+	namesHash   string
+	fingerprint string
+}
+
+// scanWalk is one collectIndexed pass's per-directory hash state, keyed by
+// normalized dir.
+type scanWalk struct {
+	dirs map[string]walkDirInfo
+}
+
 // collectIndexed walks each root for video files, consulting ix when
 // enabled. It returns the walked files (skipped subtrees excluded), the
 // visited (non-skipped) directories, the skipped records by normalized dir,
+// this pass's per-directory hash state for recordIndex (nil unless indexed),
 // and the folder/file tallies. force disables all skipping but still
 // visits every dir for recording. Any hash doubt (stat/read errors) walks
 // the folder normally. Tier-2 hits refresh the record's tier-1 hash.
@@ -463,12 +670,26 @@ func Scan(ctx context.Context, dirs []string, force bool, cacheDir string, progr
 // aborts, and collectIndexed reports cancelled=true with partial results
 // (not an error). When indexed, the index is checkpointed every
 // checkpointEveryFolders visited folders or every checkpointEveryInterval,
-// whichever comes first, via the existing atomic Save, so an interrupted
-// scan keeps what was walked so far.
-func collectIndexed(ctx context.Context, roots []string, ix *ScanIndex, useIndex bool, schema int, keyPresent func(string) bool, force bool, indexPath string) (files []string, visited []string, skipped map[string]FolderRecord, foldersScanned, foldersSkipped, filesSkipped, denied int, firstErr error, cancelled bool) {
+// whichever comes first, via SaveIfDirty (same cadence, a write only when
+// records changed), so an interrupted scan keeps what was walked so far.
+//
+// Disk discipline: the traversal itself is WalkDir (its own enumeration,
+// which the walk cannot reuse because a dir's skip decision is due before
+// its children arrive), each skip decision reads its own directory fresh
+// (tier-1 names, tier-2 fingerprint only on a tier-1 miss), and each
+// recordIndex pass re-lists every visited dir for verification. The
+// re-enumeration across phases is deliberate: sharing a listing across a
+// skip decision, the pre-fetch record and the final record would let a
+// concurrent add slip a stamp whose hashes the next scan trusts, so every
+// phase reads current filesystem state (see freshNamesHash and the
+// recordIndex verification below).
+func collectIndexed(ctx context.Context, roots []string, ix *ScanIndex, useIndex bool, schema int, keyPresent func(string) bool, force bool, indexPath string, onFile func(path string, size, mtimeUnixNano int64)) (files []string, visited []string, skipped map[string]FolderRecord, walk *scanWalk, foldersScanned, foldersSkipped, filesSkipped, denied int, firstErr error, cancelled bool) {
 	skipped = make(map[string]FolderRecord)
 	enabled := useIndex && !force && ix != nil
 	indexed := useIndex && indexPath != "" && ix != nil
+	if indexed {
+		walk = &scanWalk{dirs: make(map[string]walkDirInfo)}
+	}
 	var okRoots int
 	lastFlush := time.Now()
 	lastFlushCount := 0
@@ -478,7 +699,7 @@ func collectIndexed(ctx context.Context, roots []string, ix *ScanIndex, useIndex
 		}
 		lastFlush = time.Now()
 		lastFlushCount = len(visited)
-		if err := ix.Save(indexPath); err != nil {
+		if err := ix.SaveIfDirty(indexPath); err != nil {
 			fmt.Fprintf(os.Stderr, "library: checkpoint scan index %q: %v\n", indexPath, err)
 		}
 	}
@@ -522,33 +743,59 @@ func collectIndexed(ctx context.Context, roots []string, ix *ScanIndex, useIndex
 			}
 			if d.IsDir() {
 				if enabled {
-					if nh, nhErr := FolderNamesHash(path); nhErr == nil {
-						if ix.ShouldSkipNames(path, nh, schema, keyPresent) {
-							if rec, ok := ix.Lookup(path); ok {
-								filesSkipped += rec.Files
-								skipped[normalizeScanDir(path)] = rec
+					// One os.Stat for the dir's mtime plus one fresh
+					// listing per tier, in the exact historical skip
+					// order: names hash first, fingerprint on a
+					// tier-1 miss. Both tiers read the filesystem
+					// fresh at decision time, never a listing cached
+					// in an earlier pass: this dir may already sit
+					// in the cache as its parent's fingerprint
+					// second level, and that listing can predate a
+					// concurrent add - with the dir mtime restored
+					// the stale names still match, so the skip
+					// would hide the new files (the old
+					// FolderNamesHash read fresh names and
+					// refused). Reading fresh once is fail-closed
+					// by construction; a re-verify-on-hit would
+					// cost the same extra listing on every steady-
+					// state skip without removing the stale input.
+					// Any hash doubt walks the folder normally.
+					var nh, fp string
+					if fi, err := os.Stat(path); err == nil && fi.IsDir() {
+						if h, err := freshNamesHash(path, fi.ModTime()); err == nil {
+							nh = h
+							if ix.ShouldSkipNames(path, nh, schema, keyPresent) {
+								if rec, ok := ix.Lookup(path); ok {
+									filesSkipped += rec.Files
+									skipped[normalizeScanDir(path)] = rec
+								}
+								foldersSkipped++
+								return filepath.SkipDir
 							}
-							foldersSkipped++
-							return filepath.SkipDir
 						}
-					}
-					if fp, fpErr := FolderFingerprint(path); fpErr == nil {
-						if ix.ShouldSkip(path, fp, schema, keyPresent) {
-							rec, ok := ix.Lookup(path)
-							if ok {
-								filesSkipped += rec.Files
-								skipped[normalizeScanDir(path)] = rec
-								// Refresh tier 1: benign dir-mtime bump
-								// with identical contents. Recompute the
-								// names hash (it missed above) and
-								// re-record so the next scan hits tier 1.
-								if nh, nhErr := FolderNamesHash(path); nhErr == nil {
+						if h, err := freshFingerprint(path, fi.ModTime()); err == nil {
+							fp = h
+							if ix.ShouldSkip(path, fp, schema, keyPresent) {
+								rec, ok := ix.Lookup(path)
+								if ok {
+									filesSkipped += rec.Files
+									skipped[normalizeScanDir(path)] = rec
+									// Refresh tier 1: benign dir-mtime
+									// bump with identical contents. The
+									// names hash above missed, so it is
+									// current; re-record from this
+									// pass's fresh hashes (no
+									// recompute) so the next scan hits
+									// tier 1.
 									ix.RecordFull(path, nh, fp, schema, rec.Keys, rec.Files)
 								}
+								foldersSkipped++
+								return filepath.SkipDir
 							}
-							foldersSkipped++
-							return filepath.SkipDir
 						}
+					}
+					if walk != nil {
+						walk.dirs[normalizeScanDir(path)] = walkDirInfo{namesHash: nh, fingerprint: fp}
 					}
 				}
 				foldersScanned++
@@ -560,6 +807,17 @@ func collectIndexed(ctx context.Context, roots []string, ix *ScanIndex, useIndex
 			}
 			if videoExts[strings.ToLower(filepath.Ext(path))] {
 				files = append(files, path)
+				if onFile != nil {
+					// One more listener on the same enumeration the walk
+					// already paid for: the dir entry's own FileInfo, so
+					// the per-file diff gets (size, mtime) without a
+					// second stat of every walked file.
+					if d != nil {
+						if fi, err := d.Info(); err == nil {
+							onFile(path, fi.Size(), fi.ModTime().UnixNano())
+						}
+					}
+				}
 			}
 			return nil
 		}); err != nil {
@@ -583,9 +841,9 @@ func collectIndexed(ctx context.Context, roots []string, ix *ScanIndex, useIndex
 		cancelled = true
 	}
 	if okRoots == 0 && firstErr != nil && !cancelled {
-		return nil, nil, skipped, foldersScanned, foldersSkipped, filesSkipped, denied, firstErr, cancelled
+		return nil, nil, skipped, walk, foldersScanned, foldersSkipped, filesSkipped, denied, firstErr, cancelled
 	}
-	return files, visited, skipped, foldersScanned, foldersSkipped, filesSkipped, denied, nil, cancelled
+	return files, visited, skipped, walk, foldersScanned, foldersSkipped, filesSkipped, denied, nil, cancelled
 }
 
 // CollectResult is the outcome of an index-aware walk: the walked video
@@ -625,9 +883,20 @@ func CollectIndexedWithContext(ctx context.Context, roots []string, cacheDir, in
 	var keyPresent func(string) bool
 	if indexed {
 		ix = LoadScanIndex(indexPath)
-		keyPresent = func(key string) bool { return metadata.CacheLive(cacheDir, key) }
+		// One read per cache key per walk: the tier-1 and tier-2
+		// guards share this memo instead of each re-reading the
+		// same cache file.
+		memo := make(map[string]bool)
+		keyPresent = func(key string) bool {
+			if v, ok := memo[key]; ok {
+				return v
+			}
+			v := metadata.CacheLive(cacheDir, key)
+			memo[key] = v
+			return v
+		}
 	}
-	files, visited, skipped, fs, fk, fsk, denied, err, cancelled := collectIndexed(ctx, roots, ix, indexed, schema, keyPresent, force, indexPath)
+	files, visited, skipped, _, fs, fk, fsk, denied, err, cancelled := collectIndexed(ctx, roots, ix, indexed, schema, keyPresent, force, indexPath, nil)
 	if err != nil {
 		return CollectResult{}, cancelled, err
 	}
@@ -655,16 +924,18 @@ func CollectIndexed(roots []string, cacheDir, indexPath string, useIndex, force 
 }
 
 // RecordScan re-records every visited dir from an indexed walk (keys from
-// the walked plans plus skipped-subtree totals), prunes, and saves
-// atomically. It is a no-op for an empty indexPath or with no visited
-// dirs (still prunes/saves when an index exists). Save errors are logged,
-// never fatal.
+// the walked plans plus skipped-subtree totals) and saves when anything
+// changed. It is a no-op for an empty indexPath or with no visited dirs
+// (still saves when pruning changed the index). Save errors
+// are logged, never fatal. Without walk state every visited dir is hashed
+// fresh from a single listing; staleness is still refused (see
+// recordIndex).
 func RecordScan(indexPath string, visited []string, skipped map[string]FolderRecord, plans []FilePlan) {
 	if indexPath == "" {
 		return
 	}
 	ix := LoadScanIndex(indexPath)
-	recordIndex(ix, visited, skipped, plans, indexPath, metadata.CacheSchema())
+	recordIndex(ix, visited, skipped, plans, indexPath, metadata.CacheSchema(), nil)
 }
 
 // ScanWithOptions is Scan with an opt-in folder index. With UseIndex off
@@ -674,12 +945,12 @@ func RecordScan(indexPath string, visited []string, skipped map[string]FolderRec
 // metadata.CacheLive per recorded key); force=true ignores the index for
 // skipping but still rewrites every visited record. A missing/corrupt
 // index file is a full walk, never an error. On success the index is
-// pruned (PruneExisting) and saved atomically; a save failure is logged
+// pruned in the scan write path and saved when changed; a save failure is logged
 // to stderr but does not fail the scan.
 //
 // Checkpointing: when indexed, the walk checkpoints the index every
 // checkpointEveryFolders visited folders or every checkpointEveryInterval
-// via the existing atomic Save. The walk-phase checkpoint only persists
+// via SaveIfDirty (same cadence, a write only when records changed). The walk-phase checkpoint only persists
 // records from earlier complete runs (plus tier-2 refreshed skip records),
 // never the in-progress walk, so it can only ever write fully walked
 // folders. The pre-fetch, fetch-phase and final recordIndex flushes all
@@ -692,16 +963,43 @@ func RecordScan(indexPath string, visited []string, skipped map[string]FolderRec
 // check ctx.Err()) and returns partial stats with Cancelled=true and a
 // nil error: a user cancel is not a failure.
 func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
+	// Indexed runs take the store-backed enumerate+diff path (scan.go): one
+	// walk, a per-file (size, mtime) diff, zero fetches, then the background
+	// catch-up. The body below is the historical non-indexed fetch path,
+	// which the index-off switch, the CLI and the tests still use verbatim.
+	if opts.UseIndex && opts.IndexPath != "" {
+		return scanIndexed(ctx, opts)
+	}
 	indexed := opts.UseIndex && opts.IndexPath != ""
 	var ix *ScanIndex
 	schema := metadata.CacheSchema()
 	var keyPresent func(string) bool
+	// scanResolver backs the index guard and the pre-count below with one
+	// shared view: the first touch of a cache key probes its file
+	// (ProbeCache warms the resolver's memory for live entries only)
+	// and every later touch in this scan is served from memory,
+	// revalidated against deletion. liveMemo is that shared verdict map,
+	// covering the guard's recorded keys and the pre-count's group keys
+	// alike. A live entry's file is read once; a missing, corrupt,
+	// expired or oversize entry warms nothing, so the fetch-phase lookup
+	// re-reads it from disk (two reads for a miss) and the disk stays the
+	// source of truth.
+	var scanResolver *metadata.Resolver
+	var liveMemo map[string]bool
 	if indexed {
 		ix = LoadScanIndex(opts.IndexPath)
-		cacheDir := opts.CacheDir
-		keyPresent = func(key string) bool { return metadata.CacheLive(cacheDir, key) }
+		scanResolver = newResolver(opts.CacheDir)
+		liveMemo = make(map[string]bool)
+		keyPresent = func(key string) bool {
+			if v, ok := liveMemo[key]; ok {
+				return v
+			}
+			v := scanResolver.ProbeCache(key)
+			liveMemo[key] = v
+			return v
+		}
 	}
-	files, visited, skipped, foldersScanned, foldersSkipped, filesSkipped, denied, walkErr, walkCancelled := collectIndexed(ctx, opts.Dirs, ix, indexed, schema, keyPresent, opts.Force, opts.IndexPath)
+	files, visited, skipped, walk, foldersScanned, foldersSkipped, filesSkipped, denied, walkErr, walkCancelled := collectIndexed(ctx, opts.Dirs, ix, indexed, schema, keyPresent, opts.Force, opts.IndexPath, nil)
 	if walkErr != nil {
 		return Stats{}, walkErr
 	}
@@ -722,7 +1020,7 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 	// above). Skipped when the context is already cancelled: a cancelled
 	// run records nothing.
 	if indexed && ctx.Err() == nil {
-		recordIndex(ix, visited, skipped, plans, opts.IndexPath, schema)
+		recordIndex(ix, visited, skipped, plans, opts.IndexPath, schema, walk)
 	}
 	st := Stats{Files: len(plans), Unique: len(groups), Denied: denied,
 		FoldersScanned: foldersScanned, FoldersSkipped: foldersSkipped, FilesSkipped: filesSkipped,
@@ -732,7 +1030,23 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 	cachedHit := make(map[string]bool, len(groups))
 	if !opts.Force {
 		for _, g := range groups {
-			if metadata.CacheLive(opts.CacheDir, metadata.CacheKeyFor(g.Query)) {
+			// One shared probe per distinct cache key: guard and
+			// pre-count verdicts are memoised; live entries are
+			// served from warmed memory in the fetch phase,
+			// misses re-read from disk (see above).
+			ck := metadata.CacheKeyFor(g.Query)
+			var live bool
+			if scanResolver != nil {
+				if v, ok := liveMemo[ck]; ok {
+					live = v
+				} else {
+					live = scanResolver.ProbeCache(ck)
+					liveMemo[ck] = live
+				}
+			} else {
+				live = metadata.CacheLive(opts.CacheDir, ck)
+			}
+			if live {
 				keysCached++
 				cachedHit[g.Key] = true
 			}
@@ -749,7 +1063,10 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 	statusByKey := make(map[string]string, len(groups))
 	cachedByKey := make(map[string]bool, len(groups))
 	if len(groups) > 0 {
-		r := newResolver(opts.CacheDir)
+		r := scanResolver
+		if r == nil {
+			r = newResolver(opts.CacheDir)
+		}
 		// Provenance rides a mutex-guarded side map keyed by the same
 		// dedupe key BuildPlan used, so the FetchAll LookupFunc signature
 		// (shared with metawarm's resolver.LookupNow) stays unchanged.
@@ -777,7 +1094,7 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 				return
 			}
 			lastCkpt = time.Now()
-			recordIndex(ix, visited, skipped, plans, opts.IndexPath, schema)
+			recordIndex(ix, visited, skipped, plans, opts.IndexPath, schema, walk)
 		}
 		// No global gate (gateInterval 0): cache hits must never sleep.
 		// Provider throttling is enforced per host inside metadata's HTTP
@@ -789,65 +1106,99 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 			progress(Progress{Done: done, Total: total, FoldersScanned: foldersScanned, FoldersSkipped: foldersSkipped,
 				KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound, KeysFailed: keysFailed})
 		}
-		results := FetchAll(ctx, groups, lookup, defaultConcurrency, 0,
-			func(g *Group, fr FetchResult) {
-				srcMu.Lock()
-				fromCache := srcByKey[g.Key]
-				srcMu.Unlock()
-				n := len(g.Paths)
-				add, addCached, addFetched := 0, 0, 0
-				if fr.Err == nil && fr.Res.Found {
-					add = n
-					if fromCache {
-						addCached = n
-					} else {
-						addFetched = n
-					}
-				}
-				pmu.Lock()
-				done += n
-				resolved += add
-				cached += addCached
-				fetched += addFetched
-				if !cachedHit[g.Key] {
-					if fr.Err != nil {
-						// A cancelled fetch is incomplete, never a
-						// miss: leave it out of every bucket. A
-						// transient provider failure is unknown,
-						// never a miss: it gets its own bucket, never
-						// KeysNotFound.
-						if ctx.Err() == nil {
-							if errors.Is(fr.Err, metadata.ErrLookupUnavailable) {
-								keysFailed++
-							} else {
-								keysNotFound++
-							}
-						}
-					} else if fr.Res.Found {
-						if !fromCache {
-							keysFetched++
-						} else {
-							// Stat missed but served from cache (e.g.
-							// in-memory hit): credit as cached.
-							keysCached++
-							cachedHit[g.Key] = true
-						}
-					} else {
-						keysNotFound++
-					}
-					keysDone = keysCached + keysFetched + keysNotFound + keysFailed
+		results := make(map[string]FetchResult, len(groups))
+		onDone := func(g *Group, fr FetchResult) {
+			srcMu.Lock()
+			fromCache := srcByKey[g.Key]
+			srcMu.Unlock()
+			n := len(g.Paths)
+			add, addCached, addFetched := 0, 0, 0
+			if fr.Err == nil && fr.Res.Found {
+				add = n
+				if fromCache {
+					addCached = n
 				} else {
-					keysDone = keysCached + keysFetched + keysNotFound + keysFailed
+					addFetched = n
 				}
-				p := Progress{Done: done, Total: total, Resolved: resolved, Cached: cached, Fetched: fetched, Last: g.Paths[n-1], FoldersScanned: foldersScanned, FoldersSkipped: foldersSkipped,
-					KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound, KeysFailed: keysFailed}
-				pmu.Unlock()
-				maybeCheckpoint()
-				if progress == nil {
-					return
+			}
+			pmu.Lock()
+			done += n
+			resolved += add
+			cached += addCached
+			fetched += addFetched
+			if !cachedHit[g.Key] {
+				if fr.Err != nil {
+					// A cancelled fetch is incomplete, never a
+					// miss: leave it out of every bucket. A
+					// transient provider failure is unknown,
+					// never a miss: it gets its own bucket, never
+					// KeysNotFound.
+					if ctx.Err() == nil {
+						if errors.Is(fr.Err, metadata.ErrLookupUnavailable) {
+							keysFailed++
+						} else {
+							keysNotFound++
+						}
+					}
+				} else if fr.Res.Found {
+					if !fromCache {
+						keysFetched++
+					} else {
+						// Stat missed but served from cache (e.g.
+						// in-memory hit): credit as cached.
+						keysCached++
+						cachedHit[g.Key] = true
+					}
+				} else {
+					keysNotFound++
 				}
-				progress(p)
-			})
+				keysDone = keysCached + keysFetched + keysNotFound + keysFailed
+			} else {
+				keysDone = keysCached + keysFetched + keysNotFound + keysFailed
+			}
+			p := Progress{Done: done, Total: total, Resolved: resolved, Cached: cached, Fetched: fetched, Last: g.Paths[n-1], FoldersScanned: foldersScanned, FoldersSkipped: foldersSkipped,
+				KeysTotal: keysTotal, KeysDone: keysDone, KeysCached: keysCached, KeysFetched: keysFetched, KeysNotFound: keysNotFound, KeysFailed: keysFailed}
+			pmu.Unlock()
+			maybeCheckpoint()
+			if progress == nil {
+				return
+			}
+			progress(p)
+		}
+		// Pre-credited cache hits resolve synchronously from the
+		// probe-warmed resolver: no network, no semaphore, no fetch.
+		// ResolveCached never spawns: a hit that no longer resolves
+		// from the cache (stale entry missing this episode, or a
+		// vanished file un-warmed by probedLive) falls back to the
+		// fetch list with its pre-credit kept, exactly as if its
+		// lookup had missed the cache. The stale keys then fetch
+		// through FetchAll under the semaphore with scan-context
+		// timeouts, instead of fanning out one unbounded,
+		// uncancellable background fetch per stale key (Resolve
+		// spawns outside the semaphore with context.Background()).
+		var missGroups []*Group
+		for _, g := range groups {
+			if !cachedHit[g.Key] {
+				missGroups = append(missGroups, g)
+				continue
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			if res, ok := r.ResolveCached(g.Query); ok && res.Found {
+				srcMu.Lock()
+				srcByKey[g.Key] = true
+				srcMu.Unlock()
+				fr := FetchResult{Res: res, Err: nil, FromCache: true}
+				results[g.Key] = fr
+				onDone(g, fr)
+				continue
+			}
+			missGroups = append(missGroups, g)
+		}
+		for k, fr := range FetchAll(ctx, missGroups, lookup, defaultConcurrency, 0, onDone) {
+			results[k] = fr
+		}
 		for k, fr := range results {
 			srcMu.Lock()
 			fr.FromCache = srcByKey[k]
@@ -908,25 +1259,33 @@ func ScanWithOptions(ctx context.Context, opts Options) (Stats, error) {
 	// A cancelled run records nothing: the fetch may have resolved only
 	// some keys, so any record would stamp a partial key list.
 	if indexed && ctx.Err() == nil {
-		recordIndex(ix, visited, skipped, plans, opts.IndexPath, schema)
+		recordIndex(ix, visited, skipped, plans, opts.IndexPath, schema, walk)
 	}
 	return st, nil
 }
 
 // recordIndex aggregates per-directory cache keys and file counts
 // bottom-up (walked files plus skipped-subtree totals) and re-records
-// every visited dir, then prunes and saves. Save errors are logged,
-// never fatal to the scan.
-func recordIndex(ix *ScanIndex, visited []string, skipped map[string]FolderRecord, plans []FilePlan, indexPath string, schema int) {
-	if ix == nil || indexPath == "" || len(visited) == 0 {
-		if ix != nil && indexPath != "" {
-			ix.PruneExisting()
-			if err := ix.Save(indexPath); err != nil {
-				fmt.Fprintf(os.Stderr, "library: save scan index %q: %v\n", indexPath, err)
-			}
-		}
-		return
-	}
+// every visited dir, then saves when anything changed. Save errors are
+// logged, never fatal to the scan.
+//
+// Attribution is one ancestor walk per plan/skipped record (not one full
+// visited scan per plan), and verification re-lists each visited dir once
+// plus any new subdirectories found beneath (recursive totals descend
+// through every fresh subdirectory, skipped subtrees excepted;
+// walked-path presence is listing membership, never per-plan stats).
+// A dir is stamped only when the filesystem still shows exactly what was
+// walked: same recursive video count, every walked path still present, and
+// every skipped subtree beneath still fingerprint-identical; anything else
+// is left unrecorded and simply re-walked next time.
+//
+// Hashes come from the walk when carried (walk != nil with both hashes
+// present): the carried pair describes the same walk the key list derives
+// from, so no re-hash and no second walk is needed. Otherwise the dir is
+// hashed fresh from its single verification listing. Either way a
+// concurrent add/remove/rename refuses the stamp (fail closed), so the
+// next scan re-walks instead of trusting a partial key list.
+func recordIndex(ix *ScanIndex, visited []string, skipped map[string]FolderRecord, plans []FilePlan, indexPath string, schema int, walk *scanWalk) {
 	// Per-file cache keys for resolvable files.
 	fileCacheKey := make(map[string]string, len(plans))
 	for _, p := range plans {
@@ -935,77 +1294,195 @@ func recordIndex(ix *ScanIndex, visited []string, skipped map[string]FolderRecor
 		}
 		fileCacheKey[p.Path] = metadata.CacheKeyFor(p.Query)
 	}
-	// Order visited deepest-first so children aggregate into parents.
-	ordered := append([]string(nil), visited...)
-	sort.Slice(ordered, func(i, j int) bool { return len(ordered[i]) > len(ordered[j]) })
-	type agg struct {
+	recordIndexKeys(ix, visited, skipped, fileCacheKey, indexPath, schema, walk)
+}
+
+// recordIndexKeys is recordIndex with the per-file metadata key map supplied
+// directly, so the store-backed scan can stamp rollups from the keys its file
+// records already carry instead of re-deriving them from a parsed plan.
+func recordIndexKeys(ix *ScanIndex, visited []string, skipped map[string]FolderRecord, fileCacheKey map[string]string, indexPath string, schema int, walk *scanWalk) {
+	if ix != nil && indexPath != "" {
+		// Scan write path only: drop records for deleted folders while
+		// scanning live roots, so a save never resurrects them.
+		ix.PruneExisting()
+	}
+	if ix == nil || indexPath == "" || len(visited) == 0 {
+		if ix != nil && indexPath != "" {
+			if err := ix.SaveIfDirty(indexPath); err != nil {
+				fmt.Fprintf(os.Stderr, "library: save scan index %q: %v\n", indexPath, err)
+			}
+		}
+		return
+	}
+	// Dedupe visited by normalized dir, first spelling wins.
+	normOf := make(map[string]string, len(visited))
+	norms := make([]string, 0, len(visited))
+	for _, v := range visited {
+		nv := normalizeScanDir(v)
+		if _, ok := normOf[nv]; !ok {
+			normOf[nv] = v
+			norms = append(norms, nv)
+		}
+	}
+	// parentNorm walks one level up; "" terminates at the filesystem root.
+	parentNorm := func(nv string) string {
+		par := normalizeScanDir(filepath.Dir(nv))
+		if par == nv {
+			return ""
+		}
+		return par
+	}
+	type dirAgg struct {
 		files int
 		keys  map[string]bool
 		paths []string
 	}
-	aggs := make(map[string]*agg, len(ordered))
-	get := func(norm string) *agg {
-		a, ok := aggs[norm]
-		if !ok {
-			a = &agg{keys: make(map[string]bool)}
-			aggs[norm] = a
-		}
-		return a
+	aggs := make(map[string]*dirAgg, len(norms))
+	for _, nv := range norms {
+		aggs[nv] = &dirAgg{keys: make(map[string]bool)}
 	}
-	for _, p := range plans {
-		dir := filepath.Dir(p.Path)
-		norm := normalizeScanDir(dir)
-		// Attribute the file to every visited ancestor (prefix match). The
-		// record is derived from this plan data itself: per-dir paths are
-		// kept so the stamp below can verify the filesystem still shows
-		// exactly what was walked.
-		for _, v := range visited {
-			nv := normalizeScanDir(v)
-			if norm == nv || strings.HasPrefix(norm, nv+string(filepath.Separator)) {
-				a := get(nv)
-				a.files++
-				a.paths = append(a.paths, p.Path)
-				if k, ok := fileCacheKey[p.Path]; ok && k != "" {
-					a.keys[k] = true
-				}
-			}
-		}
-	}
-	// Fold skipped subtrees into their visited ancestors.
-	for snorm, rec := range skipped {
-		for _, v := range visited {
-			nv := normalizeScanDir(v)
-			if snorm == nv || strings.HasPrefix(snorm, nv+string(filepath.Separator)) {
-				a := get(nv)
-				a.files += rec.Files
-				for _, k := range rec.Keys {
+	// addToAncestors attributes one file bundle to a dir and every visited
+	// ancestor-or-self: the old prefix match without the O(plans x
+	// visited) scan. The record derives from this plan data itself:
+	// per-dir paths are kept so the stamp below can verify the filesystem
+	// still shows exactly what was walked.
+	addToAncestors := func(nv string, files int, keys []string, path string) {
+		for a := nv; a != ""; a = parentNorm(a) {
+			if agg, ok := aggs[a]; ok {
+				agg.files += files
+				for _, k := range keys {
 					if k != "" {
-						a.keys[k] = true
+						agg.keys[k] = true
 					}
 				}
+				if path != "" {
+					agg.paths = append(agg.paths, path)
+				}
 			}
 		}
-		_ = snorm
+	}
+	for path, k := range fileCacheKey {
+		dir := normalizeScanDir(filepath.Dir(path))
+		var keys []string
+		if k != "" {
+			keys = []string{k}
+		}
+		addToAncestors(dir, 1, keys, path)
+	}
+	// Fold skipped subtrees into their visited ancestors, and remember
+	// which skipped record each visited dir depends on for the
+	// fingerprint re-verify below.
+	depend := make(map[string][]string)
+	for snorm, rec := range skipped {
+		addToAncestors(snorm, rec.Files, rec.Keys, "")
+		for a := snorm; a != ""; a = parentNorm(a) {
+			if _, ok := aggs[a]; ok {
+				depend[a] = append(depend[a], snorm)
+			}
+		}
 	}
 	// Stamp each visited dir, but ONLY when the filesystem still shows
-	// exactly what was walked. The hashes below come from a fresh listing,
-	// so a file added or removed concurrently with the walk would otherwise
-	// be stamped with hashes describing files absent from the plan (and a
-	// key list missing them); the next scan would then skip files that were
-	// never walked. Fail closed: same recursive video count, every walked
-	// path still present, and every skipped subtree beneath still
-	// fingerprint-identical; anything else is left unrecorded and simply
+	// exactly what was walked. Fail closed: same recursive video count
+	// (recounted now by descending through every fresh subdirectory,
+	// visited or not - never rolled up from visited immediates alone),
+	// every walked path still present (listing membership, never per-plan
+	// stats), and every skipped subtree beneath still
+	// fingerprint-identical (verified once per skipped dir, not once per
+	// visited ancestor); anything else is left unrecorded and simply
 	// re-walked next time.
-	freshCount := freshVideoCounts(visited)
-	for _, v := range visited {
-		nv := normalizeScanDir(v)
-		a := get(nv)
-		if freshCount[nv] != a.files {
+	dc := &cachedDir{}
+	freshNames := make(map[string]map[string]bool, len(norms))
+	badList := make(map[string]bool)
+	for _, nv := range norms {
+		es, err := dc.list(normOf[nv])
+		if err != nil {
+			// Unreadable now: fail closed below (matches the old
+			// re-hash doubt, which also refused the stamp).
+			badList[nv] = true
+			continue
+		}
+		set := make(map[string]bool, len(es))
+		for _, e := range es {
+			set[e.Name()] = true
+		}
+		freshNames[nv] = set
+	}
+	// Fresh recursive totals descend through EVERY fresh subdirectory -
+	// visited or not - so a video added anywhere under a visited dir
+	// after the walk refuses the stamp. Rolling only visited immediates
+	// up keeps the walked count while the stamped names hash already
+	// covers the new names (e.g. a brand-new New/B.mkv: count stays 1,
+	// hash includes New), and the next scan would skip the new files.
+	// Skipped subtrees contribute their recorded counts (their
+	// fingerprints are re-verified per skipped dir below, so a changed
+	// skip refuses too). Any unreadable fresh directory poisons its
+	// visited ancestors: fail closed.
+	freshRec := make(map[string]int, len(norms))
+	poisoned := make(map[string]bool)
+	memoRec := make(map[string]int)
+	var recCount func(nv, path string) (int, bool)
+	recCount = func(nv, path string) (int, bool) {
+		if v, ok := memoRec[nv]; ok {
+			return v, true
+		}
+		es, err := dc.list(path)
+		if err != nil {
+			return 0, false
+		}
+		total := 0
+		for _, e := range es {
+			if e.IsDir() {
+				cn := normalizeScanDir(filepath.Join(path, e.Name()))
+				if rec, ok := skipped[cn]; ok {
+					total += rec.Files
+					continue
+				}
+				sub, ok := recCount(cn, filepath.Join(path, e.Name()))
+				if !ok {
+					return 0, false
+				}
+				total += sub
+				continue
+			}
+			if videoExts[strings.ToLower(filepath.Ext(e.Name()))] {
+				total++
+			}
+		}
+		memoRec[nv] = total
+		return total, true
+	}
+	for _, nv := range norms {
+		if badList[nv] {
+			continue
+		}
+		if tot, ok := recCount(nv, normOf[nv]); ok {
+			freshRec[nv] = tot
+		} else {
+			poisoned[nv] = true
+		}
+	}
+	skipFP := make(map[string]string, len(skipped))
+	for snorm := range skipped {
+		if fp, err := FolderFingerprint(snorm); err == nil {
+			skipFP[snorm] = fp
+		}
+	}
+	for _, nv := range norms {
+		v := normOf[nv]
+		a := aggs[nv]
+		if badList[nv] {
+			continue
+		}
+		if poisoned[nv] {
+			continue
+		}
+		if freshRec[nv] != a.files {
 			continue
 		}
 		verified := true
 		for _, p := range a.paths {
-			if _, err := os.Stat(p); err != nil {
+			set, ok := freshNames[normalizeScanDir(filepath.Dir(p))]
+			if !ok || !set[filepath.Base(p)] {
 				verified = false
 				break
 			}
@@ -1013,13 +1490,12 @@ func recordIndex(ix *ScanIndex, visited []string, skipped map[string]FolderRecor
 		if !verified {
 			continue
 		}
-		for snorm, rec := range skipped {
-			if snorm == nv || strings.HasPrefix(snorm, nv+string(filepath.Separator)) {
-				fpNow, fpErr := FolderFingerprint(snorm)
-				if fpErr != nil || fpNow != rec.Fingerprint {
-					verified = false
-					break
-				}
+		for _, sn := range depend[nv] {
+			rec := skipped[sn]
+			fpNow, ok := skipFP[sn]
+			if !ok || fpNow != rec.Fingerprint {
+				verified = false
+				break
 			}
 		}
 		if !verified {
@@ -1030,74 +1506,33 @@ func recordIndex(ix *ScanIndex, visited []string, skipped map[string]FolderRecor
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		nh, nhErr := FolderNamesHash(v)
-		fp, fpErr := FolderFingerprint(v)
-		if nhErr != nil || fpErr != nil {
-			continue
+		var nh, fp string
+		if walk != nil {
+			if info, ok := walk.dirs[nv]; ok && info.namesHash != "" && info.fingerprint != "" {
+				nh, fp = info.namesHash, info.fingerprint
+			}
 		}
-		ix.RecordFull(v, nh, fp, schema, keys, a.files)
-		_ = nv
-	}
-	ix.PruneExisting()
-	if err := ix.Save(indexPath); err != nil {
-		fmt.Fprintf(os.Stderr, "library: save scan index %q: %v\n", indexPath, err)
-	}
-}
-
-// freshVideoCounts walks each topmost visited dir once (via walkDir, like
-// the main walk) and tallies the current recursive video-file count per
-// visited ancestor. Unreadable entries are ignored, mirroring the walk;
-// a dir that cannot be walked simply reports no fresh files (fail closed
-// at the stamp check above).
-func freshVideoCounts(visited []string) map[string]int {
-	out := make(map[string]int, len(visited))
-	if len(visited) == 0 {
-		return out
-	}
-	sep := string(filepath.Separator)
-	norms := make([]string, len(visited))
-	for i, v := range visited {
-		norms[i] = normalizeScanDir(v)
-	}
-	isTop := make([]bool, len(visited))
-	for i := range visited {
-		top := true
-		for j := range visited {
-			if i == j {
+		if nh == "" || fp == "" {
+			// No carried hashes (RecordScan callers, force walks, or a
+			// walk-time hash doubt): hash fresh from the single
+			// verification listing already read above, reusing visited
+			// sub-listings instead of a second full walk.
+			fi, err := os.Stat(v)
+			if err != nil || !fi.IsDir() {
 				continue
 			}
-			if norms[i] == norms[j] || strings.HasPrefix(norms[i], norms[j]+sep) {
-				top = false
-				break
-			}
-		}
-		isTop[i] = top
-	}
-	for i, v := range visited {
-		if !isTop[i] {
-			continue
-		}
-		_ = walkDir(v, func(path string, d os.DirEntry, err error) error {
+			nh, err = dc.namesHash(v, fi.ModTime())
 			if err != nil {
-				if d != nil && d.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
+				continue
 			}
-			if d.IsDir() {
-				return nil
+			fp, err = dc.fingerprint(v, fi.ModTime())
+			if err != nil {
+				continue
 			}
-			if !videoExts[strings.ToLower(filepath.Ext(path))] {
-				return nil
-			}
-			dirNorm := normalizeScanDir(filepath.Dir(path))
-			for _, nv := range norms {
-				if dirNorm == nv || strings.HasPrefix(dirNorm, nv+sep) {
-					out[nv]++
-				}
-			}
-			return nil
-		})
+		}
+		ix.RecordFull(v, nh, fp, schema, keys, a.files)
 	}
-	return out
+	if err := ix.SaveIfDirty(indexPath); err != nil {
+		fmt.Fprintf(os.Stderr, "library: save scan index %q: %v\n", indexPath, err)
+	}
 }

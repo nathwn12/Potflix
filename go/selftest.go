@@ -451,9 +451,13 @@ func runSelfTest(log *logger) {
 		m3fail("timestamps = %+v, want start=12345 end=67890", a.Timestamps)
 	}
 	// Empty asset text is omitted on the wire (Discord rejects empty
-	// large_text/small_text with code 4000).
-	if a.Assets["large_image"] != "logo" || a.Assets["small_image"] != "play" {
-		m3fail("assets = %v", a.Assets)
+	// large_text/small_text with code 4000). The pristine card carries no
+	// small icon: large_image is "logo", small_image/small_text are absent.
+	if a.Assets["large_image"] != "logo" {
+		m3fail("large_image = %q, want %q (assets = %v)", a.Assets["large_image"], "logo", a.Assets)
+	}
+	if _, ok := a.Assets["small_image"]; ok {
+		m3fail("small_image present, want omitted: %v", a.Assets)
 	}
 	if _, ok := a.Assets["large_text"]; ok {
 		m3fail("large_text present while empty, want omitted: %v", a.Assets)
@@ -461,7 +465,7 @@ func runSelfTest(log *logger) {
 	if _, ok := a.Assets["small_text"]; ok {
 		m3fail("small_text present while empty, want omitted: %v", a.Assets)
 	}
-	ok("m3: SET_ACTIVITY pid=%d details=%q small_image=%q start=%d end=%d", setCmd.Args.PID, a.Details, a.Assets["small_image"], a.Timestamps.Start, a.Timestamps.End)
+	ok("m3: SET_ACTIVITY pid=%d details=%q large_image=%q start=%d end=%d", setCmd.Args.PID, a.Details, a.Assets["large_image"], a.Timestamps.Start, a.Timestamps.End)
 	log.logf("selftest: m3 set_activity ok")
 
 	// (12c) null clear: SET_ACTIVITY with "activity":null.

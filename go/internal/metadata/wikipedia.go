@@ -19,20 +19,25 @@ import (
 //
 // Two calls on the base path: list=search picks the top film hit, then
 // prop=extracts|pageimages yields the synopsis (extract) and, when one
-// exists, the poster (thumbnail). MEASURED 2026-10-10 against the live
-// API: PageImages never returns film posters (they are fair-use, and
-// PageImages serves freely-licensed images only - verified on three
-// real articles, thumbnail absent on all), so a page that resolves with
-// an empty thumbnail gets at most TWO best-effort same-host calls through
-// the SAME Action API: prop=images lists the article's files, and the
-// poster-like file (name contains "poster", case-insensitive, ending
-// .jpg/.jpeg preferred, then .png, then .webp; anything else rejected)
-// is resolved to a direct URL via prop=imageinfo&iiprop=url. When no
-// poster-like file exists Artwork stays empty - never invented, never a
-// substitute (cast photo, logo, screenshot: a wrong poster is worse than
-// none). What Wikipedia reliably yields - and what the card was missing -
-// is title, year and synopsis, plus the article URL as the View-Movie
-// button. The year comes from the page title or extract text; when
+// exists, the poster (thumbnail, else the original file URL). MEASURED
+// 2026-10-10 against the live API: PageImages never returns film posters
+// (they are fair-use, and PageImages serves freely-licensed images only -
+// verified on three real articles, thumbnail absent on all); MEASURED again
+// 2026-10-13 on "Spider-Man: Brand New Day": piprop=thumbnail|original
+// carried neither key - the article has no page image at all - so a page
+// that resolves with no page image gets at most TWO best-effort same-host
+// calls through the SAME Action API: prop=images lists the article's files,
+// and the poster-like file (name contains "poster", case-insensitive, ending
+// .jpg/.jpeg preferred, then .png, then .webp; anything else rejected) is
+// resolved to a direct URL via prop=imageinfo&iiprop=url. That listing asks
+// for the whole file list (imlimit=max): MEASURED 2026-10-13, the poster
+// "File:Spider-Man Brand New Day poster.jpg" is the 18th of 24 files, so the
+// default 10-file first page hid it and the fallback returned nothing.
+// When no page image and no poster-like file exist Artwork stays empty -
+// never invented, never a substitute (cast photo, logo, screenshot: a wrong
+// poster is worse than none). What Wikipedia reliably yields - and what the
+// card was missing - is title, year and synopsis, plus the article URL as the
+// View-Movie button. The year comes from the page title or extract text; when
 // neither yields one it stays empty - never invented.
 // Genres/Length stay empty (no keyless field carries them).
 type wikipediaSource struct {
@@ -166,6 +171,9 @@ type wikiSearchResp struct {
 
 // wikiDetailResp is GET w/api.php?action=query&prop=extracts|pageimages.
 // Pages is keyed by pageid; a "missing" page carries {"missing":""}.
+// Thumbnail is the pithumbsize rendering of the page image; Original is the
+// full-resolution file, served when a page image exists but no thumbnail
+// does (piprop=thumbnail|original).
 type wikiDetailResp struct {
 	Error *wikiAPIError `json:"error"`
 	Query struct {
@@ -176,6 +184,9 @@ type wikiDetailResp struct {
 			Thumbnail struct {
 				Source string `json:"source"`
 			} `json:"thumbnail"`
+			Original struct {
+				Source string `json:"source"`
+			} `json:"original"`
 		} `json:"pages"`
 	} `json:"query"`
 }
@@ -323,7 +334,7 @@ func (s *wikipediaSource) wikiPosterURL(ctx context.Context, page string) string
 	if err := ctx.Err(); err != nil {
 		return ""
 	}
-	listURL := s.baseURL() + "/w/api.php?action=query&prop=images&titles=" +
+	listURL := s.baseURL() + "/w/api.php?action=query&prop=images&imlimit=max&titles=" +
 		url.QueryEscape(page) + "&format=json"
 	resp, err := s.wikiGet(ctx, listURL)
 	if err != nil {
@@ -438,7 +449,7 @@ func (s *wikipediaSource) Find(ctx context.Context, q Query) (*Media, error) {
 	}
 
 	detailURL := s.baseURL() + "/w/api.php?action=query&prop=extracts|pageimages&exintro&explaintext" +
-		"&piprop=thumbnail&pithumbsize=600&titles=" + url.QueryEscape(page) + "&format=json"
+		"&piprop=thumbnail|original&pithumbsize=600&titles=" + url.QueryEscape(page) + "&format=json"
 	resp, err = s.wikiGet(ctx, detailURL)
 	if err != nil {
 		return nil, wikiTransient(err)
@@ -463,10 +474,14 @@ func (s *wikipediaSource) Find(ctx context.Context, q Query) (*Media, error) {
 		if p.Missing {
 			continue
 		}
-		if strings.TrimSpace(p.Title) == "" && strings.TrimSpace(p.Extract) == "" && strings.TrimSpace(p.Thumbnail.Source) == "" {
+		if strings.TrimSpace(p.Title) == "" && strings.TrimSpace(p.Extract) == "" &&
+			strings.TrimSpace(p.Thumbnail.Source) == "" && strings.TrimSpace(p.Original.Source) == "" {
 			continue
 		}
-		title, extract, thumb = p.Title, p.Extract, p.Thumbnail.Source
+		title, extract = p.Title, p.Extract
+		// The page image: the pithumbsize rendering when one exists, else
+		// the original file URL (piprop=thumbnail|original).
+		thumb = firstNonEmpty(p.Thumbnail.Source, p.Original.Source)
 		matched = true
 		break
 	}
@@ -478,8 +493,9 @@ func (s *wikipediaSource) Find(ctx context.Context, q Query) (*Media, error) {
 		title = strings.TrimSpace(q.Title)
 	}
 	// Poster fallback, same host, at most two extra calls, ONLY for an
-	// already-resolved page whose thumbnail came back empty: a present
-	// thumbnail returns untouched above (no extra calls on that path).
+	// already-resolved page with no page image at all: a present page image
+	// (thumbnail or original) returns untouched above (no extra calls on
+	// that path).
 	artwork := strings.TrimSpace(thumb)
 	if artwork == "" {
 		artwork = s.wikiPosterURL(ctx, page)

@@ -122,6 +122,53 @@ go test ./... -count=1
 Or one gate from the root: `powershell -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest`. Tests are pure logic — no live PotPlayer or
 Discord needed. Diagnose one title: `go run ./cmd/metacheck [-offline] <rawTitle>` (exit 0 when resolved, 1 when not).
 
+## Deviations from the Java reference
+
+The title cleaner is proven byte-identical to the frozen Java reference; the
+behaviour below is deliberately different, and mostly proven live:
+
+1. Empty asset text is omitted, not sent empty. `go\internal\discord\activity.go:86-109`
+   tags every text field `omitempty` (rationale at `activity.go:42-46`): Java
+   set `""` for `large_text` / `small_text` (`Main.java:146,150,183`) and the
+   GameSDK dropped it on the wire, so Discord never sees `"large_text":""`.
+2. Exit clears the card. `go\main.go:196-199` nulls the activity before
+   quitting; Java exited straight (`Main.java:544`) and left the last card on
+   the profile.
+3. Capped rotating debug log. `go\debuglog.go:20-23,74-97` caps
+   `potflix-debug.log` at 5 MB x 3 files beside the exe; Java appended to one
+   unbounded file (`Main.java:37-41`).
+4. Commands wait for `READY`. `go\internal\discord\pipe.go:70-73,341-343`
+   refuses a send with `ErrNotReady` until Discord's `READY` dispatch arrives
+   (Discord discards anything sent earlier); Java's GameSDK hid that handshake.
+5. `timestamps.end` rides while playing. `go\internal\presence\gate.go:151-160`
+   projects the end from the live position and
+   `go\internal\discord\activity.go:143-153` serializes start + end, so the
+   Discord time bar tracks the real position; Java sent `timestamps.start`
+   only (`Main.java:176`).
+6. A `?`-family mark between title text folds to `:`. `go\internal\titleclean\clean.go:373,381,385-419`
+   rewrites a mark (ASCII `?`, fullwidth `？`, small `﹖`) to `:` when a
+   non-space character precedes it and it is not the last character of the
+   extracted title, so `Spider-Man? Brand New Day (2026) ...` cleans to
+   `Spider-Man: Brand New Day`; a mark that ends the title is a real question
+   mark and is kept. The parity CLI (`cmd\titleclean`) therefore diverges from
+   Java on titles carrying such a mark, by design.
+7. The client-id lookup also searches beside the exe. `go\clientid.go:57-66,80-100`
+   looks in the executable's directory before the process working directory;
+   Java opened `client-id.txt` / `config.properties` against the CWD only
+   (`Main.java:524-526`).
+8. The settings window opens on a manual launch. `go\main.go:202-211` creates it
+   and calls `showMainWindow` unless the launch carries `--minimized` (the
+   tray-only autostart path); Java was headless with a tray only
+   (`Main.java:540-553`) and `setUi` is a no-op sink (`Main.java:556`).
+9. The activity type is `Watching`, not `Playing`. `go\internal\discord\activity.go:80`
+   sets `activityTypeWatching = 3` (rationale at `activity.go:76-79`: Discord's
+   time bar requires Listening or Watching); Java set `ActivityType.PLAYING`
+   (`Main.java:144,159`).
+10. A headless OP/ED with no name renders the tag alone. `go\internal\titleclean\clean.go:196-206`
+    sets both the title and the display to the episode tag, so `ED 03.mkv`
+    renders `ED 3`; Java fell through to `buildDisplay` (`Main.java:372-377`,
+    `:479-483`) and duplicated it as `ED 3 — ED 3`.
+
 ## Docs
 
 - [`go/README.md`](./go/README.md) — package layout, metadata design, scan-index tiers, rate limiter, M1–M4 status.

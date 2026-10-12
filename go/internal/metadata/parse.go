@@ -42,6 +42,13 @@ var (
 	// bare numbers ("01") are unresolvable, a lone year ("2012") is a film.
 	lettersRe  = regexp.MustCompile(`[A-Za-z]`)
 	yearOnlyRe = regexp.MustCompile(`^(\d{4})$`)
+	// movieMarkerRe spots a movie marker at the END of a cleaned title: an
+	// optional "the", the word "Movie", and an optional trailing number (the
+	// number titleclean's ALT_EP split may already have taken as a weak tag).
+	// Deliberately narrow: the marker must be the title's last word, so a
+	// film whose own title ends in "Movie" and carries nothing after the word
+	// is never rewritten.
+	movieMarkerRe = regexp.MustCompile(`(?i)^(.*?)[\s._\-]+(?:the[\s._\-]+)?movie(?:[\s._\-]+\d{1,3})?$`)
 )
 
 // ParseRaw strips the " - PotPlayer" suffix, runs titleclean.Clean, then Parse.
@@ -51,9 +58,9 @@ func ParseRaw(rawTitle string) Query {
 	return Parse(c.Title, c.EpisodeTag, c.EpisodeName)
 }
 
-// Parse builds a Query from titleclean fields. EpisodeName is already split
-// out by titleclean and ignored; the title is re-scanned only for the
-// "Episode N+M" ranges titleclean mis-splits.
+// Parse builds a Query from titleclean fields. EpisodeName is used only to
+// compose a movie's subtitle back onto its base title; the title is otherwise
+// re-scanned only for the "Episode N+M" ranges titleclean mis-splits.
 //
 // Classification follows the synthetic library's validated rules:
 //   - OP/ED theme tokens are themes, never episodes (KindUnknown, so the
@@ -66,7 +73,6 @@ func ParseRaw(rawTitle string) Query {
 //   - Ranges use the first number (S02E12-E13 -> 12, Episode 53+54 -> 53).
 //   - Extras, Sample, or no usable title are KindUnknown.
 func Parse(title, episodeTag, episodeName string) Query {
-	_ = episodeName
 	t := strings.TrimSpace(title)
 	year := 0
 	if m := yearSuffixRe.FindStringSubmatch(t); m != nil {
@@ -113,6 +119,25 @@ func Parse(title, episodeTag, episodeName string) Query {
 		}
 		return q
 	}
+	// A movie marker outranks the weak absolute tag titleclean's ALT_EP split
+	// left behind. For "[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv"
+	// that split yields title "Dragon Ball Super Movie", tag "E1" and name
+	// "Broly"; the "01" is the marker's own number, never an episode, and
+	// "Broly" is the 2018 film's subtitle. The marker is stripped and the
+	// trailing subtitle is composed back onto the base ("Dragon Ball Super" +
+	// ": " + "Broly"), which is what the movie sources are queried for.
+	// The marker only counts when something follows it - its number or the
+	// subtitle - so a title that merely ends in the word (e.g. "The Lego
+	// Movie" with nothing after it) is left exactly as parsed. Extras keep
+	// their skip, and a strong SxxEyy tag always wins.
+	if !strong && !extraRe.MatchString(t) {
+		if base, ok := movieMarker(t); ok && (q.Season > 0 || q.Episode > 0 || strings.TrimSpace(episodeName) != "") {
+			if sub := strings.TrimSpace(episodeName); sub != "" {
+				base = base + ": " + sub
+			}
+			return Query{Kind: KindMovie, Title: base, Year: year}
+		}
+	}
 	if q.Episode > 0 || q.Season > 0 {
 		q.Kind = KindSeries
 		return q
@@ -129,6 +154,21 @@ func Parse(title, episodeTag, episodeName string) Query {
 		return Query{Kind: KindUnknown, Title: t, Year: year}
 	}
 	return q
+}
+
+// movieMarker returns the title base before a trailing movie marker
+// ("Show Movie", "Show Movie 01", "Show the Movie 01" -> "Show"). ok=false
+// when there is no marker or nothing usable would remain as the base.
+func movieMarker(t string) (string, bool) {
+	m := movieMarkerRe.FindStringSubmatch(t)
+	if m == nil {
+		return "", false
+	}
+	base := strings.TrimSpace(m[1])
+	if base == "" || !lettersRe.MatchString(base) {
+		return "", false
+	}
+	return base, true
 }
 
 // isTheme reports whether a cleaned title or episode tag is an OP/ED
