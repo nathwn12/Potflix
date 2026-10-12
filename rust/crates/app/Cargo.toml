@@ -1,0 +1,43 @@
+# `potflix-app` -- the tray application: the Go root package `main`
+# (`go\main.go`, `go\selftest.go`) plus the icon resource (`build.rs`, the
+# replacement for `go\rsrc_windows_amd64.syso`).
+#
+# This is the only crate that depends on all the others; it is the app, and it
+# owns the workspace's single binary.
+
+[package]
+name = "potflix-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+[lib]
+# The lib keeps the Go module's own name, so the app's bin reads as
+# `potflix::...` and the ported modules keep their `potflix::` paths.
+name = "potflix"
+path = "src/lib.rs"
+
+# Binaries mirror the Go commands: the tray app (root package `main`) plus
+# `go\cmd\titleclean`, `go\cmd\metacheck`, `go\cmd\metawarm`.
+[[bin]]
+name = "potflix"
+path = "src/main.rs"
+
+[dependencies]
+titleclean = { path = "../titleclean" }
+store = { path = "../store" }
+metadata-core = { path = "../metadata-core" }
+metadata-http = { path = "../metadata-http" }
+metadata = { path = "../metadata" }
+library = { path = "../library" }
+discord = { path = "../discord" }
+player = { path = "../player" }
+presence = { path = "../presence" }
+repair = { path = "../repair" }
+bundle = { path = "../bundle" }
+app-support = { path = "../app-support" }
+potflix-win = { path = "../potflix-win" }
+
+[build-dependencies]
+embed-resource = "=3.0.12"

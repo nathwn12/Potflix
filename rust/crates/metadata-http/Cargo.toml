@@ -1,0 +1,17 @@
+# `metadata-http` -- the transport half of the Go package `go\internal\metadata`:
+# the shared HTTP client / fetch helpers (ureq over `native-tls`) and the
+# per-host rate limiter.
+#
+# No intra-repo edges: `http.go` and `ratelimit.go` are repo-dependency-free in
+# Go (stdlib only), so this crate needs no `metadata-core`.
+
+[package]
+name = "metadata-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

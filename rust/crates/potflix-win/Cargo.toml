@@ -1,0 +1,31 @@
+# `potflix-win` -- the Win32 surface split out of the Go root package:
+# `go\win32.go`, `go\tray.go`, `go\window.go`, `go\instance.go`,
+# `go\settings_sections.go`.
+
+[package]
+name = "potflix-win"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `Win32_UI_Input_KeyboardAndMouse`, `Win32_UI_Shell_Common` and
+# `Win32_UI_Controls_Dialogs` are additive to the workspace feature set:
+# `go\win32.go` declares `EnableWindow`, `TrackMouseEvent` (win32.go:149,278),
+# the folder picker `SHBrowseForFolderW`/`SHGetPathFromIDListW`
+# (win32.go:153-154), and `go\settings_sections.go` the Save-As/Open
+# `GetSaveFileNameW`/`GetOpenFileNameW` (settings_sections.go:292-293).
+# Features are additive, so this enables bindings for this crate only -- no
+# version, no other crate affected.
+windows-sys = { workspace = true, features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Controls_Dialogs",
+] }
+app-support = { path = "../app-support" }
+bundle = { path = "../bundle" }
+discord = { path = "../discord" }
+library = { path = "../library" }
+metadata = { path = "../metadata" }
+presence = { path = "../presence" }
+repair = { path = "../repair" }

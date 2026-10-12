@@ -1,0 +1,5 @@
+# Cargo build outputs only.
+#
+# Cargo.lock is deliberately NOT ignored: it is committed so the pinned
+# dependency set is reproducible (`cargo build --release --locked`).
+/target

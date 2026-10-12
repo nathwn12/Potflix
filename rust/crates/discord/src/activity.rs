@@ -1,0 +1,212 @@
+//! `discord::activity` -- mirrors `go\internal\discord\activity.go`.
+//!
+//! The `SET_ACTIVITY` payload shape and its serialization.
+//!
+//! SET_ACTIVITY carries:
+//!
+//! ```text
+//! {"cmd":"SET_ACTIVITY",
+//!  "args":{"pid":<std::process::id()>,
+//!          "activity":{"type":3,"name":...,"details":...,"state":...,
+//!                      "timestamps":{"start":...,"end":...},
+//!                      "assets":{"large_image":"logo","large_text":"PotFlix"}}},
+//!  "nonce":"<unique>"}
+//! ```
+//!
+//! `name` overrides the header line ("Watching <title>"); when absent the header
+//! falls back to the app name. The body is two lines: details (episode name,
+//! else episode tag, else title) and state (episode tag, else empty).
+//!
+//! A clear is the same command with `"activity":null`. The activity type is
+//! Watching (3), not the Java reference's Playing (0): Discord documents the
+//! activity time bar as requiring Listening (2) or Watching (3), and "Watching
+//! <title>" fits a video player. Deliberate, user-visible deviation -- do not
+//! "fix" it. While playing the payload carries BOTH timestamps.start and (when
+//! the duration is known) timestamps.end, so the client renders the time bar
+//! against the real media position. While paused it carries timestamps.start
+//! only, anchored at the pause moment, so the client counts the pause UP
+//! ("paused for M:SS"). The pristine card carries NO small_image/small_text (no
+//! play/pause/stop corner icon) and NO buttons: the caller-side fields are
+//! accepted for compatibility but never serialized. Deliberately NOT set:
+//! party, secrets, instance, application_id/name.
+//!
+//! Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
+//! whose assets carry a present-but-empty large_text/small_text (code 4000:
+//! "large_text is not allowed to be empty"). The Java app looked like it set
+//! empty strings, but the GameSDK's wire serialization dropped empty fields, so
+//! parity is "empty text omitted on the wire" -- hence `skip_serializing_if`.
+//!
+//! One divergence from Go is deliberate and documented: `encoding/json`
+//! HTML-escapes `<`, `>` and `&` inside strings (`\u003c`...), `serde_json`
+//! leaves them literal. Key order, key set, omission and every value are
+//! identical, and Discord parses both encodings to the same activity.
+
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+
+/// The caller-facing subset: the poll loop fills it from `presence.BuildActivity`
+/// and the fixed brand fields are added here.
+#[derive(Debug, Clone, Default)]
+pub struct Activity {
+    /// Overrides the header line ("Watching <Name>"); empty omits `name` and the
+    /// header falls back to the app name.
+    pub name: String,
+    pub details: String,
+    pub state: String,
+    /// https artwork URL; empty/invalid falls back to "logo".
+    pub large_image: String,
+    /// "PotFlix"; empty is omitted on the wire.
+    pub large_text: String,
+    /// Legacy: accepted so existing callers keep compiling, but never
+    /// serialized -- the card carries no status icon.
+    pub small_image: String,
+    /// Legacy: accepted so existing callers keep compiling, but never
+    /// serialized -- the card carries no status icon.
+    pub small_text: String,
+    pub has_start: bool,
+    /// epoch ms, set while running and paused
+    pub start: i64,
+    /// epoch ms, projected end from the gate; serialized while playing (deviation)
+    pub end: i64,
+    /// Legacy: accepted so existing callers keep compiling, but never
+    /// serialized -- the card carries no click-through links.
+    pub buttons: Vec<ActivityButton>,
+}
+
+/// One card click-through link (legacy: never serialized).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityButton {
+    pub label: String,
+    pub url: String,
+}
+
+/// Discord's ActivityType "Watching" (3). The Java reference hardcoded 0
+/// (Playing). Discord documents the activity time bar as requiring Listening (2)
+/// or Watching (3); Watching fits a video player and renders "Watching <title>".
+/// Deliberate, user-visible deviation (see the file header).
+const ACTIVITY_TYPE_WATCHING: i32 = 3;
+
+/// The wire activity object. Every empty string field is omitted so Discord
+/// never sees `"large_text":""`. The pristine card has no small image/text and
+/// no buttons, so those keys can never appear here.
+#[derive(Debug, Serialize)]
+pub(crate) struct ActivityPayload {
+    #[serde(rename = "type")]
+    pub(crate) activity_type: i32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) name: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) details: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timestamps: Option<Timestamps>,
+    pub(crate) assets: ActivityAssets,
+}
+
+/// Carries the elapsed anchor and, while playing, the projected end. A playing
+/// card carries start + end (the time bar); a paused card carries start only,
+/// anchored at the pause moment, so the client counts the pause UP. Go's
+/// `omitempty` on an int omits 0, so `start`/`end` are skipped when zero.
+#[derive(Debug, Serialize)]
+pub(crate) struct Timestamps {
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) start: i64,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(crate) end: i64,
+}
+
+/// Mirrors the contract's asset field names exactly; empty text is omitted on
+/// the wire (see the file header). Only the large image/text ride the wire: the
+/// pristine card has no small icon.
+#[derive(Debug, Serialize)]
+pub(crate) struct ActivityAssets {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) large_image: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub(crate) large_text: String,
+}
+
+/// The args object; a `None` activity marshals to `null`.
+#[derive(Debug, Serialize)]
+pub(crate) struct SetActivityArgs {
+    pub(crate) pid: i32,
+    pub(crate) activity: Option<ActivityPayload>,
+}
+
+/// The outer IPC command envelope.
+#[derive(Debug, Serialize)]
+pub(crate) struct Command {
+    pub(crate) cmd: &'static str,
+    pub(crate) args: SetActivityArgs,
+    pub(crate) nonce: String,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
+
+/// Maps one card to the wire payload. `type` is Watching (3); `large_image` is
+/// the caller's `large_image` when it is an http(s) URL, else "logo" (never
+/// empty); empty text stays omitted; `name` carries the header override.
+pub(crate) fn new_activity(a: &Activity) -> ActivityPayload {
+    let large_image =
+        if a.large_image.starts_with("http://") || a.large_image.starts_with("https://") {
+            a.large_image.clone()
+        } else {
+            "logo".to_string()
+        };
+    let mut p = ActivityPayload {
+        activity_type: ACTIVITY_TYPE_WATCHING,
+        name: a.name.clone(),
+        details: a.details.clone(),
+        state: a.state.clone(),
+        timestamps: None,
+        assets: ActivityAssets {
+            large_image,
+            large_text: a.large_text.clone(),
+        },
+    };
+    if a.has_start {
+        // Playing: start + end (when the duration is known) so the client renders
+        // the time bar. Paused: start only (a.end == 0) so the client counts the
+        // pause UP from the pause moment. This is the single place the timestamp
+        // pair is decided.
+        let mut ts = Timestamps {
+            start: a.start,
+            end: 0,
+        };
+        if a.end > 0 {
+            ts.end = a.end;
+        }
+        p.timestamps = Some(ts);
+    }
+    // Pristine card: small_image/small_text/buttons are caller-compat fields only
+    // and are never serialized -- no icon keys, no buttons key.
+    p
+}
+
+/// Renders the exact activity object `SetActivity` puts on the wire, for the
+/// push-attempt log line (the observation boundary).
+pub fn wire_json(a: &Activity) -> String {
+    serde_json::to_string(&new_activity(a)).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// `std::process::id`, isolated so tests can reason about the one dynamic field.
+pub(crate) fn pid() -> i32 {
+    std::process::id() as i32
+}
+
+/// Makes the nonce unique within the process; the timestamp keeps it unique
+/// across restarts.
+static NONCE_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// Returns a unique nonce string.
+pub(crate) fn new_nonce() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64);
+    format!("{}-{}", nanos, NONCE_SEQ.fetch_add(1, Ordering::SeqCst) + 1)
+}
