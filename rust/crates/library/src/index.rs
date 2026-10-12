@@ -29,7 +29,7 @@ pub(crate) const ENC_FOLDER_VERSION: u8 = 1;
 
 /// `maxRepairAttempts` is how many failed lookups an entry gets before it is
 /// parked as needs_repair.
-pub(crate) const MAX_REPAIR_ATTEMPTS: i32 = 3;
+pub(crate) const MAX_REPAIR_ATTEMPTS: i64 = 3;
 
 /// Per-file metadata state, exactly the strings the store records use.
 pub const STATE_RESOLVED: &str = "resolved";
@@ -67,7 +67,7 @@ pub struct FileRecord {
     pub absolute: bool,
     pub meta_key: String,
     pub state: String,
-    pub attempts: i32,
+    pub attempts: i64,
     pub last_error: String,
     pub last_try: i64,
     pub next_try: i64,
@@ -97,20 +97,20 @@ impl FileRecord {
 pub(crate) struct IndexMeta {
     pub schema: i32,
     pub migrated_at: i64,
-    pub migrated_folders: i32,
+    pub migrated_folders: i64,
 }
 
 /// A point-in-time tally over the index's records.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IndexState {
-    pub folders: i32,
-    pub files: i32,
-    pub keys: i32,
-    pub files_resolved: i32,
-    pub files_no_key: i32,
-    pub files_pending: i32,
-    pub files_needs_repair: i32,
-    pub keys_resolved: i32,
+    pub folders: i64,
+    pub files: i64,
+    pub keys: i64,
+    pub files_resolved: i64,
+    pub files_no_key: i64,
+    pub files_pending: i64,
+    pub files_needs_repair: i64,
+    pub keys_resolved: i64,
 }
 
 #[derive(Default)]
@@ -189,7 +189,7 @@ pub fn close_index(index_path: &str) -> Result<(), Error> {
 
 /// Forgets and deletes the store-backed index for `index_path`, returning the
 /// folder-record count it held.
-pub fn clear_store_index(index_path: &str) -> Result<i32, Error> {
+pub fn clear_store_index(index_path: &str) -> Result<i64, Error> {
     let sp = index_store_path(index_path);
     if sp.is_empty() {
         return Err(Error::new("library: index: empty index path"));
@@ -521,8 +521,8 @@ impl Index {
 
 fn state_of(inner: &IndexInner) -> IndexState {
     let mut s = IndexState {
-        folders: inner.folders.len() as i32,
-        files: inner.files.len() as i32,
+        folders: inner.folders.len() as i64,
+        files: inner.files.len() as i64,
         ..IndexState::default()
     };
     // key -> true when every file carrying it is resolved; false when any is not.
@@ -588,12 +588,12 @@ impl Index {
         out
     }
 
-    pub(crate) fn folder_count(&self) -> i32 {
-        self.inner.lock().unwrap().folders.len() as i32
+    pub(crate) fn folder_count(&self) -> i64 {
+        self.inner.lock().unwrap().folders.len() as i64
     }
 
     /// Drops rollups whose directory no longer exists; one stat per folder.
-    pub(crate) fn prune_folders(&self) -> i32 {
+    pub(crate) fn prune_folders(&self) -> i64 {
         let mut inner = self.inner.lock().unwrap();
         let mut n = 0;
         let keys: Vec<String> = inner.folders.keys().cloned().collect();
@@ -661,7 +661,7 @@ impl Index {
         &self,
         visited_dirs: &HashMap<String, bool>,
         enumerated: &HashMap<String, bool>,
-    ) -> i32 {
+    ) -> i64 {
         let mut inner = self.inner.lock().unwrap();
         let mut n = 0;
         let keys: Vec<String> = inner.files.keys().cloned().collect();
@@ -830,7 +830,7 @@ pub(crate) fn decode_file_record(b: &[u8]) -> Option<FileRecord> {
     r.state = state_from_code(b[n]).to_string();
     n += 1;
     let (v, nn) = get_uvarint(b, n)?;
-    r.attempts = v as i32;
+    r.attempts = v as i64;
     n = nn;
     let (last_error, nn) = get_string(b, n)?;
     r.last_error = last_error;
@@ -878,7 +878,7 @@ pub(crate) fn decode_folder_record(b: &[u8]) -> Option<FolderRecord> {
     let scanned_at_nanos = v as i64;
     n = nn;
     let (v, nn) = get_uvarint(b, n)?;
-    let files = v as i32;
+    let files = v as i64;
     n = nn;
     if n >= b.len() {
         return None;
@@ -927,7 +927,7 @@ fn decode_index_meta(b: &[u8]) -> Option<IndexMeta> {
     let (v, n) = get_uvarint(b, n)?;
     let migrated_at = v as i64;
     let (v, n) = get_uvarint(b, n)?;
-    let migrated_folders = v as i32;
+    let migrated_folders = v as i64;
     if n != b.len() {
         return None;
     }

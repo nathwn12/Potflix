@@ -68,7 +68,7 @@ fn catch_up_idempotent_start() {
     assert_eq!(fake.calls.load(Ordering::SeqCst), names.len() as i32);
     let first = c1.stats();
     assert_eq!(first.passes, 1);
-    assert_eq!(first.lookups, names.len() as i32);
+    assert_eq!(first.lookups, names.len() as i64);
     let c3 = start_catch_up(cfg.clone(), None).unwrap();
     c3.wait();
     let settled = c3.stats();
@@ -203,7 +203,7 @@ fn catch_up_writes_inventory_report() {
     assert_eq!(r.entries.len(), 1);
     let e = &r.entries[0];
     assert_eq!(e.path, path_join(&[&root.path, "Missing.S01E01.mkv"]));
-    assert_eq!(e.attempts, MAX_REPAIR_ATTEMPTS as i64);
+    assert_eq!(e.attempts, MAX_REPAIR_ATTEMPTS);
     assert!(!e.last_error.is_empty());
     assert_eq!(e.reason, repair::report::REASON_NO_METADATA);
     write_inventory(&index, "test").unwrap();
@@ -409,7 +409,7 @@ fn scan_handoff_resolves_after_the_scan_context_ends() {
         },
     )
     .unwrap();
-    assert_eq!(st.keys, names.len() as i32);
+    assert_eq!(st.keys, names.len() as i64);
     assert_eq!(st.keys_done, 0);
 
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -423,14 +423,14 @@ fn scan_handoff_resolves_after_the_scan_context_ends() {
         .ix
         .state()
         .keys_resolved
-        < names.len() as i32
+        < names.len() as i64
         && Instant::now() < deadline
     {
         std::thread::sleep(Duration::from_millis(10));
     }
     let state = crate::scanindex::load_scan_index(&index).ix.state();
     stop_catch_up(&index);
-    assert_eq!(state.keys_resolved, names.len() as i32);
+    assert_eq!(state.keys_resolved, names.len() as i64);
     let cache_idx = format!("{}.idx", cache.path);
     let fi = std::fs::metadata(&cache_idx).expect("metadata cache store missing");
     assert!(fi.len() > 0);
@@ -492,4 +492,16 @@ fn catch_up_inventory_report_needs_an_enumerated_index() {
         calls: Arc::new(AtomicI32::new(0)),
         release: Arc::new(AtomicBool::new(false)),
     };
+}
+
+/// The cumulative catch-up tallies are Go `int` (64-bit): two passes of
+/// `1<<30` lookups sum to `1<<31` without wrapping negative or panicking.
+#[test]
+fn catchup_stats_accumulate_past_i32_max() {
+    let mut st = crate::catchup::CatchUpStats::default();
+    for _ in 0..2 {
+        st.lookups += 1_i64 << 30;
+    }
+    assert_eq!(st.lookups, 1_i64 << 31);
+    assert!(st.lookups > i64::from(i32::MAX));
 }

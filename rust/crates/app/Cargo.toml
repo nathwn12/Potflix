@@ -38,6 +38,11 @@ repair = { path = "../repair" }
 bundle = { path = "../bundle" }
 app-support = { path = "../app-support" }
 potflix-win = { path = "../potflix-win" }
+# The app's own seam reads the Discord wire frames and the logged payloads back
+# as JSON: `--selftest` stage (12) decodes the handshake/SET_ACTIVITY frames and
+# the ported `gate_integration`/`m3_reply` tests decode frames and log lines.
+# `serde_json` is already in the workspace graph; this only adds the direct edge.
+serde_json.workspace = true
 
 [build-dependencies]
 embed-resource = "=3.0.12"

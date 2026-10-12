@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Rust port (rewrite)
+
+#### Added
+
+- The implementation is now a Rust Cargo workspace under `rust\` (edition 2024,
+  one member crate per Go package, plus `app` which owns the workspace's
+  `potflix` tray binary): `titleclean`, `store`, `metadata-core`,
+  `metadata-http`, `metadata`, `library`, `discord`, `player`, `presence`,
+  `repair`, `bundle`, `app-support`, `potflix-win`, `app`. The diagnostic CLIs
+  `titleclean`, `metacheck` and `metawarm` are carried by their owning crates.
+- Title-cleaner **parity contract**: the Rust cleaner is proven byte-identical
+  to the frozen Go reference's TSV output on two corpora. The committed contract
+  is `rust\parity-golden.sha256` — a SHA-256 per corpus; the corpora are
+  deliberately not committed because they carry real media filenames.
+- Pinned, minimal dependency set with `rust\Cargo.lock` committed and `--locked`
+  as the build norm: `serde`, `serde_json`, `ureq` (native-tls, SChannel),
+  `windows-sys`. No third-party Unicode/word-segmentation crate — `titleclean`
+  carries the JDK-11 tables ported verbatim.
+- Rust build and gate: `tools\rust-build.ps1` builds `dist\potflix.exe`; the
+  single exit command `tools\check.ps1` runs clippy, the workspace tests and the
+  parity step, with `-Build` / `-Selftest` adding the app build and the headless
+  self-test.
+
+#### Changed
+
+- The Go module in `go\` is now the **frozen reference implementation**, retired
+  at merge, not edited, and not built by the Rust gate; `src\main\java\me\potflix\rpc\Main.java`
+  remains the frozen Java reference. `tools\build.ps1` (the Go build) is retained
+  for reproducing the reference only.
+
+#### In progress
+
+- The Rust tray app's wiring is not yet complete and has **not yet produced a
+  passing self-test**; the app-behaviour claims in `README.md` are the intended
+  contract pending that proof.
+
 ### Added
 
 - Stdlib-only Go tray app (module `potflix`): single-instance lock, hidden

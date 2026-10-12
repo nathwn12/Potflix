@@ -379,6 +379,7 @@ dependencies = [
  "potflix-win",
  "presence",
  "repair",
+ "serde_json",
  "store",
  "titleclean",
 ]
@@ -388,6 +389,14 @@ name = "potflix-win"
 version = "1.0.0"
 dependencies = [
  "app-support",
+ "bundle",
+ "discord",
+ "library",
+ "metadata",
+ "metadata-http",
+ "presence",
+ "repair",
+ "serde_json",
  "windows-sys",
 ]
 

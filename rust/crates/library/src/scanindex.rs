@@ -20,7 +20,7 @@ use crate::sha256::{digest, hex};
 pub struct FolderRecord {
     pub fingerprint: String,
     pub names_hash: String,
-    pub files: i32,
+    pub files: i64,
     pub schema: i32,
     pub keys: Vec<String>,
     pub scanned_at_nanos: i64,
@@ -153,10 +153,10 @@ const MAX_SCAN_INDEX_BYTES: u64 = 8 << 20;
 /// `LegacyCounts` is the inventory of a legacy scanindex.json.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LegacyCounts {
-    pub folders: i32,
-    pub files: i32,
-    pub keys: i32,
-    pub key_refs: i32,
+    pub folders: i64,
+    pub files: i64,
+    pub keys: i64,
+    pub key_refs: i64,
 }
 
 #[derive(Deserialize)]
@@ -166,7 +166,7 @@ struct LegacyFolderRecord {
     #[serde(default)]
     names_hash: String,
     #[serde(default)]
-    files: i32,
+    files: i64,
     #[serde(default)]
     schema: i32,
     #[serde(default)]
@@ -232,8 +232,8 @@ pub(crate) fn read_legacy_scan_index(
             },
         );
     }
-    counts.folders = out.len() as i32;
-    counts.keys = keys.len() as i32;
+    counts.folders = out.len() as i64;
+    counts.keys = keys.len() as i64;
     Ok((out, counts))
 }
 
@@ -303,7 +303,7 @@ impl ScanIndex {
         if rec.files > 0 && rec.keys.is_empty() {
             return false;
         }
-        if rec.files > 0 && rec.keys.len() as i32 > rec.files {
+        if rec.files > 0 && rec.keys.len() as i64 > rec.files {
             return false;
         }
         for k in &rec.keys {
@@ -340,7 +340,7 @@ impl ScanIndex {
         if rec.files > 0 && rec.keys.is_empty() {
             return false;
         }
-        if rec.files > 0 && rec.keys.len() as i32 > rec.files {
+        if rec.files > 0 && rec.keys.len() as i64 > rec.files {
             return false;
         }
         for k in &rec.keys {
@@ -364,7 +364,7 @@ impl ScanIndex {
         fp: &str,
         schema: i32,
         keys: &[String],
-        files: i32,
+        files: i64,
     ) {
         self.ix.put_folder(
             dir,
@@ -399,7 +399,7 @@ impl ScanIndex {
     }
 
     /// Counts indexed folders.
-    pub fn len(&self) -> i32 {
+    pub fn len(&self) -> i64 {
         self.ix.folder_count()
     }
 

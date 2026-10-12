@@ -1753,3 +1753,15 @@ fn filetime_set(path: &str, mtime: std::time::SystemTime) -> std::io::Result<()>
         Ok(())
     }
 }
+
+/// `CollectResult`'s counters are Go `int` (64-bit): two skipped rollups of
+/// `1<<30` files each sum to `1<<31` without wrapping negative.
+#[test]
+fn files_skipped_accumulates_past_i32_max() {
+    let mut cr = crate::CollectResult::default();
+    for _ in 0..2 {
+        cr.files_skipped += 1_i64 << 30;
+    }
+    assert_eq!(cr.files_skipped, 1_i64 << 31);
+    assert!(cr.files_skipped > i64::from(i32::MAX));
+}

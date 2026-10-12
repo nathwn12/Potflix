@@ -302,50 +302,50 @@ fn walk_rec(path: &str, entry: &WalkEntry, cb: &mut WalkCb<'_>) -> std::io::Resu
 /// `Stats` tallies one Scan run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
-    pub keys: i32,
-    pub keys_cached: i32,
-    pub keys_fetched: i32,
-    pub keys_not_found: i32,
-    pub keys_failed: i32,
-    pub keys_done: i32,
+    pub keys: i64,
+    pub keys_cached: i64,
+    pub keys_fetched: i64,
+    pub keys_not_found: i64,
+    pub keys_failed: i64,
+    pub keys_done: i64,
     pub cancelled: bool,
-    pub files: i32,
-    pub skipped: i32,
-    pub unique: i32,
-    pub resolved: i32,
-    pub cached: i32,
-    pub fetched: i32,
-    pub not_found: i32,
-    pub errors: i32,
-    pub denied: i32,
-    pub folders_scanned: i32,
-    pub folders_skipped: i32,
-    pub files_skipped: i32,
-    pub unchanged: i32,
-    pub parsed: i32,
-    pub changed: i32,
-    pub pruned: i32,
-    pub pending: i32,
-    pub needs_repair: i32,
+    pub files: i64,
+    pub skipped: i64,
+    pub unique: i64,
+    pub resolved: i64,
+    pub cached: i64,
+    pub fetched: i64,
+    pub not_found: i64,
+    pub errors: i64,
+    pub denied: i64,
+    pub folders_scanned: i64,
+    pub folders_skipped: i64,
+    pub files_skipped: i64,
+    pub unchanged: i64,
+    pub parsed: i64,
+    pub changed: i64,
+    pub pruned: i64,
+    pub pending: i64,
+    pub needs_repair: i64,
 }
 
 /// `Progress` is one live scan update.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Progress {
-    pub done: i32,
-    pub total: i32,
-    pub resolved: i32,
-    pub cached: i32,
-    pub fetched: i32,
-    pub keys_total: i32,
-    pub keys_done: i32,
-    pub keys_cached: i32,
-    pub keys_fetched: i32,
-    pub keys_not_found: i32,
-    pub keys_failed: i32,
+    pub done: i64,
+    pub total: i64,
+    pub resolved: i64,
+    pub cached: i64,
+    pub fetched: i64,
+    pub keys_total: i64,
+    pub keys_done: i64,
+    pub keys_cached: i64,
+    pub keys_fetched: i64,
+    pub keys_not_found: i64,
+    pub keys_failed: i64,
     pub last: String,
-    pub folders_scanned: i32,
-    pub folders_skipped: i32,
+    pub folders_scanned: i64,
+    pub folders_skipped: i64,
 }
 
 /// The live progress callback (invoked from worker threads).
@@ -367,7 +367,7 @@ pub struct Options {
 // --- collect ---------------------------------------------------------------
 
 /// `CollectFiles` walks each root recursively for video files.
-pub fn collect_files(roots: &[String], limit: i32) -> (Vec<String>, i32, Option<Error>) {
+pub fn collect_files(roots: &[String], limit: i32) -> (Vec<String>, i64, Option<Error>) {
     let (files, denied, _cancelled, err) = collect_files_generic(None, roots, limit);
     (files, denied, err)
 }
@@ -377,7 +377,7 @@ pub fn collect_files_with_context(
     cancel: &Cancel,
     roots: &[String],
     limit: i32,
-) -> (Vec<String>, i32, bool, Option<Error>) {
+) -> (Vec<String>, i64, bool, Option<Error>) {
     let (files, denied, cancelled, err) = collect_files_generic(Some(cancel), roots, limit);
     (files, denied, cancelled, err)
 }
@@ -386,7 +386,7 @@ fn collect_files_generic(
     cancel: Option<&Cancel>,
     roots: &[String],
     limit: i32,
-) -> (Vec<String>, i32, bool, Option<Error>) {
+) -> (Vec<String>, i64, bool, Option<Error>) {
     let mut files: Vec<String> = Vec::new();
     let mut denied = 0;
     let mut ok_roots = 0;
@@ -752,10 +752,10 @@ pub(crate) struct CollectOutcome {
     pub visited: Vec<String>,
     pub skipped: HashMap<String, scanindex::FolderRecord>,
     pub walk: Option<ScanWalk>,
-    pub folders_scanned: i32,
-    pub folders_skipped: i32,
-    pub files_skipped: i32,
-    pub denied: i32,
+    pub folders_scanned: i64,
+    pub folders_skipped: i64,
+    pub files_skipped: i64,
+    pub denied: i64,
     pub first_err: Option<Error>,
     pub cancelled: bool,
 }
@@ -958,10 +958,10 @@ pub struct CollectResult {
     pub files: Vec<String>,
     pub visited: Vec<String>,
     pub skipped: HashMap<String, scanindex::FolderRecord>,
-    pub folders_scanned: i32,
-    pub folders_skipped: i32,
-    pub files_skipped: i32,
-    pub denied: i32,
+    pub folders_scanned: i64,
+    pub folders_skipped: i64,
+    pub files_skipped: i64,
+    pub denied: i64,
 }
 
 /// `CollectIndexedWithContext` is `CollectIndexed` with a cancellable context.
@@ -1123,7 +1123,7 @@ pub(crate) fn record_index_keys(
         }
     }
     struct DirAgg {
-        files: i32,
+        files: i64,
         keys: HashMap<String, bool>,
         paths: Vec<String>,
     }
@@ -1191,9 +1191,9 @@ pub(crate) fn record_index_keys(
             }
         }
     }
-    let mut fresh_rec: HashMap<String, i32> = HashMap::new();
+    let mut fresh_rec: HashMap<String, i64> = HashMap::new();
     let mut poisoned: HashMap<String, bool> = HashMap::new();
-    let mut memo_rec: HashMap<String, i32> = HashMap::new();
+    let mut memo_rec: HashMap<String, i64> = HashMap::new();
     for nv in &norms {
         if bad_list.contains_key(nv) {
             continue;
@@ -1294,10 +1294,10 @@ fn parent_norm(nv: &str) -> String {
 fn rec_count(
     dc: &mut CachedDir,
     skipped: &HashMap<String, scanindex::FolderRecord>,
-    memo: &mut HashMap<String, i32>,
+    memo: &mut HashMap<String, i64>,
     nv: &str,
     path: &str,
-) -> Option<i32> {
+) -> Option<i64> {
     if let Some(v) = memo.get(nv) {
         return Some(*v);
     }
@@ -1394,14 +1394,14 @@ impl CachedDir {
 // --- scan ------------------------------------------------------------------
 
 struct Agg {
-    done: i32,
-    resolved: i32,
-    cached: i32,
-    fetched: i32,
-    keys_cached: i32,
-    keys_fetched: i32,
-    keys_not_found: i32,
-    keys_failed: i32,
+    done: i64,
+    resolved: i64,
+    cached: i64,
+    fetched: i64,
+    keys_cached: i64,
+    keys_fetched: i64,
+    keys_not_found: i64,
+    keys_failed: i64,
     cached_hit: HashMap<String, bool>,
 }
 
@@ -1459,13 +1459,13 @@ pub fn scan_with_options(cancel: &Cancel, opts: Options) -> Result<Stats, Error>
     let (plans, groups) = build_plan(&outcome.files);
     if outcome.cancelled || cancel.err().is_some() {
         return Ok(Stats {
-            files: plans.len() as i32,
-            unique: groups.len() as i32,
+            files: plans.len() as i64,
+            unique: groups.len() as i64,
             denied: outcome.denied,
             folders_scanned: outcome.folders_scanned,
             folders_skipped: outcome.folders_skipped,
             files_skipped: outcome.files_skipped,
-            keys: groups.len() as i32,
+            keys: groups.len() as i64,
             cancelled: true,
             ..Stats::default()
         });
@@ -1484,16 +1484,16 @@ pub fn scan_with_options(cancel: &Cancel, opts: Options) -> Result<Stats, Error>
         }
     }
     let mut st = Stats {
-        files: plans.len() as i32,
-        unique: groups.len() as i32,
+        files: plans.len() as i64,
+        unique: groups.len() as i64,
         denied: outcome.denied,
         folders_scanned: outcome.folders_scanned,
         folders_skipped: outcome.folders_skipped,
         files_skipped: outcome.files_skipped,
-        keys: groups.len() as i32,
+        keys: groups.len() as i64,
         ..Stats::default()
     };
-    let keys_total = groups.len() as i32;
+    let keys_total = groups.len() as i64;
     let agg = Arc::new(Mutex::new(Agg {
         done: 0,
         resolved: 0,
@@ -1563,7 +1563,7 @@ pub fn scan_with_options(cancel: &Cancel, opts: Options) -> Result<Stats, Error>
             }
         };
         let lookup_ref: &LookupFn<'_> = &lookup;
-        let total = plans.len() as i32;
+        let total = plans.len() as i64;
         let agg2 = Arc::clone(&agg);
         let src_ref = &src_by_key;
         let progress = opts.progress.clone();
@@ -1581,7 +1581,7 @@ pub fn scan_with_options(cancel: &Cancel, opts: Options) -> Result<Stats, Error>
                 .get(&g.key)
                 .copied()
                 .unwrap_or(false);
-            let n = g.paths.len() as i32;
+            let n = g.paths.len() as i64;
             let (add, add_cached, add_fetched) = if fr.err.is_none() && fr.res.found {
                 if from_cache { (n, n, 0) } else { (n, 0, n) }
             } else {

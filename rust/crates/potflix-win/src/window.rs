@@ -31,6 +31,11 @@
 //! tests construct directly (isolated) and production wraps in a process
 //! global.
 
+// The Win32 surface is inherently pointer-taking: every entry point accepts an
+// `HWND`/`HDC` and hands it to `windows-sys`. The handles are opaque and the
+// module never dereferences them itself, so the lint is silenced module-wide.
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use std::time::{Duration, Instant};
@@ -38,7 +43,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi;
 
-use crate::win32::{utf16_z, Rect};
+use crate::win32::{Rect, utf16_z};
 
 use library::{Progress, Stats};
 use presence::{Activity, CardPreset, CardSpec};
@@ -224,7 +229,7 @@ impl CardLayout {
 }
 
 /// One painted text rect with its stable audit id (`go\window.go:666`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct NamedTextRect {
     pub id: String,
     pub rc: Rect,
@@ -922,7 +927,7 @@ pub fn main_focus_rect(l: &UiLayout, id: i32) -> Option<Rect> {
 /// `cardPresetForButton` (`go\window.go:1463`).
 #[must_use]
 pub fn card_preset_for_button(id: i32) -> Option<(i32, String)> {
-    let (dets, states) = presence::card_presets();
+    let (dets, states) = presence::cardspec::card_presets();
     let i = id - BTN_CARD_DETAILS_AT;
     if i >= 0 && (i as usize) < dets.len() {
         return Some((0, dets[i as usize].id.clone()));
@@ -1011,7 +1016,7 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
         }
         out
     };
-    let (dets, states) = presence::card_presets();
+    let (dets, states) = presence::cardspec::card_presets();
     l.btns.push(UiButton {
         id: BTN_CARD_BACK,
         label: "Back".into(),
@@ -1176,7 +1181,7 @@ pub const SCAN_BUSY_TEXT: &str = "Scan running - Cancel first.";
 
 /// `formatScanCount` (`go\window.go:1815`).
 #[must_use]
-pub fn format_scan_count(n: i32) -> String {
+pub fn format_scan_count(n: i64) -> String {
     if (-100_000..100_000).contains(&n) {
         return n.to_string();
     }
@@ -1185,8 +1190,8 @@ pub fn format_scan_count(n: i32) -> String {
 
 /// `formatScanCountUnit` (`go\window.go:1825`).
 #[must_use]
-pub fn format_scan_count_unit(n: i32) -> String {
-    let f = f64::from(n);
+pub fn format_scan_count_unit(n: i64) -> String {
+    let f = n as f64;
     let divs = [1e3_f64, 1e6, 1e9, 1e12, 1e15, 1e18];
     let sufs = ["k", "M", "B", "T", "P", "E"];
     let mut idx = 0usize;
@@ -1199,7 +1204,7 @@ pub fn format_scan_count_unit(n: i32) -> String {
 
 /// `formatScanCountCompact` (`go\window.go:1841`).
 #[must_use]
-pub fn format_scan_count_compact(n: i32) -> String {
+pub fn format_scan_count_compact(n: i64) -> String {
     if (-1000..1000).contains(&n) {
         return n.to_string();
     }
@@ -1308,7 +1313,7 @@ pub fn scan_done_text(kind: &str, s: &Stats) -> String {
 
 /// `scanCancelledText` (`go\window.go:1960`).
 #[must_use]
-pub fn scan_cancelled_text(done: i32, total: i32) -> String {
+pub fn scan_cancelled_text(done: i64, total: i64) -> String {
     fit_scan_status(&format!(
         "Scan cancelled - {}/{} keys done, progress kept",
         format_scan_count(done),
@@ -1319,11 +1324,7 @@ pub fn scan_cancelled_text(done: i32, total: i32) -> String {
 /// `scanButtonLabel` (`go\window.go:1968`).
 #[must_use]
 pub fn scan_button_label(active: bool) -> &'static str {
-    if active {
-        "Cancel"
-    } else {
-        "Scan"
-    }
+    if active { "Cancel" } else { "Scan" }
 }
 
 /// `scanRefreshEnabled` (`go\window.go:1978`).
@@ -1405,12 +1406,12 @@ pub fn scan_terminal_text(force: bool, s: &Stats, err: Option<&UiScanError>) -> 
 
 /// `scanKeyFraction` (`go\window.go:2041`).
 #[must_use]
-pub fn scan_key_fraction(done: i32, total: i32) -> Option<f64> {
+pub fn scan_key_fraction(done: i64, total: i64) -> Option<f64> {
     if total <= 0 {
         return None;
     }
     let done = done.clamp(0, total);
-    Some(f64::from(done) / f64::from(total))
+    Some(done as f64 / total as f64)
 }
 
 /// `scanPaintGate` (`go\window.go:2060`): a backward clock paints, never stalls.
@@ -1519,17 +1520,17 @@ pub fn scan_lifecycle_next(
 
 /// `minElapsedForETA` / `minKeysForETA` (`go\window.go:2142-2145`).
 pub const MIN_ELAPSED_FOR_ETA: Duration = Duration::from_secs(2);
-pub const MIN_KEYS_FOR_ETA: i32 = 5;
+pub const MIN_KEYS_FOR_ETA: i64 = 5;
 
 /// `scanObservedDone` (`go\window.go:2151`).
 #[must_use]
-pub fn scan_observed_done(p: &Progress) -> i32 {
+pub fn scan_observed_done(p: &Progress) -> i64 {
     (p.keys_done - p.keys_cached).max(0)
 }
 
 /// `scanETA` (`go\window.go:2168`).
 #[must_use]
-pub fn scan_eta(p: &Progress, observed_base: i32, resolve_elapsed: Duration) -> Option<Duration> {
+pub fn scan_eta(p: &Progress, observed_base: i64, resolve_elapsed: Duration) -> Option<Duration> {
     if p.keys_total <= 0 || p.keys_done >= p.keys_total {
         return None;
     }
@@ -1541,7 +1542,7 @@ pub fn scan_eta(p: &Progress, observed_base: i32, resolve_elapsed: Duration) -> 
     if remaining <= 0 {
         return None;
     }
-    let secs = resolve_elapsed.as_secs_f64() * f64::from(remaining) / f64::from(observed);
+    let secs = resolve_elapsed.as_secs_f64() * remaining as f64 / observed as f64;
     if secs < 0.0 {
         return None;
     }
@@ -1577,7 +1578,7 @@ pub fn scan_live_status_parts(
     p: &Progress,
     elapsed: Duration,
     resolve_elapsed: Duration,
-    observed_base: i32,
+    observed_base: i64,
 ) -> (String, String, String) {
     let base = scan_progress_text(p);
     let elapsed_sfx = format!(" | {}", format_scan_duration(elapsed));
@@ -1645,7 +1646,7 @@ pub fn scan_status_candidates(
     p: &Progress,
     elapsed: Duration,
     resolve_elapsed: Duration,
-    observed_base: i32,
+    observed_base: i64,
 ) -> Vec<String> {
     let (base, elapsed_sfx, eta_sfx) =
         scan_live_status_parts(p, elapsed, resolve_elapsed, observed_base);
@@ -1679,7 +1680,7 @@ pub fn compose_scan_live_status(
     p: &Progress,
     elapsed: Duration,
     resolve_elapsed: Duration,
-    observed_base: i32,
+    observed_base: i64,
     avail_px: i32,
     measure: impl Fn(&str) -> i32,
 ) -> String {
@@ -1716,7 +1717,7 @@ pub fn scan_indeterminate_pos(elapsed: Duration) -> f64 {
 
 /// `scanBarModel` (`go\window.go:2489`).
 #[must_use]
-pub fn scan_bar_model(active: bool, done: i32, total: i32) -> (bool, bool, f64) {
+pub fn scan_bar_model(active: bool, done: i64, total: i64) -> (bool, bool, f64) {
     if !active {
         return (false, false, 0.0);
     }
@@ -1766,11 +1767,7 @@ pub fn window_dpi(hwnd: HWND) -> i32 {
     }
     // SAFETY: GetDpiForWindow reads `hwnd` only.
     let d = unsafe { crate::win32::GetDpiForWindow(hwnd) };
-    if d != 0 {
-        d as i32
-    } else {
-        96
-    }
+    if d != 0 { d as i32 } else { 96 }
 }
 
 /// `systemDpi` (`go\window.go:3459`).
@@ -1778,11 +1775,7 @@ pub fn window_dpi(hwnd: HWND) -> i32 {
 pub fn system_dpi() -> i32 {
     // SAFETY: GetDpiForSystem takes no arguments.
     let d = unsafe { crate::win32::GetDpiForSystem() };
-    if d != 0 {
-        d as i32
-    } else {
-        96
-    }
+    if d != 0 { d as i32 } else { 96 }
 }
 
 /// `liveStatusAvailPx` (`go\window.go:2256`): the live client rect budget.
@@ -1804,7 +1797,6 @@ pub fn measure_scan_status_width(dpi: i32, s: &str) -> Option<i32> {
     use windows_sys::Win32::Foundation::SIZE;
     use windows_sys::Win32::Graphics::Gdi::{
         CreateFontW, DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
-        DEFAULT_CHARSET,
     };
     if s.is_empty() {
         return Some(0);
@@ -1826,7 +1818,7 @@ pub fn measure_scan_status_width(dpi: i32, s: &str) -> Option<i32> {
             0,
             0,
             0,
-            DEFAULT_CHARSET,
+            crate::win32::DEFAULT_CHARSET,
             0,
             0,
             0,
@@ -1844,11 +1836,7 @@ pub fn measure_scan_status_width(dpi: i32, s: &str) -> Option<i32> {
         SelectObject(hdc, old);
         DeleteObject(font);
         ReleaseDC(std::ptr::null_mut(), hdc);
-        if r == 0 {
-            None
-        } else {
-            Some(sz.cx)
-        }
+        if r == 0 { None } else { Some(sz.cx) }
     }
 }
 
@@ -1858,7 +1846,7 @@ pub fn scan_live_status_text(
     p: &Progress,
     elapsed: Duration,
     resolve_elapsed: Duration,
-    observed_base: i32,
+    observed_base: i64,
     dpi: i32,
     avail_px: i32,
 ) -> String {
@@ -1902,10 +1890,10 @@ pub const fn report_button_label() -> &'static str {
 /// `repairReportDir` (`go\window.go:1074`).
 #[must_use]
 pub fn repair_report_dir() -> std::path::PathBuf {
-    if let Ok(d) = std::env::var("LOCALAPPDATA") {
-        if !d.is_empty() {
-            return std::path::Path::new(&d).join("Potflix").join("inventory");
-        }
+    if let Ok(d) = std::env::var("LOCALAPPDATA")
+        && !d.is_empty()
+    {
+        return std::path::Path::new(&d).join("Potflix").join("inventory");
     }
     app_support::debuglog::exe_dir_or_dot().join("inventory")
 }
@@ -2018,7 +2006,7 @@ pub struct UiState {
     pub scan_start: Instant,
     pub scan_last_paint: Instant,
     pub scan_resolve_start: Option<Instant>,
-    pub scan_resolve_base: i32,
+    pub scan_resolve_base: i64,
 
     pub startup_state: bool,
     pub scan_speed_state: String,
@@ -2027,7 +2015,7 @@ pub struct UiState {
 
     pub preview: Option<Activity>,
     pub ui_icon: usize,
-    pub main_hwnd: HWND,
+    pub main_hwnd: usize,
     pub ui_centered: bool,
     pub last_mx: i32,
     pub last_my: i32,
@@ -2037,6 +2025,7 @@ pub struct UiState {
     /// Injectable seams (`go\window.go:2581-2586`, `:1055-1061`).
     pub arm_timer: Arc<dyn Fn(HWND) + Send + Sync>,
     pub kill_timer: Arc<dyn Fn(HWND) + Send + Sync>,
+    #[allow(clippy::type_complexity)]
     pub create_issue:
         Arc<dyn Fn(&repair::report::Report) -> (String, Option<repair::Error>) + Send + Sync>,
     pub open_url: Arc<dyn Fn(&str) -> bool + Send + Sync>,
@@ -2071,7 +2060,7 @@ impl Default for UiState {
             dead_cache_count: 0,
             preview: None,
             ui_icon: 0,
-            main_hwnd: std::ptr::null_mut(),
+            main_hwnd: 0,
             ui_centered: false,
             last_mx: 0,
             last_my: 0,
@@ -2147,10 +2136,10 @@ pub fn open_external_url(url: &str) -> bool {
 impl UiState {
     /// `invalidateMain` (`go\window.go:1745`).
     pub fn invalidate(&self) {
-        if !self.main_hwnd.is_null() {
+        if self.main_hwnd != 0 {
             // SAFETY: InvalidateRect only marks the window.
             unsafe {
-                crate::win32::InvalidateRect(self.main_hwnd, std::ptr::null(), 0);
+                crate::win32::InvalidateRect(self.main_hwnd as HWND, std::ptr::null(), 0);
             }
         }
     }
@@ -2749,7 +2738,7 @@ impl UiState {
             return;
         }
         self.card_spec_state = cfg.effective_card_spec();
-        let (dets, states) = presence::card_presets();
+        let (dets, states) = presence::cardspec::card_presets();
         let mut name = preset.to_string();
         if line == 0 {
             for p in &dets {
@@ -2769,23 +2758,22 @@ impl UiState {
         app_logf(&format!("card: line {} -> {preset}", line + 1));
     }
 
-    /// `onSelectScanSpeed` (`go\settings_sections.go:177`). Live rate-profile
-    /// application is owned by the app wiring.
+    /// `onSelectScanSpeed` (`go\settings_sections.go:177`). Persistence and
+    /// live rate-profile application live in the settings seam; this method
+    /// keeps the view's own state, status line, and log.
     pub fn on_select_scan_speed(&mut self, profile: &str) {
         let profile = app_support::config::normalize_scan_speed(profile);
         self.scan_speed_state = profile.to_string();
-        let mut cfg = app_support::config::load_config();
-        cfg.scan_speed = profile.to_string();
-        if let Err(e) = app_support::config::save_config(&cfg) {
-            app_logf(&format!("settings: scan speed save failed: {e}"));
-            self.set_status_text("Save failed.");
-            return;
+        match crate::settings::on_select_scan_speed(&app_support::config::config_path(), profile) {
+            Ok(status) => {
+                self.set_status_text(status);
+                app_logf(&format!("settings: scan speed {profile}"));
+            }
+            Err(e) => {
+                app_logf(&format!("settings: scan speed save failed: {e}"));
+                self.set_status_text("Save failed.");
+            }
         }
-        self.set_status_text(format!(
-            "Scan speed: {}",
-            crate::settings::scan_segment_label(profile)
-        ));
-        app_logf(&format!("settings: scan speed {profile}"));
     }
 
     /// `resetScanSnapshot` (`go\window.go:2447`).
@@ -2964,16 +2952,17 @@ impl UiState {
         let open = self.open_url.clone();
         let done = self.report_done_text.clone();
         let report = r;
+        let hwnd_raw = hwnd as usize;
         std::thread::spawn(move || {
             let (url, cerr) = create(&report);
             let text = report_issue_status(&url, cerr.as_ref(), &*open);
             *done
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
-            if !hwnd.is_null() {
+            if hwnd_raw != 0 {
                 // SAFETY: async post only; the worker never touches a control.
                 unsafe {
-                    crate::win32::PostMessageW(hwnd, WM_APP_REPORT_DONE, 0, 0);
+                    crate::win32::PostMessageW(hwnd_raw as HWND, WM_APP_REPORT_DONE, 0, 0);
                 }
             }
         });
@@ -3164,7 +3153,7 @@ pub struct PushInput<'a> {
 /// The `pushActivity` collaborators.
 pub struct PushDeps<'a> {
     pub dc: &'a discord::Client,
-    pub gate: &'a mut presence::Gate,
+    pub gate: &'a mut presence::gate::Gate,
     pub state: &'a mut UiState,
 }
 
@@ -3211,6 +3200,14 @@ pub fn push_activity(deps: &mut PushDeps, input: &PushInput) {
         has_start: out.has_start,
         start: out.start,
         end: out.end,
+        buttons: out
+            .buttons
+            .iter()
+            .map(|b| discord::ActivityButton {
+                label: b.label.clone(),
+                url: b.url.clone(),
+            })
+            .collect(),
     };
     if deps.dc.set_activity(wire).is_ok() {
         deps.state.record_preview(out);
@@ -3247,7 +3244,7 @@ pub fn create_ui_font(height: i32, weight: i32) -> Gdi::HFONT {
             0,
             0,
             0,
-            Gdi::DEFAULT_CHARSET,
+            crate::win32::DEFAULT_CHARSET,
             0,
             0,
             0,
@@ -3296,8 +3293,8 @@ fn draw_ui_text(hdc: Gdi::HDC, s: &str, rc: Rect, format: u32, font: Gdi::HFONT,
         Gdi::SetTextColor(hdc, color);
         let old = Gdi::SelectObject(hdc, font);
         let u = utf16_z(s);
-        let mut box = wr(rc);
-        Gdi::DrawTextW(hdc, u.as_ptr(), -1, &mut box, format);
+        let mut bx = wr(rc);
+        Gdi::DrawTextW(hdc, u.as_ptr(), -1, &mut bx, format);
         Gdi::SelectObject(hdc, old);
     }
 }
@@ -3309,12 +3306,12 @@ fn draw_ui_text_wrapped(hdc: Gdi::HDC, s: &str, rc: Rect, font: Gdi::HFONT, colo
         Gdi::SetTextColor(hdc, color);
         let old = Gdi::SelectObject(hdc, font);
         let u = utf16_z(s);
-        let mut box = wr(rc);
+        let mut bx = wr(rc);
         Gdi::DrawTextW(
             hdc,
             u.as_ptr(),
             -1,
-            &mut box,
+            &mut bx,
             crate::win32::DT_LEFT
                 | DT_WORD_BREAK
                 | crate::win32::DT_NO_PREFIX
@@ -3349,7 +3346,7 @@ pub fn wrapped_need(hdc: Gdi::HDC, s: &str, w: i32) -> i32 {
     // SAFETY: DT_CALCRECT writes only into `box`.
     unsafe {
         let u = utf16_z(s);
-        let mut box = windows_sys::Win32::Foundation::RECT {
+        let mut bx = windows_sys::Win32::Foundation::RECT {
             left: 0,
             top: 0,
             right: w,
@@ -3359,14 +3356,14 @@ pub fn wrapped_need(hdc: Gdi::HDC, s: &str, w: i32) -> i32 {
             hdc,
             u.as_ptr(),
             -1,
-            &mut box,
+            &mut bx,
             crate::win32::DT_LEFT
                 | DT_WORD_BREAK
                 | crate::win32::DT_NO_PREFIX
                 | crate::win32::DT_END_ELLIPSIS
                 | 0x0400,
         );
-        box.bottom - box.top
+        bx.bottom - bx.top
     }
 }
 
@@ -3382,7 +3379,7 @@ pub fn break_row(hdc: Gdi::HDC, s: &str, w: i32) -> String {
     while start < runes.len() {
         let (mut lo, mut hi) = (start + 1, runes.len());
         while lo < hi {
-            let mid = (lo + hi + 1) / 2;
+            let mid = (lo + hi).div_ceil(2);
             if single_line_fits(hdc, &runes[start..mid].iter().collect::<String>(), w) {
                 lo = mid;
             } else {
@@ -3412,11 +3409,18 @@ pub fn break_row(hdc: Gdi::HDC, s: &str, w: i32) -> String {
 }
 
 /// `paintButton` (`go\window.go:3319`).
-fn paint_button(hdc: Gdi::HDC, b: &UiButton, dpi: i32, button_font: Gdi::HFONT, small_font: Gdi::HFONT, st: &UiState) {
+fn paint_button(
+    hdc: Gdi::HDC,
+    b: &UiButton,
+    dpi: i32,
+    button_font: Gdi::HFONT,
+    small_font: Gdi::HFONT,
+    st: &UiState,
+) {
     let sc = |v: i32| scale_px(dpi, v);
     let hovered = st.hover_btn == b.id;
     let pressed = st.pressed_btn == b.id;
-    let disabled = st.scan_blocked_reason(b.id) != "";
+    let disabled = !st.scan_blocked_reason(b.id).is_empty();
     let fmt = crate::win32::DT_CENTER
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
@@ -3437,14 +3441,22 @@ fn paint_button(hdc: Gdi::HDC, b: &UiButton, dpi: i32, button_font: Gdi::HFONT, 
             draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
         }
         BTN_OUTLINE => {
-            let fill = if hovered && !disabled { COL_CARD } else { COL_BG };
+            let fill = if hovered && !disabled {
+                COL_CARD
+            } else {
+                COL_BG
+            };
             fill_round_rect(hdc, b.rc, fill, sc(8));
             stroke_round_rect(hdc, b.rc, COL_BORDER, sc(8));
             let tc = if disabled { COL_MUTED } else { COL_TEXT };
             draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
         }
         BTN_TEXT => {
-            let tc = if hovered || pressed { COL_TEXT } else { COL_MUTED };
+            let tc = if hovered || pressed {
+                COL_TEXT
+            } else {
+                COL_MUTED
+            };
             draw_ui_text(hdc, &b.label, b.rc, fmt, small_font, tc);
         }
         BTN_DANGER => {
@@ -3615,7 +3627,13 @@ fn paint_scan_bar(hdc: Gdi::HDC, status: Rect, dpi: i32, st: &UiState) {
 
 /// `auditSingleLineVerdict` (`go\window.go:3582`).
 #[must_use]
-pub fn audit_single_line_verdict(need_w: i32, need_h: i32, rect_w: i32, rect_h: i32, ellipsis: bool) -> &'static str {
+pub fn audit_single_line_verdict(
+    need_w: i32,
+    need_h: i32,
+    rect_w: i32,
+    rect_h: i32,
+    ellipsis: bool,
+) -> &'static str {
     if need_w <= rect_w && need_h <= rect_h {
         return "";
     }
@@ -3821,10 +3839,7 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         if b.id == BTN_SCAN && st.scan_active {
             label = scan_button_label(true).to_string();
         }
-        let bb = UiButton {
-            label,
-            ..b.clone()
-        };
+        let bb = UiButton { label, ..b.clone() };
         paint_button(hdc, &bb, dpi, button_font, section_font, st);
     }
     let tc = if st.hover_btn == BTN_SETTINGS || st.pressed_btn == BTN_SETTINGS {
@@ -3839,12 +3854,17 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         COL_MUTED
     };
     draw_ui_text(hdc, "Card", l.card_link, fmt_right, section_font, tc);
-    if st.focus_id != 0 {
-        if let Some(frc) = main_focus_rect(&l, st.focus_id) {
-            stroke_round_rect(hdc, frc, COL_TEXT, sc(8));
-        }
+    if let Some(frc) = main_focus_rect(&l, st.focus_id) {
+        stroke_round_rect(hdc, frc, COL_TEXT, sc(8));
     }
-    draw_ui_text(hdc, &st.status_text, l.status, fmt_left, section_font, COL_MUTED);
+    draw_ui_text(
+        hdc,
+        &st.status_text,
+        l.status,
+        fmt_left,
+        section_font,
+        COL_MUTED,
+    );
     paint_scan_bar(hdc, l.status, dpi, st);
 
     // SAFETY: fonts created above are deleted here.
@@ -3915,10 +3935,8 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     for b in &l.btns {
         paint_button(hdc, b, dpi, button_font, section_font, st);
     }
-    if st.focus_id != 0 {
-        if let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id) {
-            stroke_round_rect(hdc, b.rc, COL_TEXT, sc(8));
-        }
+    if let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id) {
+        stroke_round_rect(hdc, b.rc, COL_TEXT, sc(8));
     }
     draw_ui_text(
         hdc,
@@ -3933,7 +3951,14 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         section_font,
         COL_MUTED,
     );
-    draw_ui_text(hdc, &st.status_text, l.status, fmt_left, section_font, COL_MUTED);
+    draw_ui_text(
+        hdc,
+        &st.status_text,
+        l.status,
+        fmt_left,
+        section_font,
+        COL_MUTED,
+    );
     paint_scan_bar(hdc, l.status, dpi, st);
 
     // SAFETY: fonts created above are deleted here.
@@ -4029,12 +4054,19 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     for b in &l.btns {
         paint_button(hdc, b, dpi, button_font, section_font, st);
     }
-    if st.focus_id != 0 {
-        if let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id) {
-            stroke_round_rect(hdc, b.rc, COL_TEXT, sc(8));
-        }
+    if st.focus_id != 0
+        && let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id)
+    {
+        stroke_round_rect(hdc, b.rc, COL_TEXT, sc(8));
     }
-    draw_ui_text(hdc, &st.status_text, l.status, fmt_left, section_font, COL_MUTED);
+    draw_ui_text(
+        hdc,
+        &st.status_text,
+        l.status,
+        fmt_left,
+        section_font,
+        COL_MUTED,
+    );
     paint_scan_bar(hdc, l.status, dpi, st);
 
     // SAFETY: fonts created above are deleted here.
@@ -4056,7 +4088,6 @@ static UI: std::sync::LazyLock<Mutex<UiState>> =
     std::sync::LazyLock::new(|| Mutex::new(UiState::default()));
 
 /// The process-wide UI state the wndproc drives.
-#[must_use]
 pub fn ui() -> MutexGuard<'static, UiState> {
     UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -4094,7 +4125,8 @@ pub fn create_main_window() -> Result<(), String> {
     let dpi = system_dpi();
     let cw = scale_px(dpi, MAIN_CLIENT_W);
     let ch = scale_px(dpi, MAIN_CLIENT_H);
-    let style = crate::win32::WS_CAPTION | crate::win32::WS_SYS_MENU | crate::win32::WS_MINIMIZE_BOX;
+    let style =
+        crate::win32::WS_CAPTION | crate::win32::WS_SYS_MENU | crate::win32::WS_MINIMIZE_BOX;
     let mut wrc = wr(Rect {
         left: 0,
         top: 0,
@@ -4126,7 +4158,7 @@ pub fn create_main_window() -> Result<(), String> {
     }
     {
         let mut st = ui();
-        st.main_hwnd = hwnd;
+        st.main_hwnd = hwnd as usize;
         st.refresh_dir_list();
     }
     Ok(())
@@ -4135,10 +4167,10 @@ pub fn create_main_window() -> Result<(), String> {
 /// `showMainWindow` (`go\window.go:346`).
 pub fn show_main_window() {
     let mut st = ui();
-    if st.main_hwnd.is_null() {
+    if st.main_hwnd == 0 {
         return;
     }
-    let hwnd = st.main_hwnd;
+    let hwnd = st.main_hwnd as HWND;
     if !st.ui_centered {
         st.ui_centered = true;
         center_window(hwnd);
@@ -4190,16 +4222,22 @@ pub fn mouse_xy(lparam: usize) -> (i32, i32) {
 }
 
 /// `mainWndProc` (`go\window.go:380`).
+///
+/// # Safety
+/// Called by the OS as the window procedure for `MAIN_CLASS_NAME`; `hwnd` must be
+/// the live main window handle passed at class registration.
 pub unsafe extern "system" fn main_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: usize,
-    lparam: usize,
+    lparam: isize,
 ) -> isize {
     match msg {
         crate::win32::WM_CLOSE => {
             // NEVER DestroyWindow: closing parks the window back to the tray.
-            crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
+            unsafe {
+                crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
+            }
             return 0;
         }
         crate::win32::WM_ERASE_BKGND => return 1,
@@ -4212,7 +4250,7 @@ pub unsafe extern "system" fn main_wnd_proc(
             return 0;
         }
         crate::win32::WM_MOUSE_MOVE => {
-            let (x, y) = mouse_xy(lparam);
+            let (x, y) = mouse_xy(lparam as usize);
             let mut st = ui();
             st.last_mx = x;
             st.last_my = y;
@@ -4234,16 +4272,16 @@ pub unsafe extern "system" fn main_wnd_proc(
             return 0;
         }
         crate::win32::WM_L_BUTTON_DOWN => {
-            let (x, y) = mouse_xy(lparam);
+            let (x, y) = mouse_xy(lparam as usize);
             ui().press_at(hwnd, x, y);
             return 0;
         }
         crate::win32::WM_L_BUTTON_UP => {
-            let (x, y) = mouse_xy(lparam);
+            let (x, y) = mouse_xy(lparam as usize);
             ui().release_at(hwnd, x, y);
             return 0;
         }
-        crate::win32::WM_SETFOCUS | crate::win32::WM_KILLFOCUS => {
+        WM_SETFOCUS | WM_KILLFOCUS => {
             ui().invalidate();
             return 0;
         }
@@ -4259,16 +4297,18 @@ pub unsafe extern "system" fn main_wnd_proc(
         crate::win32::WM_SET_CURSOR => {
             let st = ui();
             if st.have_mouse && st.hit_test_code(hwnd, st.last_mx, st.last_my) != 0 {
-                let hand = crate::win32::LoadCursorW(
-                    std::ptr::null_mut(),
-                    crate::win32::IDC_HAND as usize as *const u16,
-                );
-                if !hand.is_null() {
-                    crate::win32::SetCursor(hand);
-                    return 1;
+                unsafe {
+                    let hand = crate::win32::LoadCursorW(
+                        std::ptr::null_mut(),
+                        crate::win32::IDC_HAND as usize as *const u16,
+                    );
+                    if !hand.is_null() {
+                        crate::win32::SetCursor(hand);
+                        return 1;
+                    }
                 }
             }
-            return crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam);
+            return unsafe { crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_APP_SCAN_PROGRESS => {
             ui().refresh_scan_live_text(hwnd, ScanLifecycleEvent::Progress, Instant::now());
@@ -4293,7 +4333,7 @@ pub unsafe extern "system" fn main_wnd_proc(
         }
         _ => {}
     }
-    crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam)
+    unsafe { crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
 /// `trackMouseLeave` (`go\window.go:1735`).
@@ -4304,10 +4344,2464 @@ fn track_mouse_leave(hwnd: HWND) {
         hwnd_track: hwnd as usize,
         dw_hover_time: 0,
     };
-    // SAFETY: struct is live for the call.
+    // SAFETY: struct is live for the call (same ABI as TRACKMOUSEEVENT).
     unsafe {
-        crate::win32::TrackMouseEvent(&mut tm);
+        crate::win32::TrackMouseEvent(
+            std::ptr::from_mut(&mut tm)
+                .cast::<windows_sys::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT>(),
+        );
     }
 }
 
 // ===TESTS===
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::field_reassign_with_default)]
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct Scratch {
+        dir: std::path::PathBuf,
+    }
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let dir =
+                std::env::temp_dir().join(format!("potflix-win-{tag}-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self { dir }
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.dir
+        }
+        fn join(&self, rel: &str) -> std::path::PathBuf {
+            self.dir.join(rel)
+        }
+        fn write(&self, name: &str, contents: &str) -> std::path::PathBuf {
+            let p = self.dir.join(name);
+            std::fs::write(&p, contents).unwrap();
+            p
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn r_eq(a: Rect, b: Rect) -> bool {
+        a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+    }
+
+    fn dirs(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("{}:\\Media", char::from(b'A' + (i % 26) as u8)))
+            .collect()
+    }
+
+    const NULL: HWND = std::ptr::null_mut();
+
+    // -- window_test.go -----------------------------------------------------
+
+    #[test]
+    fn pt_in_rect_boundaries() {
+        let r = Rect {
+            left: 10,
+            top: 20,
+            right: 30,
+            bottom: 40,
+        };
+        for p in [(10, 20), (29, 39), (15, 25)] {
+            assert!(pt_in_rect(r, p.0, p.1), "inside {p:?}");
+        }
+        for p in [(9, 20), (10, 19), (30, 20), (10, 40), (0, 0), (100, 100)] {
+            assert!(!pt_in_rect(r, p.0, p.1), "outside {p:?}");
+        }
+    }
+
+    #[test]
+    fn button_at_point_lookup() {
+        let btns = vec![
+            UiButton {
+                id: BTN_ADD,
+                label: "Add folder".into(),
+                style: BTN_SUBTLE,
+                rc: Rect {
+                    left: 20,
+                    top: 400,
+                    right: 224,
+                    bottom: 436,
+                },
+            },
+            UiButton {
+                id: BTN_REMOVE,
+                label: "Remove".into(),
+                style: BTN_SUBTLE,
+                rc: Rect {
+                    left: 236,
+                    top: 400,
+                    right: 440,
+                    bottom: 436,
+                },
+            },
+            UiButton {
+                id: BTN_SCAN,
+                label: "Scan".into(),
+                style: BTN_ACCENT,
+                rc: Rect {
+                    left: 20,
+                    top: 448,
+                    right: 224,
+                    bottom: 484,
+                },
+            },
+        ];
+        assert_eq!(button_at_point(&btns, 100, 410), BTN_ADD);
+        assert_eq!(button_at_point(&btns, 300, 410), BTN_REMOVE);
+        assert_eq!(button_at_point(&btns, 100, 460), BTN_SCAN);
+        assert_eq!(button_at_point(&btns, 230, 410), 0);
+        assert_eq!(button_at_point(&btns, 10, 10), 0);
+        assert_eq!(button_at_point(&[], 100, 410), 0);
+    }
+
+    #[test]
+    fn row_at_point_lookup() {
+        let rows = vec![
+            Rect {
+                left: 30,
+                top: 128,
+                right: 430,
+                bottom: 164,
+            },
+            Rect {
+                left: 30,
+                top: 172,
+                right: 430,
+                bottom: 208,
+            },
+        ];
+        assert_eq!(row_at_point(&rows, 100, 140), 0);
+        assert_eq!(row_at_point(&rows, 100, 180), 1);
+        assert_eq!(row_at_point(&rows, 100, 168), -1);
+        assert_eq!(row_at_point(&[], 100, 140), -1);
+    }
+
+    #[test]
+    fn compute_layout_buttons() {
+        let l = compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
+        assert_eq!(l.btns.len(), 6);
+        let mut seen = std::collections::HashSet::new();
+        for b in &l.btns {
+            assert!(seen.insert(b.id), "duplicate id {}", b.id);
+            assert!(
+                b.rc.left >= 0
+                    && b.rc.top >= 0
+                    && b.rc.right <= MAIN_CLIENT_W
+                    && b.rc.bottom <= MAIN_CLIENT_H,
+                "button {} escapes the client: {:?}",
+                b.id,
+                b.rc
+            );
+        }
+        for id in [
+            BTN_ADD,
+            BTN_REMOVE,
+            BTN_SCAN,
+            BTN_REFRESH,
+            BTN_REPORT,
+            BTN_CLOSE,
+        ] {
+            assert!(seen.contains(&id), "button {id} missing");
+        }
+        for (i, a) in l.btns.iter().enumerate() {
+            for b in l.btns.iter().skip(i + 1) {
+                assert!(
+                    !rects_intersect(a.rc, b.rc),
+                    "buttons {} and {} overlap",
+                    a.id,
+                    b.id
+                );
+            }
+        }
+        assert_eq!(l.rows.len(), 2);
+        for (i, r) in l.rows.iter().enumerate() {
+            assert_eq!(
+                row_at_point(&l.rows, (r.left + r.right) / 2, (r.top + r.bottom) / 2),
+                i as i32
+            );
+        }
+        for b in &l.btns {
+            assert_eq!(
+                button_at_point(
+                    &l.btns,
+                    (b.rc.left + b.rc.right) / 2,
+                    (b.rc.top + b.rc.bottom) / 2
+                ),
+                b.id
+            );
+        }
+    }
+
+    #[test]
+    fn compute_layout_card_follows_rows() {
+        let card_h = |n: usize| {
+            let d = dirs(n);
+            let l = compute_layout(&d, MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
+            let h = l.card.bottom - l.card.top;
+            (l, h)
+        };
+        let (l1, h1) = card_h(1);
+        let (l4, h4) = card_h(4);
+        assert!(h1 < h4, "1-row {h1} vs 4-row {h4}");
+        assert!(l1.rows.len() == 1 && l4.rows.len() == 4);
+        let (l20, h20) = card_h(20);
+        let (_, h5) = card_h(5);
+        assert_eq!(h20, h5 + 22);
+        assert!(l20.rows.len() == 5 && l20.overflow == 15);
+        for (i, r) in l20.rows.iter().enumerate() {
+            assert_eq!(
+                row_at_point(&l20.rows, (r.left + r.right) / 2, (r.top + r.bottom) / 2),
+                i as i32
+            );
+        }
+        for (a, b) in l1.btns.iter().zip(l20.btns.iter()) {
+            assert!(r_eq(a.rc, b.rc), "button {} moved", a.id);
+        }
+        assert!(r_eq(l1.status, l20.status));
+    }
+
+    #[test]
+    fn main_settings_affordance() {
+        let l = compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
+        assert_eq!(l.btns.len(), 6);
+        let s = l.settings;
+        assert!(s.right <= MAIN_CLIENT_W && s.bottom <= MAIN_CLIENT_H && s.left >= 0 && s.top >= 0);
+        assert!(s.right > s.left && s.bottom > s.top);
+        assert!(
+            s.top >= 52 && s.bottom <= 92,
+            "settings {s:?} leaves the header strip"
+        );
+        for b in &l.btns {
+            assert!(
+                !rects_intersect(s, b.rc),
+                "settings overlaps button {}",
+                b.id
+            );
+        }
+        for r in &l.rows {
+            assert!(!rects_intersect(s, *r));
+        }
+        assert!(!rects_intersect(s, l.status));
+        assert!(!rects_intersect(s, l.card));
+    }
+
+    #[test]
+    fn view_switch() {
+        let mut st = UiState::default();
+        assert_eq!(st.cur_view, View::Main);
+        st.open_settings();
+        assert_eq!(st.cur_view, View::Settings);
+        st.close_settings();
+        assert_eq!(st.cur_view, View::Main);
+    }
+
+    #[test]
+    fn settings_hit_test() {
+        let l = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "balanced");
+        assert_eq!(l.btns.len(), 10);
+        for id in [
+            BTN_BACK,
+            BTN_CLEAR_CACHE,
+            BTN_CLEAR_INDEX,
+            BTN_EXPORT,
+            BTN_IMPORT,
+            BTN_STARTUP,
+            BTN_OPEN_LOG,
+        ] {
+            let rc = l
+                .settings_btn(id)
+                .unwrap_or_else(|| panic!("id {id} missing"));
+            assert!(
+                rc.right <= MAIN_CLIENT_W
+                    && rc.bottom <= MAIN_CLIENT_H
+                    && rc.left >= 0
+                    && rc.top >= 0
+            );
+            assert_eq!(
+                button_at_point(&l.btns, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2),
+                id
+            );
+        }
+        for (i, a) in l.btns.iter().enumerate() {
+            for b in l.btns.iter().skip(i + 1) {
+                assert!(
+                    !rects_intersect(a.rc, b.rc),
+                    "{} and {} overlap",
+                    a.id,
+                    b.id
+                );
+            }
+        }
+        let off = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "balanced");
+        let on = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, true, "balanced");
+        assert!(r_eq(
+            off.settings_btn(BTN_STARTUP).unwrap(),
+            on.settings_btn(BTN_STARTUP).unwrap()
+        ));
+        assert_eq!(
+            off.btns.iter().find(|b| b.id == BTN_STARTUP).unwrap().label,
+            "[ ] Start with Windows"
+        );
+        assert_eq!(
+            on.btns.iter().find(|b| b.id == BTN_STARTUP).unwrap().label,
+            "[x] Start with Windows"
+        );
+        for id in [BTN_CLEAR_CACHE, BTN_CLEAR_INDEX, BTN_EXPORT, BTN_IMPORT] {
+            let rc = l.settings_btn(id).unwrap();
+            assert!(rc.top >= 100 && rc.bottom <= 140, "library {id} {rc:?}");
+        }
+        for id in [BTN_STARTUP, BTN_OPEN_LOG] {
+            let rc = l.settings_btn(id).unwrap();
+            assert!(rc.top >= 172 && rc.bottom <= 212, "startup {id} {rc:?}");
+        }
+    }
+
+    #[test]
+    fn layout_text_invariants() {
+        for dpi in [96, 120, 144, 192] {
+            let cw = scale_px(dpi, MAIN_CLIENT_W);
+            let ch = scale_px(dpi, MAIN_CLIENT_H);
+            for n in [0usize, 2, 20] {
+                let l = compute_layout(&dirs(n), cw, ch, dpi);
+                let rects = main_text_rects(cw, ch, dpi, &l, n as i32);
+                for r in &rects {
+                    assert!(
+                        r.rc.right - r.rc.left > 0 && r.rc.bottom - r.rc.top > 0,
+                        "{} non-positive",
+                        r.id
+                    );
+                    assert!(
+                        r.rc.left >= 0 && r.rc.top >= 0 && r.rc.right <= cw && r.rc.bottom <= ch,
+                        "{} escapes",
+                        r.id
+                    );
+                }
+                for (i, a) in rects.iter().enumerate() {
+                    for b in rects.iter().skip(i + 1) {
+                        assert!(
+                            !rects_intersect(a.rc, b.rc),
+                            "dpi {dpi} dirs {n}: {} and {} intersect",
+                            a.id,
+                            b.id
+                        );
+                    }
+                }
+            }
+            let sl = compute_settings_layout(cw, ch, dpi, false, "balanced");
+            let srects = settings_text_rects(cw, ch, dpi, &sl);
+            for r in &srects {
+                assert!(
+                    r.rc.right - r.rc.left > 0 && r.rc.bottom - r.rc.top > 0,
+                    "dpi {dpi}: {} non-positive",
+                    r.id
+                );
+                assert!(
+                    r.rc.left >= 0 && r.rc.top >= 0 && r.rc.right <= cw && r.rc.bottom <= ch,
+                    "dpi {dpi}: {} escapes",
+                    r.id
+                );
+            }
+            for (i, a) in srects.iter().enumerate() {
+                for b in srects.iter().skip(i + 1) {
+                    assert!(
+                        !rects_intersect(a.rc, b.rc),
+                        "dpi {dpi}: {} and {} intersect",
+                        a.id,
+                        b.id
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn settings_esc_returns_to_main() {
+        let mut st = UiState::default();
+        st.cur_view = View::Settings;
+        assert!(st.on_settings_key_down(NULL, VK_ESCAPE));
+        assert_eq!(st.cur_view, View::Main);
+        st.cur_view = View::Main;
+        assert!(!st.on_settings_key_down(NULL, VK_ESCAPE));
+    }
+
+    #[test]
+    fn focus_order_covers_rect_table() {
+        for (order, want_len) in [
+            (main_focus_order(), 8usize),
+            (settings_focus_order(), 10),
+            (card_focus_order(), 9),
+        ] {
+            assert_eq!(order.len(), want_len);
+            let mut seen = std::collections::HashSet::new();
+            for id in &order {
+                assert!(seen.insert(*id), "duplicate {id}");
+            }
+        }
+        assert_eq!(focus_order_for_view(View::Main).len(), 8);
+        assert_eq!(focus_order_for_view(View::Settings).len(), 10);
+        assert_eq!(focus_order_for_view(View::Card).len(), 9);
+        for id in [
+            BTN_ADD,
+            BTN_REMOVE,
+            BTN_SCAN,
+            BTN_REFRESH,
+            BTN_REPORT,
+            BTN_CLOSE,
+            BTN_SETTINGS,
+            BTN_CARD,
+        ] {
+            assert!(main_focus_order().contains(&id), "missing {id}");
+        }
+    }
+
+    #[test]
+    fn move_focus_wraps() {
+        let order = vec![BTN_ADD, BTN_REMOVE, BTN_SCAN];
+        assert_eq!(move_focus(0, 1, &order), BTN_ADD);
+        assert_eq!(move_focus(0, -1, &order), BTN_SCAN);
+        assert_eq!(move_focus(BTN_SCAN, 1, &order), BTN_ADD);
+        assert_eq!(move_focus(BTN_ADD, -1, &order), BTN_SCAN);
+        assert_eq!(move_focus(BTN_ADD, 1, &order), BTN_REMOVE);
+        assert_eq!(move_focus(0, 1, &[]), 0);
+    }
+
+    #[test]
+    fn focus_tab_cycle() {
+        let mut st = UiState::default();
+        st.cur_view = View::Main;
+        st.focus_id = 0;
+        assert!(st.on_settings_key_down_ex(NULL, VK_TAB, false));
+        assert_eq!(st.focus_id, BTN_ADD);
+        assert!(st.on_settings_key_down_ex(NULL, VK_TAB, false));
+        assert_eq!(st.focus_id, BTN_REMOVE);
+        assert!(st.on_settings_key_down_ex(NULL, VK_TAB, true));
+        assert_eq!(st.focus_id, BTN_ADD);
+        assert!(st.on_settings_key_down_ex(NULL, VK_DOWN, false));
+        assert_eq!(st.focus_id, BTN_REMOVE);
+        assert!(st.on_settings_key_down_ex(NULL, VK_UP, false));
+        assert_eq!(st.focus_id, BTN_ADD);
+        assert!(!st.on_settings_key_down_ex(NULL, VK_ESCAPE, false));
+    }
+
+    #[test]
+    fn focus_activate_honours_disabled() {
+        let mut st = UiState::default();
+        st.cur_view = View::Main;
+        st.scan_active = true;
+        st.focus_id = BTN_REFRESH;
+        assert!(st.on_settings_key_down_ex(NULL, VK_RETURN, false));
+        assert_eq!(st.status_text, SCAN_BUSY_TEXT);
+        assert!(st.scan_active);
+    }
+
+    #[test]
+    fn remove_without_selection_feedback() {
+        let mut st = UiState::default();
+        st.ui_dirs = vec![r"C:\Media\Movies".into()];
+        st.sel_row = -1;
+        st.hover_row = -1;
+        st.remove_dir_at(-1);
+        assert_eq!(st.status_text, "Select a folder first.");
+        assert_eq!(st.ui_dirs.len(), 1);
+    }
+
+    #[test]
+    fn scan_blocks_edits() {
+        for id in [BTN_ADD, BTN_REMOVE, BTN_REFRESH] {
+            assert_eq!(scan_blocked_reason(true, id), SCAN_BUSY_TEXT);
+        }
+        for id in [BTN_SCAN, BTN_CLOSE, BTN_SETTINGS, BTN_CARD] {
+            assert_eq!(scan_blocked_reason(true, id), "");
+        }
+        for id in [BTN_ADD, BTN_REMOVE, BTN_REFRESH, BTN_SCAN, BTN_CLOSE] {
+            assert_eq!(scan_blocked_reason(false, id), "");
+        }
+    }
+
+    #[test]
+    fn remove_dim_needs_target() {
+        assert!(!remove_has_target(-1, -1, 1));
+        assert!(remove_has_target(0, -1, 1));
+        assert!(remove_has_target(-1, 0, 1));
+        assert!(!remove_has_target(0, 0, 0));
+    }
+
+    #[test]
+    fn audit_single_line_verdict_classes() {
+        assert_eq!(audit_single_line_verdict(100, 15, 420, 20, true), "");
+        assert_eq!(audit_single_line_verdict(100, 15, 420, 20, false), "");
+        assert_eq!(audit_single_line_verdict(449, 15, 420, 20, true), "trimmed");
+        assert_eq!(
+            audit_single_line_verdict(449, 15, 420, 20, false),
+            "overflow"
+        );
+        assert_eq!(audit_single_line_verdict(100, 30, 420, 20, true), "trimmed");
+        assert_eq!(
+            audit_single_line_verdict(100, 30, 420, 20, false),
+            "overflow"
+        );
+    }
+
+    #[test]
+    fn scan_bar_model_walk_resolve() {
+        assert_eq!(scan_bar_model(false, 0, 0), (false, false, 0.0));
+        let (show, det, _) = scan_bar_model(true, 0, 0);
+        assert!(show && !det);
+        assert_eq!(scan_bar_model(true, 12, 24), (true, true, 0.5));
+        assert_eq!(scan_bar_model(true, 24, 24), (true, true, 1.0));
+        assert_eq!(scan_bar_model(true, 30, 24), (true, true, 1.0));
+    }
+
+    #[test]
+    fn scan_key_fraction_cases() {
+        let cases = [
+            (0, 10, Some(0.0)),
+            (5, 10, Some(0.5)),
+            (10, 10, Some(1.0)),
+            (15, 10, Some(1.0)),
+            (-2, 10, Some(0.0)),
+            (5, 0, None),
+            (5, -3, None),
+        ];
+        for (done, total, want) in cases {
+            assert_eq!(scan_key_fraction(done, total), want, "({done},{total})");
+        }
+    }
+
+    #[test]
+    fn scan_lifecycle_throttle() {
+        let t0 = Instant::now();
+        let (st, fx) = scan_lifecycle_next(ScanLifecycle::default(), ScanLifecycleEvent::Start, t0);
+        assert!(fx.arm && st.last_paint == t0);
+        let mut last = st;
+        let mut admitted = 0;
+        for i in 1..=100 {
+            let now = t0 + Duration::from_millis(i * 10);
+            let (next, fx) = scan_lifecycle_next(last, ScanLifecycleEvent::Progress, now);
+            if fx.paint {
+                admitted += 1;
+                last = next;
+            }
+        }
+        assert!(admitted <= 10, "admitted {admitted}/s");
+        assert!(admitted > 0);
+    }
+
+    #[test]
+    fn scan_lifecycle_arm_and_reset() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(3600);
+        let (st, fx) = scan_lifecycle_next(
+            ScanLifecycle {
+                active: false,
+                last_paint: old,
+            },
+            ScanLifecycleEvent::Start,
+            now,
+        );
+        assert!(st.active);
+        assert!(fx.arm);
+        assert_eq!(st.last_paint, now);
+        assert!(fx.paint);
+        assert!(!fx.kill);
+    }
+
+    #[test]
+    fn scan_lifecycle_one_scan_at_a_time() {
+        let now = Instant::now();
+        let running = ScanLifecycle {
+            active: true,
+            last_paint: now - Duration::from_secs(1),
+        };
+        let (next, fx) = scan_lifecycle_next(running, ScanLifecycleEvent::Start, now);
+        assert_eq!(fx, ScanFx::default());
+        assert_eq!(next, running);
+    }
+
+    #[test]
+    fn scan_lifecycle_tick_gate() {
+        let t0 = Instant::now();
+        let (st, _) = scan_lifecycle_next(ScanLifecycle::default(), ScanLifecycleEvent::Start, t0);
+        let (next, fx) = scan_lifecycle_next(st, ScanLifecycleEvent::Tick, t0);
+        assert!(!fx.paint && next.last_paint == t0);
+        let later = t0 + SCAN_PAINT_INTERVAL;
+        let (next, fx) = scan_lifecycle_next(st, ScanLifecycleEvent::Progress, later);
+        assert!(fx.paint && next.last_paint == later);
+        let (_, fx) =
+            scan_lifecycle_next(ScanLifecycle::default(), ScanLifecycleEvent::Tick, later);
+        assert_eq!(fx, ScanFx::default());
+        assert!(scan_paint_gate(t0, t0 - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn scan_lifecycle_terminal_paint() {
+        let now = Instant::now();
+        let (st, _) = scan_lifecycle_next(ScanLifecycle::default(), ScanLifecycleEvent::Start, now);
+        let (next, fx) = scan_lifecycle_next(st, ScanLifecycleEvent::Done, now);
+        assert!(fx.kill && fx.terminal && !fx.paint && !next.active);
+        let (back, fx_back) = scan_lifecycle_next(
+            st,
+            ScanLifecycleEvent::Done,
+            now - Duration::from_secs(3600),
+        );
+        assert!(fx_back.kill && fx_back.terminal && !back.active);
+        let (_, fx) = scan_lifecycle_next(ScanLifecycle::default(), ScanLifecycleEvent::Done, now);
+        assert!(fx.kill && !fx.terminal);
+    }
+
+    #[test]
+    fn scan_start_clears_stale_progress() {
+        let mut st = UiState::default();
+        st.arm_timer = Arc::new(|_| {});
+        st.scan_progress = Progress {
+            keys_done: 24,
+            keys_total: 24,
+            keys_fetched: 4,
+            keys_cached: 20,
+            folders_scanned: 6,
+            ..Progress::default()
+        };
+        st.scan_resolve_start = Some(Instant::now() - Duration::from_secs(60));
+        st.scan_resolve_base = 20;
+        let now = Instant::now();
+        let started = st.begin_scan_run(NULL, false, now);
+        assert!(started.is_some());
+        assert_eq!(st.scan_progress, Progress::default());
+        assert!(st.scan_resolve_start.is_none());
+        assert_eq!(st.scan_resolve_base, 0);
+        if let Some(c) = st.scan_cancel.take() {
+            c.cancel();
+        }
+    }
+
+    #[test]
+    fn scan_start_applies_effects() {
+        let arms = Arc::new(AtomicU32::new(0));
+        let a = arms.clone();
+        let mut st = UiState::default();
+        st.arm_timer = Arc::new(move |_| {
+            a.fetch_add(1, Ordering::SeqCst);
+        });
+        st.scan_last_paint = Instant::now() - Duration::from_secs(3600);
+        let now = Instant::now();
+        assert!(st.begin_scan_run(NULL, false, now).is_some());
+        assert!(st.scan_active);
+        assert_eq!(arms.load(Ordering::SeqCst), 1);
+        assert_eq!(st.scan_last_paint, now);
+        assert_eq!(st.status_text, "Scan starting...");
+        assert!(!st.scan_force);
+
+        assert!(
+            st.begin_scan_run(NULL, true, now + Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(arms.load(Ordering::SeqCst), 1);
+        assert_eq!(st.scan_last_paint, now);
+        assert_eq!(st.status_text, "Scan starting...");
+        if let Some(c) = st.scan_cancel.take() {
+            c.cancel();
+        }
+
+        let mut st2 = UiState::default();
+        let arms2 = Arc::new(AtomicU32::new(0));
+        let a2 = arms2.clone();
+        st2.arm_timer = Arc::new(move |_| {
+            a2.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(st2.begin_scan_run(NULL, true, now).is_some());
+        assert_eq!(st2.status_text, "Refresh starting...");
+        assert!(st2.scan_force);
+        if let Some(c) = st2.scan_cancel.take() {
+            c.cancel();
+        }
+    }
+
+    #[test]
+    fn refresh_scan_live_text_applies_effects() {
+        let mut st = UiState::default();
+        let now = Instant::now();
+        st.scan_active = true;
+        st.scan_cancel = Some(library::Cancel::background());
+        st.scan_start = now - Duration::from_secs(30);
+        st.scan_last_paint = now - Duration::from_secs(3600);
+        st.scan_resolve_start = None;
+        st.scan_resolve_base = 0;
+        let snap = Progress {
+            keys_done: 120,
+            keys_total: 1000,
+            keys_fetched: 90,
+            keys_cached: 20,
+            keys_failed: 10,
+            folders_scanned: 9,
+            folders_skipped: 1,
+            ..Progress::default()
+        };
+        st.scan_progress = snap.clone();
+        st.status_text = "SENTINEL".into();
+
+        st.refresh_scan_live_text(NULL, ScanLifecycleEvent::Progress, now);
+        assert_eq!(st.scan_last_paint, now);
+        assert_eq!(st.scan_resolve_start, Some(now));
+        assert_eq!(st.scan_resolve_base, scan_observed_done(&snap));
+        let want = scan_live_status_text(
+            &snap,
+            now.saturating_duration_since(st.scan_start),
+            scan_resolve_elapsed(Some(now), now),
+            scan_observed_done(&snap),
+            window_dpi(NULL),
+            live_status_avail_px(NULL),
+        );
+        assert_eq!(st.status_text, want);
+        assert!(st.status_text.starts_with("Scan "));
+
+        st.status_text = "SENTINEL2".into();
+        st.scan_progress = Progress {
+            keys_done: 121,
+            keys_total: 1000,
+            keys_fetched: 91,
+            keys_cached: 20,
+            keys_failed: 10,
+            folders_scanned: 9,
+            folders_skipped: 1,
+            ..Progress::default()
+        };
+        st.refresh_scan_live_text(NULL, ScanLifecycleEvent::Tick, now);
+        assert_eq!(st.status_text, "SENTINEL2");
+        assert_eq!(st.scan_last_paint, now);
+
+        st.scan_cancel = None;
+        st.status_text = "SENTINEL3".into();
+        st.refresh_scan_live_text(
+            NULL,
+            ScanLifecycleEvent::Progress,
+            now + Duration::from_secs(10),
+        );
+        assert_eq!(st.status_text, "SENTINEL3");
+    }
+
+    #[test]
+    fn scan_terminal_arg_parity() {
+        let kills = Arc::new(AtomicU32::new(0));
+        let k = kills.clone();
+        let mut st = UiState::default();
+        st.kill_timer = Arc::new(move |_| {
+            k.fetch_add(1, Ordering::SeqCst);
+        });
+        let land = |st: &mut UiState, force: bool, stats: Stats, err: Option<UiScanError>| {
+            st.scan_stats = stats;
+            st.scan_err = err;
+            st.scan_force = force;
+            st.scan_active = true;
+            st.scan_cancel = Some(library::Cancel::background());
+            st.on_scan_done(NULL);
+        };
+        let ok = Stats {
+            keys: 24,
+            keys_done: 24,
+            keys_cached: 5,
+            keys_fetched: 2,
+            keys_not_found: 17,
+            files: 10,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Stats::default()
+        };
+        land(&mut st, false, ok, None);
+        assert_eq!(st.status_text, scan_done_text("Scan", &ok));
+        land(&mut st, true, ok, None);
+        assert_eq!(st.status_text, scan_done_text("Refresh", &ok));
+        assert_eq!(kills.load(Ordering::SeqCst), 2);
+        assert!(!st.scan_active);
+        assert!(st.scan_cancel.is_none());
+
+        let cancelled = Stats {
+            keys: 24,
+            keys_done: 12,
+            cancelled: true,
+            ..Stats::default()
+        };
+        land(&mut st, false, cancelled, Some(UiScanError::other("boom")));
+        assert_eq!(st.status_text, scan_cancelled_text(12, 24));
+        let bare = Stats {
+            keys: 10,
+            keys_done: 4,
+            ..Stats::default()
+        };
+        land(&mut st, true, bare, Some(UiScanError::cancelled()));
+        assert_eq!(st.status_text, scan_cancelled_text(4, 10));
+        land(&mut st, false, ok, Some(UiScanError::other("disk gone")));
+        assert!(st.status_text.contains("Scan failed:"));
+        land(&mut st, true, ok, Some(UiScanError::other("disk gone")));
+        assert!(st.status_text.contains("Refresh failed:"));
+
+        kills.store(0, Ordering::SeqCst);
+        st.status_text = "keep me".into();
+        st.scan_active = false;
+        st.on_scan_done(NULL);
+        assert_eq!(kills.load(Ordering::SeqCst), 1);
+        assert_eq!(st.status_text, "keep me");
+    }
+
+    #[test]
+    fn scan_eta_defensible() {
+        let suppressed = [
+            (Progress::default(), Duration::from_secs(30)),
+            (
+                Progress {
+                    keys_total: 1000,
+                    ..Progress::default()
+                },
+                Duration::from_secs(30),
+            ),
+            (
+                Progress {
+                    keys_done: 3,
+                    keys_total: 1000,
+                    keys_fetched: 3,
+                    ..Progress::default()
+                },
+                Duration::from_secs(30),
+            ),
+            (
+                Progress {
+                    keys_done: 990,
+                    keys_total: 1000,
+                    keys_cached: 990,
+                    ..Progress::default()
+                },
+                Duration::from_secs(30),
+            ),
+            (
+                Progress {
+                    keys_done: 995,
+                    keys_total: 1000,
+                    keys_cached: 990,
+                    keys_fetched: 5,
+                    ..Progress::default()
+                },
+                Duration::from_secs(1),
+            ),
+            (
+                Progress {
+                    keys_done: 100,
+                    keys_total: 1000,
+                    keys_fetched: 100,
+                    ..Progress::default()
+                },
+                Duration::from_secs(1),
+            ),
+            (
+                Progress {
+                    keys_done: 1000,
+                    keys_total: 1000,
+                    keys_fetched: 900,
+                    keys_cached: 100,
+                    ..Progress::default()
+                },
+                Duration::from_secs(30),
+            ),
+        ];
+        for (p, resolve) in suppressed {
+            assert!(scan_eta(&p, 0, resolve).is_none());
+        }
+        let pre = Progress {
+            keys_done: 100,
+            keys_total: 1000,
+            keys_fetched: 100,
+            ..Progress::default()
+        };
+        assert!(scan_eta(&pre, 100, Duration::from_secs(20)).is_none());
+        let steady = Progress {
+            keys_done: 100,
+            keys_total: 1000,
+            keys_fetched: 100,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_eta(&steady, 0, Duration::from_secs(20)),
+            Some(Duration::from_secs(180))
+        );
+        let delta = Progress {
+            keys_done: 200,
+            keys_total: 1000,
+            keys_fetched: 200,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_eta(&delta, 100, Duration::from_secs(20)),
+            Some(Duration::from_secs(160))
+        );
+        let mixed = Progress {
+            keys_done: 600,
+            keys_total: 1000,
+            keys_fetched: 100,
+            keys_cached: 500,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_eta(&mixed, 0, Duration::from_secs(20)),
+            Some(Duration::from_secs(80))
+        );
+        let half = Progress {
+            keys_done: 500,
+            keys_total: 1000,
+            keys_fetched: 500,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_eta(&half, 0, Duration::from_secs(10)),
+            Some(Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn format_scan_duration_cases() {
+        let cases = [
+            (Duration::ZERO, "0s"),
+            (Duration::from_secs(5), "5s"),
+            (Duration::from_secs(65), "1m05s"),
+            (Duration::from_secs(3720), "1h02m"),
+        ];
+        for (d, want) in cases {
+            assert_eq!(format_scan_duration(d), want);
+        }
+    }
+
+    #[test]
+    fn scan_live_status_text_fit() {
+        let p = Progress {
+            keys_done: 12,
+            keys_total: 24,
+            keys_fetched: 7,
+            keys_cached: 5,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Progress::default()
+        };
+        let avail = scan_status_avail_px(96);
+        let (_, _, early_eta) = scan_live_status_parts(
+            &p,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            0,
+        );
+        assert_eq!(early_eta, "");
+        let early = scan_live_status_text(
+            &p,
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            0,
+            96,
+            avail,
+        );
+        assert!(early.contains(" | 0s"), "{early}");
+        assert!(!early.contains("eta"));
+        let (_, _, steady_eta) =
+            scan_live_status_parts(&p, Duration::from_secs(20), Duration::from_secs(20), 0);
+        assert_ne!(steady_eta, "");
+        let base = scan_progress_text(&p);
+        let steady = scan_live_status_text(
+            &p,
+            Duration::from_secs(20),
+            Duration::from_secs(20),
+            0,
+            96,
+            avail,
+        );
+        assert!(steady.contains(&base), "{steady}");
+        let walk = scan_live_status_text(
+            &Progress::default(),
+            Duration::from_secs(30),
+            Duration::ZERO,
+            0,
+            96,
+            avail,
+        );
+        assert!(!walk.contains("eta"));
+        let burst = Progress {
+            keys_done: 990,
+            keys_total: 1000,
+            keys_cached: 990,
+            ..Progress::default()
+        };
+        assert!(
+            !scan_live_status_text(
+                &burst,
+                Duration::from_secs(65),
+                Duration::from_secs(1),
+                0,
+                96,
+                avail
+            )
+            .contains("eta")
+        );
+        assert!(
+            !scan_live_status_text(
+                &burst,
+                Duration::from_secs(90),
+                Duration::from_secs(30),
+                0,
+                96,
+                avail
+            )
+            .contains("eta")
+        );
+        let big = Progress {
+            keys_done: 45000,
+            keys_total: 90000,
+            keys_fetched: 15000,
+            keys_cached: 15000,
+            keys_failed: 15000,
+            folders_scanned: 450,
+            folders_skipped: 32,
+            ..Progress::default()
+        };
+        let got = scan_live_status_text(
+            &big,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            15000,
+            96,
+            avail,
+        );
+        assert!(got.len() <= MAX_SCAN_STATUS_LEN, "len {}", got.len());
+        assert!(got.contains("folders"), "{got}");
+    }
+
+    #[test]
+    fn compose_scan_live_status_priority() {
+        let p = Progress {
+            keys_done: 12000,
+            keys_total: 30000,
+            keys_fetched: 8000,
+            keys_cached: 3000,
+            keys_failed: 1000,
+            folders_scanned: 200,
+            folders_skipped: 15,
+            ..Progress::default()
+        };
+        let (elapsed, resolve) = (Duration::from_secs(20), Duration::from_secs(20));
+        let measure = |s: &str| s.chars().count() as i32;
+        let cands = scan_status_candidates(&p, elapsed, resolve, 0);
+        let full = cands[0].clone();
+        assert!(full.contains("eta"));
+        assert_eq!(
+            compose_scan_live_status(
+                &p,
+                elapsed,
+                resolve,
+                0,
+                full.chars().count() as i32,
+                measure
+            ),
+            full
+        );
+        let (counters, elapsed_sfx, _) = scan_live_status_parts(&p, elapsed, resolve, 0);
+        let ce = format!("{counters}{elapsed_sfx}");
+        assert_eq!(
+            compose_scan_live_status(&p, elapsed, resolve, 0, ce.chars().count() as i32, measure),
+            ce
+        );
+        let short = scan_progress_short(&p);
+        let se = format!("{short}{elapsed_sfx}");
+        assert!(se.chars().count() < ce.chars().count());
+        assert_eq!(
+            compose_scan_live_status(&p, elapsed, resolve, 0, se.chars().count() as i32, measure),
+            se
+        );
+        let minimal = scan_progress_minimal(&p);
+        let floor = scan_progress_floor(&p);
+        assert_eq!(minimal, format!("{floor}, 1k failed"));
+        assert!(minimal.chars().count() < short.chars().count());
+        assert_eq!(
+            compose_scan_live_status(
+                &p,
+                elapsed,
+                resolve,
+                0,
+                minimal.chars().count() as i32,
+                measure
+            ),
+            minimal
+        );
+        assert_eq!(
+            compose_scan_live_status(&p, elapsed, resolve, 0, 1, measure),
+            floor
+        );
+    }
+
+    #[test]
+    fn scan_live_status_fits_at_all_dpi() {
+        let catching = Progress {
+            done: 23402,
+            total: 23402,
+            resolved: 1118,
+            keys_total: 2309,
+            keys_done: 1118,
+            keys_cached: 418,
+            keys_fetched: 700,
+            folders_scanned: 3,
+            ..Progress::default()
+        };
+        let cases = [
+            (
+                Progress {
+                    folders_scanned: 3,
+                    ..Progress::default()
+                },
+                Duration::from_secs(30),
+                Duration::ZERO,
+                0,
+            ),
+            (
+                Progress {
+                    keys_done: 12,
+                    keys_total: 24,
+                    keys_fetched: 7,
+                    keys_cached: 5,
+                    folders_scanned: 4,
+                    folders_skipped: 2,
+                    ..Progress::default()
+                },
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                0,
+            ),
+            (
+                Progress {
+                    keys_done: 100,
+                    keys_total: 1000,
+                    keys_fetched: 100,
+                    folders_scanned: 9,
+                    folders_skipped: 1,
+                    ..Progress::default()
+                },
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                0,
+            ),
+            (
+                Progress {
+                    keys_done: 12000,
+                    keys_total: 30000,
+                    keys_fetched: 8000,
+                    keys_cached: 3000,
+                    keys_failed: 1000,
+                    folders_scanned: 200,
+                    folders_skipped: 15,
+                    ..Progress::default()
+                },
+                Duration::from_secs(600),
+                Duration::from_secs(600),
+                0,
+            ),
+            (
+                Progress {
+                    keys_done: 45000,
+                    keys_total: 90000,
+                    keys_fetched: 15000,
+                    keys_cached: 15000,
+                    keys_failed: 15000,
+                    folders_scanned: 450,
+                    folders_skipped: 32,
+                    ..Progress::default()
+                },
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+                15000,
+            ),
+            (
+                catching,
+                Duration::from_secs(360),
+                Duration::from_secs(300),
+                418,
+            ),
+            (
+                Progress {
+                    keys_done: 999_800,
+                    keys_total: 999_900,
+                    keys_fetched: 50000,
+                    keys_cached: 50000,
+                    keys_failed: 899_800,
+                    folders_scanned: 999,
+                    folders_skipped: 99,
+                    ..Progress::default()
+                },
+                Duration::from_secs(3600),
+                Duration::from_secs(3600),
+                50000,
+            ),
+        ];
+        for dpi in [96, 120, 144, 192] {
+            let cw = scale_px(dpi, MAIN_CLIENT_W);
+            let ch = scale_px(dpi, MAIN_CLIENT_H);
+            let l = compute_layout(&dirs(0), cw, ch, dpi);
+            let avail = l.status.right - l.status.left;
+            assert_eq!(avail, scan_status_avail_px(dpi));
+            assert_eq!(avail, status_avail_px(cw, dpi));
+            let mut widths = vec![avail];
+            if dpi > 96 {
+                let narrow = status_avail_px(MAIN_CLIENT_W, dpi);
+                if narrow < avail {
+                    widths.push(narrow);
+                }
+            }
+            for budget in widths {
+                for (p, elapsed, resolve, base) in &cases {
+                    let text = scan_live_status_text(p, *elapsed, *resolve, *base, dpi, budget);
+                    let Some(need) = measure_scan_status_width(dpi, &text) else {
+                        return; // no GDI DC: skip (the one native exception)
+                    };
+                    assert!(
+                        need <= budget,
+                        "dpi {dpi} avail {budget} need {need}: {text:?}"
+                    );
+                }
+            }
+        }
+        let big = &cases[6];
+        let (counters, elapsed_sfx, eta_sfx) = scan_live_status_parts(&big.0, big.1, big.2, big.3);
+        assert_ne!(eta_sfx, "");
+        let Some(need) =
+            measure_scan_status_width(96, &format!("{counters}{elapsed_sfx}{eta_sfx}"))
+        else {
+            return;
+        };
+        assert!(
+            need > scan_status_avail_px(96),
+            "control is vacuous: {need}"
+        );
+        let narrow192 = status_avail_px(MAIN_CLIENT_W, 192);
+        let Some(min_need) = measure_scan_status_width(192, &scan_progress_minimal(&big.0)) else {
+            return;
+        };
+        assert!(
+            min_need > narrow192,
+            "minimal must overflow the narrowest budget"
+        );
+        let floor = scan_progress_floor(&big.0);
+        let Some(floor_need) = measure_scan_status_width(192, &floor) else {
+            return;
+        };
+        assert!(floor_need <= narrow192, "floor must fit");
+        let fallback = format!("{floor} | {}", format_scan_duration(big.1));
+        let Some(fb) = measure_scan_status_width(192, &fallback) else {
+            return;
+        };
+        assert!(fb <= narrow192, "fallback must fit");
+        assert_eq!(
+            scan_live_status_text(&big.0, big.1, big.2, big.3, 192, narrow192),
+            floor
+        );
+    }
+
+    #[test]
+    fn scan_bar_geometry() {
+        for dpi in [96, 120, 144, 192] {
+            let cw = scale_px(dpi, MAIN_CLIENT_W);
+            let ch = scale_px(dpi, MAIN_CLIENT_H);
+            let l = compute_layout(&dirs(0), cw, ch, dpi);
+            if dpi == 96 {
+                assert_eq!(l.status.right - l.status.left, 420);
+            }
+            let bar = scan_bar_rect(l.status, dpi);
+            assert!(bar.right > bar.left && bar.bottom > bar.top);
+            assert!(bar.left >= 0 && bar.top >= 0 && bar.right <= cw && bar.bottom <= ch);
+            assert!(
+                !rects_intersect(bar, l.status),
+                "dpi {dpi}: bar intersects status"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_indeterminate_pulse() {
+        assert_eq!(scan_indeterminate_pos(Duration::ZERO), 0.0);
+        assert_eq!(scan_indeterminate_pos(Duration::from_millis(600)), 0.5);
+        assert_eq!(scan_indeterminate_pos(Duration::from_millis(1200)), 0.0);
+        for d in [
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+            Duration::from_secs(3600),
+        ] {
+            let v = scan_indeterminate_pos(d);
+            assert!((0.0..1.0).contains(&v));
+        }
+    }
+
+    #[test]
+    fn scan_catching_up_text() {
+        let p = Progress {
+            done: 23402,
+            total: 23402,
+            resolved: 1118,
+            keys_total: 2309,
+            keys_done: 1118,
+            keys_cached: 418,
+            keys_fetched: 700,
+            folders_scanned: 3,
+            ..Progress::default()
+        };
+        assert!(scan_catching_up(&p));
+        let seg = scan_index_meta_text(&p);
+        assert_eq!(
+            seg,
+            "indexed 23402 of 23402 files | metadata 1118 of 2309 - catching up"
+        );
+        assert!(scan_progress_text(&p).contains(&seg));
+        let measure = |s: &str| s.chars().count() as i32;
+        assert_eq!(
+            compose_scan_live_status(
+                &p,
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                0,
+                seg.chars().count() as i32,
+                measure
+            ),
+            seg
+        );
+        let (show, det, frac) = scan_bar_progress(&p, true);
+        assert!(show && det && frac < 1.0);
+    }
+
+    #[test]
+    fn scan_finished_text_not_catching_up() {
+        let mut p = Progress {
+            done: 23402,
+            total: 23402,
+            resolved: 1118,
+            keys_total: 2309,
+            keys_done: 1118,
+            keys_cached: 418,
+            keys_fetched: 700,
+            folders_scanned: 3,
+            ..Progress::default()
+        };
+        p.resolved = p.keys_total;
+        p.keys_done = p.keys_total;
+        assert!(!scan_catching_up(&p));
+        let seg = scan_index_meta_text(&p);
+        assert_eq!(seg, "indexed 23402 of 23402 files | metadata 2309 of 2309");
+        assert!(!seg.contains("catching up"));
+        let measure = |s: &str| s.chars().count() as i32;
+        assert_eq!(
+            compose_scan_live_status(
+                &p,
+                Duration::from_secs(20),
+                Duration::from_secs(20),
+                0,
+                seg.chars().count() as i32,
+                measure
+            ),
+            seg
+        );
+        let (_, det, frac) = scan_bar_progress(&p, true);
+        assert!(det && frac == 1.0);
+        let walk = Progress {
+            done: 5,
+            total: 10,
+            folders_scanned: 1,
+            ..Progress::default()
+        };
+        assert!(!scan_catching_up(&walk));
+        assert_eq!(scan_index_meta_text(&walk), "indexed 5 of 10 files");
+        let (show, det, _) = scan_bar_progress(&walk, true);
+        assert!(show && !det);
+        assert_eq!(scan_index_meta_text(&Progress::default()), "");
+    }
+
+    #[test]
+    fn report_decision_branches() {
+        let scratch = Scratch::new("report-decision");
+        let missing = scratch.join("missing.json");
+        let mut st = UiState::default();
+        st.status_text = String::new();
+        st.on_report_at(NULL, &missing);
+        assert_eq!(st.status_text, REPORT_NOTHING_TEXT);
+        assert!(st.status_text.to_lowercase().contains("nothing to report"));
+
+        let dir = scratch.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        repair::report::write_report(&dir, &repair::report::Report::default()).unwrap();
+        st.status_text = String::new();
+        st.on_report_at(NULL, &dir.join(repair::report::REPORT_JSON_NAME));
+        assert_eq!(st.status_text, REPORT_NOTHING_TEXT);
+
+        let bad = scratch.write("bad.json", "{not json");
+        st.status_text = String::new();
+        st.on_report_at(NULL, &bad);
+        assert_eq!(st.status_text, REPORT_NOTHING_TEXT);
+
+        let one = repair::report::Report {
+            entries: vec![repair::report::Entry {
+                name: "a.mkv".into(),
+                ..repair::report::Entry::default()
+            }],
+            ..repair::report::Report::default()
+        };
+        assert_eq!(report_decision(&one, false), (true, ""));
+        assert_eq!(
+            report_decision(&repair::report::Report::default(), false),
+            (false, REPORT_NOTHING_TEXT)
+        );
+        assert_eq!(report_decision(&one, true), (false, REPORT_NOTHING_TEXT));
+    }
+
+    #[test]
+    fn report_off_thread() {
+        let scratch = Scratch::new("report-thread");
+        let dir = scratch.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        repair::report::write_report(
+            &dir,
+            &repair::report::Report {
+                entries: vec![repair::report::Entry {
+                    name: "a.mkv".into(),
+                    ..repair::report::Entry::default()
+                }],
+                ..repair::report::Report::default()
+            },
+        )
+        .unwrap();
+        const WANT: &str = "https://example.invalid/potflix/issues/1";
+        let mut st = UiState::default();
+        st.create_issue = Arc::new(|_| {
+            std::thread::sleep(Duration::from_millis(300));
+            (WANT.to_string(), None)
+        });
+        st.open_url = Arc::new(|_| false);
+        st.status_text = String::new();
+        let start = Instant::now();
+        st.on_report_at(NULL, &dir.join(repair::report::REPORT_JSON_NAME));
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "on_report_at blocked"
+        );
+        assert_eq!(st.status_text, REPORT_PENDING_TEXT);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !st.report_done_text.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "worker never published");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        st.on_report_done();
+        assert_eq!(st.status_text, report_launch_text(WANT));
+        assert!(st.status_text.contains(WANT));
+    }
+
+    #[test]
+    fn clear_actions_are_distinct() {
+        assert_ne!(
+            crate::settings::CLEAR_METADATA_STATUS,
+            crate::settings::clear_index_status(3)
+        );
+        let scratch = Scratch::new("clear-distinct");
+        let base = scratch.path().to_path_buf();
+        let meta = base.join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let meta_s = meta.to_string_lossy().into_owned();
+        let key = "movie|alpha|2001";
+        metadata::cache::cache_put_raw(
+            &meta_s,
+            key,
+            br#"{"key":"movie|alpha|2001","schema":3,"media":{"title":"Alpha"}}"#,
+        )
+        .unwrap();
+        let idx = base.join("scanindex.json");
+        let idx_s = idx.to_string_lossy().into_owned();
+        let seed_index = || {
+            let ix = library::scanindex::load_scan_index(&idx_s);
+            ix.record(
+                r"C:\Media",
+                "fp-1",
+                metadata::cache::CACHE_SCHEMA,
+                &[key.to_string()],
+            );
+            ix.save(&idx_s).unwrap();
+        };
+        seed_index();
+
+        let (records, err) = crate::settings::clear_scan_index(&idx_s);
+        assert!(err.is_ok());
+        assert_eq!(records, 1);
+        assert!(!std::path::Path::new(&library::index::index_store_path(&idx_s)).exists());
+        assert!(metadata::cache::cache_has(&meta_s, key));
+
+        seed_index();
+        crate::settings::clear_metadata_cache(&meta_s).unwrap();
+        assert!(!metadata::cache::cache_has(&meta_s, key));
+        assert_eq!(library::scanindex::load_scan_index(&idx_s).len(), 1);
+    }
+
+    #[test]
+    fn report_button_layout() {
+        let l = compute_layout(&dirs(1), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
+        let by_id = |id: i32| l.btns.iter().find(|b| b.id == id).cloned().unwrap();
+        let rep = by_id(BTN_REPORT);
+        let scan = by_id(BTN_SCAN);
+        let refresh = by_id(BTN_REFRESH);
+        assert_eq!(rep.label, REPORT_BUTTON_LABEL);
+        assert_eq!(rep.style, refresh.style);
+        assert_eq!(rep.rc.left, scan.rc.left);
+        assert_eq!(rep.rc.right, scan.rc.right);
+        assert!(rep.rc.top > refresh.rc.bottom);
+        assert!(rep.rc.bottom <= l.status.top && rep.rc.right <= MAIN_CLIENT_W);
+        assert_eq!(
+            button_at_point(
+                &l.btns,
+                (rep.rc.left + rep.rc.right) / 2,
+                (rep.rc.top + rep.rc.bottom) / 2
+            ),
+            BTN_REPORT
+        );
+        assert!(main_focus_order().contains(&BTN_REPORT));
+        assert_eq!(scan_blocked_reason(true, BTN_REPORT), "");
+    }
+
+    #[test]
+    fn open_url_texts() {
+        assert!(report_opened_text(false).contains("opened"));
+        assert!(report_opened_text(true).contains("prefilled"));
+        let url = "https://github.com/nathwn12/Potflix/issues/new?title=x";
+        assert!(report_launch_text(url).contains(url));
+        let path = repair_report_path();
+        assert!(
+            path.to_string_lossy()
+                .ends_with(repair::report::REPORT_JSON_NAME)
+        );
+        assert!(path.to_string_lossy().to_lowercase().contains("potflix"));
+    }
+
+    // -- cardview_test.go ---------------------------------------------------
+
+    #[test]
+    fn card_view_switch() {
+        let mut st = UiState::default();
+        st.cur_view = View::Main;
+        st.open_card();
+        assert_eq!(st.cur_view, View::Card);
+        st.close_card();
+        assert_eq!(st.cur_view, View::Main);
+    }
+
+    #[test]
+    fn card_esc() {
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        assert!(st.on_settings_key_down(NULL, VK_ESCAPE));
+        assert_eq!(st.cur_view, View::Main);
+        st.cur_view = View::Card;
+        assert!(!st.on_settings_key_down(NULL, 0x41));
+        assert_eq!(st.cur_view, View::Card);
+    }
+
+    #[test]
+    fn card_hit_test() {
+        for spec in [
+            CardSpec::default(),
+            CardSpec {
+                details: "title".into(),
+                state: "synopsis".into(),
+            },
+        ] {
+            let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &spec);
+            assert_eq!(l.btns.len(), 9);
+            for id in [
+                BTN_CARD_BACK,
+                card_details_button(0),
+                card_details_button(1),
+                card_details_button(2),
+                card_details_button(3),
+                card_state_button(0),
+                card_state_button(1),
+                card_state_button(2),
+                card_state_button(3),
+            ] {
+                let rc = l.card_btn(id).unwrap_or_else(|| panic!("id {id} missing"));
+                assert!(
+                    rc.right <= MAIN_CLIENT_W
+                        && rc.bottom <= MAIN_CLIENT_H
+                        && rc.left >= 0
+                        && rc.top >= 0
+                );
+                assert_eq!(
+                    button_at_point(&l.btns, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2),
+                    id
+                );
+            }
+            for (i, a) in l.btns.iter().enumerate() {
+                for b in l.btns.iter().skip(i + 1) {
+                    assert!(!rects_intersect(a.rc, b.rc));
+                }
+            }
+            assert_eq!(l.rows.len(), 5);
+            for r in &l.rows {
+                assert!(
+                    r.left >= l.preview.left
+                        && r.right <= l.preview.right
+                        && r.top >= l.preview.top
+                        && r.bottom <= l.preview.bottom
+                );
+            }
+        }
+        let a = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &CardSpec::default());
+        let b = compute_card_layout(
+            MAIN_CLIENT_W,
+            MAIN_CLIENT_H,
+            96,
+            &CardSpec {
+                details: "series".into(),
+                state: "none".into(),
+            },
+        );
+        for (x, y) in a.btns.iter().zip(b.btns.iter()) {
+            assert!(r_eq(x.rc, y.rc), "preset {} moved", x.id);
+        }
+    }
+
+    #[test]
+    fn card_text_invariants() {
+        for dpi in [96, 120, 144, 192] {
+            let cw = scale_px(dpi, MAIN_CLIENT_W);
+            let ch = scale_px(dpi, MAIN_CLIENT_H);
+            for spec in [
+                CardSpec::default(),
+                CardSpec {
+                    details: "title".into(),
+                    state: "tag".into(),
+                },
+            ] {
+                let l = compute_card_layout(cw, ch, dpi, &spec);
+                let rects = card_text_rects(cw, ch, dpi, &l);
+                for r in &rects {
+                    assert!(
+                        r.rc.right - r.rc.left > 0 && r.rc.bottom - r.rc.top > 0,
+                        "dpi {dpi}: {} non-positive",
+                        r.id
+                    );
+                    assert!(
+                        r.rc.left >= 0 && r.rc.top >= 0 && r.rc.right <= cw && r.rc.bottom <= ch,
+                        "dpi {dpi}: {} escapes",
+                        r.id
+                    );
+                }
+                for (i, a) in rects.iter().enumerate() {
+                    for b in rects.iter().skip(i + 1) {
+                        assert!(
+                            !rects_intersect(a.rc, b.rc),
+                            "dpi {dpi}: {} and {} intersect",
+                            a.id,
+                            b.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_card_affordance() {
+        let l = compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
+        let s = l.card_link;
+        assert!(s.right <= MAIN_CLIENT_W && s.bottom <= MAIN_CLIENT_H && s.left >= 0 && s.top >= 0);
+        assert!(s.right > s.left && s.bottom > s.top);
+        assert!(s.top >= 68 && s.bottom <= 92);
+        assert_eq!(s.right, l.settings.left);
+        let rects = main_text_rects(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &l, 2);
+        for (i, a) in rects.iter().enumerate() {
+            for b in rects.iter().skip(i + 1) {
+                assert!(
+                    !rects_intersect(a.rc, b.rc),
+                    "{} and {} intersect",
+                    a.id,
+                    b.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn card_preset_mapping() {
+        let (dets, states) = presence::cardspec::card_presets();
+        for (i, p) in dets.iter().enumerate() {
+            assert_eq!(
+                card_preset_for_button(card_details_button(i as i32)),
+                Some((0, p.id.clone()))
+            );
+        }
+        for (i, p) in states.iter().enumerate() {
+            assert_eq!(
+                card_preset_for_button(card_state_button(i as i32)),
+                Some((1, p.id.clone()))
+            );
+        }
+        for id in [0, 1, 2, 7, 10, 29, 34, 39, 44, 99] {
+            assert!(card_preset_for_button(id).is_none(), "id {id} mapped");
+        }
+        let spec = CardSpec {
+            details: "episode".into(),
+            state: "none".into(),
+        };
+        for p in &dets {
+            let want = if p.id == "episode" {
+                BTN_ACCENT
+            } else {
+                BTN_SUBTLE
+            };
+            assert_eq!(card_preset_style(0, &p.id, &spec), want);
+        }
+        for p in &states {
+            let want = if p.id == "none" {
+                BTN_ACCENT
+            } else {
+                BTN_SUBTLE
+            };
+            assert_eq!(card_preset_style(1, &p.id, &spec), want);
+        }
+    }
+
+    #[test]
+    fn preview_rows_quotes_payload() {
+        for (i, r) in preview_rows(&Activity::default(), false).iter().enumerate() {
+            assert!(!r.is_empty(), "placeholder {i} empty");
+        }
+        let act = Activity {
+            name: "Show Title".into(),
+            details: "The Episode".into(),
+            state: "S1 E2".into(),
+            large_image: "https://example.com/poster.jpg".into(),
+            small_image: "play".into(),
+            buttons: vec![
+                presence::Button {
+                    label: "Trailer".into(),
+                    url: "https://example.com/trailer".into(),
+                },
+                presence::Button {
+                    label: "IMDb".into(),
+                    url: "https://example.com/imdb".into(),
+                },
+            ],
+            ..Activity::default()
+        };
+        let got = preview_rows(&act, true);
+        assert_eq!(
+            got,
+            [
+                "Header: Show Title",
+                "Details: The Episode",
+                "State: S1 E2",
+                "Images: https://example.com/poster.jpg + play",
+                "Buttons: Trailer -> https://example.com/trailer | IMDb -> https://example.com/imdb",
+            ]
+        );
+        let idle = Activity {
+            details: "Browsing".into(),
+            state: "Idle".into(),
+            large_image: "logo".into(),
+            small_image: "stop".into(),
+            ..Activity::default()
+        };
+        let igot = preview_rows(&idle, true);
+        assert_eq!(igot[0], "Header: (Discord app name)");
+        assert_eq!(igot[2], "State: Idle");
+        assert_eq!(igot[3], "Images: logo + stop");
+        assert_eq!(igot[4], "Buttons: none");
+        let empty = Activity {
+            details: "X".into(),
+            large_image: "logo".into(),
+            small_image: "stop".into(),
+            ..Activity::default()
+        };
+        assert_eq!(preview_rows(&empty, true)[2], "State: ");
+    }
+
+    #[test]
+    fn preview_record_round_trip() {
+        let mut st = UiState::default();
+        let want = Activity {
+            name: "T".into(),
+            details: "D".into(),
+            state: "S".into(),
+            large_image: "logo".into(),
+            small_image: "play".into(),
+            ..Activity::default()
+        };
+        st.record_preview(want.clone());
+        let (got, have) = st.preview_activity();
+        assert!(have);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn preview_is_payload_through_send() {
+        let srv = discord::FakeServer::new(0);
+        let base = srv.base.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(srv.accept());
+        });
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: base,
+            retry_delay: Duration::from_millis(30),
+            on_connect: None,
+            on_frame: None,
+            on_reply: None,
+            on_ack_timeout: None,
+            on_drop: None,
+        });
+        dc.start();
+        let sc = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client connects")
+            .expect("accept");
+        let (op, _) = sc.read_frame().expect("handshake frame");
+        assert_eq!(op, discord::OP_HANDSHAKE);
+        sc.write_frame(
+            discord::OP_FRAME,
+            br#"{"cmd":"DISPATCH","evt":"READY","data":{"v":1}}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dc.generation() < 1 {
+            assert!(Instant::now() < deadline, "never became ready");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (ftx, frx) = mpsc::channel::<Vec<u8>>();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match sc.read_frame() {
+                    Ok((discord::OP_FRAME, payload)) => {
+                        if ftx.send(payload).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+        let now = 1_000_000_000_000i64;
+        let drive = |spec: CardSpec,
+                     act: &presence::Action,
+                     ct: i64|
+         -> (Activity, serde_json::Value, Vec<u8>) {
+            let mut st = UiState::default();
+            let mut gate = presence::gate::Gate::new();
+            let input = PushInput {
+                raw_title: raw,
+                action: Some(act),
+                resolved: presence::Resolved::default(),
+                resolved_found: false,
+                live_spec: spec,
+                ct,
+                total: 2_832_979,
+                now,
+                event: true,
+                debounced: false,
+            };
+            let mut deps = PushDeps {
+                dc: &dc,
+                gate: &mut gate,
+                state: &mut st,
+            };
+            push_activity(&mut deps, &input);
+            let payload = frx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("SET_ACTIVITY frame");
+            let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(v["cmd"], "SET_ACTIVITY");
+            assert!(!v["args"]["activity"].is_null());
+            let (got, have) = st.preview_activity();
+            assert!(have, "preview not recorded after a successful send");
+            (got, v, payload)
+        };
+        let check = |got: &Activity, v: &serde_json::Value| {
+            let a = &v["args"]["activity"];
+            assert_eq!(got.name, a["name"].as_str().unwrap_or(""));
+            assert_eq!(got.details, a["details"].as_str().unwrap_or(""));
+            assert_eq!(got.state, a["state"].as_str().unwrap_or(""));
+            let assets = &a["assets"];
+            let mut want_large = got.large_image.clone();
+            if want_large != "logo" && !want_large.starts_with("http") {
+                want_large = "logo".into();
+            }
+            if want_large.is_empty() {
+                want_large = "logo".into();
+            }
+            assert_eq!(assets["large_image"].as_str().unwrap_or(""), want_large);
+            assert_eq!(assets["large_text"].as_str().unwrap_or(""), got.large_text);
+            if got.has_start {
+                assert_eq!(a["timestamps"]["start"].as_i64(), Some(got.start));
+                if got.end > 0 {
+                    assert_eq!(a["timestamps"]["end"].as_i64(), Some(got.end));
+                } else {
+                    assert!(a["timestamps"]["end"].is_null());
+                }
+            }
+            assert_eq!(
+                a["buttons"].as_array().map_or(0, Vec::len),
+                got.buttons.len()
+            );
+        };
+
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 1000,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        let (got, v, _) = drive(presence::cardspec::default_card_spec(), &act, 1000);
+        check(&got, &v);
+
+        let act2 = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 2000,
+            ct: 2000,
+            ..presence::Action::default()
+        };
+        let (got2, v2, _) = drive(
+            CardSpec {
+                details: "title".into(),
+                state: "tag".into(),
+            },
+            &act2,
+            2000,
+        );
+        check(&got2, &v2);
+        assert!(!got2.details.is_empty() && !got2.state.is_empty());
+
+        let act3 = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 3000,
+            ct: 3000,
+            ..presence::Action::default()
+        };
+        let (got3, v3, frame) = drive(
+            CardSpec {
+                details: "default".into(),
+                state: "none".into(),
+            },
+            &act3,
+            3000,
+        );
+        check(&got3, &v3);
+        assert_eq!(got3.state, "");
+        let env: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert!(
+            env["args"]["activity"].get("state").is_none(),
+            "empty state reached the wire"
+        );
+        assert_eq!(env["args"]["activity"]["details"], "Pilot");
+
+        let _ = dc.close();
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn preview_not_recorded_on_send_failure() {
+        let scratch = Scratch::new("preview-fail");
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: format!("{}-no-pipe-", scratch.path().to_string_lossy()),
+            retry_delay: Duration::from_secs(3600),
+            on_connect: None,
+            on_frame: None,
+            on_reply: None,
+            on_ack_timeout: None,
+            on_drop: None,
+        });
+        let mut st = UiState::default();
+        let mut gate = presence::gate::Gate::new();
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: 999,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        let input = PushInput {
+            raw_title: "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+            action: Some(&act),
+            resolved: presence::Resolved::default(),
+            resolved_found: false,
+            live_spec: CardSpec::default(),
+            ct: 1000,
+            total: 2_832_979,
+            now: 1_000_000_000_000,
+            event: true,
+            debounced: false,
+        };
+        let mut deps = PushDeps {
+            dc: &dc,
+            gate: &mut gate,
+            state: &mut st,
+        };
+        push_activity(&mut deps, &input);
+        assert!(
+            !st.preview_activity().1,
+            "preview recorded after a failed send"
+        );
+    }
+
+    #[test]
+    fn dead_cache_label_text() {
+        assert_eq!(
+            crate::settings::dead_cache_label(0),
+            "0 titles marked dead - Clear metadata retries them"
+        );
+        assert_eq!(
+            crate::settings::dead_cache_label(5),
+            "5 titles marked dead - Clear metadata retries them"
+        );
+    }
+
+    #[test]
+    fn count_negatives_empty_dir() {
+        let scratch = Scratch::new("count-neg");
+        let dir = scratch.path().to_string_lossy().into_owned();
+        assert_eq!(metadata::cache::count_negatives(&dir), 0);
+        for name in ["notes.txt", ".tmp-abc.json", "partial"] {
+            std::fs::write(scratch.join(name), "{}").unwrap();
+        }
+        std::fs::write(scratch.join("corrupt.json"), "{not json").unwrap();
+        assert_eq!(metadata::cache::count_negatives(&dir), 0);
+        for i in 0..2 {
+            let body = format!(
+                r#"{{"key":"k{i}","schema":3,"not_found":true,"checked_at":"2026-01-01T00:00:00Z"}}"#
+            );
+            metadata::cache::cache_put_raw(&dir, &format!("k{i}"), body.as_bytes()).unwrap();
+        }
+        let pos = r#"{"key":"p","schema":3,"media":{"source":"tvmaze","sourceId":"1","kind":"series","title":"S","fetchedAt":"2026-01-01T00:00:00Z"}}"#;
+        metadata::cache::cache_put_raw(&dir, "p", pos.as_bytes()).unwrap();
+        assert_eq!(metadata::cache::count_negatives(&dir), 2);
+        assert_eq!(
+            metadata::cache::count_negatives(&scratch.join("missing").to_string_lossy()),
+            0
+        );
+    }
+
+    // -- scan_status_test.go ------------------------------------------------
+
+    #[test]
+    fn scan_progress_text_folders() {
+        let p = Progress {
+            keys_done: 12,
+            keys_total: 24,
+            keys_fetched: 3,
+            keys_cached: 5,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_progress_text(&p),
+            "Scan 12/24 keys | 3 fetched, 5 cached | 4/2 folders"
+        );
+    }
+
+    #[test]
+    fn scan_progress_text_all_cached() {
+        let p = Progress {
+            keys_done: 24,
+            keys_total: 24,
+            keys_fetched: 0,
+            keys_cached: 24,
+            folders_scanned: 6,
+            folders_skipped: 1,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_progress_text(&p),
+            "Scan 24/24 keys | 0 fetched, 24 cached | 6/1 folders"
+        );
+    }
+
+    #[test]
+    fn scan_progress_text_four_bucket() {
+        let p = Progress {
+            keys_done: 10,
+            keys_total: 20,
+            keys_fetched: 2,
+            keys_cached: 7,
+            keys_failed: 1,
+            folders_scanned: 3,
+            folders_skipped: 1,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_progress_text(&p),
+            "Scan 10/20 keys | 2 fetched, 7 cached, 1 failed | 3/1 folders"
+        );
+    }
+
+    #[test]
+    fn scan_progress_text_huge_elides() {
+        let p = Progress {
+            keys_done: 12_345_678,
+            keys_total: 98_765_432,
+            keys_fetched: 123_456,
+            keys_cached: 12_222_222,
+            folders_scanned: 1_234_567,
+            folders_skipped: 7_654_321,
+            ..Progress::default()
+        };
+        let got = scan_progress_text(&p);
+        assert!(
+            !got.contains("12345678") && !got.contains("98765432"),
+            "{got}"
+        );
+        assert!(got.contains("folders") && got.contains('/'));
+        assert!(got.len() <= MAX_SCAN_STATUS_LEN, "len {}", got.len());
+        // Extreme int64-scale counts stay bounded and keep the suffix.
+        let huge = Progress {
+            keys_done: 1 << 60,
+            keys_total: 1 << 60,
+            keys_fetched: 1 << 60,
+            keys_cached: 0,
+            folders_scanned: 1 << 40,
+            folders_skipped: 1 << 40,
+            ..Progress::default()
+        };
+        let got_huge = scan_progress_text(&huge);
+        assert!(!got_huge.contains(&(1_i64 << 60).to_string()), "{got_huge}");
+        assert!(got_huge.contains("folders"));
+        assert!(got_huge.len() <= MAX_SCAN_STATUS_LEN);
+    }
+
+    #[test]
+    fn scan_done_text_folders() {
+        let st = Stats {
+            keys: 24,
+            keys_cached: 5,
+            keys_fetched: 2,
+            keys_not_found: 1,
+            files: 10,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Stats::default()
+        };
+        assert_eq!(
+            scan_done_text("Scan", &st),
+            "Scan done: 24 keys - 5 cached, 2 fetched - 4/2 folders"
+        );
+        let r = scan_done_text("Refresh", &st);
+        assert!(r.starts_with("Refresh done: ") && r.contains("4/2 folders"));
+    }
+
+    #[test]
+    fn scan_done_text_all_cached() {
+        let st = Stats {
+            keys: 5,
+            keys_cached: 5,
+            keys_fetched: 0,
+            keys_not_found: 0,
+            files: 5,
+            folders_scanned: 3,
+            folders_skipped: 0,
+            ..Stats::default()
+        };
+        assert_eq!(
+            scan_done_text("Scan", &st),
+            "Scan done: 5 keys - 5 cached, 0 fetched - 3/0 folders"
+        );
+    }
+
+    #[test]
+    fn scan_done_text_nothing_to_fetch() {
+        let st = Stats {
+            keys: 7,
+            keys_cached: 7,
+            keys_fetched: 0,
+            keys_not_found: 0,
+            files: 9,
+            folders_scanned: 4,
+            folders_skipped: 3,
+            ..Stats::default()
+        };
+        assert_eq!(
+            scan_done_text("Scan", &st),
+            "Scan done: nothing to fetch (7 cached) - 3 folders skipped"
+        );
+        assert_eq!(
+            scan_done_text("Refresh", &st),
+            "Refresh done: nothing to fetch (7 cached) - 3 folders skipped"
+        );
+    }
+
+    #[test]
+    fn scan_done_text_huge_elides() {
+        let st = Stats {
+            keys: 12_345_678,
+            keys_cached: 12_222_222,
+            keys_fetched: 123_456,
+            keys_not_found: 999_999,
+            files: 2_345_678,
+            folders_scanned: 1_234_567,
+            folders_skipped: 7_654_321,
+            ..Stats::default()
+        };
+        let got = scan_done_text("Scan", &st);
+        assert!(!got.contains("12345678"), "{got}");
+        assert!(got.contains("folders"));
+        assert!(got.len() <= MAX_SCAN_STATUS_LEN);
+    }
+
+    #[test]
+    fn scan_status_keeps_folders_suffix() {
+        let long = format!("{} 4/2 folders", "k".repeat(MAX_SCAN_STATUS_LEN));
+        let got = fit_scan_status(&long);
+        assert!(got.len() <= MAX_SCAN_STATUS_LEN, "len {}", got.len());
+        assert!(got.contains("4/2 folders"), "{got}");
+        let st = Stats {
+            keys: 24,
+            keys_cached: 5,
+            keys_fetched: 2,
+            keys_not_found: 1,
+            files: 10,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Stats::default()
+        };
+        let got_done = scan_done_text(&"R".repeat(MAX_SCAN_STATUS_LEN), &st);
+        assert!(got_done.len() <= MAX_SCAN_STATUS_LEN);
+        assert!(got_done.contains("4/2 folders"));
+    }
+
+    #[test]
+    fn build_scan_options_contract() {
+        let d = vec![r"C:\Media\Movies".to_string(), r"D:\Shows".to_string()];
+        let scan = build_scan_options(d.clone(), false, None);
+        assert!(scan.use_index);
+        assert_eq!(scan.index_path, crate::settings::scan_index_path());
+        assert_eq!(scan.cache_dir, crate::settings::metadata_dir());
+        assert!(!scan.force);
+        assert_eq!(scan.dirs, d);
+        let refresh = build_scan_options(d.clone(), true, None);
+        assert!(
+            refresh.use_index
+                && refresh.index_path == crate::settings::scan_index_path()
+                && refresh.cache_dir == crate::settings::metadata_dir()
+        );
+        assert!(refresh.force);
+    }
+
+    #[test]
+    fn scan_cancelled_text_cases() {
+        assert_eq!(
+            scan_cancelled_text(12, 24),
+            "Scan cancelled - 12/24 keys done, progress kept"
+        );
+        let huge = scan_cancelled_text(12_345_678, 98_765_432);
+        assert!(!huge.contains("12345678") && !huge.contains("98765432"));
+        assert!(huge.starts_with("Scan cancelled - ") && huge.ends_with("progress kept"));
+        assert!(huge.len() <= MAX_SCAN_STATUS_LEN);
+    }
+
+    #[test]
+    fn scan_result_cancelled_never_fails() {
+        let cancelled = Stats {
+            keys: 24,
+            keys_done: 12,
+            cancelled: true,
+            ..Stats::default()
+        };
+        let got = scan_result_text("Scan", &cancelled, None);
+        assert_eq!(got, scan_cancelled_text(12, 24));
+        assert!(!got.contains("failed"));
+        assert_eq!(
+            scan_result_text("Scan", &cancelled, Some(&UiScanError::other("boom"))),
+            scan_cancelled_text(12, 24)
+        );
+        let bare = Stats {
+            keys: 10,
+            keys_done: 4,
+            ..Stats::default()
+        };
+        assert_eq!(
+            scan_result_text("Scan", &bare, Some(&UiScanError::cancelled())),
+            scan_cancelled_text(4, 10)
+        );
+        let ok = Stats {
+            keys: 24,
+            keys_cached: 5,
+            keys_fetched: 2,
+            keys_not_found: 1,
+            files: 10,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Stats::default()
+        };
+        assert_eq!(
+            scan_result_text("Scan", &ok, None),
+            scan_done_text("Scan", &ok)
+        );
+        assert!(
+            scan_result_text("Scan", &ok, Some(&UiScanError::other("disk gone")))
+                .contains("failed")
+        );
+    }
+
+    #[test]
+    fn scan_failed_suffix() {
+        let clean = Progress {
+            keys_done: 12,
+            keys_total: 24,
+            keys_fetched: 3,
+            keys_cached: 5,
+            folders_scanned: 4,
+            folders_skipped: 2,
+            ..Progress::default()
+        };
+        assert_eq!(
+            scan_progress_text(&clean),
+            "Scan 12/24 keys | 3 fetched, 5 cached | 4/2 folders"
+        );
+        let bad = Progress {
+            keys_failed: 2,
+            ..clean.clone()
+        };
+        assert_eq!(
+            scan_progress_text(&bad),
+            "Scan 12/24 keys | 3 fetched, 5 cached, 2 failed | 4/2 folders"
+        );
+        let st = Stats {
+            keys: 7,
+            keys_cached: 7,
+            keys_fetched: 0,
+            keys_not_found: 0,
+            files: 9,
+            folders_scanned: 4,
+            folders_skipped: 3,
+            ..Stats::default()
+        };
+        assert_eq!(
+            scan_done_text("Scan", &st),
+            "Scan done: nothing to fetch (7 cached) - 3 folders skipped"
+        );
+        let st_bad = Stats {
+            keys_failed: 1,
+            ..st
+        };
+        let got = scan_done_text("Scan", &st_bad);
+        assert!(!got.contains("nothing to fetch"), "{got}");
+        assert!(got.contains("1 failed"), "{got}");
+    }
+
+    #[test]
+    fn scan_control_state() {
+        assert_eq!(scan_button_label(false), "Scan");
+        assert!(scan_refresh_enabled(false));
+        assert_eq!(scan_button_label(true), "Cancel");
+        assert!(!scan_refresh_enabled(true));
+        assert_eq!(scan_button_label(false), "Scan");
+        assert!(scan_refresh_enabled(false));
+    }
+
+    // -- settings_scan_test.go ----------------------------------------------
+
+    #[test]
+    fn settings_scan_hit_test() {
+        let l = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "balanced");
+        assert_eq!(l.btns.len(), 10);
+        for id in [BTN_SCAN_GENTLE, BTN_SCAN_BALANCED, BTN_SCAN_TURBO] {
+            let rc = l
+                .settings_btn(id)
+                .unwrap_or_else(|| panic!("scan id {id} missing"));
+            assert!(
+                rc.right <= MAIN_CLIENT_W
+                    && rc.bottom <= MAIN_CLIENT_H
+                    && rc.left >= 0
+                    && rc.top >= 0
+            );
+            assert_eq!(
+                button_at_point(&l.btns, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2),
+                id
+            );
+        }
+        let g = l.settings_btn(BTN_SCAN_GENTLE).unwrap();
+        let b = l.settings_btn(BTN_SCAN_BALANCED).unwrap();
+        let u = l.settings_btn(BTN_SCAN_TURBO).unwrap();
+        assert!(g.top == b.top && b.top == u.top && g.bottom == b.bottom && b.bottom == u.bottom);
+        assert!(g.right <= b.left && b.right <= u.left);
+        for (i, a) in l.btns.iter().enumerate() {
+            for c in l.btns.iter().skip(i + 1) {
+                assert!(!rects_intersect(a.rc, c.rc));
+            }
+        }
+        for id in [BTN_SCAN_GENTLE, BTN_SCAN_BALANCED, BTN_SCAN_TURBO] {
+            let rc = l.settings_btn(id).unwrap();
+            assert!(rc.top >= 204 && rc.bottom <= 340, "scan {id} {rc:?}");
+        }
+    }
+
+    #[test]
+    fn scan_segment_model() {
+        assert_eq!(crate::settings::scan_segment_label("gentle"), "Gentle");
+        assert_eq!(crate::settings::scan_segment_label("balanced"), "Balanced");
+        assert_eq!(crate::settings::scan_segment_label("turbo"), "Turbo");
+        assert_eq!(crate::settings::scan_segment_label("bogus"), "Turbo");
+        for (profile, id) in [
+            ("gentle", BTN_SCAN_GENTLE),
+            ("balanced", BTN_SCAN_BALANCED),
+            ("turbo", BTN_SCAN_TURBO),
+        ] {
+            assert_eq!(crate::settings::scan_button_for_profile(profile), id);
+            assert_eq!(crate::settings::scan_profile_for_button(id), profile);
+        }
+        assert_eq!(crate::settings::scan_profile_for_button(BTN_BACK), "");
+        for cur in ["gentle", "balanced", "turbo"] {
+            for seg in ["gentle", "balanced", "turbo"] {
+                let want = if seg == cur { BTN_ACCENT } else { BTN_SUBTLE };
+                assert_eq!(crate::settings::scan_segment_style(seg, cur), want);
+            }
+        }
+        for cur in ["", "   ", "bogus"] {
+            assert_eq!(
+                crate::settings::scan_button_for_profile(cur),
+                BTN_SCAN_TURBO
+            );
+            assert_eq!(
+                crate::settings::scan_segment_style("turbo", cur),
+                BTN_ACCENT
+            );
+            assert_eq!(
+                crate::settings::scan_segment_style("balanced", cur),
+                BTN_SUBTLE
+            );
+        }
+        assert!(
+            crate::settings::SCAN_HINT_TEXT.contains("Turbo")
+                && crate::settings::SCAN_HINT_TEXT.contains("(default)")
+        );
+    }
+
+    #[test]
+    fn mouse_xy_splits_lparam() {
+        assert_eq!(mouse_xy(0x00C8_0064), (0x64, 0x00C8));
+    }
+}

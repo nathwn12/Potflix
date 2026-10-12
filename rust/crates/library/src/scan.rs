@@ -78,7 +78,7 @@ pub(crate) fn scan_indexed(cancel: &crate::Cancel, opts: &Options) -> Result<Sta
     }
     if outcome.cancelled {
         let st = Stats {
-            files: enumerated.borrow().len() as i32,
+            files: enumerated.borrow().len() as i64,
             denied: outcome.denied,
             cancelled: true,
             folders_scanned: outcome.folders_scanned,
@@ -141,7 +141,7 @@ pub(crate) fn scan_indexed(cancel: &crate::Cancel, opts: &Options) -> Result<Sta
         if let Some(progress) = &opts.progress {
             if parsed % 500 == 0 {
                 progress(Progress {
-                    done: keys.len() as i32,
+                    done: keys.len() as i64,
                     folders_scanned: outcome.folders_scanned,
                     folders_skipped: outcome.folders_skipped,
                     last: st.path.clone(),
@@ -172,7 +172,7 @@ pub(crate) fn scan_indexed(cancel: &crate::Cancel, opts: &Options) -> Result<Sta
     // --- report the index phase --------------------------------------
     let state = idx.state();
     let st = Stats {
-        files: enumerated.borrow().len() as i32,
+        files: enumerated.borrow().len() as i64,
         unique: distinct_keys(&keys),
         keys: state.keys,
         keys_done: state.keys_resolved,
@@ -237,14 +237,14 @@ fn visited_set(visited: &[String]) -> HashMap<String, bool> {
 }
 
 /// Counts the distinct non-empty metadata keys of one walk's file-key map.
-fn distinct_keys(keys: &HashMap<String, String>) -> i32 {
+fn distinct_keys(keys: &HashMap<String, String>) -> i64 {
     let mut seen: HashMap<&str, bool> = HashMap::new();
     for k in keys.values() {
         if !k.is_empty() {
             seen.insert(k.as_str(), true);
         }
     }
-    seen.len() as i32
+    seen.len() as i64
 }
 
 /// Maps a parsed query kind onto the stored kind string.

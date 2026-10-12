@@ -200,9 +200,9 @@ struct Counts {
     resolved: i32,
     not_found: i32,
     errors: i32,
-    denied: i32,
-    folders_scanned: i32,
-    folders_skipped: i32,
+    denied: i64,
+    folders_scanned: i64,
+    folders_skipped: i64,
     keys: i32,
     keys_cached: i32,
     keys_fetched: i32,
@@ -221,7 +221,7 @@ fn real_main(cancel: &Cancel, args: &[String], out: &mut dyn Write, err: &mut dy
     };
     let use_index = !cfg.index_path.is_empty();
     let mut files: Vec<String>;
-    let denied: i32;
+    let denied: i64;
     let mut f_scanned = 0;
     let mut f_skipped = 0;
     let mut visited: Vec<String> = Vec::new();

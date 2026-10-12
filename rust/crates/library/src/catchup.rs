@@ -42,13 +42,13 @@ pub struct CatchUpConfig {
 /// `CatchUpStats` reports the worker's cumulative work.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CatchUpStats {
-    pub passes: i32,
-    pub lookups: i32,
-    pub resolved: i32,
-    pub missed: i32,
-    pub failed: i32,
-    pub needs_repair: i32,
-    pub files_applied: i32,
+    pub passes: i64,
+    pub lookups: i64,
+    pub resolved: i64,
+    pub missed: i64,
+    pub failed: i64,
+    pub needs_repair: i64,
+    pub files_applied: i64,
 }
 
 #[derive(Default)]
@@ -58,13 +58,13 @@ struct CatchUpInner {
     cancel: Option<Cancel>,
     done: Option<JoinHandle<()>>,
     cb: Option<ProgressFn>,
-    passes: i32,
-    lookups: i32,
-    resolved: i32,
-    missed: i32,
-    failed: i32,
-    repair: i32,
-    applied: i32,
+    passes: i64,
+    lookups: i64,
+    resolved: i64,
+    missed: i64,
+    failed: i64,
+    repair: i64,
+    applied: i64,
 }
 
 /// One store's catch-up worker.
@@ -195,7 +195,7 @@ impl CatchUp {
 
         let records = idx.files_snapshot();
         let mut t = PassTally {
-            files: records.len() as i32,
+            files: records.len() as i64,
             ..PassTally::default()
         };
         let mut aggs: HashMap<String, KeyAgg> = HashMap::new();
@@ -233,7 +233,7 @@ impl CatchUp {
             agg.unsettled = true;
         }
 
-        t.keys = aggs.len() as i32;
+        t.keys = aggs.len() as i64;
         t.files -= pruned;
         let mut groups: Vec<crate::Group> = Vec::new();
         for (key, agg) in &aggs {
@@ -258,7 +258,7 @@ impl CatchUp {
         {
             let mut inner = self.mu.lock().unwrap();
             inner.passes += 1;
-            inner.lookups += groups.len() as i32;
+            inner.lookups += groups.len() as i64;
         }
 
         let t_mu = Mutex::new(t);
@@ -425,15 +425,15 @@ struct KeyAgg {
 /// One pass's counters.
 #[derive(Default)]
 struct PassTally {
-    files: i32,
-    keys: i32,
-    keys_resolved: i32,
-    cached: i32,
-    fetched: i32,
-    missed: i32,
-    failed: i32,
-    applied: i32,
-    repair: i32,
+    files: i64,
+    keys: i64,
+    keys_resolved: i64,
+    cached: i64,
+    fetched: i64,
+    missed: i64,
+    failed: i64,
+    applied: i64,
+    repair: i64,
     last_path: String,
 }
 
@@ -477,16 +477,16 @@ impl Index {
                 name: rec.name.clone(),
                 kind: rec.kind.clone(),
                 reason: repair::report::REASON_NO_METADATA.to_string(),
-                attempts: rec.attempts as i64,
+                attempts: rec.attempts,
                 last_error: rec.last_error.clone(),
                 last_try: nanos_to_time(rec.last_try),
             });
         }
         let state = self.state();
         r.totals = repair::report::Totals {
-            files: state.files as i64,
-            indexed: state.files as i64,
-            resolved: state.keys_resolved as i64,
+            files: state.files,
+            indexed: state.files,
+            resolved: state.keys_resolved,
             needs_repair: r.entries.len() as i64,
         };
         let dir = path_join(&[&path_dir(index_path), "inventory"]);
@@ -506,7 +506,7 @@ impl Index {
         res: &metadata::Resolution,
         lerr: Option<&metadata::Error>,
         now: i64,
-    ) -> (i32, i32, String) {
+    ) -> (i64, i64, String) {
         if key.is_empty() {
             return (0, 0, String::new());
         }

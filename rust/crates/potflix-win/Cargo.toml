@@ -27,5 +27,9 @@ bundle = { path = "../bundle" }
 discord = { path = "../discord" }
 library = { path = "../library" }
 metadata = { path = "../metadata" }
+metadata-http = { path = "../metadata-http" }
 presence = { path = "../presence" }
 repair = { path = "../repair" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

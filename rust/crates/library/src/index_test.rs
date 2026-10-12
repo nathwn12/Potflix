@@ -302,7 +302,44 @@ fn index_store_load_time() {
     close_index(&index).unwrap();
     let reopened = shared_index(&index).unwrap();
     let state = reopened.state();
-    assert_eq!(state.files, FILES);
-    assert_eq!(state.keys, KEYS);
+    assert_eq!(state.files, i64::from(FILES));
+    assert_eq!(state.keys, i64::from(KEYS));
     let _ = Options::default();
+}
+
+/// The store record's `files` is Go `int` (64-bit): a value above `i32::MAX`
+/// must encode and decode unchanged, not negative, and never clamp to zero.
+#[test]
+fn folder_record_files_above_i32_max_round_trips() {
+    let big = 1_i64 << 31; // 2147483648
+    let rec = FolderRecord {
+        fingerprint: "fp".to_string(),
+        names_hash: "nh".to_string(),
+        files: big,
+        schema: 7,
+        keys: vec!["k".to_string()],
+        scanned_at_nanos: 42,
+        per_file: true,
+    };
+    let mut buf = Vec::new();
+    encode_folder_record(&mut buf, &rec);
+    let got = decode_folder_record(&buf).expect("decode");
+    assert_eq!(got.files, big, "files decoded negative or clamped");
+    assert_eq!(got, rec);
+}
+
+/// End-to-end store round-trip: write `files = 1<<31`, reopen, read it back.
+#[test]
+fn store_round_trip_files_above_i32_max() {
+    let dir = temp_dir("bigfiles");
+    let big = 1_i64 << 31;
+    let dir_key = crate::pathutil::join(&[&dir.path, "lib"]);
+    let path = crate::pathutil::join(&[&dir.path, "scanindex.json"]);
+    let ix = load_scan_index(&path);
+    ix.record_full(&dir_key, "nh", "fp", 7, &["k".to_string()], big);
+    ix.save(&path).unwrap();
+    close_index(&path).unwrap();
+    let reopened = load_scan_index(&path);
+    let rec = reopened.lookup(&dir_key).expect("record after reopen");
+    assert_eq!(rec.files, big, "store round-trip clamped files");
 }
