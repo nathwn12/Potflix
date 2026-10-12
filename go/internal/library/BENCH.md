@@ -1,7 +1,8 @@
 # Library/metadata benchmark baselines (measurement only)
 
 Harness: `go/internal/metadata/bench_test.go` (parse/context/cache hot path)
-and `go/internal/library/bench_test.go` (plan/scan/fetch hot path).
+and `go/internal/library/bench_test.go` (plan/scan/fetch hot path), plus
+`go/internal/store/store_bench_test.go` (store put/load hot path).
 No benchmark touches production code, the live cache dir
 (`%LOCALAPPDATA%\Potflix\meta` - every cache is a `b.TempDir()`), or the
 real network (empty/offline sources, in-process `fakeSource`, or loopback
@@ -122,3 +123,75 @@ Notes:
   grows with file count per skipped folder.
 - Allocs drop ~9x (9,255 -> 996): no walked-file plans, groups, or
   resolver results are built for skipped subtrees.
+
+**Superseded (2026-10-13):** the table above is the JSON-index baseline,
+kept as the dated measurement it is. The index now lives in `library.idx`
+(store-backed; next section), so the first Notes bullet's remaining-cost
+claim is no longer true: the indexed scan's per-key guard is always-true
+(`scan.go` `keyPresent`) and metadata liveness is the store's own per-file
+state, so `BenchmarkScanIndexSecondPass/WithIndex`'s second pass skips
+every subtree without touching the metadata cache.
+
+## Store-backed index (`library.idx`) - 2026-10-13 - `go1.27.0 windows/amd64` (AMD Ryzen 7 5800X)
+
+The JSON index (`scanindex.json`, 565,380 bytes, rewritten in full on
+every dirty checkpoint) is replaced by one `internal/store` file beside
+it - `library.idx`: one record per video file plus a rollup per folder -
+and the metadata cache by one `meta.idx` store in place of 1,118 loose
+per-key JSON files. Frames are `tag | len | crc32 | payload` behind a
+24-byte CRC'd header; replay truncates a torn tail instead of erroring;
+a commit fsyncs. The controlled payload codec (binary varints) measures
+**~218 B per file record against ~429 B of JSON** for a 92-character
+path (`TestFileRecordEncodingBudget`).
+
+Store micro-bench, from `go/`:
+
+```powershell
+go test ./internal/store -run '^$' -bench . -benchtime=10x -v
+```
+
+| Measurement | Result |
+|---|---|
+| `BenchmarkPut23402`: 23,402 puts + commit (fsync) | 38.43 ms total |
+| `BenchmarkLoad23402`: open of 24,520 records | 7.386 ms |
+
+Full-size store load (test-logged measurements, not asserted gates):
+
+| Measurement | Result |
+|---|---|
+| migrated real index (928 folder rollups) | 9.04 ms (`TestMigrationParityRealIndex`) |
+| 23,402-record store, 7,556,531 bytes: reopen + decode | 28.6 ms (`TestIndexStoreLoadTime`) |
+
+Scan cost over the owner-shaped corpus (93 folders / 2,300 files / 230
+keys, in-process provider, zero network): `WarmDiff` moves every folder's
+mtime so each file is re-enumerated and (size, mtime)-diffed, `WarmSkip`
+is the steady state with the rollups matching. Exact command (from `go/`):
+
+```powershell
+go test ./internal/library -run '^$' -bench BenchmarkScanRealShape -benchtime=1x -benchmem -count=3
+```
+
+| Leg | per-op (three runs) | Asserted during measurement |
+|---|---|---|
+| `BenchmarkScanRealShape/WarmDiff` | 141.9 / 143.6 / 149.7 ms | `Parsed==0`, `fetches==0` |
+| `BenchmarkScanRealShape/WarmSkip` | 6.4 / 7.6 / 7.7 ms | `Files==0`, `FilesSkipped==2,300`, `fetches==0` |
+
+Notes:
+
+- The full-scale leg (`POTFLIX_BENCH_REALSHAPE=full`: 930 folders /
+  23,000 files / 2,300 keys) was **NOT re-run** for this change - it
+  needs a multi-minute seeding pass and never converges under
+  `-benchtime` on this box. The reduced default above (93 folders /
+  2,300 files / 230 keys, from `realShapeScale`) is the benched corpus.
+- `Scan` performs zero fetches by construction: the walk enumerates and
+  diffs, and metadata resolution is the background catch-up
+  (`catchup.go`, started at launch), bounded at 3 concurrent lookups.
+- Migration on first open: 928 folders / 23,402 files imported from the
+  legacy index (renamed `scanindex.json.bak`, never deleted) and 1,118
+  entries imported from the legacy `meta\` directory (kept in place as
+  the recovery copy; only `metadata.ClearCache` removes it).
+- The metadata cache is one store file behind one held handle per cache
+  directory, so a read is a map lookup instead of a whole-file replay.
+  That removes the old 64 KiB per-entry read cap, under which four
+  entries on this machine (96 KB - 232 KB) were permanently treated as
+  "not cached". No per-operation cache timing is quoted here.

@@ -14,8 +14,8 @@ func TestSettingsScanHitTest(t *testing.T) {
 	defer func() { scanSpeedState = oldScan }()
 
 	l := computeSettingsLayout(mainClientW, mainClientH, 96, false)
-	if len(l.btns) != 9 {
-		t.Fatalf("settings buttons = %d, want 9 (Back + 3 LIBRARY + 2 STARTUP + 3 SCAN)", len(l.btns))
+	if len(l.btns) != 10 {
+		t.Fatalf("settings buttons = %d, want 10 (Back + 4 LIBRARY + 2 STARTUP + 3 SCAN)", len(l.btns))
 	}
 	for _, id := range []int{btnScanGentle, btnScanBalanced, btnScanTurbo} {
 		rc, ok := l.settingsBtn(id)

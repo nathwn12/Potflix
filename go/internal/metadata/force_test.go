@@ -7,25 +7,27 @@ import (
 	"time"
 )
 
-func cacheFileModTime(t *testing.T, dir string) time.Time {
+// cacheEntryState returns the stored record for key and the store file's
+// modification time. The cache is ONE store file (<dir>.idx) keyed by the raw
+// cache key, so where the loose layout offered a per-key file to stat, the
+// record's own bytes are the per-key truth and the store file's mtime is the
+// write witness.
+func cacheEntryState(t *testing.T, dir, key string) (string, time.Time) {
 	t.Helper()
-	entries, err := os.ReadDir(dir)
+	data, ok := cacheRecord(dir, key)
+	if !ok {
+		t.Fatalf("cache record for %q missing from the store", key)
+	}
+	fi, err := os.Stat(cacheIndexPath(dir))
 	if err != nil {
-		t.Fatalf("read cache dir: %v", err)
+		t.Fatalf("stat store file: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Fatalf("cache files = %d, want 1", len(entries))
-	}
-	fi, err := entries[0].Info()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return fi.ModTime()
+	return string(data), fi.ModTime()
 }
 
 // TestLookupNowForceRewritesCache proves the force path bypasses the cached
 // entry and rewrites it, while a non-force second run is a strict no-op
-// (served from disk: zero fetches, cache file untouched).
+// (served from the store: zero fetches, stored record untouched).
 func TestLookupNowForceRewritesCache(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -48,10 +50,10 @@ func TestLookupNowForceRewritesCache(t *testing.T) {
 	if n := fake1.calls.Load(); n != 1 {
 		t.Fatalf("run 1 fetches = %d, want 1", n)
 	}
-	mtime1 := cacheFileModTime(t, dir)
+	body1, mtime1 := cacheEntryState(t, dir, cacheKey(q))
 
-	// Run 2, non-force, through a FRESH resolver (proves the disk entry is
-	// the no-op source): still V1, zero fetches, file untouched.
+	// Run 2, non-force, through a FRESH resolver (proves the store entry is
+	// the no-op source): still V1, zero fetches, record untouched.
 	fake2 := &fakeSource{name: "fake", media: mediaWith("V2")}
 	r2 := New(Options{Dir: dir, Sources: []Source{fake2}, Timeout: 5 * time.Second})
 	res2, err := r2.LookupNow(ctx, q)
@@ -59,9 +61,9 @@ func TestLookupNowForceRewritesCache(t *testing.T) {
 		t.Fatalf("run 2 (non-force) = %+v,%v; want cached V1 found", res2, err)
 	}
 	if n := fake2.calls.Load(); n != 0 {
-		t.Errorf("run 2 fetches = %d, want 0 (disk no-op)", n)
+		t.Errorf("run 2 fetches = %d, want 0 (store no-op)", n)
 	}
-	if mt := cacheFileModTime(t, dir); !mt.Equal(mtime1) {
+	if body, mt := cacheEntryState(t, dir, cacheKey(q)); body != body1 || !mt.Equal(mtime1) {
 		t.Errorf("run 2 rewrote the cache entry without force (mtime %v != %v)", mt, mtime1)
 	}
 
@@ -74,8 +76,12 @@ func TestLookupNowForceRewritesCache(t *testing.T) {
 	if n := fake2.calls.Load(); n != 1 {
 		t.Errorf("run 3 fetches = %d, want 1 (forced refetch)", n)
 	}
-	if mt := cacheFileModTime(t, dir); !mt.After(mtime1) {
-		t.Errorf("run 3 did not rewrite the cache entry (mtime %v, want after %v)", mt, mtime1)
+	body3, mt3 := cacheEntryState(t, dir, cacheKey(q))
+	if body3 == body1 {
+		t.Errorf("run 3 left the stored record unchanged, want the refetched V2")
+	}
+	if !mt3.After(mtime1) {
+		t.Errorf("run 3 did not rewrite the cache entry (mtime %v, want after %v)", mt3, mtime1)
 	}
 
 	// force=false stays exactly LookupNow: served from memory, no fetch.

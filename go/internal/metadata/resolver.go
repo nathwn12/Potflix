@@ -30,6 +30,7 @@ type Resolver struct {
 	mem      map[string]*Media
 	inflight map[string]chan struct{}
 	neg      map[string]time.Time
+	probed   map[string]bool
 	dir      string
 	timeout  time.Duration
 	sources  []Source
@@ -70,6 +71,7 @@ func New(opts Options) *Resolver {
 		mem:      make(map[string]*Media),
 		inflight: make(map[string]chan struct{}),
 		neg:      make(map[string]time.Time),
+		probed:   make(map[string]bool),
 		dir:      resolveCacheDir(opts.Dir),
 		timeout:  timeout,
 		sources:  cp,
@@ -317,13 +319,69 @@ func resolutionButtons(m *Media, ep Episode, hasEp, isMovie bool) []Button {
 	return out
 }
 
+// probedLive revalidates a probe-warmed entry: an entry invalidated after the
+// probe must never be served from warmed memory. ClearCache is that
+// invalidation (the cache is one store file keyed by the raw key, so there is
+// no per-key file to delete), and the store - held open for the process - is
+// what the check reads: a record that is no longer present un-warms the key and
+// reports false so the caller falls through to a fresh read (never a warmed
+// serve). Keys never warmed by ProbeCache report true without any I/O, so
+// non-scan callers behave exactly as before.
+func (r *Resolver) probedLive(key string) bool {
+	if !r.probed[key] {
+		return true
+	}
+	if CacheHas(r.dir, key) {
+		return true
+	}
+	delete(r.mem, key)
+	delete(r.neg, key)
+	delete(r.probed, key)
+	return false
+}
+
+// ResolveCached is Resolve without the fetch: it reports the cached answer
+// when memory or disk can answer q and ok=false otherwise, never touching
+// the network and never spawning a background fetch. A stale key (a live
+// entry that cannot answer q) reports false so the caller routes it through
+// its bounded fetch path instead of fanning out one unbounded,
+// uncancellable fetch per stale key.
+func (r *Resolver) ResolveCached(q Query) (Resolution, bool) {
+	key := cacheKey(q)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m, ok := r.mem[key]; ok && mediaAnswers(m, q) && r.probedLive(key) {
+		return resolveFromMedia(m, q), true
+	}
+	if exp, ok := r.neg[key]; ok {
+		if time.Now().Before(exp) {
+			if r.probedLive(key) {
+				return Resolution{}, true
+			}
+		} else {
+			delete(r.neg, key)
+		}
+	}
+	if e, ok := cacheLoadEntry(r.dir, key); ok {
+		if e.NotFound {
+			r.neg[key] = negativeMemExpiry(e.CheckedAt, time.Now())
+			return Resolution{}, true
+		}
+		if mediaAnswers(e.Media, q) {
+			r.mem[key] = e.Media
+			return resolveFromMedia(e.Media, q), true
+		}
+	}
+	return Resolution{}, false
+}
+
 // Resolve NEVER blocks on network: it returns from the memory/disk cache
 // when present, else fires ONE background fetch per cache key
 // (single-flight) and returns Found=false.
 func (r *Resolver) Resolve(ctx context.Context, q Query) (Resolution, error) {
 	key := cacheKey(q)
 	r.mu.Lock()
-	if m, ok := r.mem[key]; ok && mediaAnswers(m, q) {
+	if m, ok := r.mem[key]; ok && mediaAnswers(m, q) && r.probedLive(key) {
 		r.mu.Unlock()
 		return resolveFromMedia(m, q), nil
 	}
@@ -333,10 +391,13 @@ func (r *Resolver) Resolve(ctx context.Context, q Query) (Resolution, error) {
 	// for other episodes sharing this key.
 	if exp, ok := r.neg[key]; ok {
 		if time.Now().Before(exp) {
-			r.mu.Unlock()
-			return Resolution{}, nil
+			if r.probedLive(key) {
+				r.mu.Unlock()
+				return Resolution{}, nil
+			}
+		} else {
+			delete(r.neg, key)
 		}
-		delete(r.neg, key)
 	}
 	if e, ok := cacheLoadEntry(r.dir, key); ok {
 		if e.NotFound {
@@ -369,12 +430,12 @@ func (r *Resolver) Resolve(ctx context.Context, q Query) (Resolution, error) {
 	done := make(chan struct{})
 	r.inflight[key] = done
 	r.mu.Unlock()
-	go r.backgroundFetch(q, key, done)
+	go r.backgroundFetch(ctx, q, key, done)
 	return Resolution{}, nil
 }
 
-func (r *Resolver) backgroundFetch(q Query, key string, done chan struct{}) {
-	fetchCtx, cancel := context.WithTimeout(context.Background(), r.timeout*4)
+func (r *Resolver) backgroundFetch(ctx context.Context, q Query, key string, done chan struct{}) {
+	fetchCtx, cancel := context.WithTimeout(ctx, r.timeout*4)
 	defer cancel()
 	m, definitive, _ := r.fetchMedia(fetchCtx, q)
 	r.mu.Lock()
@@ -431,16 +492,19 @@ func (r *Resolver) LookupNowForceSrc(ctx context.Context, q Query, force bool) (
 	var hadPrevNeg bool
 	r.mu.Lock()
 	if !force {
-		if m, ok := r.mem[key]; ok && mediaAnswers(m, q) {
+		if m, ok := r.mem[key]; ok && mediaAnswers(m, q) && r.probedLive(key) {
 			r.mu.Unlock()
 			return resolveFromMedia(m, q), true, nil
 		}
 		if exp, ok := r.neg[key]; ok {
 			if time.Now().Before(exp) {
-				r.mu.Unlock()
-				return Resolution{}, false, nil
+				if r.probedLive(key) {
+					r.mu.Unlock()
+					return Resolution{}, false, nil
+				}
+			} else {
+				delete(r.neg, key)
 			}
-			delete(r.neg, key)
 		}
 		if e, ok := cacheLoadEntry(r.dir, key); ok {
 			if e.NotFound {

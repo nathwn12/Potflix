@@ -5,13 +5,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"potflix/internal/library"
 	"potflix/internal/presence"
+	"potflix/internal/repair"
 )
 
 // window.go - tray-resident settings window (PotflixMainWnd), stdlib + win32.
@@ -57,6 +60,13 @@ const (
 	btnScanGentle   = 20
 	btnScanBalanced = 21
 	btnScanTurbo    = 22
+	// Main view "Report" control: reads the local needs-repair report and
+	// files it as a GitHub issue (see onReport).
+	btnReport = 23
+	// Settings view LIBRARY section: the second clear action, so the metadata
+	// cache and the file index can be cleared independently (Clear metadata
+	// keeps the id btnClearCache; see onClearMetadata/onClearIndex).
+	btnClearIndex = 24
 )
 
 // Scan progress/completion messages posted by the worker goroutine to the
@@ -64,6 +74,22 @@ const (
 const (
 	wmAppScanProgress = wmApp + 3
 	wmAppScanDone     = wmApp + 4
+	// wmAppReportDone carries the Report worker's completion back to the UI
+	// thread; the payload rides a reportMu-guarded var, never wparam.
+	wmAppReportDone = wmApp + 5
+
+	// wmTimer is the Win32 timer message (declared here, not win32.go, to
+	// keep this change inside window.go).
+	wmTimer = 0x0113
+)
+
+// scanTimerID is the SetTimer id for the live-scan repaint tick; the tick
+// paints the latest worker snapshot so progress posts never repaint
+// directly more than the gate allows. scanPaintInterval caps live repaints
+// at ~10/s.
+const (
+	scanTimerID       = 7
+	scanPaintInterval = 100 * time.Millisecond
 )
 
 // mainHwnd is the settings window handle, 0 until createMainWindow runs.
@@ -136,6 +162,17 @@ var (
 	scanProgress library.Progress
 	scanStats    library.Stats
 	scanErr      error
+	// scanStart is the elapsed-timer origin of the current run; scanLastPaint
+	// is the last live repaint (progress posts and the timer tick share one
+	// gate over it); scanResolveStart is the resolve-phase origin (the first
+	// snapshot carrying a key total - the walk has no total, so no rate) and
+	// scanResolveBase the completions already observed then (the ETA divides
+	// only the delta - see scanETA). scanStart/scanLastPaint/scanResolveStart/
+	// scanResolveBase are UI thread only.
+	scanStart        time.Time
+	scanLastPaint    time.Time
+	scanResolveStart time.Time
+	scanResolveBase  int
 )
 
 // Dark palette (logical colors; see the design spec in the brief).
@@ -169,6 +206,14 @@ var (
 	// GetKeyState reads the Shift state for Shift+Tab; kept here (not
 	// win32.go) to keep this change inside window.go.
 	procGetKeyState = user32.NewProc("GetKeyState")
+	// Scan repaint-tick timer; kept here (not win32.go) to keep this
+	// change inside window.go.
+	procSetTimer  = user32.NewProc("SetTimer")
+	procKillTimer = user32.NewProc("KillTimer")
+	// Screen-DC measurement for the live status fit (same GetTextExtent
+	// technique the paint path audits with); kept here, not win32.go.
+	procGetDC     = user32.NewProc("GetDC")
+	procReleaseDC = user32.NewProc("ReleaseDC")
 )
 
 // Settings-view message, key, and text constants.
@@ -392,18 +437,24 @@ func mainWndProc(hwnd, msg, wparam, lparam uintptr) uintptr {
 		r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
 		return r
 	case wmAppScanProgress:
-		if scanActive && scanCancel == nil {
-			// Cancel requested: keep the cancelled summary; ignore late
-			// progress posts until the worker's done message lands.
+		refreshScanLiveText(hwnd, scanEvProgress, time.Now())
+		return 0
+	case wmTimer:
+		if wparam == uintptr(scanTimerID) {
+			// Repaint tick: paint the latest worker snapshot (elapsed +
+			// pulse advance) through the same coalescing gate as progress
+			// posts, so live repaints never exceed ~10/s. No drawing here -
+			// setStatusText invalidates and paint runs on the UI thread.
+			if scanActive {
+				refreshScanLiveText(hwnd, scanEvTick, time.Now())
+			}
 			return 0
 		}
-		scanMu.Lock()
-		p := scanProgress
-		scanMu.Unlock()
-		setStatusText(scanProgressText(p))
-		return 0
 	case wmAppScanDone:
 		onScanDone(hwnd)
+		return 0
+	case wmAppReportDone:
+		onReportDone()
 		return 0
 	}
 	r, _, _ := procDefWindowProcW.Call(hwnd, msg, wparam, lparam)
@@ -526,6 +577,13 @@ func computeLayout(cw, ch int32, dpi int) uiLayout {
 	l.btns = append(l.btns, uiButton{id: btnClose, label: "Close to tray", style: btnText,
 		rc: rect{left: cardLeft + cardW - closeW, top: y1 + btnH + sc(8), right: cardLeft + cardW, bottom: y1 + btnH + sc(8) + closeH}})
 
+	// "Report" takes the third grid slot of the SAME action block (left
+	// column, one row below Scan/Refresh), so it needs no metric change and no
+	// window resize: the row-3 left cell is dead space - Close to tray is
+	// right-aligned and 120 logical px wide, 216 px clear of it at every DPI.
+	l.btns = append(l.btns, uiButton{id: btnReport, label: reportButtonLabel, style: btnOutline,
+		rc: rect{left: x0, top: y1 + btnH + btnGap, right: x0 + btnW, bottom: y1 + btnH + btnGap + btnH}})
+
 	// "Settings" text affordance: header row, right-aligned under the icon,
 	// muted text style. Placed in the dead strip between the icon bottom
 	// (y=52) and the section label (y=92); every rect above is untouched.
@@ -558,14 +616,15 @@ func computeSettingsLayout(cw, ch int32, dpi int, startup bool) settingsLayout {
 	backW, backH := sc(80), sc(28)
 	back := rect{left: margin, top: sc(16), right: margin + backW, bottom: sc(16) + backH}
 
-	// LIBRARY section: label + one row of three (Clear cache / Export... /
-	// Import...).
+	// LIBRARY section: label + one row of four (Clear metadata / Clear index /
+	// Export... / Import...).
 	libTop := sc(100)
 	libH := sc(32)
-	libW := (cw - margin*2 - sc(12)*2) / 3
-	clearRc := rect{left: margin, top: libTop, right: margin + libW, bottom: libTop + libH}
-	exportRc := rect{left: margin + libW + sc(12), top: libTop, right: margin + libW*2 + sc(12), bottom: libTop + libH}
-	importRc := rect{left: margin + libW*2 + sc(24), top: libTop, right: cw - margin, bottom: libTop + libH}
+	libW := (cw - margin*2 - sc(12)*3) / 4
+	clearMetaRc := rect{left: margin, top: libTop, right: margin + libW, bottom: libTop + libH}
+	clearIdxRc := rect{left: margin + libW + sc(12), top: libTop, right: margin + libW*2 + sc(12), bottom: libTop + libH}
+	exportRc := rect{left: margin + libW*2 + sc(24), top: libTop, right: margin + libW*3 + sc(24), bottom: libTop + libH}
+	importRc := rect{left: margin + libW*3 + sc(36), top: libTop, right: cw - margin, bottom: libTop + libH}
 
 	startTop := sc(172)
 	startH := sc(32)
@@ -589,7 +648,8 @@ func computeSettingsLayout(cw, ch int32, dpi int, startup bool) settingsLayout {
 	l.status = status
 	l.btns = []uiButton{
 		{id: btnBack, label: "Back", style: btnText, rc: back},
-		{id: btnClearCache, label: "Clear cache", style: btnDanger, rc: clearRc},
+		{id: btnClearCache, label: "Clear metadata", style: btnDanger, rc: clearMetaRc},
+		{id: btnClearIndex, label: "Clear index", style: btnDanger, rc: clearIdxRc},
 		{id: btnExport, label: "Export...", style: btnSubtle, rc: exportRc},
 		{id: btnImport, label: "Import...", style: btnSubtle, rc: importRc},
 		{id: btnStartup, label: startupToggleLabel(startup), style: btnSubtle, rc: toggleRc},
@@ -957,9 +1017,189 @@ func doButtonAction(hwnd uintptr, id int) {
 		}
 	case btnRefresh:
 		startLibraryScan(hwnd, true)
+	case btnReport:
+		onReport(hwnd)
 	case btnClose:
 		procShowWindow.Call(hwnd, swHide)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Report button: the local needs-repair report (internal/repair) -> a GitHub
+// issue. Read-only: the app never writes the report itself.
+// ---------------------------------------------------------------------------
+
+const (
+	// reportButtonLabel is the Report control caption.
+	reportButtonLabel = "Report"
+	// reportRepo is the repository a filed needs-repair issue targets.
+	reportRepo = "nathwn12/Potflix"
+	// reportLabel is the single label attached to a filed issue.
+	reportLabel = "needs-repair"
+	// reportNothingText is the status line when there is nothing to report:
+	// no report file, an unreadable one, or a report with zero entries. The
+	// button says so on the status line - never a dialog, never a crash.
+	reportNothingText = "Nothing to report - no needs-repair entries."
+	// reportFailedText is the status line when no issue URL could be built at
+	// all (the library's own error is in the debug log).
+	reportFailedText = "Report failed - see the debug log."
+	// reportPendingText is the status line while the issue is being filed off
+	// the UI thread (CreateIssue runs gh synchronously when one is on PATH,
+	// and a slow network must never freeze the window).
+	reportPendingText = "Filing report..."
+)
+
+// reportCreateIssue is the issue runner the Report path calls. A package var
+// so tests inject a runner that sleeps and prove the handler returns before
+// the run finishes, without reaching gh, the network, or a browser.
+var reportCreateIssue = func(ctx context.Context, r repair.Report, opts repair.Options) (string, error) {
+	return repair.CreateIssue(ctx, r, opts)
+}
+
+// reportOpenURL hands the returned URL to the browser. A package var for the
+// same reason: a test must never launch a browser.
+var reportOpenURL = openExternalURL
+
+// reportMu guards the worker's completion payload published by
+// wmAppReportDone, the way scanMu guards the scan snapshot.
+var (
+	reportMu       sync.Mutex
+	reportDoneText string
+)
+
+// repairReportDir is the needs-repair report directory: os.UserCacheDir() +
+// \Potflix\inventory, falling back to the exe directory - the same idiom as
+// MetadataDir/ScanIndexPath, so the window never hardcodes %LOCALAPPDATA%.
+// internal/repair owns the file name (ReportJSONName).
+func repairReportDir() string {
+	if d, err := os.UserCacheDir(); err == nil && d != "" {
+		return filepath.Join(d, "Potflix", "inventory")
+	}
+	return filepath.Join(exeDir(), "inventory")
+}
+
+// repairReportPath is the report file the Report button reads:
+// repairReportDir() + repair.ReportJSONName (needs-repair.json).
+func repairReportPath() string {
+	return filepath.Join(repairReportDir(), repair.ReportJSONName)
+}
+
+// reportDecision decides what the Report button does with a loaded report:
+// proceed only when the file was readable AND carries entries. A missing
+// file, an unreadable one, and an empty report all land on the same "nothing
+// to report" status line. Pure so tests drive both branches without a report
+// on disk.
+func reportDecision(r repair.Report, err error) (proceed bool, status string) {
+	if err != nil || len(r.Entries) == 0 {
+		return false, reportNothingText
+	}
+	return true, ""
+}
+
+// reportOpenedText is the status line once the returned URL went to the
+// browser; ghFailed records that CreateIssue fell back to a prefilled URL
+// because its gh run failed (the URL is still usable). Pure.
+func reportOpenedText(ghFailed bool) string {
+	if ghFailed {
+		return "Report: gh failed - opened a prefilled issue instead."
+	}
+	return "Report: issue opened in your browser."
+}
+
+// reportLaunchText is the status line when the URL could not be handed to the
+// browser: the URL itself stays on the line, so it can still be copied by
+// hand. Pure.
+func reportLaunchText(url string) string {
+	return "Report issue: " + url
+}
+
+// openExternalURL opens url in the default browser through the SAME
+// ShellExecuteW path onOpenLogFolder uses (verb "open", show-normal; the proc
+// is declared above - no second win32 layer). ok=false means the call did not
+// succeed and the caller must surface the URL itself.
+func openExternalURL(url string) bool {
+	if url == "" {
+		return false
+	}
+	target, err := syscall.UTF16PtrFromString(url)
+	if err != nil {
+		return false
+	}
+	op, _ := syscall.UTF16PtrFromString("open")
+	ret, _, _ := procShellExecuteW.Call(0, uintptr(unsafe.Pointer(op)),
+		uintptr(unsafe.Pointer(target)), 0, 0, swShowNormal)
+	return ret > 32 // ShellExecuteW: >32 is success, <=32 an error code
+}
+
+// onReport is the Report button's action: read the local needs-repair report
+// and, when it carries entries, file it as a GitHub issue on a worker
+// goroutine. The UI thread returns at once - never blocked on gh or the
+// network - and the worker hands its one status line back through
+// wmAppReportDone, the SAME post-a-message pattern the scan uses.
+func onReport(hwnd uintptr) {
+	onReportAt(hwnd, repairReportPath())
+}
+
+// onReportAt is the Report action core, taking hwnd + the report path so tests
+// drive the missing/empty/corrupt branches AND the in-flight path (with an
+// injected runner) on temp paths. The nothing-to-report branch returns before
+// any goroutine starts, so no test reaches gh, the network, or a browser.
+func onReportAt(hwnd uintptr, path string) {
+	r, err := repair.ReadReport(path)
+	if err != nil {
+		appLogf("report: read %s: %s", path, err)
+	}
+	if proceed, status := reportDecision(r, err); !proceed {
+		setStatusText(status)
+		return
+	}
+	setStatusText(reportPendingText)
+	go func() {
+		url, cerr := reportCreateIssue(context.Background(), r, repair.Options{
+			Repo:   reportRepo,
+			Labels: []string{reportLabel},
+		})
+		text := reportIssueStatus(url, cerr, reportOpenURL)
+		reportMu.Lock()
+		reportDoneText = text
+		reportMu.Unlock()
+		// Async post only: the worker never touches a control directly.
+		procPostMessageW.Call(hwnd, wmAppReportDone, 0, 0)
+	}()
+}
+
+// reportIssueStatus maps a finished issue run to the status line: an empty URL
+// is a failure, a URL handed to the browser reports opened (ghFailed notes the
+// gh fallback), and a URL the browser refused stays on the line so it can
+// still be copied by hand. The opener is injected so tests drive all three
+// branches without a browser. Failures go to the debug log and the status
+// line - never a blocking dialog.
+func reportIssueStatus(url string, err error, open func(string) bool) string {
+	if url == "" {
+		appLogf("report: create issue: %s", err)
+		return reportFailedText
+	}
+	if err != nil {
+		appLogf("report: create issue (gh): %s", err)
+	}
+	if open != nil && open(url) {
+		return reportOpenedText(err != nil)
+	}
+	appLogf("report: open %s failed", url)
+	return reportLaunchText(url)
+}
+
+// onReportDone lands the worker's completion payload on the UI thread: the
+// status line is the one result, exactly like onScanDone. UI thread only.
+func onReportDone() {
+	reportMu.Lock()
+	text := reportDoneText
+	reportDoneText = ""
+	reportMu.Unlock()
+	if text == "" {
+		return // a stray post: nothing landed
+	}
+	setStatusText(text)
 }
 
 // ---------------------------------------------------------------------------
@@ -999,15 +1239,15 @@ func enterMain() {
 	closeSettings()
 }
 
-// mainFocusOrder is the Tab order over the main view's rect table: the five
+// mainFocusOrder is the Tab order over the main view's rect table: the six
 // rect-table buttons plus the Settings and Card text affordances.
 func mainFocusOrder() []int {
-	return []int{btnAdd, btnRemove, btnScan, btnRefresh, btnClose, btnSettings, btnCard}
+	return []int{btnAdd, btnRemove, btnScan, btnRefresh, btnReport, btnClose, btnSettings, btnCard}
 }
 
 // settingsFocusOrder is the Tab order over the settings view's rect table.
 func settingsFocusOrder() []int {
-	return []int{btnBack, btnClearCache, btnExport, btnImport, btnStartup, btnOpenLog,
+	return []int{btnBack, btnClearCache, btnClearIndex, btnExport, btnImport, btnStartup, btnOpenLog,
 		btnScanGentle, btnScanBalanced, btnScanTurbo}
 }
 
@@ -1161,7 +1401,9 @@ func doSettingsAction(hwnd uintptr, id int) {
 			onSelectScanSpeed(profile)
 		}
 	case btnClearCache:
-		onClearCache(hwnd)
+		onClearMetadata(hwnd)
+	case btnClearIndex:
+		onClearIndex(hwnd)
 	case btnExport:
 		onExportBundle(hwnd)
 	case btnImport:
@@ -1574,6 +1816,13 @@ func formatScanCount(n int) string {
 	if n < 100000 && n > -100000 {
 		return fmt.Sprintf("%d", n)
 	}
+	return formatScanCountUnit(n)
+}
+
+// formatScanCountUnit renders n in k/M/B/T/P/E unconditionally (the shared
+// core: rounding that would hit 1000 promotes to the next unit, so 999999
+// is "1M", never "1000k").
+func formatScanCountUnit(n int) string {
 	f := float64(n)
 	divs := []float64{1e3, 1e6, 1e9, 1e12, 1e15, 1e18}
 	sufs := []string{"k", "M", "B", "T", "P", "E"}
@@ -1584,6 +1833,16 @@ func formatScanCount(n int) string {
 	s := fmt.Sprintf("%.1f%s", f/divs[idx], sufs[idx])
 	s = strings.Replace(s, ".0"+sufs[idx], sufs[idx], 1)
 	return s
+}
+
+// formatScanCountCompact renders n exactly below 1000, compact above
+// (45000 -> "45k"): the abbreviated form the shortened status tiers use so
+// a large-but-plausible scale fits before any field is dropped.
+func formatScanCountCompact(n int) string {
+	if n < 1000 && n > -1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	return formatScanCountUnit(n)
 }
 
 // fitScanStatus caps s to maxScanStatusLen, preserving the "folders"
@@ -1615,9 +1874,44 @@ func fitScanStatus(s string) string {
 	return s[:maxScanStatusLen-len("...")] + "..."
 }
 
-// scanProgressText maps a library.Progress to the live status line: the X/Y
-// key progress first, then the fetched/cached counts, the failed count ONLY
-// when non-zero, then the folders pair (scanned/skipped, in that order).
+// scanCatchingUp reports the state the index phase leaves behind: every file
+// walked and indexed (Done == Total, and a real total) while metadata keys
+// are still being resolved (Resolved < KeysTotal). The library keeps posting
+// progress through that phase, so it is still working - never finished. Pure.
+func scanCatchingUp(p library.Progress) bool {
+	return p.Total > 0 && p.Done == p.Total && p.Resolved < p.KeysTotal
+}
+
+// scanIndexMetaText renders the two-phase pair the live line leads with:
+// "indexed <Done> of <Total> files" (the enumerate/index phase, complete once
+// Done == Total) and "metadata <Resolved> of <KeysTotal>" (the metadata keys
+// that keep resolving after it). The pair exists only once a file total is
+// known - before that (the walk's opening posts, a bare Progress) the
+// pre-existing counters line stands alone, so this changes nothing for a
+// snapshot that carries no file total. The metadata segment joins it once a
+// key total is known, and the catching-up state appends "- catching up" so a
+// fully indexed run never reads as finished while keys remain. Counts stay
+// exact (not compacted) so the line is quotable against the library's own
+// numbers; composition drops the whole pair for a narrower tier rather than
+// truncating it. Pure so tests drive it without a live window.
+func scanIndexMetaText(p library.Progress) string {
+	if p.Total <= 0 {
+		return ""
+	}
+	s := fmt.Sprintf("indexed %d of %d files", p.Done, p.Total)
+	if p.KeysTotal > 0 {
+		s += fmt.Sprintf(" | metadata %d of %d", p.Resolved, p.KeysTotal)
+	}
+	if scanCatchingUp(p) {
+		s += " - catching up"
+	}
+	return s
+}
+
+// scanProgressText maps a library.Progress to the live status line: the
+// index/metadata pair first (see scanIndexMetaText), then the X/Y
+// key progress, the fetched/cached counts, the failed count ONLY when
+// non-zero, then the folders pair (scanned/skipped, in that order).
 // Short separators and the "N/M folders" pair keep the whole line inside
 // the 420 px status rect at 96 DPI. Pure so tests drive it without a live
 // window.
@@ -1627,10 +1921,17 @@ func scanProgressText(p library.Progress) string {
 	if p.KeysFailed > 0 {
 		failed = fmt.Sprintf(", %s failed", formatScanCount(p.KeysFailed))
 	}
-	return fitScanStatus(fmt.Sprintf("Scan %s/%s keys | %s fetched, %s cached%s | %s/%s folders",
+	line := fmt.Sprintf("Scan %s/%s keys | %s fetched, %s cached%s | %s/%s folders",
 		formatScanCount(p.KeysDone), formatScanCount(p.KeysTotal),
 		formatScanCount(p.KeysFetched), formatScanCount(p.KeysCached), failed,
-		formatScanCount(p.FoldersScanned), formatScanCount(p.FoldersSkipped)))
+		formatScanCount(p.FoldersScanned), formatScanCount(p.FoldersSkipped))
+	// The pair leads when the snapshot carries a file or key total; a bare
+	// Progress (the walk's first post) keeps the pre-existing line byte for
+	// byte, so nothing below changes for it.
+	if seg := scanIndexMetaText(p); seg != "" {
+		line = seg + " | " + line
+	}
+	return fitScanStatus(line)
 }
 
 // scanDoneText maps kind ("Scan"/"Refresh") + stats to the final summary:
@@ -1723,6 +2024,541 @@ func scanResultText(kind string, s library.Stats, err error) string {
 	return scanDoneText(kind, s)
 }
 
+// ---------------------------------------------------------------------------
+// Responsive scan display: coalesced repaints + elapsed/ETA + progress strip.
+// Scan semantics, controls, and the worker are untouched - this block only
+// decides WHAT the UI thread paints from the snapshots the worker posts.
+// Shipped behaviour: walk (no key total yet) -> indeterminate sweeping bar
+// + elapsed; resolve (a key total exists) -> determinate keys bar + elapsed.
+// The split is driven by scanKeyFraction via scanBarModel (ok=false means
+// "no defensible total, sweep instead of faking a percent") - there is no
+// second phase enum.
+// ---------------------------------------------------------------------------
+
+// scanKeyFraction maps resolve progress to a [0,1] bar fraction; ok=false
+// when there is no defensible total (walk phase) so callers show an
+// indeterminate bar instead of a fake percentage. Pure.
+func scanKeyFraction(done, total int) (float64, bool) {
+	if total <= 0 {
+		return 0, false
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	return float64(done) / float64(total), true
+}
+
+// scanPaintGate throttles live repaints to scanPaintInterval: progress posts
+// and the 100 ms tick share one gate over scanLastPaint, so repaints never
+// exceed ~10/s however fast the worker posts. A gated-out update drops
+// nothing - the worker already stored the newest snapshot under scanMu, so
+// the next admitted tick paints the latest state. Pure; terminal states
+// bypass it in scanLifecycleNext, so it takes no terminal flag.
+func scanPaintGate(last, now time.Time) bool {
+	d := now.Sub(last)
+	if d < 0 {
+		return true // clock stepped back: paint rather than stall
+	}
+	return d >= scanPaintInterval
+}
+
+// scanLifecycleEvent is one UI-thread lifecycle input for a scan run:
+// Start (button), Progress (worker post), Tick (100 ms repaint timer), Done
+// (worker completion post).
+type scanLifecycleEvent int
+
+const (
+	scanEvStart scanLifecycleEvent = iota
+	scanEvProgress
+	scanEvTick
+	scanEvDone
+)
+
+// scanLifecycle is the pure run model behind the scan globals: active
+// mirrors scanActive, lastPaint mirrors scanLastPaint. Production owns the
+// globals and executes the returned effects; this struct is the testable
+// decision core both sides share.
+type scanLifecycle struct {
+	active    bool
+	lastPaint time.Time
+}
+
+// scanFx is the explicit effect set one lifecycle step requests - the only
+// thing production consumes, so the lifecycle tests pin these flags and the
+// start/done-path tests pin the production call each flag owns: arm starts
+// the 100 ms repaint tick (SetTimer), kill stops it (KillTimer), paint
+// repaints the live line now, terminal lands the final summary line. The
+// throttle clock re-originates through the returned state (lastPaint = now),
+// not through a flag - production copies it unconditionally.
+type scanFx struct {
+	arm      bool
+	kill     bool
+	paint    bool
+	terminal bool
+}
+
+// scanLifecycleNext advances st by ev at now - the single decision point
+// for the whole gate/lifecycle, which production calls at every site:
+//   - Start while idle arms the tick, resets the throttle, and paints the
+//     "starting" line; Start while active is a no-op (one scan at a time).
+//   - Progress and Tick share the ~10/s gate (a gated-out tick paints
+//     nothing; the latest worker snapshot wins the next admitted window).
+//   - Done always kills the tick; the terminal line always lands for a
+//     real run (an idle Done still kills defensively but lands nothing).
+//
+// Pure so tests pin every arm/kill/paint/terminal edge and the lastPaint
+// reset: dropping timer registration, timer cleanup, the terminal paint, or
+// the clock re-origin from this function fails the lifecycle tests.
+func scanLifecycleNext(st scanLifecycle, ev scanLifecycleEvent, now time.Time) (scanLifecycle, scanFx) {
+	switch ev {
+	case scanEvStart:
+		if st.active {
+			return st, scanFx{}
+		}
+		return scanLifecycle{active: true, lastPaint: now}, scanFx{arm: true, paint: true}
+	case scanEvProgress, scanEvTick:
+		if !st.active {
+			return st, scanFx{}
+		}
+		if !scanPaintGate(st.lastPaint, now) {
+			return st, scanFx{}
+		}
+		st.lastPaint = now
+		return st, scanFx{paint: true}
+	case scanEvDone:
+		if !st.active {
+			return scanLifecycle{}, scanFx{kill: true}
+		}
+		return scanLifecycle{}, scanFx{kill: true, terminal: true}
+	}
+	return st, scanFx{}
+}
+
+// ETA floor: a rate from fewer observed keys or less resolve time than
+// this is noise, not an estimate - show elapsed alone instead.
+const (
+	minElapsedForETA = 2 * time.Second
+	minKeysForETA    = 5
+)
+
+// scanObservedDone counts resolve work actually observed on the wire/disk:
+// cache hits arrive pre-credited and instantly, so they carry no rate
+// information - a burst of 990 instant hits after a 60 s walk must not
+// project a "0.6s remaining" fantasy. Clamped, since snapshots race. Pure.
+func scanObservedDone(p library.Progress) int {
+	o := p.KeysDone - p.KeysCached
+	if o < 0 {
+		o = 0
+	}
+	return o
+}
+
+// scanETA projects remaining resolve time linearly from the RESOLVE phase's
+// own clock (resolveElapsed, not total scan elapsed) and the rate of work
+// actually observed since the resolve origin opened (scanObservedDone now
+// minus the observedBase captured then - work finished before the measured
+// interval never feeds the rate, so 100 banked completions followed by 2 s
+// of silence project nothing). ok=false whenever no honest rate exists:
+// walk phase (no total), nothing (or everything) done, too few observed
+// keys, or too little resolve time to trust. Pure so tests drive it without
+// a live window.
+func scanETA(p library.Progress, observedBase int, resolveElapsed time.Duration) (time.Duration, bool) {
+	if p.KeysTotal <= 0 || p.KeysDone >= p.KeysTotal {
+		return 0, false
+	}
+	observed := scanObservedDone(p) - observedBase
+	if observed < minKeysForETA {
+		return 0, false
+	}
+	if resolveElapsed < minElapsedForETA {
+		return 0, false
+	}
+	remaining := p.KeysTotal - p.KeysDone
+	if remaining <= 0 {
+		return 0, false
+	}
+	eta := time.Duration(float64(resolveElapsed) * float64(remaining) / float64(observed))
+	if eta < 0 {
+		return 0, false
+	}
+	return eta, true
+}
+
+// scanResolveElapsed reports time since the resolve phase began (the first
+// snapshot carrying a key total); zero before that, so the ETA stays
+// suppressed through the whole walk however long it takes. Pure over the
+// UI-thread resolve origin.
+func scanResolveElapsed(origin, now time.Time) time.Duration {
+	if origin.IsZero() {
+		return 0
+	}
+	if d := now.Sub(origin); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// formatScanDuration renders d compactly for the status line: "0s", "45s",
+// "2m05s", "1h02m". Negative clamps to zero. Pure.
+func formatScanDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	s := int(d / time.Second)
+	if s < 60 {
+		return fmt.Sprintf("%ds", s)
+	}
+	m := s / 60
+	if m < 60 {
+		return fmt.Sprintf("%dm%02ds", m, s%60)
+	}
+	return fmt.Sprintf("%dh%02dm", m/60, m%60)
+}
+
+// scanLiveStatusParts splits the live line by priority: the counters first
+// (keys, fetched/cached/failed, folders - never dropped), then the elapsed
+// suffix, then the ETA suffix (only when the resolve counters defend one).
+// observedBase is the resolve-origin completion baseline (see scanETA).
+// Pure so tests drive it without a live window.
+func scanLiveStatusParts(p library.Progress, elapsed, resolveElapsed time.Duration, observedBase int) (base, elapsedSfx, etaSfx string) {
+	base = scanProgressText(p)
+	elapsedSfx = " | " + formatScanDuration(elapsed)
+	if eta, ok := scanETA(p, observedBase, resolveElapsed); ok {
+		etaSfx = ", eta " + formatScanDuration(eta) + " left"
+	}
+	return base, elapsedSfx, etaSfx
+}
+
+// scanStatusAvailPx is the status text width in px at dpi for the standard
+// fixed client: the 460-logical client minus the 20-logical margins on both
+// sides (420/525/630/840 px at 96/120/144/192 DPI). Pure; matches
+// computeLayout's status rect exactly at the standard size.
+func scanStatusAvailPx(dpi int) int32 {
+	return scalePx(int32(dpi), mainClientW-2*mainMargin)
+}
+
+// statusAvailPx is the status text width for a live client width cw at dpi:
+// the client minus the 20-logical margins on both sides. Pure; matches
+// computeLayout's status rect exactly at ANY size, so the composition
+// budget can never disagree with the rect actually drawn into
+// (WM_DPICHANGED only invalidates - the client keeps its physical px, and
+// composition reads those live px instead of assuming the standard size).
+func statusAvailPx(cw int32, dpi int) int32 {
+	return cw - 2*scalePx(int32(dpi), mainMargin)
+}
+
+// liveStatusAvailPx derives the composition budget from the live client
+// rect at composition time; the standard-size budget when the window has no
+// size yet (headless/early) - never a DPI-scaled guess about the size.
+func liveStatusAvailPx(hwnd uintptr) int32 {
+	var rc rect
+	procGetClientRect.Call(hwnd, uintptr(unsafe.Pointer(&rc)))
+	if cw := rc.right - rc.left; cw > 0 {
+		return statusAvailPx(cw, windowDpi(hwnd))
+	}
+	return scanStatusAvailPx(96)
+}
+
+// measureScanStatusWidth reports the px width of s in the status-line font
+// (Segoe UI at the section size) at dpi, with GetTextExtentPoint32W - the
+// same native technique the paint path audits single-line draws with. A
+// screen DC suffices (extents do not depend on the target surface).
+// ok=false when no DC or font is available; callers then land the short
+// pre-ETA shape instead of guessing.
+func measureScanStatusWidth(dpi int, s string) (int32, bool) {
+	if s == "" {
+		return 0, true
+	}
+	hdc, _, _ := procGetDC.Call(0)
+	if hdc == 0 {
+		return 0, false
+	}
+	defer procReleaseDC.Call(0, hdc)
+	font := createUIFont(-scalePx(int32(dpi), 12), fwNormal)
+	if font == 0 {
+		return 0, false
+	}
+	defer procDeleteObject.Call(font)
+	old, _, _ := procSelectObject.Call(hdc, font)
+	defer procSelectObject.Call(hdc, old)
+	u, err := syscall.UTF16FromString(s)
+	if err != nil || len(u) < 2 {
+		return 0, false
+	}
+	var sz textSize
+	r, _, _ := procGetTextExtentPoint32W.Call(hdc,
+		uintptr(unsafe.Pointer(&u[0])), uintptr(len(u)-1),
+		uintptr(unsafe.Pointer(&sz)))
+	if r == 0 {
+		return 0, false
+	}
+	return sz.cx, true
+}
+
+// scanProgressShort is the abbreviated counters line: compact (k/M) key
+// progress, the failed count ONLY when non-zero, then the folders pair. It
+// drops the fetched/cached split (already summarized by the keys pair), so
+// a scale that overflows the full line can still keep elapsed beside the
+// counters. Pure so tests drive it without a live window.
+func scanProgressShort(p library.Progress) string {
+	failed := ""
+	if p.KeysFailed > 0 {
+		failed = fmt.Sprintf(", %s failed", formatScanCountCompact(p.KeysFailed))
+	}
+	return fitScanStatus(fmt.Sprintf("Scan %s/%s keys%s | %s/%s folders",
+		formatScanCountCompact(p.KeysDone), formatScanCountCompact(p.KeysTotal), failed,
+		formatScanCountCompact(p.FoldersScanned), formatScanCountCompact(p.FoldersSkipped)))
+}
+
+// scanProgressFloor is the absolute floor of the live line: compact key
+// progress alone ("Scan 999.8k/999.9k keys") - no failed suffix, no folders,
+// no ETA, no elapsed. The compact pair peaks at a handful of chars, so the
+// floor fits the narrowest budget the fit table covers (380 px at 192 DPI on
+// a 460 px client - proved by TestScanLiveStatusFitsAtAllDPI's pathological
+// case). If even the floor cannot fit, the client itself is narrower than the
+// floor needs: composition still returns the floor and the painter
+// end-ellipsizes it (dtEndEllipsis) - ellipsis on an impossible client is the
+// stated policy, never a silent truncation of a higher tier. Pure.
+func scanProgressFloor(p library.Progress) string {
+	return fitScanStatus(fmt.Sprintf("Scan %s/%s keys",
+		formatScanCountCompact(p.KeysDone), formatScanCountCompact(p.KeysTotal)))
+}
+
+// scanProgressMinimal is the last counters tier before the floor: the floor
+// pair plus a non-zero failed count. The suffix can still overflow a narrow
+// rect at pathological scale, so composition falls through to the floor when
+// it does. Pure so tests drive it without a live window.
+func scanProgressMinimal(p library.Progress) string {
+	failed := ""
+	if p.KeysFailed > 0 {
+		failed = fmt.Sprintf(", %s failed", formatScanCountCompact(p.KeysFailed))
+	}
+	return fitScanStatus(scanProgressFloor(p) + failed)
+}
+
+// scanStatusCandidates lists the live line in decreasing verbosity: the full
+// counters with elapsed and ETA, the full counters with elapsed, the
+// index/metadata pair with elapsed and ETA, the pair with elapsed, the pair
+// alone, the abbreviated counters with elapsed and ETA, the abbreviated
+// counters with elapsed, the abbreviated counters alone, the minimal keys
+// pair with the failed count, then the floor done/total pair alone. Tiers run
+// full -> pair -> short -> minimal -> floor with the ETA suffix added last and
+// dropped first: full precision without ETA is preferred over abbreviated
+// counters with ETA; the pair (only present once a file total is known)
+// outranks the abbreviated counters so a catching-up run keeps saying so, and
+// abbreviation compacts the counts and drops the fetched/cached
+// split (full -> short), then the folders pair (short -> minimal), then the
+// failed count (minimal -> floor). A dropped field is never truncated, so
+// end-ellipsis can never eat a high-priority counter. Pure so tests drive it
+// without GDI.
+func scanStatusCandidates(p library.Progress, elapsed, resolveElapsed time.Duration, observedBase int) []string {
+	base, elapsedSfx, etaSfx := scanLiveStatusParts(p, elapsed, resolveElapsed, observedBase)
+	cands := []string{}
+	if etaSfx != "" {
+		cands = append(cands, base+elapsedSfx+etaSfx)
+	}
+	cands = append(cands, base+elapsedSfx)
+	// The index/metadata pair as its own tier pair, above the abbreviated key
+	// counters: a rect too narrow for the full counters line still shows the
+	// two phases (and so still says "catching up") instead of falling back to
+	// keys alone. Dropped when its own totals are unknown (the walk).
+	if seg := scanIndexMetaText(p); seg != "" {
+		if etaSfx != "" {
+			cands = append(cands, seg+elapsedSfx+etaSfx)
+		}
+		cands = append(cands, seg+elapsedSfx, seg)
+	}
+	short := scanProgressShort(p)
+	if etaSfx != "" {
+		cands = append(cands, short+elapsedSfx+etaSfx)
+	}
+	cands = append(cands, short+elapsedSfx, short, scanProgressMinimal(p), scanProgressFloor(p))
+	return cands
+}
+
+// composeScanLiveStatus lands the longest candidate that measures inside
+// availPx, else the floor done/total pair (which fits by construction - see
+// scanProgressFloor; on a client narrower than even the floor needs the floor
+// still returns and the painter end-ellipsizes it). Pure over an injected
+// measure so tests drive it without GDI.
+func composeScanLiveStatus(p library.Progress, elapsed, resolveElapsed time.Duration, observedBase int, availPx int32, measure func(string) int32) string {
+	cands := scanStatusCandidates(p, elapsed, resolveElapsed, observedBase)
+	for _, c := range cands {
+		if measure(c) <= availPx {
+			return c
+		}
+	}
+	return cands[len(cands)-1]
+}
+
+// scanLiveStatusText is the throttled live status line: the longest
+// candidate that measures inside the live status rect actually lands (see
+// composeScanLiveStatus) - the counters, then elapsed, then an ETA only
+// when the resolve counters defend one. Still capped by fitScanStatus for
+// pathological counts, and the bar lives below the text rect, so text never
+// leaves its rect. availPx is the live status width (liveStatusAvailPx),
+// never a DPI-scaled guess about the client size.
+func scanLiveStatusText(p library.Progress, elapsed, resolveElapsed time.Duration, observedBase int, dpi int, availPx int32) string {
+	base, elapsedSfx, _ := scanLiveStatusParts(p, elapsed, resolveElapsed, observedBase)
+	if _, ok := measureScanStatusWidth(dpi, base+elapsedSfx); !ok {
+		// No HDC to prove the fit: land the floor pair with elapsed (no
+		// folders, no failed suffix, no estimate), which the fit table
+		// proves inside the narrowest real rect even at pathological scale.
+		return fitScanStatus(scanProgressFloor(p) + elapsedSfx)
+	}
+	return fitScanStatus(composeScanLiveStatus(p, elapsed, resolveElapsed, observedBase, availPx, func(s string) int32 {
+		w, ok := measureScanStatusWidth(dpi, s)
+		if !ok {
+			return availPx + 1 // unmeasurable: never sneak in
+		}
+		return w
+	}))
+}
+
+// scanBarRect is the progress strip: a thin track in the dead margin BELOW
+// the status rect (the status bottom sits sc(14) above the client bottom),
+// so the status text rect keeps its exact geometry and the layout table is
+// untouched. Pure so tests drive it at any DPI.
+func scanBarRect(status rect, dpi int) rect {
+	sc := func(v int32) int32 { return scalePx(int32(dpi), v) }
+	top := status.bottom + sc(3)
+	return rect{left: status.left, top: top, right: status.right, bottom: top + sc(5)}
+}
+
+// scanIndeterminatePos maps elapsed scan time to a [0,1) sweep position for
+// the walk-phase bar chunk (1.2 s loop). Pure.
+func scanIndeterminatePos(elapsed time.Duration) float64 {
+	if elapsed < 0 {
+		elapsed = 0
+	}
+	const loop = 1200 * time.Millisecond
+	return float64(elapsed%loop) / float64(loop)
+}
+
+// resetScanSnapshot clears the live progress snapshot and the resolve-phase
+// clock (origin + completion baseline) so a fresh run can never render the
+// previous run's bar and counters (a completed 24/24 line would otherwise
+// linger through the next walk). UI thread only: scan start alone calls it -
+// the cancel path keeps the snapshot so the retained determinate bar and the
+// landed kept-progress summary agree until the done message arrives.
+func resetScanSnapshot() {
+	scanMu.Lock()
+	scanProgress = library.Progress{}
+	scanMu.Unlock()
+	scanResolveStart = time.Time{}
+	scanResolveBase = 0
+}
+
+// refreshScanLiveText repaints the live scan line from the latest worker
+// snapshot through the lifecycle decision (progress posts and the timer
+// tick both funnel here with their own event; the terminal state lands in
+// onScanDone and paints unconditionally). UI thread only.
+func refreshScanLiveText(hwnd uintptr, ev scanLifecycleEvent, now time.Time) {
+	if scanActive && scanCancel == nil {
+		// Cancel requested: the cancelled summary owns the line until the
+		// worker's done message lands.
+		return
+	}
+	st, fx := scanLifecycleNext(scanLifecycle{active: scanActive, lastPaint: scanLastPaint}, ev, now)
+	if !fx.paint {
+		return
+	}
+	scanLastPaint = st.lastPaint
+	scanMu.Lock()
+	p := scanProgress
+	scanMu.Unlock()
+	if scanResolveStart.IsZero() && p.KeysTotal > 0 {
+		// Resolve origin: the first snapshot carrying a key total opens the
+		// measured interval, and the completions already observed then are
+		// the baseline - the rate divides only the delta (see scanETA).
+		scanResolveStart = now
+		scanResolveBase = scanObservedDone(p)
+	}
+	setStatusText(scanLiveStatusText(p, now.Sub(scanStart), scanResolveElapsed(scanResolveStart, now), scanResolveBase, windowDpi(hwnd), liveStatusAvailPx(hwnd)))
+}
+
+// scanBarModel maps run state to the strip presentation: hidden unless a
+// run is in flight; determinate (fraction) once a key total exists;
+// sweeping indeterminate while the walk has no total yet. Pure; paintScanBar
+// renders exactly this model, so the shipped behaviour is "walk phase ->
+// indeterminate sweeping bar + elapsed; resolve phase -> determinate keys
+// bar + elapsed" with no second phase enum.
+func scanBarModel(active bool, done, total int) (show, determinate bool, frac float64) {
+	if !active {
+		return false, false, 0
+	}
+	if f, ok := scanKeyFraction(done, total); ok {
+		return true, true, f
+	}
+	return true, false, 0
+}
+
+// scanBarProgress is the live bar model: scanBarModel fed the METADATA pair
+// (Resolved of KeysTotal), never the file pair (Done of Total). A finished
+// index phase says nothing about metadata - Done == Total with Resolved <
+// KeysTotal is the catching-up state (scanCatchingUp) and the bar must not
+// read as finished there. With Resolved of KeysTotal it structurally cannot
+// (the fraction is strictly below 1), so no clamp is needed and no full fill
+// is ever painted while keys remain. No key total yet (the walk) still sweeps
+// indeterminate, exactly as scanBarModel decides. Pure.
+func scanBarProgress(p library.Progress, active bool) (show, determinate bool, frac float64) {
+	return scanBarModel(active, p.Resolved, p.KeysTotal)
+}
+
+// paintScanBar draws the scan strip below the status line: an honest
+// determinate accent fill in resolve/done (Resolved/KeysTotal - never full
+// while metadata is still catching up), a sweeping chunk while the walk has
+// no total yet. Same palette and rounded fills as the folder pills; silent
+// unless a scan is running. UI thread only (called from paint, which takes
+// one brief mutex snapshot and never blocks).
+func paintScanBar(hdc uintptr, status rect, dpi int) {
+	if !scanActive {
+		return
+	}
+	bar := scanBarRect(status, dpi)
+	if bar.right <= bar.left || bar.bottom <= bar.top {
+		return
+	}
+	sc := func(v int32) int32 { return scalePx(int32(dpi), v) }
+	fillRoundRect(hdc, bar, colRow, sc(4))
+	scanMu.Lock()
+	p := scanProgress
+	scanMu.Unlock()
+	show, determinate, frac := scanBarProgress(p, scanActive)
+	if !show {
+		return
+	}
+	barW := bar.right - bar.left
+	if determinate {
+		w := int32(frac * float64(barW))
+		if w <= 0 {
+			return
+		}
+		if w < sc(8) {
+			w = sc(8) // a sliver still reads as started
+		}
+		if w > barW {
+			w = barW
+		}
+		fillRoundRect(hdc, rect{left: bar.left, top: bar.top, right: bar.left + w, bottom: bar.bottom}, colAccent, sc(4))
+		return
+	}
+	// Walk phase: no total, so a sweeping chunk instead of a fake percent.
+	chunk := barW / 4
+	if chunk < sc(24) {
+		chunk = sc(24)
+	}
+	if chunk >= barW {
+		chunk = barW
+	}
+	pos := scanIndeterminatePos(time.Since(scanStart))
+	x := bar.left + int32(pos*float64(barW-chunk))
+	fillRoundRect(hdc, rect{left: x, top: bar.top, right: x + chunk, bottom: bar.bottom}, colAccent, sc(4))
+}
+
 // buildScanOptions is the indexed scan configuration for the Scan/Refresh
 // buttons (and the post-import auto-scan, which calls startLibraryScan with
 // force=false): the configured DIRs, the live metadata cache dir, the scan
@@ -1737,6 +2573,60 @@ func buildScanOptions(dirs []string, force bool, progress func(library.Progress)
 		UseIndex:  true,
 		Progress:  progress,
 	}
+}
+
+// scanArmTimer starts the live-scan repaint tick and scanKillTimer stops it.
+// Package vars (not direct proc calls) so the start/done-path tests observe
+// the exact effect each lifecycle flag owns without a live window.
+var scanArmTimer = func(hwnd uintptr) {
+	procSetTimer.Call(hwnd, uintptr(scanTimerID), uintptr(scanPaintInterval/time.Millisecond), 0)
+}
+
+var scanKillTimer = func(hwnd uintptr) {
+	procKillTimer.Call(hwnd, uintptr(scanTimerID))
+}
+
+// beginScanRun is the UI-thread half of scan start, extracted so tests drive
+// the REAL start path without launching the worker: it consumes the start
+// effects the lifecycle emits - arming the tick and painting the opening
+// line - copies the re-originated throttle clock from the returned state,
+// clears the stale snapshot, and reports whether a run began (false while one
+// is active). startLibraryScan
+// calls it, then launches the worker with the returned context. The stored
+// scanCancel is cancelled by cancelLibraryScan or onScanDone; tests cancel
+// it in cleanup.
+func beginScanRun(hwnd uintptr, force bool, now time.Time) (context.Context, bool) {
+	st, fx := scanLifecycleNext(scanLifecycle{active: scanActive, lastPaint: scanLastPaint}, scanEvStart, now)
+	if !fx.arm {
+		return nil, false // one scan at a time
+	}
+	scanActive = true
+	ctx, cancel := context.WithCancel(context.Background())
+	scanCancel = cancel
+	scanStart = now
+	// The start state re-originated the throttle clock; production copies it
+	// unconditionally (no flag owns this) - deleting this line leaves the
+	// previous run's clock behind (pinned by the start tests).
+	scanLastPaint = st.lastPaint
+	resetScanSnapshot() // a fresh run never renders the previous run's bar
+	scanMu.Lock()
+	scanForce = force
+	scanMu.Unlock()
+	enableScanButtons(hwnd, false)
+	kind := "Scan"
+	if force {
+		kind = "Refresh"
+	}
+	if fx.paint {
+		setStatusText(kind + " starting...")
+	}
+	// Repaint tick: progress posts only store the snapshot (the worker
+	// already holds the latest under scanMu); this 100 ms tick paints it
+	// through the coalescing gate, so live repaints never exceed ~10/s
+	// however fast the worker posts. The done message kills the tick and
+	// paints the final state unconditionally.
+	scanArmTimer(hwnd)
+	return ctx, true
 }
 
 // startLibraryScan launches a Scan (force=false) or Refresh (force=true) on
@@ -1754,23 +2644,19 @@ func startLibraryScan(hwnd uintptr, force bool) {
 		return
 	}
 	dirs := loadConfig().Dirs
-	kind, lname := "Scan", "scan"
+	lname := "scan"
 	if force {
-		kind, lname = "Refresh", "refresh"
+		lname = "refresh"
 	}
 	if len(dirs) == 0 {
 		setStatusText("No folders configured - Add folder first.")
 		appLogf("%s: no dirs configured", lname)
 		return
 	}
-	scanActive = true
-	ctx, cancel := context.WithCancel(context.Background())
-	scanCancel = cancel
-	scanMu.Lock()
-	scanForce = force
-	scanMu.Unlock()
-	enableScanButtons(hwnd, false)
-	setStatusText(kind + " starting...")
+	ctx, ok := beginScanRun(hwnd, force, time.Now())
+	if !ok {
+		return // one scan at a time
+	}
 	appLogf("%s: started (dirs=%d force=%t)", lname, len(dirs), force)
 	go func() {
 		stats, err := library.ScanWithOptions(ctx, buildScanOptions(dirs, force, func(p library.Progress) {
@@ -1803,13 +2689,37 @@ func cancelLibraryScan() {
 	p := scanProgress
 	scanMu.Unlock()
 	setStatusText(scanCancelledText(p.KeysDone, p.KeysTotal))
+	// No snapshot reset here: the cancelled summary owns the line AND the
+	// retained snapshot owns the bar, so the determinate progress stays
+	// visible ("progress kept") until the done message lands the final
+	// partial stats. Resetting would let a pending paint swap the retained
+	// bar for a walk strip mid-cancel.
 	appLogf("scan: cancel requested (%d/%d keys done)", p.KeysDone, p.KeysTotal)
+}
+
+// scanTerminalText maps a landed run to its status line: the kind derives
+// from the force flag exactly as onScanDone derives it ("Refresh" iff
+// force), then scanResultText owns the cancelled/failed/done split. Pure,
+// and the single text source for the terminal path, so tests pin the same
+// arguments production passes (argument parity by construction).
+func scanTerminalText(force bool, s library.Stats, err error) string {
+	kind := "Scan"
+	if force {
+		kind = "Refresh"
+	}
+	return scanResultText(kind, s, err)
 }
 
 // onScanDone lands the worker's result on the UI thread: re-enable the
 // buttons and show the final summary in the status line. A Cancelled
 // result is never a failure: it lands on the cancelled message.
 func onScanDone(hwnd uintptr) {
+	// The tick dies with the run; the terminal line below paints exactly
+	// when the lifecycle says so (a real run always lands it).
+	_, fx := scanLifecycleNext(scanLifecycle{active: scanActive, lastPaint: scanLastPaint}, scanEvDone, time.Now())
+	if fx.kill {
+		scanKillTimer(hwnd)
+	}
 	scanMu.Lock()
 	stats, err, force := scanStats, scanErr, scanForce
 	scanMu.Unlock()
@@ -1819,21 +2729,23 @@ func onScanDone(hwnd uintptr) {
 		scanCancel = nil
 	}
 	enableScanButtons(hwnd, true)
-	kind, lname := "Scan", "scan"
+	lname := "scan"
 	if force {
-		kind, lname = "Refresh", "refresh"
+		lname = "refresh"
 	}
+	if !fx.terminal {
+		appLogf("%s: stray done with no run, line untouched", lname)
+		return
+	}
+	setStatusText(scanTerminalText(force, stats, err))
 	if stats.Cancelled || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		setStatusText(scanCancelledText(stats.KeysDone, stats.Keys))
 		appLogf("%s: cancelled (%d/%d keys done, progress kept)", lname, stats.KeysDone, stats.Keys)
 		return
 	}
 	if err != nil {
-		setStatusText(fitScanStatus(kind + " failed: " + err.Error()))
 		appLogf("%s: failed: %s", lname, err)
 		return
 	}
-	setStatusText(scanDoneText(kind, stats))
 	appLogf("%s: complete files=%d skipped=%d unique=%d resolved=%d cached=%d fetched=%d not-found=%d errors=%d denied=%d foldersScanned=%d foldersSkipped=%d filesSkipped=%d",
 		lname, stats.Files, stats.Skipped, stats.Unique, stats.Resolved, stats.Cached, stats.Fetched, stats.NotFound, stats.Errors, stats.Denied, stats.FoldersScanned, stats.FoldersSkipped, stats.FilesSkipped)
 }
@@ -2073,6 +2985,10 @@ func paintMainCard(hdc uintptr, rc rect, dpi int) {
 	// 5. Status line.
 	drawUIText(hdc, "main.status", statusText, l.status,
 		dtLeft|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, sectionFont, colMuted)
+	// 5b. Scan strip: thin determinate/indeterminate bar in the dead margin
+	// below the status rect (text geometry untouched). Silent unless a run
+	// is in flight.
+	paintScanBar(hdc, l.status, dpi)
 }
 
 // paintSettingsCard draws the settings view in the same window: Back +
@@ -2149,6 +3065,8 @@ func paintSettingsCard(hdc uintptr, rc rect, dpi int) {
 	// Status line (shared with the main view).
 	drawUIText(hdc, "settings.status", statusText, l.status,
 		dtLeft|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, sectionFont, colMuted)
+	// Scan strip below the status rect (text geometry untouched).
+	paintScanBar(hdc, l.status, dpi)
 }
 
 // paintCardView draws the Card view in the same window: Back + title, the
@@ -2226,6 +3144,8 @@ func paintCardView(hdc uintptr, rc rect, dpi int) {
 	// Status line (shared with the other views).
 	drawUIText(hdc, "card.status", statusText, l.status,
 		dtLeft|dtSingleLine|dtNoPrefix|dtVCenter|dtEndEllipsis, sectionFont, colMuted)
+	// Scan strip below the status rect (text geometry untouched).
+	paintScanBar(hdc, l.status, dpi)
 }
 
 // singleLineFits reports whether s fits in w px on hdc with the currently

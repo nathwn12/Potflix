@@ -574,10 +574,10 @@ func TestPreviewNotRecordedOnSendFailure(t *testing.T) {
 
 // TestDeadCacheLabel proves the Settings dead-titles line text.
 func TestDeadCacheLabel(t *testing.T) {
-	if got, want := deadCacheLabel(0), "0 titles marked dead - Clear cache retries them"; got != want {
+	if got, want := deadCacheLabel(0), "0 titles marked dead - Clear metadata retries them"; got != want {
 		t.Fatalf("deadCacheLabel(0) = %q, want %q", got, want)
 	}
-	if got, want := deadCacheLabel(5), "5 titles marked dead - Clear cache retries them"; got != want {
+	if got, want := deadCacheLabel(5), "5 titles marked dead - Clear metadata retries them"; got != want {
 		t.Fatalf("deadCacheLabel(5) = %q, want %q", got, want)
 	}
 }

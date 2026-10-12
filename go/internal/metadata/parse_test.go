@@ -60,6 +60,44 @@ func TestParseTitlecleanMovie(t *testing.T) {
 	}
 }
 
+// TestParseMovieMarker pins the movie-marker rule. A "Movie"/"the Movie"
+// marker in the cleaned title, with its number or a trailing subtitle, means
+// the file is a film: the marker (and its number) is stripped, the trailing
+// subtitle is composed back onto the base title, and the weak absolute tag
+// titleclean's ALT_EP split left behind is dropped.
+//
+// Real file: "[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv" parsed as
+// title "Dragon Ball Super Movie" + E1 before this rule; it is the 2018 film
+// "Dragon Ball Super: Broly" (iTunes/Wikipedia are the movie sources).
+//
+// The last three rows are REGRESSIONS: the behaviour captured before the
+// change, asserted unchanged.
+func TestParseMovieMarker(t *testing.T) {
+	cases := []struct {
+		file  string
+		kind  Kind
+		title string
+		ep    int
+	}{
+		{"[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv", KindMovie, "Dragon Ball Super: Broly", 0},
+		{"[Anime Time] Dragon Ball Super Movie 01.mkv", KindMovie, "Dragon Ball Super", 0},
+		{"[Anime Time] Dragon Ball Super the Movie 01 - Broly.mkv", KindMovie, "Dragon Ball Super: Broly", 0},
+		// REGRESSIONS.
+		{"[SubsPlease] Frieren - 01 (1080p).mkv", KindSeries, "Frieren", 1},
+		{"Dragon Ball Super - 01.mkv", KindSeries, "Dragon Ball Super", 1},
+		{"[JySzE] Dragon Ball Super - Broly [2018].mkv", KindMovie, "Dragon Ball Super - Broly", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.file, func(t *testing.T) {
+			q := ParseRaw(tc.file)
+			if q.Kind != tc.kind || q.Title != tc.title || q.Season != 0 || q.Episode != tc.ep {
+				t.Fatalf("ParseRaw(%q) = (Kind=%d Title=%q S=%d E=%d), want (Kind=%d Title=%q S=0 E=%d)",
+					tc.file, q.Kind, q.Title, q.Season, q.Episode, tc.kind, tc.title, tc.ep)
+			}
+		})
+	}
+}
+
 func TestParseRaw(t *testing.T) {
 	q1 := ParseRaw("Show.S01E02.Pilot.1080p.mkv - PotPlayer")
 	want := Query{Kind: KindSeries, Title: "Show", Season: 1, Episode: 2}

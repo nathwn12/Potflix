@@ -12,15 +12,37 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"potflix/internal/metadata"
 )
 
 const testSchema = 3
 
+// cacheNameFor restates the 16-hex cache filename rule independently of the
+// package under test; TestBundleCacheNameRuleMatchesMetadata pins it against
+// the metadata package's own export.
 func cacheNameFor(key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return hex.EncodeToString(sum[:])[:16] + ".json"
 }
 
+// seedLiveEntry stores one live cache entry the way the resolver does: the
+// store record is the cache envelope's bytes (metadata.CachePutRaw), so media
+// is opaque here exactly as it is to the store.
+func seedLiveEntry(t *testing.T, dir, key string, schema int, media string) {
+	t.Helper()
+	payload, err := json.Marshal(cacheRecord{Key: key, Schema: schema, Media: json.RawMessage(media)})
+	if err != nil {
+		t.Fatalf("marshal live seed %q: %v", key, err)
+	}
+	if err := metadata.CachePutRaw(dir, key, payload); err != nil {
+		t.Fatalf("seed live entry %q: %v", key, err)
+	}
+}
+
+// seedCacheFile writes one LEGACY loose per-key cache file (the pre-store
+// layout, still the recovery copy migration imports): a 16-hex .json name with
+// a cache-shaped body.
 func seedCacheFile(t *testing.T, dir, key string, schema int, media string) string {
 	t.Helper()
 	name := cacheNameFor(key)
@@ -34,17 +56,23 @@ func seedCacheFile(t *testing.T, dir, key string, schema int, media string) stri
 	return name
 }
 
-func readCacheRecord(t *testing.T, path string) cacheRecord {
+// liveValue returns a copy of the stored bytes for key in dir's live cache.
+func liveValue(t *testing.T, dir, key string) ([]byte, bool) {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	var out []byte
+	found := false
+	err := metadata.CacheForEach(dir, func(k string, v []byte) bool {
+		if k == key {
+			out = append([]byte(nil), v...)
+			found = true
+			return false
+		}
+		return true
+	})
 	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+		t.Fatalf("CacheForEach(%s): %v", dir, err)
 	}
-	var rec cacheRecord
-	if err := json.Unmarshal(data, &rec); err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
-	return rec
+	return out, found
 }
 
 // testBundleBytes builds a minimal well-formed bundle payload for Import tests.
@@ -81,18 +109,24 @@ func dirChildNames(t *testing.T, dir string) []string {
 	return names
 }
 
+// TestBundleRoundTrip is the integration contract the store rework left open:
+// export the LIVE cache, import into an empty live cache, and the imported
+// entries are live and counted there - no file in either directory is written
+// or read.
 func TestBundleRoundTrip(t *testing.T) {
 	a := t.TempDir()
 	b := t.TempDir()
 	keys := []string{"movie|alpha|2001", "series|beta|2020|2", "movie|gamma|1999"}
 	media := []string{
-		`{"title":"Alpha","poster":"https://image.example.com/alpha.jpg"}`,
-		`{"title":"Beta","genres":["Drama"]}`,
-		`{"title":"Gamma","length":5400}`,
+		`{"source":"tvmaze","title":"Alpha","artwork":"https://image.example.com/alpha.jpg"}`,
+		`{"source":"tvmaze","title":"Beta","genres":"Drama"}`,
+		`{"source":"itunes","title":"Gamma","length":"1h 30m"}`,
 	}
-	names := make([]string, len(keys))
 	for i := range keys {
-		names[i] = seedCacheFile(t, a, keys[i], testSchema, media[i])
+		seedLiveEntry(t, a, keys[i], testSchema, media[i])
+	}
+	if c, err := Count(a); err != nil || c != 3 {
+		t.Fatalf("Count(A) = %d, %v; want 3", c, err)
 	}
 
 	var buf bytes.Buffer
@@ -139,24 +173,38 @@ func TestBundleRoundTrip(t *testing.T) {
 	}
 
 	for i := range keys {
-		da, err := os.ReadFile(filepath.Join(a, names[i]))
-		if err != nil {
-			t.Fatalf("read source %s: %v", names[i], err)
+		// Live for the reader that matters: the resolver's own gates
+		// (schema, key, non-empty Source).
+		if !metadata.CacheLive(b, keys[i]) {
+			t.Fatalf("imported entry %q is not live in the destination cache", keys[i])
 		}
-		db, err := os.ReadFile(filepath.Join(b, names[i]))
-		if err != nil {
-			t.Fatalf("missing imported file %s: %v", names[i], err)
+		// Byte-identical media through the store, like the loose files were.
+		da, ok := liveValue(t, a, keys[i])
+		if !ok {
+			t.Fatalf("source entry %q vanished from the live cache", keys[i])
+		}
+		db, ok := liveValue(t, b, keys[i])
+		if !ok {
+			t.Fatalf("imported entry %q missing from the destination cache", keys[i])
 		}
 		if !bytes.Equal(da, db) {
-			t.Fatalf("file %s differs after round-trip", names[i])
+			t.Fatalf("entry %q differs after round-trip:\n%s\n%s", keys[i], da, db)
 		}
-		ra := readCacheRecord(t, filepath.Join(a, names[i]))
-		rb := readCacheRecord(t, filepath.Join(b, names[i]))
-		if string(ra.Media) != media[i] {
-			t.Fatalf("source media mangled for %q: %s", keys[i], ra.Media)
+	}
+	// Visible to the resolver's own probe path too, immediately afterwards:
+	// the Settings import runs against the resolver's live cache dir.
+	res := metadata.New(metadata.Options{Dir: b, Offline: true})
+	for i := range keys {
+		if !res.ProbeCache(keys[i]) {
+			t.Fatalf("ProbeCache(%q) missed right after the import", keys[i])
 		}
-		if string(rb.Media) != string(ra.Media) {
-			t.Fatalf("media not byte-identical for %q", keys[i])
+	}
+	// Neither directory gained a cache file: the cache is the store beside it.
+	for _, dir := range []string{a, b} {
+		for _, n := range dirChildNames(t, dir) {
+			if validCacheName(n) {
+				t.Fatalf("bundle wrote a loose cache file %q into %s", n, dir)
+			}
 		}
 	}
 }
@@ -192,19 +240,18 @@ func TestBundleDeterminism(t *testing.T) {
 	}
 }
 
-// TestBundleSixteenHexNames proves the real cache filename rule (16 hex
-// chars per metadata.cacheFileName): such a file is exported and is removed
-// by Clear, while a stale 64-hex name is ignored by both.
-func TestBundleSixteenHexNames(t *testing.T) {
+// TestBundleEntryFileNameFollowsMetadataRule proves each exported entry
+// carries the 16-hex legacy cache name derived from its key
+// (metadata.CacheFileNameFor). The store keys entries by the raw cache key, so
+// the bundle's "file" field is derived rather than copied - and stays the name
+// a pre-rework bundle carries, which is what keeps the FILE format compatible.
+func TestBundleEntryFileNameFollowsMetadataRule(t *testing.T) {
+	if got := cacheNameFor("movie|tracked|2001"); got != metadata.CacheFileNameFor("movie|tracked|2001") {
+		t.Fatalf("local name rule %q disagrees with metadata.CacheFileNameFor", got)
+	}
 	dir := t.TempDir()
-	name := seedCacheFile(t, dir, "movie|sixteen|2001", testSchema, `{"title":"Sixteen"}`)
-	if len(name) != 16+len(".json") {
-		t.Fatalf("cache name %q is %d chars, want 16 hex + .json", name, len(name))
-	}
-	stale := strings.Repeat("ab", 32) + ".json" // 64 hex: the old wrong rule
-	if err := os.WriteFile(filepath.Join(dir, stale), []byte(`{"key":"stale"}`), 0o644); err != nil {
-		t.Fatalf("write stale fixture: %v", err)
-	}
+	key := "movie|sixteen|2001"
+	seedLiveEntry(t, dir, key, testSchema, `{"source":"tvmaze","title":"Sixteen"}`)
 
 	var buf bytes.Buffer
 	est, err := Export(dir, &buf, testSchema, "test")
@@ -212,28 +259,82 @@ func TestBundleSixteenHexNames(t *testing.T) {
 		t.Fatalf("Export: %v", err)
 	}
 	if est.Entries != 1 {
-		t.Fatalf("Export entries = %d, want 1 (the 16-hex file only)", est.Entries)
+		t.Fatalf("Export entries = %d, want 1", est.Entries)
 	}
 	var got Bundle
 	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
 		t.Fatalf("exported bundle does not parse: %v", err)
 	}
-	if len(got.Entries) != 1 || got.Entries[0].File != name {
-		t.Fatalf("bundle entries = %+v, want the single 16-hex file %q", got.Entries, name)
+	if len(got.Entries) != 1 {
+		t.Fatalf("bundle holds %d entries, want 1", len(got.Entries))
 	}
+	want := metadata.CacheFileNameFor(key)
+	if got.Entries[0].File != want {
+		t.Fatalf("entry file = %q, want %q", got.Entries[0].File, want)
+	}
+	if !validCacheName(want) || len(want) != 16+len(".json") {
+		t.Fatalf("entry file %q is not 16-hex + .json", want)
+	}
+}
 
-	removed, err := Clear(dir)
+// TestBundleLegacyBundleFileStillImports proves a bundle file written before
+// the cache rework imports unchanged: the envelope and the entry fields are the
+// same, and the entry lands in the LIVE cache (no loose file, immediately live).
+func TestBundleLegacyBundleFileStillImports(t *testing.T) {
+	key := "series|legacy|2016|1"
+	file := cacheNameFor(key)
+	media := json.RawMessage(`{"source":"tvmaze","title":"Legacy","genres":"Drama"}`)
+	legacy := Bundle{
+		Header: Header{
+			Format:     FormatName,
+			Version:    FormatVersion,
+			Schema:     testSchema,
+			AppVersion: "potflix-legacy",
+			ExportedAt: time.Date(2025, 3, 4, 5, 6, 7, 0, time.UTC),
+			Count:      1,
+			Note:       NoteText,
+		},
+		Entries: []Entry{{File: file, Key: key, Schema: testSchema, Media: media}},
+	}
+	raw, err := json.MarshalIndent(legacy, "", "  ")
 	if err != nil {
-		t.Fatalf("Clear: %v", err)
+		t.Fatalf("marshal legacy bundle: %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("Clear removed %d, want 1 (the 16-hex file; stale 64-hex kept)", removed)
+	raw = append(raw, '\n')
+	path := filepath.Join(t.TempDir(), "potflix-metadata-legacy.json")
+	if err := os.WriteFile(path, raw, 0o644); err != nil {
+		t.Fatalf("write legacy bundle: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-		t.Fatalf("16-hex cache file was not removed")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open legacy bundle: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dir, stale)); err != nil {
-		t.Fatalf("stale 64-hex file touched: %v", err)
+	defer f.Close()
+
+	dst := t.TempDir()
+	st, err := Import(dst, f, testSchema)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if st.Added != 1 || st.Total != 1 || st.Present != 0 || st.SkippedSchema != 0 || st.Invalid != 0 {
+		t.Fatalf("Import stats = %+v, want Added=1 Total=1 rest 0", st)
+	}
+	if !metadata.CacheLive(dst, key) {
+		t.Fatalf("legacy-bundle entry %q is not live after import", key)
+	}
+	got, ok := liveValue(t, dst, key)
+	if !ok {
+		t.Fatalf("legacy-bundle entry %q missing from the live cache", key)
+	}
+	var rec cacheRecord
+	if err := json.Unmarshal(got, &rec); err != nil {
+		t.Fatalf("stored record does not parse: %v", err)
+	}
+	if rec.Key != key || rec.Schema != testSchema || string(rec.Media) != string(media) {
+		t.Fatalf("stored record = %+v, want key %q schema %d media %s", rec, key, testSchema, media)
+	}
+	if _, ok := liveValue(t, dst, "other"); ok {
+		t.Fatalf("import invented an extra entry")
 	}
 }
 
@@ -242,23 +343,18 @@ func TestBundleFillMissingOnly(t *testing.T) {
 	b := t.TempDir()
 	keys := []string{"movie|alpha|2001", "movie|beta|2002", "movie|gamma|2003"}
 	for _, k := range keys {
-		seedCacheFile(t, a, k, testSchema, "{\"title\":\""+k+"\"}")
+		seedLiveEntry(t, a, k, testSchema, `{"source":"tvmaze","title":"`+k+`"}`)
 	}
 	var buf bytes.Buffer
 	if _, err := Export(a, &buf, testSchema, "test"); err != nil {
 		t.Fatalf("Export: %v", err)
 	}
 
-	// Pre-create one file in B with different content.
-	preName := seedCacheFile(t, b, keys[0], testSchema, `{"title":"stale ogniwa"}`)
-	prePath := filepath.Join(b, preName)
-	before, err := os.ReadFile(prePath)
-	if err != nil {
-		t.Fatalf("read pre-created file: %v", err)
-	}
-	fi0, err := os.Stat(prePath)
-	if err != nil {
-		t.Fatalf("stat pre-created file: %v", err)
+	// Pre-populate B with a DIFFERENT record for the first key.
+	seedLiveEntry(t, b, keys[0], testSchema, `{"source":"tvmaze","title":"stale ogniwa"}`)
+	before, ok := liveValue(t, b, keys[0])
+	if !ok {
+		t.Fatalf("pre-seeded entry missing")
 	}
 
 	st, err := Import(b, bytes.NewReader(buf.Bytes()), testSchema)
@@ -268,19 +364,15 @@ func TestBundleFillMissingOnly(t *testing.T) {
 	if st.Present != 1 || st.Added != 2 || st.Total != 3 {
 		t.Fatalf("Import stats = %+v, want Present=1 Added=2 Total=3", st)
 	}
-	after, err := os.ReadFile(prePath)
-	if err != nil {
-		t.Fatalf("read pre-created file after import: %v", err)
+	after, ok := liveValue(t, b, keys[0])
+	if !ok {
+		t.Fatalf("pre-existing entry vanished from the store")
 	}
 	if !bytes.Equal(before, after) {
-		t.Fatalf("pre-existing file bytes changed")
+		t.Fatalf("pre-existing stored bytes replaced:\n%s\n%s", before, after)
 	}
-	fi1, err := os.Stat(prePath)
-	if err != nil {
-		t.Fatalf("stat after import: %v", err)
-	}
-	if !fi1.ModTime().Equal(fi0.ModTime()) {
-		t.Fatalf("pre-existing file mtime changed: %v -> %v", fi0.ModTime(), fi1.ModTime())
+	if c, err := Count(b); err != nil || c != 3 {
+		t.Fatalf("Count(B) = %d, %v; want 3", c, err)
 	}
 }
 
@@ -297,8 +389,8 @@ func TestBundleSchemaMismatch(t *testing.T) {
 	if st.SkippedSchema != 1 || st.Total != 1 || st.Added != 0 || st.Present != 0 || st.Invalid != 0 {
 		t.Fatalf("Import stats = %+v, want SkippedSchema=1 Total=1 rest 0", st)
 	}
-	if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-		t.Fatalf("schema-mismatched entry wrote a file")
+	if metadata.CacheHas(dir, "movie|stale|2001") {
+		t.Fatalf("schema-mismatched entry was stored")
 	}
 	if c, err := Count(dir); err != nil || c != 0 {
 		t.Fatalf("Count = %d, %v; want 0", c, err)
@@ -337,13 +429,20 @@ func TestBundleInvalidEntries(t *testing.T) {
 	}
 }
 
+// TestBundleCorruptSourceSkipped proves a stored record that does not decode as
+// a cache entry is counted Skipped and never fails the export, and that a
+// corrupt LEGACY file (no key) never becomes an entry at all: the store's
+// migration is the only reader of the old layout now.
 func TestBundleCorruptSourceSkipped(t *testing.T) {
 	dir := t.TempDir()
-	seedCacheFile(t, dir, "movie|good-a|2001", testSchema, `{"title":"A"}`)
-	seedCacheFile(t, dir, "movie|good-b|2002", testSchema, `{"title":"B"}`)
-	badName := cacheNameFor("movie|bad|2003")
-	if err := os.WriteFile(filepath.Join(dir, badName), []byte(`{"key": oops, not json`), 0o644); err != nil {
-		t.Fatalf("write corrupt file: %v", err)
+	seedLiveEntry(t, dir, "movie|good-a|2001", testSchema, `{"source":"tvmaze","title":"A"}`)
+	seedLiveEntry(t, dir, "movie|good-b|2002", testSchema, `{"source":"tvmaze","title":"B"}`)
+	if err := metadata.CachePutRaw(dir, "movie|broken|2003", []byte(`{"key": oops, not json`)); err != nil {
+		t.Fatalf("seed undecodable record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, cacheNameFor("movie|legacy-corrupt|2004")),
+		[]byte(`{"key": oops, not json`), 0o644); err != nil {
+		t.Fatalf("write corrupt legacy file: %v", err)
 	}
 
 	var buf bytes.Buffer
@@ -361,12 +460,21 @@ func TestBundleCorruptSourceSkipped(t *testing.T) {
 	if len(got.Entries) != 2 {
 		t.Fatalf("bundle holds %d entries, want 2", len(got.Entries))
 	}
+	for _, e := range got.Entries {
+		if strings.Contains(e.Key, "broken") || strings.Contains(e.Key, "corrupt") {
+			t.Fatalf("bundle carries a record that does not decode: %+v", e)
+		}
+	}
 }
 
+// TestBundleClear proves Clear empties the LIVE cache (metadata's store), leaves
+// everything that is not a cache entry alone, and takes the legacy cache files
+// with it so the next read cannot re-import what was cleared.
 func TestBundleClear(t *testing.T) {
 	dir := t.TempDir()
-	n1 := seedCacheFile(t, dir, "movie|keep-a|2001", testSchema, `{"title":"A"}`)
-	n2 := seedCacheFile(t, dir, "movie|keep-b|2002", testSchema, `{"title":"B"}`)
+	seedLiveEntry(t, dir, "movie|keep-a|2001", testSchema, `{"source":"tvmaze","title":"A"}`)
+	seedLiveEntry(t, dir, "movie|keep-b|2002", testSchema, `{"source":"tvmaze","title":"B"}`)
+	legacy := seedCacheFile(t, dir, "movie|legacy-c|2003", testSchema, `{"title":"C"}`)
 	if err := os.WriteFile(filepath.Join(dir, "notes.json"), []byte(`{"keep":true}`), 0o644); err != nil {
 		t.Fatalf("write notes.json: %v", err)
 	}
@@ -385,28 +493,47 @@ func TestBundleClear(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
-	if removed != 3 {
-		t.Fatalf("Clear removed %d, want 3 (2 cache + 1 orphan)", removed)
+	// Two titles: the stored entries. The legacy file is not one of them -
+	// migration imports only into an EMPTY store, so a cache that already
+	// holds entries never picks up a loose file dropped beside it - but Clear
+	// still removes it, so the next read cannot resurrect it.
+	if removed != 2 {
+		t.Fatalf("Clear cleared %d titles, want 2", removed)
 	}
-	for _, gone := range []string{n1, n2, ".tmp-orphan-123.json"} {
+	if metadata.CacheHas(dir, "movie|keep-a|2001") || metadata.CacheHas(dir, "movie|keep-b|2002") ||
+		metadata.CacheHas(dir, "movie|legacy-c|2003") {
+		t.Fatalf("cleared titles still report present in the live cache")
+	}
+	n := 0
+	if err := metadata.CacheForEach(dir, func(string, []byte) bool { n++; return true }); err != nil {
+		t.Fatalf("CacheForEach after Clear: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("live cache still holds %d entries, want 0", n)
+	}
+	if c, err := Count(dir); err != nil || c != 0 {
+		t.Fatalf("Count after Clear = %d, %v; want 0", c, err)
+	}
+	for _, gone := range []string{legacy, ".tmp-orphan-123.json"} {
 		if _, err := os.Stat(filepath.Join(dir, gone)); !os.IsNotExist(err) {
 			t.Fatalf("%s was not removed", gone)
 		}
 	}
-	keep, err := os.ReadFile(filepath.Join(dir, "notes.json"))
-	if err != nil || string(keep) != `{"keep":true}` {
-		t.Fatalf("non-matching notes.json touched: %q, %v", keep, err)
+	if keep, err := os.ReadFile(filepath.Join(dir, "notes.json")); err != nil || string(keep) != `{"keep":true}` {
+		t.Fatalf("non-cache notes.json touched: %q, %v", keep, err)
 	}
-	inner, err := os.ReadFile(filepath.Join(sub, "inner.json"))
-	if err != nil || string(inner) != `{"in":"sub"}` {
+	if inner, err := os.ReadFile(filepath.Join(sub, "inner.json")); err != nil || string(inner) != `{"in":"sub"}` {
 		t.Fatalf("subdirectory touched: %q, %v", inner, err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("Clear removed the cache directory itself: %v", err)
 	}
 }
 
 func TestBundlePrivacyGuard(t *testing.T) {
 	dir := t.TempDir()
-	seedCacheFile(t, dir, "movie|url|2001", testSchema,
-		`{"title":"Linked","poster":"https://image.example.com/poster.jpg","watch":"https://example.com/watch"}`)
+	seedLiveEntry(t, dir, "movie|url|2001", testSchema,
+		`{"source":"tvmaze","title":"Linked","artwork":"https://image.example.com/poster.jpg","movieUrl":"https://example.com/watch"}`)
 
 	var buf bytes.Buffer
 	if _, err := Export(dir, &buf, testSchema, "test"); err != nil {
@@ -438,34 +565,27 @@ func TestBundleOversizeRejected(t *testing.T) {
 	if len(dirChildNames(t, dir)) != 0 {
 		t.Fatalf("oversize import wrote files: %q", dirChildNames(t, dir))
 	}
+	if c, err := Count(dir); err != nil || c != 0 {
+		t.Fatalf("Count after rejected import = %d, %v; want 0", c, err)
+	}
 }
 
-// TestBundleImportNoReplace proves the import publish path never replaces
-// an existing file: a pre-created target keeps its bytes and mtime and the
-// entry reports Present, even though the bundle carries different media for
-// the same key. The pre-created target makes the guarantee deterministic
-// (no race window is needed to exercise it).
+// TestBundleImportNoReplace proves the import publish path never replaces a
+// stored entry: a key the live cache already holds keeps its bytes and reports
+// Present, even though the bundle carries different media for the same key.
 func TestBundleImportNoReplace(t *testing.T) {
 	dir := t.TempDir()
 	key := "movie|noreplace|2001"
 	name := cacheNameFor(key)
-	original := `{"key":"` + key + `","schema":3,"media":{"title":"ORIGINAL"}}`
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(original), 0o644); err != nil {
-		t.Fatalf("write pre-created target: %v", err)
-	}
-	// Pin the mtime back so any replacement is visible even on
-	// filesystems with coarse timestamp granularity.
-	old := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
-	if err := os.Chtimes(filepath.Join(dir, name), old, old); err != nil {
-		t.Fatalf("chtimes pre-created target: %v", err)
-	}
-	before, err := os.ReadFile(filepath.Join(dir, name))
-	if err != nil {
-		t.Fatalf("read pre-created target: %v", err)
+	original := `{"source":"tvmaze","title":"ORIGINAL"}`
+	seedLiveEntry(t, dir, key, testSchema, original)
+	before, ok := liveValue(t, dir, key)
+	if !ok {
+		t.Fatalf("pre-seeded entry missing")
 	}
 
 	data := testBundleBytes(t, []Entry{
-		{File: name, Key: key, Schema: testSchema, Media: json.RawMessage(`{"title":"BUNDLE"}`)},
+		{File: name, Key: key, Schema: testSchema, Media: json.RawMessage(`{"source":"tvmaze","title":"BUNDLE"}`)},
 	})
 	st, err := Import(dir, bytes.NewReader(data), testSchema)
 	if err != nil {
@@ -474,24 +594,68 @@ func TestBundleImportNoReplace(t *testing.T) {
 	if st.Present != 1 || st.Added != 0 || st.Total != 1 {
 		t.Fatalf("Import stats = %+v, want Present=1 Added=0 Total=1", st)
 	}
-	after, err := os.ReadFile(filepath.Join(dir, name))
-	if err != nil {
-		t.Fatalf("read target after import: %v", err)
+	after, ok := liveValue(t, dir, key)
+	if !ok {
+		t.Fatalf("pre-existing entry vanished")
 	}
 	if !bytes.Equal(before, after) {
-		t.Fatalf("pre-existing file bytes changed")
-	}
-	fi, err := os.Stat(filepath.Join(dir, name))
-	if err != nil {
-		t.Fatalf("stat target after import: %v", err)
-	}
-	if !fi.ModTime().Equal(old) {
-		t.Fatalf("pre-existing file mtime changed: %v -> %v", old, fi.ModTime())
+		t.Fatalf("pre-existing stored bytes replaced:\n%s\n%s", before, after)
 	}
 	for _, n := range dirChildNames(t, dir) {
 		if strings.HasPrefix(n, ".tmp-") {
 			t.Fatalf("temp file left behind: %q", n)
 		}
+	}
+}
+
+// TestBundleForeignFilesIgnored proves a file in the cache directory that is not
+// a cache record - the old notes.json case - is neither imported into the live
+// cache nor exported, and that Clear leaves it alone.
+func TestBundleForeignFilesIgnored(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "notes.json"), []byte(`{"keep":true}`), 0o644); err != nil {
+		t.Fatalf("write notes.json: %v", err)
+	}
+	seedLiveEntry(t, dir, "movie|real|2001", testSchema, `{"source":"tvmaze","title":"Real"}`)
+
+	var buf bytes.Buffer
+	est, err := Export(dir, &buf, testSchema, "test")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if est.Entries != 1 || est.Skipped != 0 {
+		t.Fatalf("Export stats = %+v, want Entries=1 Skipped=0 (notes.json is not a cache record)", est)
+	}
+	if _, err := Clear(dir); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if keep, err := os.ReadFile(filepath.Join(dir, "notes.json")); err != nil || string(keep) != `{"keep":true}` {
+		t.Fatalf("non-cache notes.json touched: %q, %v", keep, err)
+	}
+}
+
+// TestBundleOversizeLegacyEntryNeverBecomesAnEntry proves the store's own
+// per-record cap is the size guard on the read path: a legacy file larger than
+// a record is refused by the store, so it is neither cached nor exported, and
+// the bundle never reads it whole.
+func TestBundleOversizeLegacyEntryNeverBecomesAnEntry(t *testing.T) {
+	dir := t.TempDir()
+	seedLiveEntry(t, dir, "movie|good|2001", testSchema, `{"source":"tvmaze","title":"Good"}`)
+	key := "movie|big|2002"
+	if err := os.WriteFile(filepath.Join(dir, cacheNameFor(key)), bytes.Repeat([]byte("x"), (4<<20)+1), 0o644); err != nil {
+		t.Fatalf("write oversized fixture: %v", err)
+	}
+
+	var buf bytes.Buffer
+	est, err := Export(dir, &buf, testSchema, "test")
+	if err != nil {
+		t.Fatalf("Export: %v", err)
+	}
+	if est.Entries != 1 || est.Skipped != 0 {
+		t.Fatalf("Export stats = %+v, want Entries=1 Skipped=0", est)
+	}
+	if metadata.CacheHas(dir, key) {
+		t.Fatalf("oversize legacy file was stored as a cache entry")
 	}
 }
 
@@ -517,7 +681,7 @@ func TestBundleReparsePointDirRefused(t *testing.T) {
 		t.Fatalf("Export error = %v, want a reparse-point refusal", err)
 	}
 	if n, err := Clear(link); err == nil {
-		t.Fatalf("Clear through a reparse-point dir succeeded (removed %d), want refusal", n)
+		t.Fatalf("Clear through a reparse-point dir succeeded (cleared %d), want refusal", n)
 	} else if !strings.Contains(err.Error(), "reparse-point") {
 		t.Fatalf("Clear error = %v, want a reparse-point refusal", err)
 	}
@@ -533,12 +697,17 @@ func TestBundleReparsePointDirRefused(t *testing.T) {
 	if c, err := Count(real); err != nil || c != 1 {
 		t.Fatalf("real dir touched: Count = %d, %v; want 1", c, err)
 	}
+	if !metadata.CacheHas(real, "movie|behind-link|2001") {
+		t.Fatalf("the entry behind the link is not in the live cache")
+	}
 }
 
-// TestBundleReparsePointEntrySkipped proves a cache entry that is itself a
-// reparse point is never read (Export) nor deleted (Clear) through the
-// link, while a neighbouring real entry is handled normally.
-func TestBundleReparsePointEntrySkipped(t *testing.T) {
+// TestBundleClearKeepsReparsePointEntries proves Clear never deletes a cache
+// file through a reparse point, while a neighbouring real legacy cache file is
+// removed as usual. The linked file's title is imported like any other legacy
+// file (the store's migration reads it), which is why the cleared count covers
+// both titles - what must survive is the link and its target.
+func TestBundleClearKeepsReparsePointEntries(t *testing.T) {
 	dir := t.TempDir()
 	outside := t.TempDir()
 	secret := filepath.Join(outside, "secret.json")
@@ -549,32 +718,14 @@ func TestBundleReparsePointEntrySkipped(t *testing.T) {
 	if err := os.Symlink(secret, filepath.Join(dir, linkName)); err != nil {
 		t.Skipf("os.Symlink refused (no privilege/Developer Mode?): %v", err)
 	}
-	seedCacheFile(t, dir, "movie|good|2002", testSchema, `{"title":"Good"}`)
-
-	var buf bytes.Buffer
-	est, err := Export(dir, &buf, testSchema, "test")
-	if err != nil {
-		t.Fatalf("Export: %v", err)
-	}
-	if est.Entries != 1 || est.Skipped != 1 {
-		t.Fatalf("Export stats = %+v, want Entries=1 Skipped=1", est)
-	}
-	var got Bundle
-	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
-		t.Fatalf("exported bundle does not parse: %v", err)
-	}
-	for _, e := range got.Entries {
-		if e.Key == "movie|secret|2001" {
-			t.Fatalf("bundle carries the reparse-point entry")
-		}
-	}
+	good := seedCacheFile(t, dir, "movie|good|2002", testSchema, `{"title":"Good"}`)
 
 	removed, err := Clear(dir)
 	if err != nil {
 		t.Fatalf("Clear: %v", err)
 	}
-	if removed != 1 {
-		t.Fatalf("Clear removed %d, want 1 (the good file; the link kept)", removed)
+	if removed != 2 {
+		t.Fatalf("Clear cleared %d titles, want 2 (the real file and the linked one)", removed)
 	}
 	if _, err := os.Lstat(filepath.Join(dir, linkName)); err != nil {
 		t.Fatalf("reparse-point entry was deleted through the link: %v", err)
@@ -582,24 +733,50 @@ func TestBundleReparsePointEntrySkipped(t *testing.T) {
 	if _, err := os.Stat(secret); err != nil {
 		t.Fatalf("outside link target touched: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(dir, good)); !os.IsNotExist(err) {
+		t.Fatalf("neighbouring legacy cache file was not removed")
+	}
 }
 
-// TestBundleExportEntryCap proves an entry larger than 4 MB is skipped per
-// the cap instead of being read unbounded into memory.
-func TestBundleExportEntryCap(t *testing.T) {
-	dir := t.TempDir()
-	seedCacheFile(t, dir, "movie|good|2001", testSchema, `{"title":"Good"}`)
-	bigName := cacheNameFor("movie|big|2002")
-	if err := os.WriteFile(filepath.Join(dir, bigName), bytes.Repeat([]byte("x"), (4<<20)+1), 0o644); err != nil {
-		t.Fatalf("write oversized fixture: %v", err)
+// TestBundleEmptyDirRefused proves every entry point refuses an empty directory
+// instead of silently resolving it to the metadata package's default cache
+// directory (the live one).
+func TestBundleEmptyDirRefused(t *testing.T) {
+	var buf bytes.Buffer
+	if _, err := Export("", &buf, testSchema, "test"); err == nil {
+		t.Fatalf("Export with no directory succeeded")
 	}
+	if _, err := Count(""); err == nil {
+		t.Fatalf("Count with no directory succeeded")
+	}
+	if _, err := Clear(""); err == nil {
+		t.Fatalf("Clear with no directory succeeded (this would clear the live cache)")
+	}
+	data := testBundleBytes(t, []Entry{{File: cacheNameFor("k"), Key: "k", Schema: testSchema, Media: json.RawMessage(`{}`)}})
+	if _, err := Import("", bytes.NewReader(data), testSchema); err == nil {
+		t.Fatalf("Import with no directory succeeded")
+	}
+}
 
+// TestBundleMissingDirIsEmpty proves the store layout's absence semantics: a
+// cache directory that was never created (or was removed by the Clear-metadata
+// action) holds no entries, so Count reports 0 and Export writes an empty
+// bundle rather than failing - the cache is the store file beside the
+// directory, and it may well be there while the directory is not.
+func TestBundleMissingDirIsEmpty(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "meta")
+	if c, err := Count(dir); err != nil || c != 0 {
+		t.Fatalf("Count(missing) = %d, %v; want 0", c, err)
+	}
+	if removed, err := Clear(dir); err != nil || removed != 0 {
+		t.Fatalf("Clear(missing) = %d, %v; want 0", removed, err)
+	}
 	var buf bytes.Buffer
 	est, err := Export(dir, &buf, testSchema, "test")
 	if err != nil {
-		t.Fatalf("Export: %v", err)
+		t.Fatalf("Export(missing): %v", err)
 	}
-	if est.Entries != 1 || est.Skipped != 1 {
-		t.Fatalf("Export stats = %+v, want Entries=1 Skipped=1", est)
+	if est.Entries != 0 {
+		t.Fatalf("Export(missing) entries = %d, want 0", est.Entries)
 	}
 }

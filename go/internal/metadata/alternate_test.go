@@ -3,8 +3,6 @@ package metadata
 import (
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -237,8 +235,8 @@ func TestAlternateTransientMerging(t *testing.T) {
 		// wantErr is "" for a definitive miss (nil error), or a substring
 		// the transient error must carry (and wrap ErrLookupUnavailable).
 		wantErr string
-		// wantFile reports whether a negative file must exist afterwards.
-		wantFile bool
+		// wantNegative reports whether a negative record must be stored.
+		wantNegative bool
 	}{
 		{
 			name: "both transient pins primary error",
@@ -275,8 +273,8 @@ func TestAlternateTransientMerging(t *testing.T) {
 			find: func(q Query) (*Media, error) {
 				return nil, nil
 			},
-			wantErr:  "",
-			wantFile: true,
+			wantErr:      "",
+			wantNegative: true,
 		},
 	}
 	for _, tc := range cases {
@@ -301,13 +299,18 @@ func TestAlternateTransientMerging(t *testing.T) {
 					t.Errorf("err = %q, want underlying cause %q", err.Error(), tc.wantErr)
 				}
 			}
+			// The store must hold the negative for a definitive miss and
+			// nothing at all for a transient outcome.
 			key := cacheKey(q)
-			_, statErr := os.Stat(filepath.Join(dir, cacheFileName(key)))
-			if tc.wantFile && os.IsNotExist(statErr) {
-				t.Errorf("definitive miss persisted no file, want one negative")
-			}
-			if !tc.wantFile && statErr == nil {
-				t.Errorf("transient lookup persisted a file, want nothing")
+			if tc.wantNegative {
+				if !CacheHas(dir, key) {
+					t.Errorf("definitive miss stored no record, want one negative")
+				}
+				if e, ok := cacheLoadEntry(dir, key); !ok || !e.NotFound {
+					t.Errorf("definitive miss record = %+v,%v; want a persisted negative", e, ok)
+				}
+			} else if CacheHas(dir, key) {
+				t.Errorf("transient lookup stored a record, want nothing")
 			}
 		})
 	}
@@ -399,12 +402,12 @@ func TestAlternateNeverSubstitutesUncertainPrimary(t *testing.T) {
 		t.Errorf("alternate chain calls = %d, want 0 (unknown primary must not retry)", altCalls)
 	}
 	key := cacheKey(q)
-	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
-		t.Errorf("transient lookup persisted %v, want nothing on disk", statErr)
+	if CacheHas(dir, key) {
+		t.Errorf("transient lookup stored a record, want nothing")
 	}
 }
 
-// TestAlternateFailedRefreshPreservesCachedPositive seeds the on-disk cache
+// TestAlternateFailedRefreshPreservesCachedPositive seeds the store
 // with the correct entry under the ORIGINAL key, then runs the forced
 // refresh path while the primary is transient and an eligible alternate
 // WOULD match a different show. The seeded positive must survive on disk
@@ -424,9 +427,9 @@ func TestAlternateFailedRefreshPreservesCachedPositive(t *testing.T) {
 	if err := cacheStore(dir, key, correct); err != nil {
 		t.Fatalf("seed cache: %v", err)
 	}
-	before, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
-	if err != nil {
-		t.Fatalf("read seeded cache: %v", err)
+	before, ok := cacheRecord(dir, key)
+	if !ok {
+		t.Fatalf("read seeded record: missing from the store")
 	}
 	primaryBoom := errors.New("primary-outage")
 	src := &titleFuncSource{name: "tvmaze", find: func(q Query) (*Media, error) {
@@ -450,14 +453,89 @@ func TestAlternateFailedRefreshPreservesCachedPositive(t *testing.T) {
 	if !errors.Is(err, ErrLookupUnavailable) {
 		t.Fatalf("err = %v, want ErrLookupUnavailable", err)
 	}
-	after, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
-	if err != nil {
-		t.Fatalf("read cache after failed refresh: %v", err)
+	after, ok := cacheRecord(dir, key)
+	if !ok {
+		t.Fatalf("read record after failed refresh: missing from the store")
 	}
 	if string(after) != string(before) {
 		t.Errorf("seeded positive changed by failed forced refresh; want it byte-identical")
 	}
 	if e, ok := cacheLoadEntry(dir, key); !ok || e.NotFound || e.Media == nil || e.Media.SourceID != "93969" {
 		t.Errorf("seeded entry = %+v,%v; want the correct SourceID 93969 still on disk", e, ok)
+	}
+}
+
+// TestMovieMarkerChainQueriesMovieSource proves the marker-derived movie
+// query reaches the movie source chain verbatim as its PRIMARY candidate:
+// "[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv" parses to the movie
+// "Dragon Ball Super: Broly" (no season, no episode), and that is the title
+// the movie sources are asked for.
+func TestMovieMarkerChainQueriesMovieSource(t *testing.T) {
+	dir := t.TempDir()
+	q := ParseRaw("[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv")
+	if q.Kind != KindMovie || q.Title != "Dragon Ball Super: Broly" || q.Season != 0 || q.Episode != 0 {
+		t.Fatalf("ParseRaw = %+v, want KindMovie %q with no season/episode", q, "Dragon Ball Super: Broly")
+	}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	src := &titleFuncSource{name: "itunes", mu: &mu, calls: calls, find: func(cq Query) (*Media, error) {
+		if cq.Title == "Dragon Ball Super: Broly" {
+			return &Media{
+				Source: "itunes", SourceID: "1440924834",
+				Kind: KindMovie, Title: "Dragon Ball Super: Broly", Year: 2018,
+				Artwork: "https://example.com/dbs-broly.jpg",
+			}, nil
+		}
+		return nil, nil
+	}}
+	r := New(Options{Dir: dir, Sources: []Source{src}, Timeout: 5 * time.Second})
+
+	res, err := r.LookupNow(context.Background(), q)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if !res.Found || !res.IsMovie || res.Series != "Dragon Ball Super: Broly" || res.Year != 2018 {
+		t.Fatalf("resolution = %+v, want the 2018 movie %q", res, "Dragon Ball Super: Broly")
+	}
+	if res.Season != 0 || res.Number != 0 {
+		t.Errorf("resolution = S%d E%d, want no season/episode for a movie", res.Season, res.Number)
+	}
+	mu.Lock()
+	queried := calls["Dragon Ball Super: Broly"]
+	all := len(calls)
+	mu.Unlock()
+	if queried != 1 || all != 1 {
+		t.Errorf("source queries = %v (%d total), want exactly one, for %q", calls, all, "Dragon Ball Super: Broly")
+	}
+}
+
+// TestMovieMarkerMissIsCleanNegative pins the fallback contract when the
+// movie path yields no candidate: the outcome is a definitive not-found
+// (nil error, nothing persisted as an error), never a crash, and no series
+// alternate is fabricated for it - alternateQuery still refuses KindMovie,
+// so the existing series fallback behaviour is untouched.
+func TestMovieMarkerMissIsCleanNegative(t *testing.T) {
+	dir := t.TempDir()
+	q := ParseRaw("[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv")
+	if _, ok := alternateQuery(q); ok {
+		t.Fatalf("alternateQuery(%+v) ok = true, want false (movies never alternate)", q)
+	}
+	var mu sync.Mutex
+	calls := map[string]int{}
+	src := &titleFuncSource{name: "itunes", mu: &mu, calls: calls, find: func(Query) (*Media, error) { return nil, nil }}
+	r := New(Options{Dir: dir, Sources: []Source{src}, Timeout: 5 * time.Second})
+
+	res, err := r.LookupNow(context.Background(), q)
+	if err != nil {
+		t.Fatalf("LookupNow movie miss: %v, want a clean nil-error not-found", err)
+	}
+	if res.Found {
+		t.Fatalf("resolution = %+v, want not found", res)
+	}
+	mu.Lock()
+	all := len(calls)
+	mu.Unlock()
+	if all != 1 {
+		t.Errorf("source queries = %v (%d), want exactly 1 (no alternate retry for a movie)", calls, all)
 	}
 }

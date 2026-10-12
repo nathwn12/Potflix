@@ -370,8 +370,50 @@ func stripTags(s string) string {
 		r = javaTrim(gs[1])
 		year = " (" + gs[2] + ")"
 	}
+	r = foldTitleMarks(r)
 	r = javaUpperFirst(r)
 	return javaTrim(r + year)
+}
+
+// isTitleMarkRune reports the "?" family a scene release writes where a
+// filename cannot hold ':': ASCII '?' (U+003F), fullwidth '？' (U+FF1F) and
+// small '﹖' (U+FE56).
+func isTitleMarkRune(c rune) bool {
+	return c == '?' || c == '\uFF1F' || c == '\uFE56'
+}
+
+// foldTitleMarks is deviation P13 from the frozen Java cleaner. A scene
+// release stands in for the ':' Windows forbids in a filename
+// ("Spider-Man? Brand New Day (2026) (1080p ...).mkv"), and Java's UTF-8
+// encoder writes the same '?' for an unpaired surrogate, so an extracted
+// title can carry a mark that means ":". MEASURED 2026-10-13: the app queried
+// Wikipedia with "Spider-Man? Brand New Day" and cached the answer under
+// "movie|spider-man? brand new day|0". The mark folds back to the ':' it
+// stands in for, once, where it separates title text - so every provider
+// query, cache key and card string gets the readable title.
+//
+// The rule: a mark folds ONLY when it is preceded by a non-space character
+// AND is not the last character of the extracted title. A mark that ends the
+// title is a real question mark ("Who Framed Roger Rabbit?") and is left
+// alone: once the parenthesised tail is stripped, no scene convention tells
+// a genuine question mark from a stand-in whose tail is gone.
+func foldTitleMarks(s string) string {
+	r := []rune(s)
+	folded := false
+	for i, c := range r {
+		if !isTitleMarkRune(c) || i == 0 || i+1 >= len(r) {
+			continue
+		}
+		if r[i-1] <= ' ' {
+			continue
+		}
+		r[i] = ':'
+		folded = true
+	}
+	if !folded {
+		return s
+	}
+	return string(r)
 }
 
 // buildDisplay mirrors me.potflix.rpc.Main.buildDisplay.
