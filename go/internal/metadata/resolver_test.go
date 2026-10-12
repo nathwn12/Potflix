@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"potflix/internal/store"
 )
 
 type fakeSource struct {
@@ -353,11 +353,11 @@ func TestNegativePersistedAndColdHitNoNetwork(t *testing.T) {
 	if n := miss.calls.Load(); n != 1 {
 		t.Fatalf("run 1 provider calls = %d, want 1", n)
 	}
-	// The negative entry is on disk under the same key filename.
+	// The negative record is stored under the same key.
 	key := cacheKey(q)
-	data, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
-	if err != nil {
-		t.Fatalf("negative entry missing on disk: %v", err)
+	data, ok := cacheRecord(dir, key)
+	if !ok {
+		t.Fatal("negative entry missing from the store, want a stored negative")
 	}
 	var cf cacheFile
 	if err := json.Unmarshal(data, &cf); err != nil {
@@ -443,9 +443,7 @@ func TestNegativeExpiredReattempted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, cacheFileName(key)), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	storeRawRecord(t, dir, key, data)
 	fake := &fakeSource{name: "fake"}
 	r := New(Options{Dir: dir, Sources: []Source{fake}, Timeout: 5 * time.Second})
 	res, err := r.LookupNow(ctx, q)
@@ -478,8 +476,8 @@ func TestProviderErrorPersistsNothing(t *testing.T) {
 	if res.Found {
 		t.Fatalf("error lookup = %+v, want miss", res)
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
-		t.Fatalf("provider error persisted a file, want nothing (stat err = %v)", statErr)
+	if CacheHas(dir, key) {
+		t.Fatalf("provider error persisted a record, want nothing")
 	}
 	if CacheLive(dir, key) {
 		t.Fatal("CacheLive after provider error = true, want false")
@@ -500,7 +498,7 @@ func TestProviderErrorPersistsNothing(t *testing.T) {
 }
 
 // TestProviderTimeoutPersistsNothing proves a timed-out fetch persists
-// nothing: the file is absent and the next lookup re-attempts.
+// nothing: no record is stored and the next lookup re-attempts.
 func TestProviderTimeoutPersistsNothing(t *testing.T) {
 	dir := t.TempDir()
 	q := Query{Kind: KindSeries, Title: "Slow Show", Season: 1, Episode: 2}
@@ -513,8 +511,8 @@ func TestProviderTimeoutPersistsNothing(t *testing.T) {
 	if err == nil {
 		t.Fatal("timed-out LookupNow err = nil, want ctx error")
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
-		t.Fatalf("timed-out fetch persisted a file, want nothing (stat err = %v)", statErr)
+	if CacheHas(dir, key) {
+		t.Fatalf("timed-out fetch stored a record, want nothing")
 	}
 	if CacheLive(dir, key) {
 		t.Fatal("CacheLive after timeout = true, want false")
@@ -522,7 +520,7 @@ func TestProviderTimeoutPersistsNothing(t *testing.T) {
 }
 
 // TestFailedForcedRefreshPreservesPositive proves a failed forced refresh
-// (provider error) leaves an existing positive file byte-identical and the
+// (provider error) leaves an existing stored positive byte-identical and the
 // positive still serves afterwards.
 func TestFailedForcedRefreshPreservesPositive(t *testing.T) {
 	dir := t.TempDir()
@@ -533,9 +531,9 @@ func TestFailedForcedRefreshPreservesPositive(t *testing.T) {
 	if err := cacheStore(dir, key, media); err != nil {
 		t.Fatalf("seed cacheStore: %v", err)
 	}
-	before, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
-	if err != nil {
-		t.Fatalf("seed read: %v", err)
+	before, ok := cacheRecord(dir, key)
+	if !ok {
+		t.Fatal("seed record missing from the store")
 	}
 	boom := &fakeSource{name: "fake", err: errors.New("transport down")}
 	r := New(Options{Dir: dir, Sources: []Source{boom}, Timeout: 5 * time.Second})
@@ -552,12 +550,12 @@ func TestFailedForcedRefreshPreservesPositive(t *testing.T) {
 	if res.Found {
 		t.Fatalf("failed force = %+v, want miss", res)
 	}
-	after, err := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
-	if err != nil {
-		t.Fatalf("post-force read: %v", err)
+	after, ok := cacheRecord(dir, key)
+	if !ok {
+		t.Fatal("stored record vanished from the store")
 	}
 	if string(after) != string(before) {
-		t.Fatalf("positive file clobbered by failed refresh:\nbefore %s\nafter  %s", string(before), string(after))
+		t.Fatalf("stored positive clobbered by failed refresh:\nbefore %s\nafter  %s", string(before), string(after))
 	}
 	if !CacheLive(dir, key) {
 		t.Fatal("CacheLive after failed force = false, want true (positive intact)")
@@ -570,7 +568,7 @@ func TestFailedForcedRefreshPreservesPositive(t *testing.T) {
 }
 
 // TestCancelledBackgroundFetchStoresNothing proves a cancelled/timed-out
-// background fetch persists no negative file and sets no suppression.
+// background fetch stores no negative record and sets no suppression.
 func TestCancelledBackgroundFetchStoresNothing(t *testing.T) {
 	dir := t.TempDir()
 	q := Query{Kind: KindSeries, Title: "Bg Cancel", Season: 1, Episode: 2}
@@ -582,14 +580,14 @@ func TestCancelledBackgroundFetchStoresNothing(t *testing.T) {
 	r.mu.Lock()
 	r.inflight[key] = done
 	r.mu.Unlock()
-	go r.backgroundFetch(q, key, done)
+	go r.backgroundFetch(context.Background(), q, key, done)
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("backgroundFetch never finished")
 	}
-	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
-		t.Fatalf("cancelled backgroundFetch persisted a file, want nothing (stat err = %v)", statErr)
+	if CacheHas(dir, key) {
+		t.Fatalf("cancelled backgroundFetch stored a record, want nothing")
 	}
 	r.mu.Lock()
 	_, suppressed := r.neg[key]
@@ -612,9 +610,7 @@ func TestNegativeBackoffBoundedByTTL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, cacheFileName(key)), data, 0o644); err != nil {
-		t.Fatal(err)
-	}
+	storeRawRecord(t, dir, key, data)
 	counting := &fakeSource{name: "fake"}
 	r := New(Options{Dir: dir, Sources: []Source{counting}, Timeout: 5 * time.Second})
 	if res, err := r.LookupNow(ctx, q); err != nil || res.Found {
@@ -640,17 +636,23 @@ func TestNegativeBackoffBoundedByTTL(t *testing.T) {
 
 // TestTransientVsDefinitiveMissDistinguishable proves the honest-counters
 // contract at the resolver boundary: a transient provider failure returns
-// ErrLookupUnavailable (wrapping the underlying cause) and persists nothing,
+// ErrLookupUnavailable (wrapping the underlying cause) and stores nothing,
 // while a definitive miss (every source answered, none has the title)
-// returns a nil error and persists exactly one negative.
+// returns a nil error and stores exactly one negative.
 func TestTransientVsDefinitiveMissDistinguishable(t *testing.T) {
 	dir := t.TempDir()
-	countFiles := func() int {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			t.Fatalf("read cache dir: %v", err)
+	countRecords := func() int {
+		if !cacheExists(dir) {
+			return 0
 		}
-		return len(entries)
+		n := 0
+		if err := withCache(dir, func(db *store.DB) error {
+			n = db.Len()
+			return nil
+		}); err != nil {
+			t.Fatalf("count stored records: %v", err)
+		}
+		return n
 	}
 	ctx := context.Background()
 
@@ -668,8 +670,8 @@ func TestTransientVsDefinitiveMissDistinguishable(t *testing.T) {
 	if res.Found {
 		t.Fatalf("transient res = %+v, want miss", res)
 	}
-	if n := countFiles(); n != 0 {
-		t.Fatalf("transient persisted %d files, want 0", n)
+	if n := countRecords(); n != 0 {
+		t.Fatalf("transient stored %d records, want 0", n)
 	}
 
 	// Definitive: every source answered and none has the title.
@@ -682,10 +684,84 @@ func TestTransientVsDefinitiveMissDistinguishable(t *testing.T) {
 	if res.Found {
 		t.Fatalf("definitive miss res = %+v, want miss", res)
 	}
-	if n := countFiles(); n != 1 {
-		t.Fatalf("definitive miss left %d files, want exactly 1 negative", n)
+	if n := countRecords(); n != 1 {
+		t.Fatalf("definitive miss left %d records, want exactly 1 negative", n)
 	}
 	if !CacheLive(dir, cacheKey(qMissing)) {
 		t.Fatal("CacheLive after definitive miss = false, want true")
+	}
+}
+
+// TestProbedEntryDeletedNotServed proves an entry invalidated after
+// ProbeCache warmed memory is never served from that memory. ClearCache is the
+// invalidation path now (the cache is one store file keyed by the raw key, so
+// there is no per-key file to delete), and it removes the record the probe
+// warmed: an invalidated positive resolves Found=false (never the warmed
+// title) and its lookup re-attempts the fetch, and an invalidated fresh
+// negative does not suppress its fetch (the lookup proceeds to the sources
+// instead of reporting a warmed miss).
+func TestProbedEntryDeletedNotServed(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	// Invalidated positive: Resolve must not serve the warmed title.
+	q := Query{Kind: KindSeries, Title: "Probe Del", Season: 1, Episode: 1}
+	key := cacheKey(q)
+	m := &Media{Source: "tvmaze", SourceID: "1", Kind: KindSeries, Title: "Probe Del",
+		Episodes: []Episode{{Season: 1, Number: 1, Title: "Pilot"}}, FetchedAt: time.Now().UTC()}
+	if err := cacheStore(dir, key, m); err != nil {
+		t.Fatal(err)
+	}
+	r := New(Options{Dir: dir, Sources: []Source{&fakeSource{name: "fake"}}, Offline: true})
+	if !r.ProbeCache(key) {
+		t.Fatal("ProbeCache on a live positive = false, want true")
+	}
+	if err := ClearCache(dir); err != nil {
+		t.Fatalf("ClearCache: %v", err)
+	}
+	if CacheHas(dir, key) {
+		t.Fatal("cleared cache still holds the probed record, want it gone")
+	}
+	if res, err := r.Resolve(ctx, q); err != nil || res.Found {
+		t.Fatalf("Resolve after invalidation = %+v,%v; want not-found (never warmed memory)", res, err)
+	}
+	// Same, via the blocking lookup on a fresh resolver: the fetch is
+	// re-attempted instead of serving warmed memory.
+	if err := cacheStore(dir, key, m); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeSource{name: "fake", err: errors.New("boom")}
+	r2 := New(Options{Dir: dir, Sources: []Source{fake}})
+	if !r2.ProbeCache(key) {
+		t.Fatal("ProbeCache on a live positive = false, want true")
+	}
+	if err := ClearCache(dir); err != nil {
+		t.Fatalf("ClearCache: %v", err)
+	}
+	if res, _, err := r2.LookupNowForceSrc(ctx, q, false); err == nil || res.Found {
+		t.Fatalf("LookupNowForceSrc after invalidation = %+v,%v; want a transient error (fetch re-attempted)", res, err)
+	}
+	if got := fake.calls.Load(); got == 0 {
+		t.Fatal("lookup after invalidation made no source call; want the miss re-attempted from store/network")
+	}
+	// Invalidated fresh negative: the lookup must fetch, not report a warmed
+	// miss.
+	nq := Query{Kind: KindSeries, Title: "Probe Neg", Season: 1, Episode: 1}
+	nkey := cacheKey(nq)
+	if err := cacheStoreNegative(dir, nkey); err != nil {
+		t.Fatal(err)
+	}
+	nfake := &fakeSource{name: "fake"}
+	r3 := New(Options{Dir: dir, Sources: []Source{nfake}})
+	if !r3.ProbeCache(nkey) {
+		t.Fatal("ProbeCache on a fresh negative = false, want true")
+	}
+	if err := ClearCache(dir); err != nil {
+		t.Fatalf("ClearCache: %v", err)
+	}
+	if res, _, err := r3.LookupNowForceSrc(ctx, nq, false); err != nil || res.Found {
+		t.Fatalf("LookupNowForceSrc after negative invalidation = %+v,%v; want a clean miss after a real fetch", res, err)
+	}
+	if got := nfake.calls.Load(); got == 0 {
+		t.Fatal("lookup after negative invalidation made no source call; want the fetch, not a warmed miss")
 	}
 }

@@ -29,6 +29,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cache over a library walk), `titleclean` (corpus parity TSV).
 - Inno Setup installer (`tools/potflix.iss`) and embedded exe/tray icon
   resources.
+- `internal/store`: crash-safe, append-only single-file key/value store behind
+  both the file index and the metadata cache - a 24-byte own-CRC header,
+  `tag | len | crc32 | payload` frames, a torn tail truncated on replay instead
+  of erroring, temp + `Sync` + rename compaction, `Commit` as the fsync
+  barrier, and (Windows) a `syscall.CreateFile` open with
+  `FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE` so a live handle never
+  blocks removal, with an explicit `ErrRemoved` contract for the durability
+  claims.
+- `internal/repair`: the needs-repair inventory the user can file -
+  `needs-repair.json` + `needs-repair.txt` written atomically into
+  `<index dir>\inventory`, plus a GitHub issue path (`gh issue create` when the
+  GitHub CLI is available, otherwise a prefilled new-issue URL) whose published
+  body carries only the reason, the file's basename, the attempt count and a
+  sanitized error - never a local path
+  (`TestIssueBodyNeverCarriesALocalPath`); the local report keeps the full path.
+- Library window: a `Report` control that reads the local needs-repair report
+  and files it; the live `indexed N of M files | metadata K of J` line with its
+  `- catching up` state and a bar driven by metadata progress, so it cannot read
+  full while metadata remains.
+- Metadata catch-up: `StartCatchUp` resolves whatever the index still owes on a
+  background worker (3 lookups at a time), started once at launch from
+  `main.go:189`, idempotent and resumable because the pending set is the index's
+  own state; entries unresolved after 3 attempts are parked `needs_repair` and
+  retried only after a 6-hour cooldown.
+
+### Changed
+
+- Library index moved off the JSON file: `library.idx` (one `internal/store`
+  file beside the configured index path) holds a record per video file - path,
+  name, type, size, mtime, parsed title/kind/season/episode, metadata key,
+  state, attempts, last error, next try - plus a rollup per folder. A scan is
+  now enumerate + a `(size, mtime)` diff: unchanged files keep their record and
+  are never re-parsed, vanished files are pruned, and an indexed `Scan`
+  performs ZERO network fetches (metadata is the background catch-up above).
+  First open on a machine with the old index imports it and RENAMES it to
+  `scanindex.json.bak` - never deletes it - and the imported rollups carry no
+  per-file data, so their folders re-walk once. Measured on this box (see
+  `go/internal/library/BENCH.md`): the record codec is ~218 B binary against
+  ~429 B of JSON for a 92-character path, the migrated real index (928
+  folder rollups) loads in 9.04 ms, a 23,402-record store (7,556,531 B)
+  reopens and decodes in 28.6 ms, and the store micro-bench writes 23,402
+  records in 38.43 ms total and loads 24,520 records in 7.386 ms; a warm
+  re-walk of the reduced real-shape corpus (2,300 files, all folders
+  re-walked) is 141.9 / 143.6 / 149.7 ms with `Parsed==0` and zero fetches,
+  and the folder-skip steady state is 6.4 / 7.6 / 7.7 ms.
+- Metadata cache moved off one JSON file per key: 1,118 loose
+  `meta\*.json` files become one `meta.idx` store behind one handle held for
+  the process, so a read is a map lookup rather than a whole-file replay and
+  the old 64 KiB per-entry read cap is gone (four entries on this machine were
+  64 KB-232 KB and were therefore permanently treated as "not cached"). When
+  the store is empty the legacy directory is imported once and KEPT as the
+  recovery copy - only the new `ClearCache(dir)` removes it.
+- Settings: the single Clear action is split into **Clear metadata** (cache
+  only - the file index survives, so no re-walk) and **Clear index** (drops the
+  file index for a full re-index; the metadata cache is untouched).
+- Library scan does each piece of disk work once: one directory enumeration
+  per folder (reused for the folder hash and the recorded record), no second
+  traversal or repeated hashing at record time, the index saves only when
+  records changed, and every cached key is probed once for its live verdict;
+  a hit is then served from memory without a second read, and pure cache
+  hits no longer queue behind the network limiter. Pruning now
+  happens on the scan write path, so loading the index never mutates it.
+  Measured on this box (see `go/internal/library/BENCH.md`): `ScanWarm`
+  26.3 ms -> 20.3 ms, indexed second pass 25.0 ms -> 20.0 ms without the
+  index and 19.1 ms -> 8.8 ms with it (-54%), the real-shape benchmark
+  0.59 s/op on the reduced corpus while the full-scale baseline could not
+  finish a single op in over 30 minutes, and a real-corpus read-only warm
+  walk (`metawarm -dry -offline` over `D:\1movies;D:\2animes;E:\2movies`)
+  covering 4,255 files / 3,776 unique in about 1.2 s.
+- Library window scan progress is phase-aware: a sweeping strip while
+  walking, a determinate keys bar while resolving, with live counters,
+  elapsed time, and an ETA only when a measured resolve-phase rate supports
+  one; repaints are coalesced to about ten per second with the terminal
+  state always painted; cancelling keeps the progress made so far.
 
 ### Fixed
 
@@ -37,3 +111,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the lookup normalizes the separator (` - ` -> `: `) instead of truncating
   the name, so the card shows the 2026 series, `The God Who Destroys`, and
   artwork instead of the 2015 series or a bare absolute tag.
+- `[Anime Time] Dragon Ball Super Movie 01 - Broly.mkv` now parses as the 2018
+  MOVIE `Dragon Ball Super: Broly` (no season, no episode): a trailing
+  `Movie <n>` / `the Movie` marker outranks the weak absolute-episode tag the
+  cleaner's `ALT_EP` split leaves behind, and the marker's own number is never
+  an episode, so it no longer resolves as the series `Dragon Ball Super Movie`
+  episode 1. A strong `SxxEyy` tag still wins, and a title that merely ends in
+  the word (e.g. `The Lego Movie`) is left exactly as parsed.

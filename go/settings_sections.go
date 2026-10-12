@@ -17,8 +17,12 @@ import (
 //
 // Same owner-drawn window, palette, fonts, DPI scaling, hover/double-buffering
 // as window.go; this file only adds behaviour behind new rect-table ids:
-//   - LIBRARY: Clear cache (danger-styled) / Export... / Import... backed by
-//     internal/bundle over MetadataDir(), plus the ScanIndexPath() index file.
+//   - LIBRARY: Clear metadata / Clear index (both danger-styled) / Export... /
+//     Import.... Clear metadata calls metadata.ClearCache(MetadataDir()) and
+//     leaves the file index alone (no re-walk); Clear index removes the index
+//     files behind ScanIndexPath() - library.IndexStorePath maps them to
+//     library.idx - and forces a full re-index. Export/Import are backed by
+//     internal/bundle over MetadataDir().
 //     Import is followed by an incremental library.Scan via the SAME
 //     goroutine + PostMessage path as the Scan button (startLibraryScan).
 //   - STARTUP: Start-with-Windows toggle via HKCU Run (advapi32, stdlib-only
@@ -37,9 +41,25 @@ const appVersion = "1.0.0"
 // Status strings: pure mappers from results to the status line.
 // ---------------------------------------------------------------------------
 
-// clearCacheStatus maps a Clear outcome to the status line.
+// clearCacheStatus maps the PRE-SPLIT combined clear to its status line. The
+// Settings view no longer clears both at once (see clearMetadataStatus /
+// clearIndexStatus); it stays because settings_sections_test.go pins the old
+// combined core's status line.
 func clearCacheStatus(titles, records int) string {
 	return fmt.Sprintf("Cleared %d cached titles - %d folder records", titles, records)
+}
+
+// clearMetadataStatus is the Clear-metadata status line. The clear drops every
+// cached metadata entry and leaves the file index alone, so no re-walk is
+// needed. The store's entry count is not observable through the metadata
+// package's API, so the line names what changed instead of printing a guessed
+// count.
+const clearMetadataStatus = "Cleared metadata cache - titles refetch on the next scan; the file index is kept."
+
+// clearIndexStatus maps the Clear-index outcome to its status line: how many
+// folder records went with the file index, and the re-index it forces.
+func clearIndexStatus(records int) string {
+	return fmt.Sprintf("Cleared file index - %d folder records dropped; the next scan re-indexes every folder.", records)
 }
 
 // exportBundleStatus maps an Export outcome to the status line. The dest
@@ -140,9 +160,9 @@ func scanSegmentStyle(seg, current string) int {
 var deadCacheCount int
 
 // deadCacheLabel renders the count as one muted line under the SCAN hint:
-// "N titles marked dead - Clear cache retries them".
+// "N titles marked dead - Clear metadata retries them".
 func deadCacheLabel(n int) string {
-	return fmt.Sprintf("%d titles marked dead - Clear cache retries them", n)
+	return fmt.Sprintf("%d titles marked dead - Clear metadata retries them", n)
 }
 
 // refreshDeadCacheCount re-reads the not-found entry count from the live
@@ -174,19 +194,58 @@ func onSelectScanSpeed(profile string) {
 // Window-free cores: take explicit dirs so tests run on temp dirs.
 // ---------------------------------------------------------------------------
 
-// clearLibraryCache deletes the bundle cache files under metaDir plus the
-// scan index file at indexPath. It reports removed cache files and the folder
-// record count seen before deletion. A missing index is not an error.
+// clearLibraryCache is the PRE-SPLIT combined clear: the bundle cache files
+// under metaDir plus the whole scan index at indexPath. The Settings view no
+// longer calls it (Clear metadata and Clear index are separate buttons now);
+// it stays because settings_sections_test.go pins its contract, and it
+// composes the live clearScanIndex core so there is exactly ONE
+// index-deletion path in the file.
 func clearLibraryCache(metaDir, indexPath string) (titles, records int, err error) {
 	titles, err = bundle.Clear(metaDir)
 	if err != nil {
 		return titles, 0, err
 	}
+	records, err = clearScanIndex(indexPath)
+	return titles, records, err
+}
+
+// clearMetadataCache is the Clear-metadata action core: every cached entry
+// under metaDir goes (metadata.ClearCache - the store's entries are deleted
+// and the file compacted back to an empty snapshot, and the legacy
+// one-file-per-key directory goes with it), idempotently. The file index and
+// its per-file records are NOT touched, so nothing has to be re-walked.
+func clearMetadataCache(metaDir string) error {
+	return metadata.ClearCache(metaDir)
+}
+
+// clearScanIndex is the Clear-index action core: it removes every index file
+// behind indexPath and reports the folder records the index held. The index
+// lives in the store file library.IndexStorePath maps indexPath to
+// (library.idx beside scanindex.json - the library's own helper, never a name
+// restated here) plus the legacy JSON index that store replaced. The
+// process-wide index handle is dropped first: it keeps its records in memory,
+// so deleting the file under a live handle would leave the next scan skipping
+// folders on records that are no longer on disk. A missing index is not an
+// error.
+func clearScanIndex(indexPath string) (records int, err error) {
 	records = library.LoadScanIndex(indexPath).Len()
-	if rerr := os.Remove(indexPath); rerr != nil && !os.IsNotExist(rerr) {
-		return titles, records, rerr
+	_ = library.CloseIndex(indexPath) // the next scan reopens an empty index
+	for _, p := range indexFiles(indexPath) {
+		if rerr := os.Remove(p); rerr != nil && !os.IsNotExist(rerr) {
+			return records, rerr
+		}
 	}
-	return titles, records, nil
+	return records, nil
+}
+
+// indexFiles lists the index files at indexPath: the store holding today's
+// records and the legacy JSON index it replaced.
+func indexFiles(indexPath string) []string {
+	store := library.IndexStorePath(indexPath)
+	if store == "" || store == indexPath {
+		return []string{indexPath}
+	}
+	return []string{store, indexPath}
 }
 
 // exportBundleTo writes one bundle of metaDir to dest.
@@ -296,17 +355,27 @@ func desktopDir() string {
 	return ""
 }
 
-// confirmClearCache shows the native warning dialog first: Yes deletes,
-// anything else aborts. Counts are pre-delete (bundle.Count + index Len).
-func confirmClearCache(owner uintptr, titles, records int) bool {
-	text := fmt.Sprintf("Delete %d cached titles and the folder scan index (%d folder records)? They will be fetched again from the internet. Your folders are kept.",
-		titles, records)
+// confirmClear shows the native warning dialog: Yes proceeds, anything else
+// aborts. The pre-split clear used one dialog for the combined delete; the
+// split action uses one per button, differing only in its text.
+func confirmClear(owner uintptr, title, text string) bool {
 	t, _ := syscall.UTF16PtrFromString(text)
-	c, _ := syscall.UTF16PtrFromString("Potflix - Clear cache")
+	c, _ := syscall.UTF16PtrFromString(title)
 	r, _, _ := procMessageBoxW.Call(owner,
 		uintptr(unsafe.Pointer(t)), uintptr(unsafe.Pointer(c)),
 		uintptr(mbYesNo|mbIconWarning))
 	return r == idYes
+}
+
+// clearMetadataConfirmText / clearIndexConfirmText are the two confirmation
+// texts: each names exactly what its button deletes and what survives. Pure,
+// so tests pin the wording without a dialog.
+func clearMetadataConfirmText() string {
+	return "Delete every cached title? They will be fetched again from the internet. Your folders and the file index are kept."
+}
+
+func clearIndexConfirmText() string {
+	return "Delete the file index? The next scan re-walks every folder. Your folders and the cached metadata are kept."
 }
 
 // saveBundleDialog opens the native Save-As dialog (default dir Desktop,
@@ -519,23 +588,38 @@ func setStartupEnabled(on bool) error {
 // Handlers: invoked from doSettingsAction (UI thread).
 // ---------------------------------------------------------------------------
 
-// onClearCache confirms natively, then clears bundle.Clear(metaDir) plus the
-// scan index file, and reports counts in the status line.
-func onClearCache(hwnd uintptr) {
-	meta, idx := MetadataDir(), ScanIndexPath()
-	titles, _ := bundle.Count(meta)
-	records := library.LoadScanIndex(idx).Len()
-	if !confirmClearCache(hwnd, titles, records) {
+// onClearMetadata confirms natively, then drops every cached metadata entry
+// (metadata.ClearCache) and leaves the file index alone - the next scan still
+// knows every folder it already walked.
+func onClearMetadata(hwnd uintptr) {
+	if !confirmClear(hwnd, "Potflix - Clear metadata", clearMetadataConfirmText()) {
 		return
 	}
-	got, recs, err := clearLibraryCache(meta, idx)
+	if err := clearMetadataCache(MetadataDir()); err != nil {
+		appLogf("library: clear metadata failed: %s", err)
+		setStatusText(fitScanStatus("Clear metadata failed: " + err.Error()))
+		return
+	}
+	refreshDeadCacheCount() // the dead-entry label now matches the emptied cache
+	appLogf("library: cleared metadata cache")
+	setStatusText(clearMetadataStatus)
+}
+
+// onClearIndex confirms natively, then removes the file index only, forcing a
+// full re-index on the next scan. The metadata cache is untouched, so the
+// re-walk fetches nothing that is already cached.
+func onClearIndex(hwnd uintptr) {
+	if !confirmClear(hwnd, "Potflix - Clear index", clearIndexConfirmText()) {
+		return
+	}
+	records, err := clearScanIndex(ScanIndexPath())
 	if err != nil {
-		appLogf("library: clear failed: %s", err)
-		setStatusText(fitScanStatus("Clear failed: " + err.Error()))
+		appLogf("library: clear index failed: %s", err)
+		setStatusText(fitScanStatus("Clear index failed: " + err.Error()))
 		return
 	}
-	appLogf("library: cleared (titles=%d records=%d)", got, recs)
-	setStatusText(clearCacheStatus(got, recs))
+	appLogf("library: cleared file index (folder records=%d)", records)
+	setStatusText(clearIndexStatus(records))
 }
 
 // onExportBundle prompts for a Save-As path, writes the bundle, and reports.

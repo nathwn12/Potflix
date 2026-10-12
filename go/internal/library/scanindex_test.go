@@ -203,8 +203,8 @@ func TestScanIndexRoundTrip(t *testing.T) {
 	if err := ix.Save(path); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if _, err := os.Stat(path); err != nil {
-		t.Fatalf("Save did not leave a file at %q: %v", path, err)
+	if _, err := os.Stat(IndexStorePath(path)); err != nil {
+		t.Fatalf("Save did not leave a store at %q: %v", IndexStorePath(path), err)
 	}
 
 	loaded := LoadScanIndex(path)
@@ -221,8 +221,12 @@ func TestScanIndexRoundTrip(t *testing.T) {
 		t.Fatal("round-trip: d2 with a missing key must not skip")
 	}
 
-	// Corrupt the file in place: the loader must stay tolerant.
-	if err := os.WriteFile(path, []byte("{{not json"), 0o644); err != nil {
+	// Corrupt the store in place: the loader must stay tolerant (the
+	// unreadable file is quarantined and the index comes back empty).
+	if err := CloseIndex(path); err != nil {
+		t.Fatalf("close index: %v", err)
+	}
+	if err := os.WriteFile(IndexStorePath(path), []byte("not a store file"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got := LoadScanIndex(path); got.Len() != 0 {

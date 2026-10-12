@@ -2,7 +2,6 @@ package library
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"io/fs"
 	"os"
@@ -15,6 +14,31 @@ import (
 
 	"potflix/internal/metadata"
 )
+
+// metaCacheDir returns a metadata cache directory OUTSIDE the test's temp
+// tree.
+//
+// Cross-package handle lifetime: internal/metadata holds its store file
+// (<dir>.idx, cacheHandleFor in internal/metadata/cache.go) open for the
+// process, and Windows refuses to unlink that file while the handle lives, so
+// a cache created under t.TempDir() fails the test's own TempDir cleanup.
+// That package's tests call closeCacheHandles from their own t.Cleanup; this
+// package cannot (it is unexported), so the cache lives under the OS temp dir
+// and is removed best-effort here. Reported to the fleet as a cross-package
+// blocker; when a release path is exported this helper collapses back to
+// t.TempDir().
+func metaCacheDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "potflix-libtest-meta-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+		_ = os.Remove(dir + ".idx")
+	})
+	return dir
+}
 
 // seedLib builds a tiny fake library:
 //   - the same episode in two folders (must dedupe to one key)
@@ -324,30 +348,13 @@ func seedScanLib(t *testing.T) string {
 	return root
 }
 
-func cacheModTimes(t *testing.T, dir string) map[string]time.Time {
-	t.Helper()
-	out := map[string]time.Time{}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("read cache dir: %v", err)
-	}
-	for _, e := range entries {
-		fi, err := e.Info()
-		if err != nil {
-			t.Fatal(err)
-		}
-		out[e.Name()] = fi.ModTime()
-	}
-	return out
-}
-
 // TestScanIncrementalAndForce proves the Scan semantics end to end against a
 // temp library and a temp cache dir: run 1 resolves and caches (one fetch per
 // unique key), run 2 without force is a no-op (zero fetches, cache files
 // untouched), run 3 with force refetches and rewrites every entry.
 func TestScanIncrementalAndForce(t *testing.T) {
 	root := seedScanLib(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	ctx := context.Background()
 
 	orig := newResolver
@@ -386,9 +393,14 @@ func TestScanIncrementalAndForce(t *testing.T) {
 	if res, err := offline.LookupNow(ctx, q); err != nil || !res.Found || res.Episode != "V1" {
 		t.Fatalf("run 1 cached content = %+v,%v; want episode V1 found", res, err)
 	}
-	before := cacheModTimes(t, cache)
-	if len(before) != 2 {
-		t.Fatalf("cache files = %d, want 2 (one per show)", len(before))
+	// The cache medium is internal/metadata's store file now (per-key JSON
+	// files are its legacy import source), so "one entry per show" is asserted
+	// through the cache's own probe rather than a directory count.
+	for _, n := range []string{"ShowA.S01E01.mkv", "ShowB.S01E01.mkv"} {
+		key := metadata.CacheKeyFor(metadata.ResolveQuery(n, filepath.Join(root, "A", n)))
+		if key == "" || !metadata.CacheHas(cache, key) {
+			t.Fatalf("cache has no entry for %q (key %q) after run 1", n, key)
+		}
 	}
 
 	// Run 2 (non-force): everything is cached, so no fetch may happen and no
@@ -413,9 +425,12 @@ func TestScanIncrementalAndForce(t *testing.T) {
 	if n := fake2.calls.Load(); n != 0 {
 		t.Errorf("run 2 fetches = %d, want 0 (all served from disk)", n)
 	}
-	for name, mt := range cacheModTimes(t, cache) {
-		if !mt.Equal(before[name]) {
-			t.Errorf("run 2 rewrote %q (mtime changed without force)", name)
+	// "No rewrite without force" is asserted where the cache can see it: zero
+	// provider calls above and zero fetched keys, plus every probe still live.
+	for _, n := range []string{"ShowA.S01E01.mkv", "ShowB.S01E01.mkv"} {
+		key := metadata.CacheKeyFor(metadata.ResolveQuery(n, filepath.Join(root, "A", n)))
+		if !metadata.CacheLive(cache, key) {
+			t.Errorf("run 2 lost the live cache entry for %q (key %q)", n, key)
 		}
 	}
 
@@ -440,12 +455,8 @@ func TestScanIncrementalAndForce(t *testing.T) {
 	if n := fake3.calls.Load(); n != 2 {
 		t.Errorf("run 3 fetches = %d, want 2 (forced refetch per key)", n)
 	}
-	after := cacheModTimes(t, cache)
-	for name, mt := range after {
-		if !mt.After(before[name]) {
-			t.Errorf("run 3 did not rewrite %q (mtime %v, want after %v)", name, mt, before[name])
-		}
-	}
+	// The forced refetch is proven by the provider count and by the entry's
+	// content: the rewritten cache must now answer V2.
 	offline3 := metadata.New(metadata.Options{Dir: cache, Offline: true})
 	if res, err := offline3.LookupNow(ctx, q); err != nil || !res.Found || res.Episode != "V2" {
 		t.Fatalf("run 3 cached content = %+v,%v; want episode V2 found", res, err)
@@ -458,7 +469,7 @@ func TestScanIncrementalAndForce(t *testing.T) {
 // Cached + Fetched == Resolved in both runs.
 func TestScanCachedVsFetched(t *testing.T) {
 	root := seedScanLib(t) // 3 files, 2 unique keys, all resolvable
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	ctx := context.Background()
 
 	orig := newResolver
@@ -538,8 +549,12 @@ func seedIndexCorpus(t *testing.T) (dirs []string, parent string) {
 	return dirs, parent
 }
 
+// indexScanOpts is the indexed-run configuration for the scan tests: they pin
+// the index phase (walk, per-file diff, folder skip tallies), so they run with
+// SkipCatchUp - no background metadata pass, and nothing racing the temp-dir
+// cleanup. The catch-up has its own tests (catchup_test.go).
 func indexScanOpts(dirs []string, cache, index string, force bool) Options {
-	return Options{Dirs: dirs, Force: force, CacheDir: cache, IndexPath: index, UseIndex: true}
+	return Options{Dirs: dirs, Force: force, CacheDir: cache, IndexPath: index, UseIndex: true, SkipCatchUp: true}
 }
 
 func withFakeResolver(tag string, calls *atomic.Int32) func() {
@@ -562,7 +577,7 @@ func withFakeResolver(tag string, calls *atomic.Int32) func() {
 // file callback, so the count stays 0 without timing tricks.
 func TestIndexSecondScanSkipsUnchanged(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -594,7 +609,7 @@ func TestIndexSecondScanSkipsUnchanged(t *testing.T) {
 	}
 
 	var last Progress
-	st2, err := ScanWithOptions(ctx, Options{Dirs: dirs, CacheDir: cache, IndexPath: index, UseIndex: true, Progress: func(p Progress) { last = p }})
+	st2, err := ScanWithOptions(ctx, Options{Dirs: dirs, CacheDir: cache, IndexPath: index, UseIndex: true, SkipCatchUp: true, Progress: func(p Progress) { last = p }})
 	if err != nil {
 		t.Fatalf("scan 2: %v", err)
 	}
@@ -622,7 +637,7 @@ func TestIndexSecondScanSkipsUnchanged(t *testing.T) {
 // rescans only d1; d2/d3 still skip.
 func TestIndexAddFileRescansOnlyThatFolder(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -655,7 +670,7 @@ func TestIndexRenameIsNotSkipped(t *testing.T) {
 	if _, err := os.Stat(trailer); err != nil {
 		t.Fatalf("trailer seed missing: %v", err)
 	}
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -683,7 +698,7 @@ func TestIndexRenameIsNotSkipped(t *testing.T) {
 // produce tier-1-miss+tier-2-hit; the state is injected directly.)
 func TestIndexStaleTier1RefreshesViaTier2(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -719,38 +734,60 @@ func TestIndexStaleTier1RefreshesViaTier2(t *testing.T) {
 	}
 }
 
-// TestIndexMissingCacheKeyDisablesSkip proves the skip guard: deleting one
-// key's cache file forces its folder to rescan.
+// TestIndexMissingCacheKeyDisablesSkip proves where payload loss is handled
+// now: a folder whose recorded keys have no live cache entry is no longer
+// re-WALKED for that (its skip is a filesystem decision), but the catch-up
+// re-resolves every key whose payload is gone. Here the metadata cache is
+// cleared, the folder still skips, and the next pass calls the provider for
+// every key again.
 func TestIndexMissingCacheKeyDisablesSkip(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
-	restore := withFakeResolver("V1", nil)
-	defer restore()
+	fast := &fakeSource{name: "fake", tag: "V1"}
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	newResolver = func(dir string) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{fast}})
+	}
 	if _, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false)); err != nil {
 		t.Fatalf("scan 1: %v", err)
 	}
-	q := metadata.ResolveQuery("ShowA.S01E01.mkv", filepath.Join(dirs[0], "ShowA.S01E01.mkv"))
-	key := metadata.CacheKeyFor(q)
-	if err := os.Remove(filepath.Join(cache, metadata.CacheFileNameFor(key))); err != nil {
-		t.Fatalf("remove cache file: %v", err)
+	StartCatchUp(CatchUpConfig{Dirs: dirs, CacheDir: cache, IndexPath: index}, nil).Wait()
+	before := fast.calls.Load()
+	if before == 0 {
+		t.Fatalf("first catch-up called the provider 0 times, want every key")
+	}
+
+	// Drop every cached payload: the records still say resolved, so only the
+	// catch-up's cache probe can notice the loss.
+	if err := metadata.ClearCache(cache); err != nil {
+		t.Fatalf("clear metadata cache: %v", err)
 	}
 	st2, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false))
 	if err != nil {
 		t.Fatalf("scan 2: %v", err)
 	}
-	if st2.FoldersScanned != 1 || st2.FoldersSkipped != 2 {
-		t.Errorf("missing key: folders = %d scanned %d skipped, want 1/2 (%+v)", st2.FoldersScanned, st2.FoldersSkipped, st2)
+	if st2.FoldersScanned != 0 || st2.FoldersSkipped != 3 {
+		t.Errorf("scan 2 folders = %d scanned %d skipped, want 0/3 (%+v)", st2.FoldersScanned, st2.FoldersSkipped, st2)
+	}
+	StartCatchUp(CatchUpConfig{Dirs: dirs, CacheDir: cache, IndexPath: index}, nil).Wait()
+	if got := int(fast.calls.Load()) - int(before); got != int(before) {
+		t.Errorf("re-resolve calls = %d, want %d (every key whose payload vanished)", got, before)
 	}
 }
 
 // TestIndexForceRewritesWithoutSkipping proves force=true walks everything
-// and rewrites records.
+// and re-records every visited dir. Identical content is not rewritten to
+// disk (dirty-gated folder rollups), so the test pins the ROLLUP content
+// instead of a blind mtime bump - plus a follow-up force scan over changed
+// content, which must update the record. The index medium is the store file
+// beside the path (IndexStorePath), not the retired JSON.
 func TestIndexForceRewritesWithoutSkipping(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -759,9 +796,9 @@ func TestIndexForceRewritesWithoutSkipping(t *testing.T) {
 	if _, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false)); err != nil {
 		t.Fatalf("scan 1: %v", err)
 	}
-	before, err := os.Stat(index)
-	if err != nil {
-		t.Fatalf("stat index: %v", err)
+	before, ok := LoadScanIndex(index).Lookup(dirs[0])
+	if !ok {
+		t.Fatalf("no rollup for %q after scan 1", dirs[0])
 	}
 	time.Sleep(60 * time.Millisecond)
 	st, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, true))
@@ -774,13 +811,47 @@ func TestIndexForceRewritesWithoutSkipping(t *testing.T) {
 	if st.FoldersScanned != 3 {
 		t.Errorf("force: FoldersScanned = %d, want 3", st.FoldersScanned)
 	}
-	after, err := os.Stat(index)
-	if err != nil {
-		t.Fatalf("stat index after: %v", err)
+	// Unchanged content re-records the same rollup (ScannedAt aside), so the
+	// store write is dirty-gated away: the content must be identical.
+	after, ok := LoadScanIndex(index).Lookup(dirs[0])
+	if !ok || !sameScanRecord(before, after) {
+		t.Errorf("force scan changed the rollup content:\nbefore = %+v\nafter  = %+v", before, after)
 	}
-	if !after.ModTime().After(before.ModTime()) {
-		t.Errorf("force did not rewrite index (mtime %v, want after %v)", after.ModTime(), before.ModTime())
+	// Changed content still updates the record: drop a file and force-scan.
+	if err := os.Remove(filepath.Join(dirs[0], "ShowA.S01E02.mkv")); err != nil {
+		t.Fatal(err)
 	}
+	time.Sleep(60 * time.Millisecond)
+	if _, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, true)); err != nil {
+		t.Fatalf("force scan 2: %v", err)
+	}
+	if rec, ok := LoadScanIndex(index).Lookup(dirs[0]); !ok || rec.Files != 1 {
+		t.Errorf("d1 record after removal = %+v, want Files:1", rec)
+	}
+}
+
+// scanRecordsEqual compares two indexes record by record, ignoring ScannedAt
+// (write-only clock stamp, never read by the skip guard).
+func scanRecordsEqual(t *testing.T, a, b *ScanIndex) bool {
+	t.Helper()
+	na, nb := a.Len(), b.Len()
+	if na != nb {
+		return false
+	}
+	for _, dir := range a.ix.folderNames() {
+		ra, ok := a.Lookup(dir)
+		if !ok {
+			return false
+		}
+		rb, ok := b.Lookup(dir)
+		if !ok {
+			return false
+		}
+		if !sameScanRecord(ra, rb) {
+			return false
+		}
+	}
+	return true
 }
 
 // TestIndexSchemaBumpSkipsNothing proves records under an older schema
@@ -788,7 +859,7 @@ func TestIndexForceRewritesWithoutSkipping(t *testing.T) {
 // full walk.
 func TestIndexSchemaBumpSkipsNothing(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -797,24 +868,18 @@ func TestIndexSchemaBumpSkipsNothing(t *testing.T) {
 	if _, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false)); err != nil {
 		t.Fatalf("scan 1: %v", err)
 	}
-	data, err := os.ReadFile(index)
-	if err != nil {
-		t.Fatalf("read index: %v", err)
+	// Stale schema, written through the index's own API (the JSON rewrite the
+	// old test did is gone with the medium).
+	ix := LoadScanIndex(index)
+	for _, d := range dirs {
+		rec, ok := ix.Lookup(d)
+		if !ok {
+			t.Fatalf("no rollup for %q after scan 1", d)
+		}
+		ix.RecordFull(d, rec.NamesHash, rec.Fingerprint, metadata.CacheSchema()+1, rec.Keys, rec.Files)
 	}
-	var raw map[string]FolderRecord
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("unmarshal index: %v", err)
-	}
-	for k, v := range raw {
-		v.Schema = metadata.CacheSchema() + 1
-		raw[k] = v
-	}
-	data, err = json.Marshal(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(index, data, 0o644); err != nil {
-		t.Fatal(err)
+	if err := ix.Save(index); err != nil {
+		t.Fatalf("save stale-schema records: %v", err)
 	}
 	st2, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false))
 	if err != nil {
@@ -826,10 +891,12 @@ func TestIndexSchemaBumpSkipsNothing(t *testing.T) {
 }
 
 // TestIndexMissingOrCorruptIsFullWalk proves a missing or corrupt index is
-// a full walk, never an error.
+// a full walk, never an error. The medium is the store file beside the index
+// path, so the corruption is applied there: a file this layer cannot read as
+// a store is quarantined and the index starts empty.
 func TestIndexMissingOrCorruptIsFullWalk(t *testing.T) {
 	dirs, _ := seedIndexCorpus(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -842,7 +909,10 @@ func TestIndexMissingOrCorruptIsFullWalk(t *testing.T) {
 	if st1.FoldersScanned != 3 || st1.FoldersSkipped != 0 {
 		t.Errorf("missing index: folders = %d scanned %d skipped, want 3/0 (%+v)", st1.FoldersScanned, st1.FoldersSkipped, st1)
 	}
-	if err := os.WriteFile(index, []byte("{{not json"), 0o644); err != nil {
+	if err := CloseIndex(index); err != nil {
+		t.Fatalf("close index: %v", err)
+	}
+	if err := os.WriteFile(IndexStorePath(index), []byte("{{not a store file at all, forty bytes or so"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	st2, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false))
@@ -851,6 +921,9 @@ func TestIndexMissingOrCorruptIsFullWalk(t *testing.T) {
 	}
 	if st2.FoldersScanned != 3 || st2.FoldersSkipped != 0 {
 		t.Errorf("corrupt index: folders = %d scanned %d skipped, want 3/0 (%+v)", st2.FoldersScanned, st2.FoldersSkipped, st2)
+	}
+	if _, err := os.Stat(IndexStorePath(index) + ".corrupt"); err != nil {
+		t.Errorf("corrupt store was not quarantined beside the index: %v", err)
 	}
 }
 
@@ -866,11 +939,12 @@ func (m *missSource) Find(ctx context.Context, q metadata.Query) (*metadata.Medi
 	return nil, nil
 }
 
-// TestIndexAllNegativeFolderSkipped proves folders whose files all
-// resolved not-found are still skippable: the first pass persists a
-// negative entry per key (so CacheHas passes), and the second pass skips
-// the folder entirely (FoldersScanned==0) with the numbers staying
-// honest (first pass NotFound==files, second pass FilesSkipped==files).
+// TestIndexAllNegativeFolderSkipped proves folders whose files all resolved
+// not-found are still skippable without network: the scan itself never
+// fetches (the folder is indexed with its files pending), the catch-up
+// persists the negatives, and the next scan skips the folder entirely
+// (FoldersScanned==0) with the numbers staying honest (first pass
+// Pending==files, second pass FilesSkipped==files).
 func TestIndexAllNegativeFolderSkipped(t *testing.T) {
 	parent := t.TempDir()
 	folder := filepath.Join(parent, "missfolder")
@@ -884,7 +958,7 @@ func TestIndexAllNegativeFolderSkipped(t *testing.T) {
 		}
 	}
 	dirs := []string{folder}
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 	ctx := context.Background()
 
@@ -899,14 +973,15 @@ func TestIndexAllNegativeFolderSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan 1: %v", err)
 	}
-	if st1.Files != 2 || st1.NotFound != 2 || st1.Resolved != 0 {
-		t.Fatalf("scan 1 stats = %+v, want {Files:2 NotFound:2 Resolved:0}", st1)
+	if st1.Files != 2 || st1.Pending != 2 || st1.Resolved != 0 {
+		t.Fatalf("scan 1 stats = %+v, want {Files:2 Pending:2 Resolved:0} (the scan never fetches)", st1)
 	}
 	if st1.FoldersScanned != 1 || st1.FoldersSkipped != 0 {
 		t.Fatalf("scan 1 folders = %d scanned %d skipped, want 1/0 (%+v)", st1.FoldersScanned, st1.FoldersSkipped, st1)
 	}
-	// Every recorded key must now satisfy the skip guard via its
-	// persisted negative entry.
+	// The catch-up owns the lookups: a definitive miss persists a negative
+	// entry per key and leaves the record pending (attempt 1 of 3).
+	StartCatchUp(CatchUpConfig{Dirs: dirs, CacheDir: cache, IndexPath: index}, nil).Wait()
 	for _, n := range []string{"ShowM.S01E01.mkv", "ShowN.S01E01.mkv"} {
 		q := metadata.ResolveQuery(n, filepath.Join(folder, n))
 		if q.Kind == metadata.KindUnknown {
@@ -917,8 +992,8 @@ func TestIndexAllNegativeFolderSkipped(t *testing.T) {
 		}
 	}
 
-	// Second pass: a fresh miss provider must never be called - the
-	// folder skips on its negative entries.
+	// Second pass: a fresh miss provider must never be called - the folder
+	// skips on its unchanged filesystem identity.
 	miss2 := &missSource{}
 	newResolver = func(dir string) *metadata.Resolver {
 		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{miss2}})
@@ -940,7 +1015,7 @@ func TestIndexAllNegativeFolderSkipped(t *testing.T) {
 		t.Errorf("scan 2 FilesSkipped = %d, want 2", st2.FilesSkipped)
 	}
 	if n := miss2.calls.Load(); n != 0 {
-		t.Errorf("scan 2 provider calls = %d, want 0 (negative-cached folder skipped, no network)", n)
+		t.Errorf("scan 2 provider calls = %d, want 0 (skipped folder, no network)", n)
 	}
 }
 
@@ -950,7 +1025,7 @@ func TestIndexAllNegativeFolderSkipped(t *testing.T) {
 // Stats carry Keys == KeysDone == KeysCached.
 func TestScanKeysFullyCached(t *testing.T) {
 	root := seedScanLib(t) // 3 files, 2 unique keys, all resolvable
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	ctx := context.Background()
 
 	orig := newResolver
@@ -1009,7 +1084,7 @@ func TestScanKeysFullyCached(t *testing.T) {
 // callback and at the end.
 func TestScanKeysPartiallyCached(t *testing.T) {
 	root := seedScanLib(t) // 2 keys warmed below
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	ctx := context.Background()
 
 	orig := newResolver
@@ -1077,46 +1152,43 @@ func TestScanKeysPartiallyCached(t *testing.T) {
 	}
 }
 
-// TestScanCancelReturnsPartialQuickly proves prompt cancellation: with a
-// slow ctx-aware provider, cancelling mid-fetch returns within ~1s with
-// Cancelled=true and a nil error, and the index file exists and parses.
+// TestScanCancelReturnsPartialQuickly proves prompt cancellation: a cancel
+// that lands during the walk stops the run within ~1s with Cancelled=true and
+// a nil error, keeps the numbers honest, and leaves the store-backed index
+// readable. (The fetch phase these tests used to cancel is the catch-up's now;
+// see TestCatchUpCancelStopsPass.)
 func TestScanCancelReturnsPartialQuickly(t *testing.T) {
 	root := seedScanLib(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 
-	orig := newResolver
-	defer func() { newResolver = orig }()
-	slow := &slowCancelSource{name: "fake", tag: "V1", started: make(chan struct{}), release: make(chan struct{})}
-	newResolver = func(dir string) *metadata.Resolver {
-		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{slow}})
+	origWalk := walkDir
+	defer func() { walkDir = origWalk }()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	seen := 0
+	walkDir = func(walkRoot string, fn fs.WalkDirFunc) error {
+		return origWalk(walkRoot, func(p string, d fs.DirEntry, err error) error {
+			if err == nil && d != nil && !d.IsDir() {
+				// Cancel on the second file: mid-walk, deterministic.
+				seen++
+				if seen == 2 {
+					cancel()
+				}
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fn(p, d, err)
+		})
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var st Stats
-	var scanErr error
-	go func() {
-		defer close(done)
-		st, scanErr = ScanWithOptions(ctx, Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true})
-	}()
-	select {
-	case <-slow.started:
-	case <-time.After(5 * time.Second):
-		cancel()
-		t.Fatal("slow provider never started")
-	}
-	cancelAt := time.Now()
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cancelled Scan did not return within 5s")
-	}
-	latency := time.Since(cancelAt)
+	start := time.Now()
+	st, scanErr := ScanWithOptions(ctx, indexScanOpts([]string{root}, cache, index, false))
+	latency := time.Since(start)
 	t.Logf("cancel latency=%dms", latency.Milliseconds())
 	if latency > 2*time.Second {
-		t.Errorf("cancel latency = %v, want <2s (~1s)", latency)
+		t.Errorf("cancel latency = %v, want <2s", latency)
 	}
 	if scanErr != nil {
 		t.Errorf("cancelled Scan err = %v, want nil (cancel is not failure)", scanErr)
@@ -1124,81 +1196,71 @@ func TestScanCancelReturnsPartialQuickly(t *testing.T) {
 	if !st.Cancelled {
 		t.Errorf("cancelled Scan Cancelled = false, want true (%+v)", st)
 	}
-	fi, err := os.Stat(index)
+	if st.Files == 0 {
+		t.Errorf("cancelled Scan Files = 0, want the walked-so-far count kept (%+v)", st)
+	}
+	fi, err := os.Stat(IndexStorePath(index))
 	if err != nil {
-		t.Fatalf("index file missing after cancel: %v", err)
+		t.Fatalf("index store missing after cancel: %v", err)
 	}
 	if fi.Size() == 0 {
-		t.Errorf("index file empty after cancel")
+		t.Errorf("index store empty after cancel")
 	}
-	data, err := os.ReadFile(index)
-	if err != nil {
-		t.Fatalf("read index: %v", err)
-	}
-	var raw map[string]FolderRecord
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("index file does not parse: %v", err)
+	// A cancelled run records NOTHING: no folder rollup may survive it.
+	if got := LoadScanIndex(index).Len(); got != 0 {
+		t.Errorf("cancelled walk recorded %d folder rollups, want 0", got)
 	}
 }
 
-// TestScanResumeAfterCancelSkipsCachedFolders proves a resume over the same
-// corpus with the same index skips folders whose keys are all present and
-// never calls the provider for them.
+// TestScanResumeAfterCancelSkipsCachedFolders proves the resume contract over
+// the same corpus and the same index: once the metadata is caught up, a
+// second scan skips the unchanged folders and calls the provider for nothing.
 func TestScanResumeAfterCancelSkipsCachedFolders(t *testing.T) {
 	root := seedScanLib(t) // A: ShowA; B: ShowA+ShowB
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 
 	orig := newResolver
 	defer func() { newResolver = orig }()
 
-	// Cancelled run: ShowA fast, ShowB blocks until cancel.
-	split := &splitSpeedSource{name: "fake", tag: "V1", release: make(chan struct{})}
-	newResolver = func(dir string) *metadata.Resolver {
-		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{split}})
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	var st1 Stats
-	go func() {
-		defer close(done)
-		st1, _ = ScanWithOptions(ctx, Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true})
-	}()
-	time.Sleep(200 * time.Millisecond) // let ShowA finish, ShowB block
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cancelled Scan did not return")
-	}
-	if !st1.Cancelled {
-		t.Fatalf("first Scan Cancelled = false, want true (%+v)", st1)
-	}
-	close(split.release)
-
-	// Resume with a counting fast provider: ShowA cached, ShowB missing.
+	// First run: index the corpus and let the catch-up resolve every key.
 	fast := &fakeSource{name: "fake", tag: "V1"}
 	newResolver = func(dir string) *metadata.Resolver {
 		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{fast}})
 	}
-	st2, err := ScanWithOptions(context.Background(), Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true})
+	st1, err := ScanWithOptions(context.Background(), indexScanOpts([]string{root}, cache, index, false))
+	if err != nil {
+		t.Fatalf("first Scan: %v", err)
+	}
+	if st1.Cancelled {
+		t.Fatalf("first Scan Cancelled = true, want false (%+v)", st1)
+	}
+	StartCatchUp(CatchUpConfig{Dirs: []string{root}, CacheDir: cache, IndexPath: index}, nil).Wait()
+
+	// Resume with a counting fast provider: everything is indexed and
+	// resolved, so the resume skips every folder and calls nothing.
+	resume := &fakeSource{name: "fake", tag: "V1"}
+	newResolver = func(dir string) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{resume}})
+	}
+	st2, err := ScanWithOptions(context.Background(), indexScanOpts([]string{root}, cache, index, false))
 	if err != nil {
 		t.Fatalf("resume Scan: %v", err)
 	}
 	if st2.Cancelled {
 		t.Errorf("resume Cancelled = true, want false")
 	}
-	if st2.FoldersSkipped < 1 {
-		t.Errorf("resume FoldersSkipped = %d, want >=1 (ShowA-only folder) (%+v)", st2.FoldersSkipped, st2)
+	if st2.FoldersScanned != 0 || st2.FilesSkipped != 3 {
+		t.Errorf("resume folders = %d scanned, files skipped %d, want 0 scanned / 3 skipped (%+v)", st2.FoldersScanned, st2.FilesSkipped, st2)
 	}
-	if n := fast.calls.Load(); n != 1 {
-		t.Errorf("resume provider calls = %d, want 1 (ShowB only, ShowA served from cache)", n)
+	if n := resume.calls.Load(); n != 0 {
+		t.Errorf("resume provider calls = %d, want 0 (indexed and caught up)", n)
 	}
 }
 
-// TestScanCheckpointExistsBeforeFetchCompletes proves mid-scan flushing:
-// with a corpus big enough to flush (>=50 folders), the index file exists
-// while a blocking provider still holds the fetch phase open.
+// TestScanCheckpointExistsBeforeFetchCompletes proves mid-run flushing: the
+// index phase is committed to the store before any metadata work runs, so the
+// index exists while the catch-up is still blocked on a provider.
 func TestScanCheckpointExistsBeforeFetchCompletes(t *testing.T) {
 	root := t.TempDir()
 	for i := 0; i < 60; i++ {
@@ -1210,7 +1272,7 @@ func TestScanCheckpointExistsBeforeFetchCompletes(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 
 	orig := newResolver
@@ -1219,36 +1281,30 @@ func TestScanCheckpointExistsBeforeFetchCompletes(t *testing.T) {
 	newResolver = func(dir string) *metadata.Resolver {
 		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{block}})
 	}
-	done := make(chan struct{})
-	var st Stats
-	var scanErr error
-	go func() {
-		defer close(done)
-		st, scanErr = ScanWithOptions(context.Background(), Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true})
-	}()
+	st, err := ScanWithOptions(context.Background(), indexScanOpts([]string{root}, cache, index, false))
+	if err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	_ = st
+
+	// The index phase is on disk; the catch-up now blocks in the provider.
+	c := StartCatchUp(CatchUpConfig{Dirs: []string{root}, CacheDir: cache, IndexPath: index}, nil)
 	select {
 	case <-block.started:
 	case <-time.After(10 * time.Second):
+		close(block.release)
+		StopCatchUp(index)
 		t.Fatal("blocking provider never started")
 	}
-	// Fetch is blocked: the walk + pre-fetch checkpoint must have flushed.
-	fi, err := os.Stat(index)
+	fi, err := os.Stat(IndexStorePath(index))
 	if err != nil {
-		t.Fatalf("index file missing while fetch blocked: %v", err)
+		t.Fatalf("index store missing while the catch-up is blocked: %v", err)
 	}
 	if fi.Size() == 0 {
-		t.Errorf("index file empty while fetch blocked")
+		t.Errorf("index store empty while the catch-up is blocked")
 	}
 	close(block.release)
-	select {
-	case <-done:
-	case <-time.After(15 * time.Second):
-		t.Fatal("Scan did not complete after release")
-	}
-	if scanErr != nil {
-		t.Fatalf("Scan after release: %v", scanErr)
-	}
-	_ = st
+	c.Wait()
 }
 
 // pad3 formats 0-999 as three digits without fmt (stdlib-only, no extra dep).
@@ -1276,7 +1332,7 @@ func TestScanCancelledWalkRecordsNothing(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 
 	origWalk := walkDir
@@ -1356,29 +1412,34 @@ func TestRecordIndexNeverStampsStaleFolder(t *testing.T) {
 	}
 }
 
-// TestShouldSkipValidityAware proves F3: the skip guard verifies keys by
-// liveness (metadata.CacheLive), not mere file existence. An expired
-// negative entry or a corrupt cache file must NOT satisfy the guard (no
-// skip), while a live positive and a fresh (unexpired) negative still do.
+// TestShouldSkipValidityAware proves the skip guard's contract moved one
+// level: the folder guard is a filesystem decision, and the verifier it is
+// handed is what carries metadata liveness. The scan itself no longer
+// consults the metadata cache to decide a walk skip (an unchanged folder with
+// pending metadata is still skippable - the catch-up resolves those keys from
+// the index), so this drives both: the guard itself with a liveness verifier,
+// and the scan with the per-file state that replaced it.
 func TestShouldSkipValidityAware(t *testing.T) {
 	ctx := context.Background()
 	live := func(cache string) func(string) bool {
 		return func(k string) bool { return metadata.CacheLive(cache, k) }
 	}
 
-	// Live positive control: fill via a fake resolver and index the folder.
+	// Live positive control: the scan indexes the folder, the catch-up fills
+	// the metadata, and the guard then skips with a liveness verifier.
 	posDir := t.TempDir()
 	posName := "ShowP.S01E01.mkv"
 	if err := os.WriteFile(filepath.Join(posDir, posName), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	posCache := t.TempDir()
+	posCache := metaCacheDir(t)
 	posIndex := filepath.Join(t.TempDir(), "scanindex.json")
 	restore := withFakeResolver("V1", nil)
 	if _, err := ScanWithOptions(ctx, indexScanOpts([]string{posDir}, posCache, posIndex, false)); err != nil {
 		restore()
 		t.Fatalf("positive fill scan: %v", err)
 	}
+	StartCatchUp(CatchUpConfig{Dirs: []string{posDir}, CacheDir: posCache, IndexPath: posIndex}, nil).Wait()
 	restore()
 	posFP, err := FolderFingerprint(posDir)
 	if err != nil {
@@ -1386,6 +1447,11 @@ func TestShouldSkipValidityAware(t *testing.T) {
 	}
 	if !LoadScanIndex(posIndex).ShouldSkip(posDir, posFP, metadata.CacheSchema(), live(posCache)) {
 		t.Errorf("ShouldSkip(live positive) = false, want true")
+	}
+	// The scan's own guard needs no cache at all: filesystem identity plus
+	// per-file records is its whole contract.
+	if !LoadScanIndex(posIndex).ShouldSkip(posDir, posFP, metadata.CacheSchema(), func(string) bool { return true }) {
+		t.Errorf("ShouldSkip(filesystem-identical) = false, want true")
 	}
 
 	// Negative setup: a miss resolver persists a fresh negative entry.
@@ -1395,7 +1461,7 @@ func TestShouldSkipValidityAware(t *testing.T) {
 	if err := os.WriteFile(negPath, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	negCache := t.TempDir()
+	negCache := metaCacheDir(t)
 	negIndex := filepath.Join(t.TempDir(), "scanindex.json")
 	orig := newResolver
 	miss := &missSource{}
@@ -1406,6 +1472,8 @@ func TestShouldSkipValidityAware(t *testing.T) {
 		newResolver = orig
 		t.Fatalf("negative fill scan: %v", err)
 	}
+	// The catch-up persists the fresh negative entries the guard verifies.
+	StartCatchUp(CatchUpConfig{Dirs: []string{negDir}, CacheDir: negCache, IndexPath: negIndex}, nil).Wait()
 	newResolver = orig
 	negFP, err := FolderFingerprint(negDir)
 	if err != nil {
@@ -1417,48 +1485,25 @@ func TestShouldSkipValidityAware(t *testing.T) {
 	}
 	negKey := metadata.CacheKeyFor(negQ)
 	negIx := LoadScanIndex(negIndex)
+	if !metadata.CacheLive(negCache, negKey) {
+		t.Fatalf("CacheLive(fresh negative) = false, want true")
+	}
 	if !negIx.ShouldSkip(negDir, negFP, metadata.CacheSchema(), live(negCache)) {
 		t.Fatalf("ShouldSkip(fresh negative) = false, want true")
 	}
 
-	// Expire the negative entry by backdating its CheckedAt past the TTL.
-	entries, err := os.ReadDir(negCache)
-	if err != nil || len(entries) != 1 {
-		t.Fatalf("cache entries = %v, %v; want exactly 1 negative file", entries, err)
-	}
-	negFile := filepath.Join(negCache, entries[0].Name())
-	raw, err := os.ReadFile(negFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatalf("negative cache file does not parse: %v", err)
-	}
-	doc["checkedAt"] = time.Now().Add(-31 * 24 * time.Hour).UTC().Format(time.RFC3339)
-	backdated, err := json.Marshal(doc)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(negFile, backdated, 0o644); err != nil {
-		t.Fatal(err)
+	// Payload loss must stop the guard from skipping: the verifier is passed
+	// in, so the guard honours liveness, not mere record presence. (The
+	// expired-negative and corrupt-file cases moved with the per-key cache
+	// files into internal/metadata's own store-backed cache tests.)
+	if err := metadata.ClearCache(negCache); err != nil {
+		t.Fatalf("clear metadata cache: %v", err)
 	}
 	if metadata.CacheLive(negCache, negKey) {
-		t.Errorf("CacheLive(expired negative) = true, want false")
+		t.Errorf("CacheLive(after clear) = true, want false")
 	}
 	if LoadScanIndex(negIndex).ShouldSkip(negDir, negFP, metadata.CacheSchema(), live(negCache)) {
-		t.Errorf("ShouldSkip(expired negative) = true, want false (stale miss must rescan)")
-	}
-
-	// Corrupt the cache file: existence alone must never satisfy the guard.
-	if err := os.WriteFile(negFile, []byte("corrupt{{{not-json"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if metadata.CacheLive(negCache, negKey) {
-		t.Errorf("CacheLive(corrupt entry) = true, want false")
-	}
-	if LoadScanIndex(negIndex).ShouldSkip(negDir, negFP, metadata.CacheSchema(), live(negCache)) {
-		t.Errorf("ShouldSkip(corrupt entry) = true, want false")
+		t.Errorf("ShouldSkip(no payload) = true, want false (a key with no live answer must not skip)")
 	}
 }
 
@@ -1514,9 +1559,12 @@ func TestCollectFilesWithContextHonoursCancel(t *testing.T) {
 // TestScanCancelledFetchCountsNoError proves F5: fetches that end because
 // the context was cancelled are reported as cancelled/incomplete, never as
 // failures: Errors stays 0.
+// TestScanCancelledFetchCountsNoError proves a cancelled metadata lookup is an
+// incomplete result, never a failure: cancelling the catch-up pass mid-lookup
+// leaves no failed/missed count and parks nothing as needs_repair.
 func TestScanCancelledFetchCountsNoError(t *testing.T) {
 	root := seedScanLib(t)
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 	index := filepath.Join(t.TempDir(), "scanindex.json")
 
 	orig := newResolver
@@ -1528,33 +1576,30 @@ func TestScanCancelledFetchCountsNoError(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := make(chan struct{})
-	var st Stats
-	var scanErr error
-	go func() {
-		defer close(done)
-		st, scanErr = ScanWithOptions(ctx, Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true})
-	}()
+	if _, err := ScanWithOptions(ctx, Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true, SkipCatchUp: true}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	c := StartCatchUp(CatchUpConfig{Dirs: []string{root}, CacheDir: cache, IndexPath: index}, nil)
 	select {
 	case <-slow.started:
 	case <-time.After(5 * time.Second):
-		cancel()
+		close(slow.release)
+		StopCatchUp(index)
 		t.Fatal("slow provider never started")
 	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cancelled Scan did not return within 5s")
+	StopCatchUp(index)
+	close(slow.release)
+	c.Wait()
+
+	stats := c.Stats()
+	if stats.Failed != 0 {
+		t.Errorf("cancelled catch-up Failed = %d, want 0 (a cancelled lookup is incomplete, not a failure)", stats.Failed)
 	}
-	if scanErr != nil {
-		t.Errorf("cancelled Scan err = %v, want nil (cancel is not failure)", scanErr)
+	if stats.Missed != 0 {
+		t.Errorf("cancelled catch-up Missed = %d, want 0", stats.Missed)
 	}
-	if !st.Cancelled {
-		t.Errorf("cancelled Scan Cancelled = false, want true (%+v)", st)
-	}
-	if st.Errors != 0 {
-		t.Errorf("cancelled Scan Errors = %d, want 0 (cancelled fetches are incomplete, not failures) (%+v)", st.Errors, st)
+	if got := LoadScanIndex(index).State().FilesNeedsRepair; got != 0 {
+		t.Errorf("cancelled catch-up parked %d records as needs_repair, want 0", got)
 	}
 }
 
@@ -1598,7 +1643,7 @@ func TestScanTransientFailureHonestCounters(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cache := t.TempDir()
+	cache := metaCacheDir(t)
 
 	orig := newResolver
 	defer func() { newResolver = orig }()
@@ -1639,13 +1684,379 @@ func TestScanTransientFailureHonestCounters(t *testing.T) {
 	if st.Resolved != 1 || st.NotFound != 1 || st.Errors != 1 {
 		t.Errorf("file verdicts = resolved %d notfound %d errors %d, want 1/1/1 (%+v)", st.Resolved, st.NotFound, st.Errors, st)
 	}
-	// The transient failure persisted nothing: exactly the fetched positive
-	// plus the definitive-miss negative are on disk.
-	entries, err := os.ReadDir(cache)
-	if err != nil {
-		t.Fatalf("read cache dir: %v", err)
+	// The transient failure persisted nothing: the fetched positive and the
+	// definitive-miss negative are both in the cache, and the key whose
+	// provider failed is not.
+	for _, tc := range []struct {
+		name string
+		key  string
+		want bool
+	}{
+		{"Found.S01E01.mkv", metadata.CacheKeyFor(metadata.ResolveQuery("Found.S01E01.mkv", filepath.Join(root, "Found.S01E01.mkv"))), true},
+		{"Missing.S01E01.mkv", metadata.CacheKeyFor(metadata.ResolveQuery("Missing.S01E01.mkv", filepath.Join(root, "Missing.S01E01.mkv"))), true},
+		{"Unreachable.S01E01.mkv", metadata.CacheKeyFor(metadata.ResolveQuery("Unreachable.S01E01.mkv", filepath.Join(root, "Unreachable.S01E01.mkv"))), false},
+	} {
+		if got := metadata.CacheHas(cache, tc.key); got != tc.want {
+			t.Errorf("cache entry for %s = %t, want %t (transient failures persist nothing)", tc.name, got, tc.want)
+		}
 	}
-	if len(entries) != 2 {
-		t.Errorf("cache dir has %d entries, want 2 (positive + negative, transient wrote nothing)", len(entries))
+}
+
+// TestScanUseIndexOffMatchesPlainScan proves verdict equivalence with the
+// index off: Scan (public) and ScanWithOptions{UseIndex:false} over
+// identical corpora and identically-seeded caches produce identical Stats
+// and identical final Progress payloads.
+func TestScanUseIndexOffMatchesPlainScan(t *testing.T) {
+	ctx := context.Background()
+	// One episode per cache key: same-key concurrent episodes would join
+	// a single inflight fetch and resolve with the wrong episode
+	// (scheduling-nondeterministic), so the corpus keeps every key
+	// unique to compare exact verdicts.
+	seedUnique := func(t *testing.T) string {
+		t.Helper()
+		root := t.TempDir()
+		for _, f := range []string{
+			filepath.Join(root, "A", "UniqShowA.S01E01.mkv"),
+			filepath.Join(root, "B", "UniqShowB.S02E03.mkv"),
+			filepath.Join(root, "B", "UniqShowC.S01E01.mkv"),
+			filepath.Join(root, "Movies", "UniqFilm.2001.mkv"),
+			filepath.Join(root, "Extras", "UniqShowA trailer.mkv"),
+		} {
+			if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	run := func(scan func(ctx context.Context, root, cache string, prog func(Progress)) (Stats, error)) (Stats, Progress) {
+		root := seedUnique(t)
+		cache := metaCacheDir(t)
+		restore := withFakeResolver("V1", nil)
+		defer restore()
+		var last Progress
+		st, err := scan(ctx, root, cache, func(p Progress) { last = p })
+		if err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		last.Last = "" // completion order is nondeterministic; values must match
+		return st, last
+	}
+	stPlain, lastPlain := run(func(ctx context.Context, root, cache string, prog func(Progress)) (Stats, error) {
+		return Scan(ctx, []string{root}, false, cache, prog)
+	})
+	stOpt, lastOpt := run(func(ctx context.Context, root, cache string, prog func(Progress)) (Stats, error) {
+		return ScanWithOptions(ctx, Options{Dirs: []string{root}, Force: false, CacheDir: cache, Progress: prog})
+	})
+	if stPlain != stOpt {
+		t.Errorf("Stats differ:\nplain = %+v\nopt   = %+v", stPlain, stOpt)
+	}
+	if lastPlain != lastOpt {
+		t.Errorf("final Progress differs:\nplain = %+v\nopt   = %+v", lastPlain, lastOpt)
+	}
+}
+
+// TestScanIndexedFirstPassMatchesPlainTallies proves the first indexed scan
+// (empty index, everything walked) sees the same corpus as a plain Scan: every
+// file/folder tally matches. The metadata verdicts that used to be produced
+// inline are the catch-up's now, so the test drives the catch-up and checks
+// that the same key count resolves.
+func TestScanIndexedFirstPassMatchesPlainTallies(t *testing.T) {
+	ctx := context.Background()
+	// Deterministic corpus: one episode per cache key (same-key
+	// concurrent episodes would join a single inflight fetch and resolve
+	// with the first completer's media, which is
+	// scheduling-nondeterministic).
+	root := t.TempDir()
+	for _, f := range []string{
+		filepath.Join(root, "A", "UniqShowA.S01E01.mkv"),
+		filepath.Join(root, "B", "UniqShowB.S02E03.mkv"),
+		filepath.Join(root, "B", "UniqShowC.S01E01.mkv"),
+		filepath.Join(root, "Movies", "UniqFilm.2001.mkv"),
+		filepath.Join(root, "Extras", "UniqShowA trailer.mkv"),
+	} {
+		if err := os.MkdirAll(filepath.Dir(f), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	restore := withFakeResolver("V1", nil)
+	defer restore()
+	cache := metaCacheDir(t)
+	stPlain, err := Scan(ctx, []string{root}, false, cache, nil)
+	if err != nil {
+		t.Fatalf("plain Scan: %v", err)
+	}
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+	stIdx, err := ScanWithOptions(ctx, indexScanOpts([]string{root}, cache, index, false))
+	if err != nil {
+		t.Fatalf("indexed Scan: %v", err)
+	}
+	if stIdx.Files != stPlain.Files || stIdx.Skipped != stPlain.Skipped ||
+		stIdx.FoldersScanned != stPlain.FoldersScanned || stIdx.FoldersSkipped != stPlain.FoldersSkipped {
+		t.Errorf("corpus tallies differ:\nplain = %+v\nindex = %+v", stPlain, stIdx)
+	}
+	if stIdx.FoldersSkipped != 0 || stIdx.FilesSkipped != 0 {
+		t.Errorf("first indexed pass skipped folders/files %+v, want none (empty index walks all)", stIdx)
+	}
+	if stIdx.Pending != stPlain.Files-stPlain.Skipped {
+		t.Errorf("indexed Pending = %d, want %d (resolvable files wait for the catch-up)", stIdx.Pending, stPlain.Files-stPlain.Skipped)
+	}
+	// The catch-up resolves them: the same keys the plain scan resolved.
+	StartCatchUp(CatchUpConfig{Dirs: []string{root}, CacheDir: cache, IndexPath: index}, nil).Wait()
+	state := LoadScanIndex(index).State()
+	if state.Keys != stPlain.Keys {
+		t.Errorf("index keys = %d, want plain Keys %d", state.Keys, stPlain.Keys)
+	}
+	if state.KeysResolved != stPlain.Keys {
+		t.Errorf("caught-up resolved keys = %d, want %d (every key resolvable)", state.KeysResolved, stPlain.Keys)
+	}
+}
+
+// TestCollectSkippedSetsIndexedSecondPass proves the skipped/visited folder
+// sets: after one indexed scan and its catch-up (so the recorded keys have
+// live metadata, which is what CollectIndexed's guard verifies), an
+// index-aware collect skips exactly the three corpus dirs with the recorded
+// file counts, and the second scan's tallies agree.
+func TestCollectSkippedSetsIndexedSecondPass(t *testing.T) {
+	dirs, _ := seedIndexCorpus(t)
+	cache := metaCacheDir(t)
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+	ctx := context.Background()
+
+	restore := withFakeResolver("V1", nil)
+	defer restore()
+	st1, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false))
+	if err != nil {
+		t.Fatalf("scan 1: %v", err)
+	}
+	StartCatchUp(CatchUpConfig{Dirs: dirs, CacheDir: cache, IndexPath: index}, nil).Wait()
+	cr, err := CollectIndexed([]string{dirs[0], dirs[1], dirs[2]}, cache, index, true, false)
+	if err != nil {
+		t.Fatalf("CollectIndexed: %v", err)
+	}
+	if len(cr.Visited) != 0 {
+		t.Errorf("Visited = %v, want none (all skipped)", cr.Visited)
+	}
+	if len(cr.Skipped) != 3 {
+		t.Fatalf("Skipped dirs = %d, want 3 (%v)", len(cr.Skipped), cr.Skipped)
+	}
+	for _, d := range dirs {
+		if _, ok := cr.Skipped[normalizeScanDir(d)]; !ok {
+			t.Errorf("skipped set lacks %q (%v)", d, cr.Skipped)
+		}
+	}
+	if cr.FilesSkipped != st1.Files {
+		t.Errorf("FilesSkipped = %d, want scan-1 Files %d", cr.FilesSkipped, st1.Files)
+	}
+	st2, err := ScanWithOptions(ctx, indexScanOpts(dirs, cache, index, false))
+	if err != nil {
+		t.Fatalf("scan 2: %v", err)
+	}
+	if st2.FoldersScanned != 0 || st2.FoldersSkipped != 3 || st2.FilesSkipped != st1.Files {
+		t.Errorf("scan 2 folders = %+v, want Scanned:0 Skipped:3 FilesSkipped:%d", st2, st1.Files)
+	}
+}
+
+// TestScanCancelFetchPhaseKeepsCheckpoint proves a cancelled catch-up keeps
+// what it applied: verdicts written before the cancel are committed and
+// survive a reopen of the index, and unfinished keys stay pending (no
+// invented failures).
+func TestScanCancelFetchPhaseKeepsCheckpoint(t *testing.T) {
+	_, parent := seedIndexCorpus(t)
+	root := parent
+	cache := metaCacheDir(t)
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	// Three lookups land (the catch-up's concurrency), every later one blocks:
+	// the pass is cancelled with real, order-independent progress in hand.
+	block := &firstNThenBlockSource{name: "fake", n: catchUpConcurrency, release: make(chan struct{})}
+	newResolver = func(dir string) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{block}})
+	}
+	if _, err := ScanWithOptions(context.Background(), Options{Dirs: []string{root}, CacheDir: cache, IndexPath: index, UseIndex: true, SkipCatchUp: true}); err != nil {
+		t.Fatalf("Scan: %v", err)
+	}
+	c := StartCatchUp(CatchUpConfig{Dirs: []string{root}, CacheDir: cache, IndexPath: index}, nil)
+	deadline := time.Now().Add(5 * time.Second)
+	for LoadScanIndex(index).State().KeysResolved == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	StopCatchUp(index)
+	close(block.release)
+	c.Wait()
+
+	state := LoadScanIndex(index).State()
+	if state.KeysResolved == 0 {
+		t.Fatalf("cancelled catch-up kept no applied verdicts in memory (%+v)", state)
+	}
+	// Reopen the store from disk: the applied verdicts must have survived.
+	if err := CloseIndex(index); err != nil {
+		t.Fatalf("close index: %v", err)
+	}
+	reopened := LoadScanIndex(index).State()
+	if reopened.KeysResolved == 0 {
+		t.Errorf("reopened index lost every applied verdict (%+v)", reopened)
+	}
+	if reopened.FilesNeedsRepair != 0 {
+		t.Errorf("cancelled catch-up parked %d records as needs_repair, want 0", reopened.FilesNeedsRepair)
+	}
+}
+
+// firstNThenBlockSource resolves its first n lookups immediately and blocks
+// every later one until ctx is done or release is closed. With the catch-up's
+// concurrency of 3 it pins "some verdicts land, then the pass is cancelled
+// mid-flight" without depending on lookup order.
+type firstNThenBlockSource struct {
+	name    string
+	n       int
+	calls   atomic.Int32
+	release chan struct{}
+}
+
+func (s *firstNThenBlockSource) Name() string { return s.name }
+
+func (s *firstNThenBlockSource) Find(ctx context.Context, q metadata.Query) (*metadata.Media, error) {
+	if int(s.calls.Add(1)) > s.n {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.release:
+		}
+	}
+	m := &metadata.Media{
+		Source: "fake", SourceID: "1",
+		Kind: q.Kind, Title: q.Title, Year: q.Year,
+		FetchedAt: time.Now().UTC(),
+	}
+	if q.Kind != metadata.KindMovie {
+		m.Episodes = []metadata.Episode{{Season: q.Season, Number: q.Episode, Title: "V1"}}
+	}
+	return m, nil
+}
+
+// TestStaleRecordScanRefusesNewSubdir is the finding-1 regression: a
+// RecordScan stamped from stale walk state (plans missing a file added
+// under a brand-new subdirectory afterwards) must refuse every affected
+// dir. The pre-fix rollup kept the walked count while the stamped names
+// hash already covered the new names, so the next scan skipped the new
+// files entirely.
+func TestStaleRecordScanRefusesNewSubdir(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	aPath := filepath.Join(root, "ShowA.S01E01.mkv")
+	if err := os.WriteFile(aPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := metaCacheDir(t)
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+	restore := withFakeResolver("V1", nil)
+	defer restore()
+
+	if _, err := ScanWithOptions(ctx, indexScanOpts([]string{root}, cache, index, false)); err != nil {
+		t.Fatalf("scan 1: %v", err)
+	}
+	// Stale walk state: visited/plans captured before New/B.mkv exists.
+	crForce, _, err := CollectIndexedWithContext(ctx, []string{root}, cache, index, true, true)
+	if err != nil {
+		t.Fatalf("force collect: %v", err)
+	}
+	plans, _ := BuildPlan(crForce.Files)
+	bPath := filepath.Join(root, "New", "ShowB.S01E01.mkv")
+	if err := os.MkdirAll(filepath.Dir(bPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	RecordScan(index, crForce.Visited, crForce.Skipped, plans)
+	cr2, _, err := CollectIndexedWithContext(ctx, []string{root}, cache, index, true, false)
+	if err != nil {
+		t.Fatalf("scan 2: %v", err)
+	}
+	for _, want := range []string{aPath, bPath} {
+		found := false
+		for _, f := range cr2.Files {
+			if f == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("scan 2 files %v: missing %q (stale stamp skipped it)", cr2.Files, want)
+		}
+	}
+}
+
+// TestMidWalkAddUsesFreshDecision is the finding-2 regression: a file added
+// to a child dir after the parent's fingerprint but before the child's skip
+// decision (with the child's mtime restored) must still be found. The
+// pre-fix decision hashed the listing cached in the earlier pass, which
+// predates the add and still matches the record, so the child skipped.
+func TestMidWalkAddUsesFreshDecision(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	child := filepath.Join(root, "Child")
+	aPath := filepath.Join(child, "ShowA.S01E01.mkv")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(aPath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cache := metaCacheDir(t)
+	index := filepath.Join(t.TempDir(), "scanindex.json")
+	restore := withFakeResolver("V1", nil)
+	defer restore()
+
+	if _, err := ScanWithOptions(ctx, indexScanOpts([]string{root}, cache, index, false)); err != nil {
+		t.Fatalf("scan 1: %v", err)
+	}
+	cfi, err := os.Stat(child)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childMtime := cfi.ModTime()
+	// A benign root-level change forces scan 2 to descend past the root.
+	if err := os.WriteFile(filepath.Join(root, "notes.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bPath := filepath.Join(child, "ShowB.S01E01.mkv")
+	origWalk := walkDir
+	defer func() { walkDir = origWalk }()
+	mutated := false
+	walkDir = func(wroot string, fn fs.WalkDirFunc) error {
+		return origWalk(wroot, func(p string, d fs.DirEntry, err error) error {
+			if !mutated && err == nil && d != nil && d.IsDir() && normalizeScanDir(p) == normalizeScanDir(child) {
+				mutated = true
+				if err := os.WriteFile(bPath, []byte("x"), 0o644); err != nil {
+					t.Errorf("mid-walk add: %v", err)
+				}
+				if err := os.Chtimes(child, childMtime, childMtime); err != nil {
+					t.Errorf("mid-walk mtime restore: %v", err)
+				}
+				fi, serr := os.Stat(child)
+				if serr != nil || !fi.ModTime().Equal(childMtime) {
+					t.Skipf("platform cannot restore dir mtime exactly, hook unverifiable here")
+				}
+			}
+			return fn(p, d, err)
+		})
+	}
+	st2, err := ScanWithOptions(ctx, indexScanOpts([]string{root}, cache, index, false))
+	if err != nil {
+		t.Fatalf("scan 2: %v", err)
+	}
+	if !mutated {
+		t.Fatal("mid-walk hook never fired")
+	}
+	if st2.Files != 2 {
+		t.Errorf("scan 2 Files = %d, want 2 (ShowA + mid-walk ShowB); filesSkipped=%d foldersSkipped=%d", st2.Files, st2.FilesSkipped, st2.FoldersSkipped)
 	}
 }

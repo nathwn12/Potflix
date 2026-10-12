@@ -1,13 +1,21 @@
 // Package bundle exports, imports, counts and clears Potflix metadata
 // cache bundles.
 //
-// It is intentionally self-contained: it never imports the metadata
-// package, so it cannot collide with work in progress there. It relies
-// only on the documented on-disk shape: one JSON file per key named
-// <sha256-hex>.json with content {"key":...,"schema":N,"media":{...}}.
-// Import publishes fill-missing-only with no-replace semantics (temp file
-// plus hard link onto the final name, falling back to an exclusive
-// create); it never renames over an existing file.
+// The live cache is not a directory of files any more: the metadata package
+// keeps ONE store file per cache directory (metadata.CacheForEach,
+// metadata.CachePutRaw, metadata.ClearCacheEntries; <dir>.idx, one record per
+// cache key). This package therefore reads and writes the cache through that
+// surface instead of assuming a layout, and never opens the store file itself.
+//
+// The bundle FILE format is unchanged and self-contained: one JSON envelope
+// ({"format":"potflix-metadata","version":1,...}) carrying one entry per cache
+// key, {"file":"<16-hex>.json","key":...,"schema":N,"media":{...}}, where
+// "file" is the name metadata.CacheFileNameFor derives from the key. A bundle
+// written before the store rework imports exactly as it did then: only the
+// envelope and the entry fields are read, never a file on disk.
+//
+// Import is fill-missing-only: an entry whose key the live cache already holds
+// is reported Present and its stored bytes are never replaced.
 package bundle
 
 import (
@@ -19,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"potflix/internal/metadata"
 )
 
 // FormatName identifies bundle payloads. FormatVersion is the bundle
@@ -32,12 +42,11 @@ const FormatVersion = 1
 // refused so a hostile or huge file cannot exhaust memory.
 const maxBundleBytes = 64 << 20 // 64 MB
 
-// maxBundleEntryBytes caps how much Export will read for ONE cache entry:
-// a larger entry counts as Skipped so a hostile file cannot exhaust
-// memory. maxBundleTotalBytes caps the aggregate bytes read across one
-// Export: beyond it Export fails with an error rather than growing the
-// bundle without bound.
-const maxBundleEntryBytes = 4 << 20  // 4 MB
+// maxBundleTotalBytes caps the aggregate bytes Export will carry: beyond it
+// Export fails with an error rather than growing the bundle without bound. One
+// entry is bounded by the cache itself - the store refuses a record larger than
+// metadata's per-record cap when it is written - so only the aggregate needs a
+// guard here.
 const maxBundleTotalBytes = 64 << 20 // 64 MB
 
 // NoteText is the Export header note. It states the privacy scope of a
@@ -86,18 +95,32 @@ type ImportStats struct {
 	Total         int
 }
 
-// cacheRecord mirrors the on-disk cache envelope. Media stays raw so its
-// bytes survive an export/import round-trip unchanged.
+// cacheRecord mirrors the cache envelope the store carries: the record's own
+// key, schema and media. Media stays raw so its bytes survive an export/import
+// round-trip unchanged, and the fields the store does not model (a negative
+// entry's notFound/checkedAt) are not carried - exactly as before the store.
 type cacheRecord struct {
 	Key    string          `json:"key"`
 	Schema int             `json:"schema"`
 	Media  json.RawMessage `json:"media"`
 }
 
+// requireDir refuses an empty cache directory. Every function here takes the
+// directory explicitly, and an empty one would otherwise resolve to the
+// metadata package's DEFAULT cache directory - the live one - so a caller that
+// lost the argument would count, clear or overwrite the real cache.
+func requireDir(dir string) error {
+	if strings.TrimSpace(dir) == "" {
+		return fmt.Errorf("bundle: no cache directory given")
+	}
+	return nil
+}
+
 // validCacheName reports whether name is a cache filename: 16 lowercase
 // hex chars plus ".json". The 16-char rule is owned by
 // metadata.cacheFileName (hex of sha256 truncated to 16 chars); this
-// package re-states it so it never imports the metadata package.
+// package re-states it so an entry's declared File is validated on import
+// without a round trip through the metadata package.
 func validCacheName(name string) bool {
 	const suffix = ".json"
 	if len(name) != 16+len(suffix) || !strings.HasSuffix(name, suffix) {
@@ -146,69 +169,51 @@ func isReparsePoint(path string) bool {
 	return dirHasReparseAttribute(path)
 }
 
-// readCappedEntry reads one cache entry capped at maxBundleEntryBytes. It
-// reports false (never an error, never unbounded memory) when the file
-// cannot be read or exceeds the cap; the caller counts that as Skipped.
-func readCappedEntry(path string) ([]byte, bool) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, false
-	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, maxBundleEntryBytes+1))
-	if err != nil {
-		return nil, false
-	}
-	if len(data) > maxBundleEntryBytes {
-		return nil, false
-	}
-	return data, true
-}
-
-// Export reads every cache entry in dir and writes one indented bundle to
-// w. Entries are sorted by Key so two exports of the same cache are
-// byte-identical. A corrupt or unreadable entry file counts as Skipped and
-// never fails the export. Files that are not cache entries (other names,
-// ".tmp-" orphans, subdirectories) are ignored.
+// Export reads every entry in the live cache under dir and writes one indented
+// bundle to w. Entries are sorted by Key so two exports of the same cache are
+// byte-identical. A stored record that does not decode as a cache entry (no
+// key, or not JSON) counts as Skipped and never fails the export. Each entry's
+// File is the 16-hex name metadata.CacheFileNameFor derives from its key, so a
+// bundle exported after the store rework is byte-identical in shape to one
+// exported from the legacy per-key files. A cache directory that is not there
+// holds no entries, so it exports an empty bundle rather than an error: the
+// cache is the store file beside the directory, which the directory removal of
+// metadata.ClearCache leaves in place.
 func Export(dir string, w io.Writer, schema int, appVersion string) (ExportStats, error) {
 	var st ExportStats
-	if err := checkBundleDir(dir); err != nil {
+	if err := requireDir(dir); err != nil {
 		return st, err
 	}
-	fis, err := os.ReadDir(dir)
-	if err != nil {
+	if err := checkBundleDir(dir); err != nil {
 		return st, err
 	}
 	entries := []Entry{}
 	var total int64
-	for _, fi := range fis {
-		if fi.IsDir() {
-			continue
-		}
-		name := fi.Name()
-		if !validCacheName(name) {
-			continue
-		}
-		full := filepath.Join(dir, name)
-		if isReparsePoint(full) {
-			st.Skipped++
-			continue
-		}
-		data, ok := readCappedEntry(full)
-		if !ok {
-			st.Skipped++
-			continue
-		}
-		total += int64(len(data))
+	var capErr error
+	err := metadata.CacheForEach(dir, func(_ string, value []byte) bool {
+		total += int64(len(value))
 		if total > maxBundleTotalBytes {
-			return st, fmt.Errorf("bundle: refusing export larger than 64 MB (aggregate entry bytes exceed the cap)")
+			capErr = fmt.Errorf("bundle: refusing export larger than 64 MB (aggregate entry bytes exceed the cap)")
+			return false
 		}
 		var rec cacheRecord
-		if err := json.Unmarshal(data, &rec); err != nil || rec.Key == "" {
+		if err := json.Unmarshal(value, &rec); err != nil || rec.Key == "" {
 			st.Skipped++
-			continue
+			return true
 		}
-		entries = append(entries, Entry{File: name, Key: rec.Key, Schema: rec.Schema, Media: rec.Media})
+		entries = append(entries, Entry{
+			File:   metadata.CacheFileNameFor(rec.Key),
+			Key:    rec.Key,
+			Schema: rec.Schema,
+			Media:  rec.Media,
+		})
+		return true
+	})
+	if capErr != nil {
+		return st, capErr
+	}
+	if err != nil {
+		return st, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Key < entries[j].Key })
 	// ExportedAt is wall-clock: determinism holds over the ENTRIES (sorted
@@ -239,14 +244,24 @@ func Export(dir string, w io.Writer, schema int, appVersion string) (ExportStats
 	return st, nil
 }
 
-// Import merges a bundle from r into dir: fill-missing-only. It NEVER
-// overwrites an existing cache file. Entries whose Schema differs from
-// schema are skipped (SkippedSchema); entries with a bad File name or an
-// empty Key are Invalid. A bad header or an unparsable body is an error,
-// and in the unparsable case nothing has been written, because the body is
-// parsed fully before the first write.
+// Import merges a bundle from r into the live cache under dir:
+// fill-missing-only. It NEVER replaces an entry the cache already holds - a
+// key the store has is reported Present and its stored bytes are untouched.
+// Entries whose Schema differs from schema are skipped (SkippedSchema); entries
+// with a bad File name or an empty Key are Invalid. A bad header or an
+// unparsable body is an error, and in the unparsable case nothing has been
+// written, because the body is parsed fully before the first write.
+//
+// An imported entry is committed (flush + fsync) as it lands, so CacheLive,
+// CacheHas and ProbeCache see it the moment this returns. A record the store
+// refuses - larger than its per-record cap - fails the import with that key's
+// error, exactly as any other write failure does; entries written before it
+// stay imported.
 func Import(dir string, r io.Reader, schema int) (ImportStats, error) {
 	var st ImportStats
+	if err := requireDir(dir); err != nil {
+		return st, err
+	}
 	if err := checkBundleDir(dir); err != nil {
 		return st, err
 	}
@@ -265,9 +280,10 @@ func Import(dir string, r io.Reader, schema int) (ImportStats, error) {
 		return st, fmt.Errorf("bundle: unsupported bundle header: format %q version %d (want %q version %d)",
 			b.Header.Format, b.Header.Version, FormatName, FormatVersion)
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return st, err
-	}
+	// Nothing is written to the directory itself: the first stored entry
+	// creates the store file beside it, exactly as a resolver write does, so
+	// an import never leaves a loose JSON file behind and never needs the
+	// legacy directory to exist.
 	st.Total = len(b.Entries)
 	for _, e := range b.Entries {
 		if !validCacheName(e.File) || e.Key == "" {
@@ -278,111 +294,87 @@ func Import(dir string, r io.Reader, schema int) (ImportStats, error) {
 			st.SkippedSchema++
 			continue
 		}
-		dest := filepath.Join(dir, e.File)
-		if _, err := os.Lstat(dest); err == nil {
+		// Fill-missing-only: presence is the store's, read through the same
+		// held handle the write uses. The app is single-instance and one
+		// import runs at a time, so nothing claims the key between this check
+		// and the write; even a rival in-process writer would cost one
+		// duplicate count, never a second record, because the store keeps one
+		// record per key.
+		if metadata.CacheHas(dir, e.Key) {
 			st.Present++
 			continue
-		} else if !os.IsNotExist(err) {
-			return st, err
 		}
 		payload, err := json.Marshal(cacheRecord{Key: e.Key, Schema: e.Schema, Media: e.Media})
 		if err != nil {
 			st.Invalid++
 			continue
 		}
-		tmp, err := os.CreateTemp(dir, ".tmp-*.json")
-		if err != nil {
+		if err := metadata.CachePutRaw(dir, e.Key, payload); err != nil {
 			return st, err
-		}
-		tmpName := tmp.Name()
-		_, werr := tmp.Write(payload)
-		cerr := tmp.Close()
-		if werr != nil || cerr != nil {
-			os.Remove(tmpName)
-			if werr != nil {
-				return st, werr
-			}
-			return st, cerr
-		}
-		// No-replace publish: hard-link the temp file onto the final name.
-		// os.Link fails with EEXIST when the name is already taken, so
-		// fill-missing-only holds even if a rival claims dest inside the
-		// Lstat/publish race above. os.Rename must never be used here: it
-		// would silently replace the existing file.
-		if err := os.Link(tmpName, dest); err == nil {
-			os.Remove(tmpName)
-			st.Added++
-			continue
-		} else if os.IsExist(err) {
-			os.Remove(tmpName)
-			st.Present++
-			continue
-		}
-		// Filesystems without hard links fall back to an exclusive create,
-		// which likewise fails with EEXIST instead of replacing.
-		f, oerr := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if oerr != nil {
-			os.Remove(tmpName)
-			if os.IsExist(oerr) {
-				st.Present++
-				continue
-			}
-			return st, oerr
-		}
-		_, werr = f.Write(payload)
-		cerr = f.Close()
-		os.Remove(tmpName)
-		if werr != nil {
-			os.Remove(dest)
-			return st, werr
-		}
-		if cerr != nil {
-			os.Remove(dest)
-			return st, cerr
 		}
 		st.Added++
 	}
 	return st, nil
 }
 
-// Count returns how many cache files (names matching
-// ^[0-9a-f]{16}\.json$ per metadata.cacheFileName) sit directly inside dir.
+// Count returns how many entries the live cache under dir holds (one record per
+// cache key, i.e. one per show/season or movie/year - metadata.CacheKeyFor).
 func Count(dir string) (int, error) {
-	fis, err := os.ReadDir(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
+	if err := requireDir(dir); err != nil {
 		return 0, err
 	}
 	n := 0
-	for _, fi := range fis {
-		if fi.IsDir() {
-			continue
-		}
-		if validCacheName(fi.Name()) {
-			n++
-		}
+	err := metadata.CacheForEach(dir, func(_ string, _ []byte) bool {
+		n++
+		return true
+	})
+	if err != nil {
+		return 0, err
 	}
 	return n, nil
 }
 
-// Clear deletes only cache files (names matching ^[0-9a-f]{16}\.json$ per
-// metadata.cacheFileName) plus ".tmp-" orphans directly inside dir. It never recurses, never
-// touches a subdirectory, and never deletes anything else. It returns how
-// many files it removed.
+// Clear empties the live cache under dir (metadata.ClearCacheEntries: every
+// stored record is deleted and the store file compacted back to an empty
+// snapshot) and removes the legacy per-key cache files the store replaced -
+// names matching ^[0-9a-f]{16}\.json$ per metadata.cacheFileName, plus ".tmp-"
+// orphans - directly inside dir. It returns how many cache ENTRIES (titles) it
+// cleared. It never recurses, never removes dir itself, never touches a
+// subdirectory, and never deletes anything else: the legacy meta\ recovery
+// directory is removed by metadata.ClearCache alone. The legacy files must go,
+// because they are what migration imports into an empty store - leaving them
+// would resurrect exactly what was cleared on the next read.
 func Clear(dir string) (int, error) {
+	if err := requireDir(dir); err != nil {
+		return 0, err
+	}
 	if err := checkBundleDir(dir); err != nil {
 		return 0, err
 	}
+	// Counting and clearing are one operation on the store, and its own
+	// enumeration imports any legacy file it finds first, so a title that
+	// still lives only as a legacy file is counted once, not twice.
+	cleared, err := metadata.ClearCacheEntries(dir)
+	if err != nil {
+		return cleared, err
+	}
+	if err := removeLegacyCacheFiles(dir); err != nil {
+		return cleared, err
+	}
+	return cleared, nil
+}
+
+// removeLegacyCacheFiles deletes the legacy per-key cache files directly inside
+// dir - never another file, never a subdirectory, and never through a reparse
+// point. A missing dir removes nothing and is not an error.
+func removeLegacyCacheFiles(dir string) error {
 	fis, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return 0, nil
+			return nil
 		}
-		return 0, err
+		return err
 	}
-	removed := 0
 	for _, fi := range fis {
 		if fi.IsDir() {
 			continue
@@ -395,13 +387,9 @@ func Clear(dir string) (int, error) {
 		if isReparsePoint(full) {
 			continue // never delete through a reparse point
 		}
-		if err := os.Remove(full); err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return removed, err
+		if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+			return err
 		}
-		removed++
 	}
-	return removed, nil
+	return nil
 }
