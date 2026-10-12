@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"potflix/internal/discord"
+	"potflix/internal/library"
 	"potflix/internal/metadata"
 	"potflix/internal/player"
 	"potflix/internal/presence"
@@ -179,6 +180,17 @@ func runUI(log *logger) {
 		// names/timeouts only, never secrets.
 		Logf: func(format string, args ...any) { log.logf(format, args...) },
 	})
+	// Library catch-up: resolve whatever metadata the store-backed index
+	// still owes, on a background worker (never the UI thread), resuming
+	// where the last run stopped. It is a no-op when no folder is
+	// configured or the index is empty, and it is idempotent - a Scan that
+	// starts later simply reinstalls its own progress callback. Nil
+	// progress: the window owns its live line from the Scan button onward.
+	library.StartCatchUp(library.CatchUpConfig{
+		Dirs:      cfg.Dirs,
+		CacheDir:  MetadataDir(),
+		IndexPath: ScanIndexPath(),
+	}, nil)
 	go pollLoop(log, dc)
 
 	// Fleet decision 6 (deviation): clear the Discord card before exiting.

@@ -5,8 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -17,14 +15,16 @@ import (
 // images/imageinfo bodies serve the poster-fallback calls (prop=images,
 // prop=imageinfo); "" serves an empty image list / empty imageinfo.
 type wikiFake struct {
-	t         *testing.T
-	hits      int
-	sawUA     string
-	search    string // body for list=search; "" serves {"query":{"search":[]}}
-	detail    string // body for prop=extracts|pageimages
-	images    string // body for prop=images
-	imageinfo string // body for prop=imageinfo
-	failMode  string // "search500" | "detail500" | "badjson" | "images500" | "imageinfo500" | ""
+	t           *testing.T
+	hits        int
+	sawUA       string
+	search      string // body for list=search; "" serves {"query":{"search":[]}}
+	detail      string // body for prop=extracts|pageimages
+	images      string // body for prop=images
+	imageinfo   string // body for prop=imageinfo
+	failMode    string // "search500" | "detail500" | "badjson" | "images500" | "imageinfo500" | ""
+	detailQuery string // raw query string of the prop=extracts|pageimages call
+	imagesQuery string // raw query string of the prop=images call
 }
 
 func (f *wikiFake) handler() http.HandlerFunc {
@@ -50,6 +50,7 @@ func (f *wikiFake) handler() http.HandlerFunc {
 			return
 		}
 		if q.Get("prop") == "images" {
+			f.imagesQuery = r.URL.RawQuery
 			if f.failMode == "images500" {
 				http.Error(w, "boom", http.StatusInternalServerError)
 				return
@@ -77,6 +78,7 @@ func (f *wikiFake) handler() http.HandlerFunc {
 			http.Error(w, "boom", http.StatusInternalServerError)
 			return
 		}
+		f.detailQuery = r.URL.RawQuery
 		_, _ = w.Write([]byte(f.detail))
 	}
 }
@@ -539,8 +541,8 @@ func TestWikipediaAPIErrorIsTransientNoNegative(t *testing.T) {
 		t.Fatalf("LookupNow = %+v, want miss on API error", res)
 	}
 	key := cacheKey(q)
-	if _, statErr := os.Stat(filepath.Join(dir, cacheFileName(key))); !os.IsNotExist(statErr) {
-		t.Fatalf("API error persisted a file, want nothing (stat err = %v)", statErr)
+	if CacheHas(dir, key) {
+		t.Fatalf("API error stored a record, want nothing")
 	}
 	r.mu.Lock()
 	_, suppressed := r.neg[key]
@@ -609,9 +611,9 @@ func TestWikipediaMissingStringIsDefinitiveMiss(t *testing.T) {
 		t.Fatalf("LookupNow = %+v, want miss", res)
 	}
 	key := cacheKey(q)
-	data, statErr := os.ReadFile(filepath.Join(dir, cacheFileName(key)))
-	if statErr != nil {
-		t.Fatalf("definitive miss persisted no file: %v", statErr)
+	data, stored := cacheRecord(dir, key)
+	if !stored {
+		t.Fatalf("definitive miss stored no record, want one negative")
 	}
 	if !strings.Contains(string(data), "NotFound") && !strings.Contains(string(data), "notfound") {
 		t.Logf("negative entry body: %s", string(data))
@@ -652,5 +654,94 @@ func TestWikiPickPosterGuidelinesRejected(t *testing.T) {
 	})
 	if got != "File:Dune theatrical poster.jpg" {
 		t.Fatalf("mixed pick = %q, want the genuine poster", got)
+	}
+}
+
+// TestWikipediaPageImageOriginal proves the page-image request carries
+// piprop=thumbnail|original and that a page image served ONLY as `original`
+// (no thumbnail) still lands in Artwork: the record's artwork must come from
+// the matched page image, and the poster-file fallback must NOT run when one
+// exists. RED before the fix: the original was ignored, so Artwork stayed
+// empty AND a third (prop=images) call was made.
+func TestWikipediaPageImageOriginal(t *testing.T) {
+	f := &wikiFake{
+		search: wikiHitSearch,
+		detail: `{"query":{"pages":{"12345":{"pageid":12345,` +
+			`"title":"Dune (2021 film)",` +
+			`"extract":"Dune is a 2021 American epic science fiction film directed by Denis Villeneuve.",` +
+			`"pageimage":"Dune_poster.jpg",` +
+			`"original":{"source":"https://upload.wikimedia.org/wikipedia/en/8/8e/Dune_original_poster.jpg","width":2000,"height":3000}}}}}`,
+	}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	s := &wikipediaSource{base: srv.URL, client: srv.Client()}
+	q := Query{Kind: KindMovie, Title: "Dune", Year: 2021}
+	m, err := s.Find(context.Background(), q)
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected media, got nil")
+	}
+	want := "https://upload.wikimedia.org/wikipedia/en/8/8e/Dune_original_poster.jpg"
+	if m.Artwork != want {
+		t.Fatalf("artwork = %q, want %q (page image original)", m.Artwork, want)
+	}
+	if f.hits != 2 {
+		t.Fatalf("hits = %d, want exactly 2 (search+detail: a page image exists, so no poster-file fallback)", f.hits)
+	}
+	if !strings.Contains(f.detailQuery, "piprop=thumbnail|original") && !strings.Contains(f.detailQuery, "piprop=thumbnail%7Coriginal") {
+		t.Fatalf("detail query = %q, want piprop=thumbnail|original", f.detailQuery)
+	}
+	if f.imagesQuery != "" {
+		t.Fatalf("prop=images was called (%q) despite a page image", f.imagesQuery)
+	}
+
+	r := New(Options{Dir: t.TempDir(), Sources: []Source{s}, Timeout: 5 * time.Second})
+	res, err := r.LookupNow(context.Background(), q)
+	if err != nil {
+		t.Fatalf("LookupNow: %v", err)
+	}
+	if res.Artwork != want {
+		t.Fatalf("resolution artwork = %q, want %q (record artwork reaches the card)", res.Artwork, want)
+	}
+}
+
+// TestWikipediaImageListAsksForEveryFile proves prop=images asks for the
+// whole file list (imlimit=max). MEASURED 2026-10-13 on
+// "Spider-Man: Brand New Day": the article's fair-use poster
+// "File:Spider-Man Brand New Day poster.jpg" is the 18th of 24 files, so the
+// default 10-file first page hid it and the fallback returned nothing.
+func TestWikipediaImageListAsksForEveryFile(t *testing.T) {
+	f := &wikiFake{
+		search: wikiHitSearch,
+		detail: `{"query":{"pages":{"12345":{"pageid":12345,` +
+			`"title":"Spider-Man: Brand New Day",` +
+			`"extract":"Spider-Man: Brand New Day is a 2026 American superhero film."}}}}`,
+		images: `{"query":{"pages":{"12345":{"pageid":12345,"images":` +
+			`[{"title":"File:Commons-logo.svg"},{"title":"File:Movie set of Spider-Man Brand New Day (2025) (2).jpg"},` +
+			`{"title":"File:Spider-Man Brand New Day poster.jpg"}]}}}}`,
+		imageinfo: `{"query":{"pages":{"999":{"pageid":999,` +
+			`"title":"File:Spider-Man Brand New Day poster.jpg",` +
+			`"imageinfo":[{"url":"https://upload.wikimedia.org/wikipedia/en/9/9a/Spider-Man_Brand_New_Day_poster.jpg"}]}}}}`,
+	}
+	srv := httptest.NewServer(f.handler())
+	defer srv.Close()
+
+	s := &wikipediaSource{base: srv.URL, client: srv.Client()}
+	m, err := s.Find(context.Background(), Query{Kind: KindMovie, Title: "Spider-Man: Brand New Day"})
+	if err != nil {
+		t.Fatalf("Find: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected media, got nil")
+	}
+	if !strings.Contains(f.imagesQuery, "imlimit=max") {
+		t.Fatalf("prop=images query = %q, want imlimit=max (the poster sits past the default 10-file page)", f.imagesQuery)
+	}
+	want := "https://upload.wikimedia.org/wikipedia/en/9/9a/Spider-Man_Brand_New_Day_poster.jpg"
+	if m.Artwork != want {
+		t.Fatalf("artwork = %q, want %q", m.Artwork, want)
 	}
 }

@@ -497,6 +497,75 @@ func TestCleanTagVocabP10P11(t *testing.T) {
 // title/display "ED 3"/"ED 3 - ED 3" there (harness-verified), the Go port
 // shows the tag alone per the report. The Saiki NCOP01 (`OP 1`) and the
 // S01E03 headless-title rows already live in TestCleanSection6 rows 7 and 2.
+// TestCleanTitleMarkFold pins the Go-side deviation P13: the character a
+// scene release leaves where Windows forbids ':' - '?' (U+003F, which is
+// also what Java's UTF-8 encoder writes for an unpaired surrogate) and its
+// fullwidth/small lookalikes (U+FF1F, U+FE56) - folds back to ':' inside an
+// extracted title. Live case (2026-10-13): "Spider-Man? Brand New Day
+// (2026) (1080p MA WEB-DL x265 EAC3 Silence).mkv" reached Wikipedia as
+// "Spider-Man? Brand New Day" and cached under key
+// "movie|spider-man? brand new day|0".
+//
+// The rule: a mark folds ONLY when it sits between title text - preceded by
+// a non-space character and not the last character of the extracted title.
+// A mark that ends the title is a real question mark and is kept, since no
+// scene convention distinguishes "Who Framed Roger Rabbit?" from a stand-in
+// with its tail already stripped.
+func TestCleanTitleMarkFold(t *testing.T) {
+	cases := []struct {
+		name                        string
+		in                          string
+		title, tag, epName, display string
+	}{
+		{
+			// The exact live filename, colon stand-in between title text.
+			"live spider-man filename",
+			"Spider-Man? Brand New Day (2026) (1080p MA WEB-DL x265 EAC3 Silence).mkv",
+			"Spider-Man: Brand New Day", "", "",
+			"Spider-Man: Brand New Day",
+		},
+		{
+			// Same stand-in with no following space: the mark is replaced
+			// one-for-one, so the spacing comes from the filename.
+			"no space after the mark",
+			"Spider-Man?Brand New Day (2026).mkv",
+			"Spider-Man:Brand New Day", "", "",
+			"Spider-Man:Brand New Day",
+		},
+		{
+			// The fullwidth lookalike folds the same way.
+			"fullwidth lookalike",
+			"Spider-Man\uFF1FBrand New Day (2026).mkv",
+			"Spider-Man:Brand New Day", "", "",
+			"Spider-Man:Brand New Day",
+		},
+		{
+			// A trailing mark ends the extracted title once the
+			// parenthesised tail is gone: kept, never a dangling colon.
+			"trailing mark",
+			"Spider-Man? (2026) (1080p MA WEB-DL x265 EAC3 Silence).mkv",
+			"Spider-Man?", "", "",
+			"Spider-Man?",
+		},
+		{
+			// The only mark is a real question mark at the end.
+			"real question mark",
+			"Who Framed Roger Rabbit? (1988).mkv",
+			"Who Framed Roger Rabbit?", "", "",
+			"Who Framed Roger Rabbit?",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := clean(c.in)
+			if got.Title != c.title || got.EpisodeTag != c.tag || got.EpisodeName != c.epName || got.Display != c.display {
+				t.Errorf("clean(%q) = %+v, want title=%q tag=%q name=%q display=%q",
+					c.in, got, c.title, c.tag, c.epName, c.display)
+			}
+		})
+	}
+}
+
 func TestCleanP1P12(t *testing.T) {
 	cases := []struct {
 		in                        string

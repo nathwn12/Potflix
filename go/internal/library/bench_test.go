@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -293,16 +294,25 @@ func BenchmarkScanIndexSecondPass(b *testing.B) {
 		newResolver = func(dir string) *metadata.Resolver {
 			return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{fake}})
 		}
+		// SkipCatchUp: the index phase is what this sub-benchmark measures;
+		// the metadata pass is driven explicitly below so its fetches are
+		// counted where they happen.
 		opts := func() Options {
-			return Options{Dirs: []string{root}, Force: false, CacheDir: cache, IndexPath: index, UseIndex: true}
+			return Options{Dirs: []string{root}, Force: false, CacheDir: cache, IndexPath: index, UseIndex: true, SkipCatchUp: true}
 		}
 
-		// First pass populates both the temp cache and the index file.
+		// Index phase: one walk, zero fetches (the store-backed scan never
+		// touches the network).
 		if _, err := ScanWithOptions(ctx, opts()); err != nil {
 			b.Fatalf("first indexed Scan: %v", err)
 		}
+		if pre := fake.calls.Load(); pre != 0 {
+			b.Fatalf("first indexed scan fetches = %d, want 0 (index phase is offline)", pre)
+		}
+		// Catch-up: the metadata pass, one fetch per unique key.
+		StartCatchUp(CatchUpConfig{Dirs: []string{root}, CacheDir: cache, IndexPath: index}, nil).Wait()
 		if pre := fake.calls.Load(); pre != 50 {
-			b.Fatalf("first indexed fetches = %d, want 50 (once per unique key)", pre)
+			b.Fatalf("catch-up fetches = %d, want 50 (once per unique key)", pre)
 		}
 		// Probe: the populated second pass must skip everything.
 		probe, err := ScanWithOptions(ctx, opts())
@@ -361,4 +371,160 @@ func BenchmarkFetchAll1000(b *testing.B) {
 		}
 		benchFetchSink = out
 	}
+}
+
+// realShapeScale is the corpus shape the real-shape benchmarks use: 1/10 of
+// the owner's library by default (93 folders, 2,300 files, 230 cache keys),
+// because the full shape (930 folders / 23,000 files / 2,300 keys) needs a
+// multi-minute seeding pass and never converges under -benchtime. Set
+// POTFLIX_BENCH_REALSHAPE=full to measure the full shape deliberately.
+func realShapeScale() (folders, shows, seasons, dupFiles int) {
+	folders, shows, seasons, dupFiles = 93, 46, 5, 10
+	if strings.EqualFold(os.Getenv("POTFLIX_BENCH_REALSHAPE"), "full") {
+		folders, shows = 930, 460
+	}
+	return folders, shows, seasons, dupFiles
+}
+
+// seedRealShape writes shows*seasons*dupFiles video files into folders dirs:
+// one episode per key, so a key's duplicate files are the same episode in
+// several folders. It returns the file count.
+func seedRealShape(b *testing.B, root string, folders, shows, seasons, dupFiles int) int {
+	b.Helper()
+	for f := 0; f < folders; f++ {
+		if err := os.MkdirAll(filepath.Join(root, fmt.Sprintf("folder%03d", f)), 0o755); err != nil {
+			b.Fatal(err)
+		}
+	}
+	n := 0
+	for show := 0; show < shows; show++ {
+		for season := 1; season <= seasons; season++ {
+			name := fmt.Sprintf("RealShapeShow%03d.S%02dE01.1080p.WEB-DL.x264-GRP.mkv", show, season)
+			for d := 0; d < dupFiles; d++ {
+				p := filepath.Join(root, fmt.Sprintf("folder%03d", n%folders), name)
+				if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+					b.Fatal(err)
+				}
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// BenchmarkScanRealShape measures the store-backed scan over an owner-shaped
+// corpus: 93 folders, 2,300 files, 230 distinct cache keys (one episode per
+// key, ten duplicate files each), all under b.TempDir() with an in-process
+// provider and ZERO network.
+//
+// Both measured shapes assert the fetch count is exactly zero:
+//
+//   - WarmDiff: every folder's mtime is bumped outside the timer, so no
+//     rollup matches and each file is enumerated and (size, mtime)-compared.
+//     Unchanged files must reuse their stored record, so the parse counter and
+//     Parsed stay at zero - this is the per-file fast path the rework exists
+//     for.
+//   - WarmSkip: the steady state. The rollups match, whole subtrees are
+//     skipped, and the walk never lists their files.
+func BenchmarkScanRealShape(b *testing.B) {
+	folders, shows, seasons, dupFiles := realShapeScale()
+	wantFiles := shows * seasons * dupFiles
+	wantKeys := shows * seasons
+
+	root := b.TempDir()
+	cache := b.TempDir()
+	index := filepath.Join(b.TempDir(), "scanindex.json")
+	ctx := context.Background()
+
+	if got := seedRealShape(b, root, folders, shows, seasons, dupFiles); got != wantFiles {
+		b.Fatalf("seeded files = %d, want %d", got, wantFiles)
+	}
+
+	orig := newResolver
+	defer func() { newResolver = orig }()
+	origParse := parseQuery
+	defer func() { parseQuery = origParse }()
+	fake := &fakeSource{name: "fake", tag: "Real"}
+	newResolver = func(dir string) *metadata.Resolver {
+		return metadata.New(metadata.Options{Dir: dir, Sources: []metadata.Source{fake}})
+	}
+	parses := 0
+	parseQuery = func(rawTitle, path string) metadata.Query {
+		parses++
+		return origParse(rawTitle, path)
+	}
+	opts := func() Options {
+		return Options{Dirs: []string{root}, Force: false, CacheDir: cache, IndexPath: index, UseIndex: true, SkipCatchUp: true}
+	}
+
+	// Index phase (untimed): one walk, one parse per file, zero fetches.
+	if _, err := ScanWithOptions(ctx, opts()); err != nil {
+		b.Fatalf("first indexed Scan: %v", err)
+	}
+	if pre := fake.calls.Load(); pre != 0 {
+		b.Fatalf("index phase fetches = %d, want 0 (the scan never touches the network)", pre)
+	}
+	if parses != wantFiles {
+		b.Fatalf("index phase parses = %d, want %d (one per new file)", parses, wantFiles)
+	}
+	if state := LoadScanIndex(index).State(); state.Files != wantFiles || state.Keys != wantKeys {
+		b.Fatalf("indexed state = %+v, want %d files / %d keys", state, wantFiles, wantKeys)
+	}
+	pre := fake.calls.Load()
+
+	// bumpFolders moves every folder's mtime so the rollups cannot match: the
+	// walk must enumerate and diff every file. Untimed, like the evictions it
+	// replaces.
+	bump := time.Now().Add(30 * time.Second)
+	bumpFolders := func() {
+		if err := os.Chtimes(root, bump, bump); err != nil {
+			b.Fatal(err)
+		}
+		for f := 0; f < folders; f++ {
+			if err := os.Chtimes(filepath.Join(root, fmt.Sprintf("folder%03d", f)), bump, bump); err != nil {
+				b.Fatal(err)
+			}
+		}
+		bump = bump.Add(30 * time.Second)
+	}
+
+	b.Run("WarmDiff", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			parses = 0
+			bumpFolders()
+			b.StartTimer()
+			st, err := ScanWithOptions(ctx, opts())
+			if err != nil {
+				b.Fatalf("warm diff scan: %v", err)
+			}
+			b.StopTimer()
+			benchStatsSink = st
+			if st.Files != wantFiles || st.Unchanged != wantFiles || st.Parsed != 0 || parses != 0 {
+				b.Fatalf("iter %d stats = %+v (parses %d), want Files:Unchanged:%d Parsed:0", i, st, parses, wantFiles)
+			}
+			if got := fake.calls.Load() - pre; got != 0 {
+				b.Fatalf("iter %d fetches = %d, want 0", i, got)
+			}
+			b.StartTimer()
+		}
+	})
+
+	b.Run("WarmSkip", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			st, err := ScanWithOptions(ctx, opts())
+			if err != nil {
+				b.Fatalf("warm skip scan: %v", err)
+			}
+			benchStatsSink = st
+			if st.Files != 0 || st.FilesSkipped != wantFiles || st.FoldersSkipped == 0 {
+				b.Fatalf("iter %d stats = %+v, want Files:0 FilesSkipped:%d", i, st, wantFiles)
+			}
+			if got := fake.calls.Load() - pre; got != 0 {
+				b.Fatalf("iter %d fetches = %d, want 0", i, got)
+			}
+		}
+	})
 }
