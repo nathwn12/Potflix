@@ -194,6 +194,13 @@ powershell -ExecutionPolicy Bypass -File tools\rust-build.ps1
    the window parks it back to the tray. First run: the `Potflix` window
    opens — `Add folder`, then `Scan`.
 
+Prefer an installer to the manual build? `tools\make-installer.ps1` produces
+`dist\Potflix-Setup.exe` — per-user, no UAC (`PrivilegesRequired=lowest`),
+installing to `%LOCALAPPDATA%\Programs\Potflix` with a Start Menu entry. The
+desktop icon is a task: ticked on a first install, but unchecked when Setup
+finds an existing Potflix — tick `desktopicon` (or pass `/TASKS=desktopicon`
+to a silent install) to get one.
+
 ## Usage
 
 Normal launch shows the `Potflix` settings window; the card appears on your
