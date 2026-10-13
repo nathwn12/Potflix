@@ -1,0 +1,28 @@
+# `metadata` -- the provider half of the Go package `go\internal\metadata`: the
+# permanent on-disk cache, the provider chain (`resolver`) and the five keyless
+# providers. Owns `[[bin]] metacheck` (`go\cmd\metacheck`).
+#
+# `ureq` is a direct edge here for ONE reason: `wikipedia.go` sends a different
+# `User-Agent` than every other provider (the Wikimedia policy identifier, and
+# `wikipedia_test.go` asserts it case-sensitively), while
+# `metadata-http::HttpClient` hardcodes the shared one. `wikipedia.rs` therefore
+# owns a thin wire variant that reuses `metadata-http`'s limiter, retry-wait
+# parser, caps and `decode_capped` -- only the header differs.
+
+[package]
+name = "metadata"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+metadata-core = { path = "../metadata-core" }
+metadata-http = { path = "../metadata-http" }
+store = { path = "../store" }
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+
+[[bin]]
+name = "metacheck"
+path = "src/bin/metacheck.rs"

@@ -1,4 +1,12 @@
-# potflix (Go)
+# potflix (Go) — FROZEN REFERENCE
+
+> **Frozen.** This tree is the retired-at-merge reference implementation of the
+> Rust rewrite under `rust\`. The Rust title cleaner is proven byte-identical to
+> this tree's cleaner, and the committed oracle `rust\parity-golden.sha256`
+> records that contract. The tree is **not edited** and **not built by the Rust
+> gate** (`tools\check.ps1`); its own build (`tools\build.ps1`, the `go build`
+> lines below) is retained only so the reference can still be reproduced. New
+> work happens in `rust\`.
 
 Go module `potflix`. Stdlib only, no external modules, no `go.sum`.
 (The only network use is keyless metadata lookups over stdlib `net/http`;

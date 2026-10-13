@@ -1,0 +1,14 @@
+# `store` -- the Go package `go\internal\store`, the crash-safe single-file
+# key/value store.
+#
+# Win32 only for the file-sharing flags of `CreateFileW`; CRC32 is hand-rolled,
+# so no other dependency (see the workspace dependency policy).
+
+[package]
+name = "store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+windows-sys.workspace = true

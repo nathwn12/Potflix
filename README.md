@@ -2,33 +2,152 @@
   <img src="assets/icon.svg" width="120" height="120" alt="Potflix icon" />
 </p>
 <h1 align="center">Potflix</h1>
-<p align="center"><strong>Mirror whatever plays in PotPlayer on your Discord card — Go.</strong></p>
+<p align="center"><strong>Mirror whatever plays in PotPlayer on your Discord card — Rust.</strong></p>
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/github/license/nathwn12/Potflix" alt="License" /></a>
   <img src="https://img.shields.io/github/languages/top/nathwn12/Potflix" alt="Language" />
   <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
-  <a href="https://github.com/nathwn12/Potflix/actions/workflows/ci.yml"><img src="https://github.com/nathwn12/Potflix/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
 </p>
 
 ## What it is
 
 Potflix is a Windows tray app that watches the PotPlayer window and mirrors
-it as a Discord Rich Presence card (`Watching <title>`). It is stdlib-only Go
-(module `potflix`, Go 1.27, no `go.sum`): no Java runtime, no API keys, no
-account. Filenames are cleaned into real titles (codecs, tags, and release
-groups stripped, years parenthesized, `SxxEyy` parsed), series and episode
-names resolve from free keyless sources, and a settings window holds the
-library folders, scan controls, and card preview.
+it as a Discord Rich Presence card (`Watching <title>`): no Java runtime, no
+API keys, no account. Filenames are cleaned into real titles (codecs, tags,
+and release groups stripped, years parenthesized, `SxxEyy` parsed), series and
+episode names resolve from free keyless sources, and a settings window holds
+the library folders, scan controls, and card preview.
 
-## Why
+This repository is mid-rewrite. The implementation is now the Rust workspace
+under `rust\` — a Cargo workspace whose member crates under `rust\crates\*`
+mirror the Go packages one-for-one. The Go module in `go\` is the **frozen
+reference implementation**, retained until the Rust port merges and takes over
+the shipped binary; it is not edited and it is not built by the Rust gate. The
+original Java sources under `src\main\java\me\potflix\rpc\` (`Main.java`) are
+retained in the same way — the reference the cleaner was proven against.
 
-The retired Java flow compiled against an upstream fat jar downloaded from a
-mutable release tag and needed a Java runtime on every machine. The Go port
-builds to one self-contained `dist\potflix.exe` with nothing to install, keeps
-the title-cleaner byte-identical to the frozen Java reference, and resolves
-canonical names without credentials.
+## Layout
+
+- `rust\` — the implementation: a Cargo workspace (`rust\Cargo.toml`) with one
+  member crate per Go package under `rust\crates\*`, plus `app`, which owns the
+  workspace's `potflix` tray binary. Cargo workspace, edition 2024.
+- `go\` — the frozen Go reference implementation (module `potflix`). Retired at
+  merge; not built by the Rust gate. See `go\README.md`.
+- `src\main\java\me\potflix\rpc\Main.java` — the frozen Java reference the title
+  cleaner was proven against.
+- `tools\check.ps1` — the single exit command (gate). `tools\rust-build.ps1` —
+  the Rust build. `tools\build.ps1` — the frozen Go build.
+
+## Crates
+
+One member crate per Go package; each line is the crate's own ownership.
+
+| Crate | Owns |
+|---|---|
+| `titleclean` | Dependency-free port of the Java media-title cleaner (`me.potflix.rpc.Main.clean`); JDK-11 Unicode tables ported as data; also carries the `titleclean` parity CLI. |
+| `store` | The crash-safe single-file append-only key/value store behind the library index and the metadata cache; hand-rolled CRC32, `CreateFileW` for the share flags. |
+| `metadata-core` | The network-free half of metadata: record types, filename parsing, candidate matching, alternate titles, request context. |
+| `metadata-http` | The transport half: the shared HTTP client / fetch helpers (ureq over `native-tls`) and the per-host rate limiter. |
+| `metadata` | The provider chain, the five keyless providers (TVmaze, AniList, Jikan, iTunes, Wikipedia) and the permanent on-disk cache; owns the `metacheck` CLI. |
+| `library` | The shared walk + diff loop behind Scan / Refresh, the background metadata catch-up, and `metawarm`; the store-backed `library.idx`; owns the `metawarm` CLI. |
+| `discord` | Local Discord IPC pipe transport over `\\.\pipe\discord-ipc-0..9`: handshake, `SET_ACTIVITY`, `READY` gating, reply matching. |
+| `player` | PotPlayer window discovery (`EnumWindows`), the `WM_USER` time/status queries, and the `WM_COPYDATA` play-file path query. |
+| `presence` | The presence state machine and the activity payload builder; owns `CardSpec`, the stored card shape. |
+| `repair` | The needs-repair report and the sanitized GitHub issue path. |
+| `bundle` | Metadata-only cache bundles: export, fill-missing import, count, clear. |
+| `app-support` | The non-Win32 support surface split out of the Go root package: client-id resolution, the settings/config store, the debug log, and the single-instance lock. |
+| `potflix-win` | The Win32 surface split out of the Go root package: the raw binding table, the tray window, and the settings window. |
+| `app` | The tray application — the Go root package `main` plus `selftest` — and the icon resource (`build.rs`); owns the workspace's `potflix` binary. |
+
+## Build and test
+
+Rust is the implementation, so the gate lives in Rust. `tools\check.ps1` is the
+single exit command; from the repo root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\check.ps1                 # clippy + tests + titleclean parity
+powershell -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest
+```
+
+`tools\check.ps1` fails fast and always runs, from `rust\`:
+
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace --release --locked`
+- the title-cleaner parity step (below)
+
+Its flags add the app build and the headless self-test:
+
+- `-Build` — runs `tools\rust-build.ps1`, which is `cargo build --workspace
+  --release --locked` in `rust\` and copies `rust\target\release\potflix.exe` to
+  `dist\potflix.exe`.
+- `-Selftest` — runs `dist\potflix.exe --selftest` and requires the success
+  marker `M1 SELFTEST PASS`. It needs the binary; run with `-Build` to produce it
+  from current source.
+
+Per-crate gates:
+
+```powershell
+cargo test  -p <crate> --release
+cargo clippy -p <crate> --all-targets -- -D warnings
+cargo fmt   -p <crate> -- --check
+```
+
+Tests are pure logic — no live PotPlayer or Discord needed. Diagnose one title
+with the `metacheck` CLI.
+
+## The parity contract
+
+This rewrite's core claim: the Rust title cleaner reproduces the frozen Go
+implementation's output **byte-for-byte**. On each corpus the two binaries are
+run with the same arguments from the repo root and their TSV outputs must hash
+identically. The committed contract is [`rust\parity-golden.sha256`](./rust/parity-golden.sha256)
+— a 64-hex SHA-256 per corpus, nothing else.
+
+The corpora themselves (`tools\titles-sample4.txt`, `tools\titles-sample.txt`)
+are deliberately **not committed**: they carry real media filenames from a real
+library, which must not be published. The oracle therefore holds hashes only,
+so a missing corpus fails the gate rather than being treated as "nothing to
+compare" (`tools\check.ps1` § `Invoke-TitlecleanParity`). Regenerate the oracle
+from the frozen Go reference with the commands in the oracle's own header
+comment.
+
+## Windows-specific notes
+
+These are load-bearing for the port and easy to break:
+
+- The `PAINTSTRUCT` mirror is **72 bytes on amd64**. 68 is the sum of the field
+  widths, not the ABI size; Go rounds to the 8-byte alignment and reports 72,
+  exactly like the Windows header. A 68-byte buffer is a stack overwrite by
+  `BeginPaint`, so 72 is what the port asserts.
+- All UI geometry is integer `scalePx = (v*dpi + 48) / 96` from a 460x680
+  logical design, and font heights are negative. An `f32`/`f64` scale would
+  change hit-tests versus paint, so the port keeps `i32` everywhere.
+- One OS thread owns the tray and main window procedures and the `GetMessageW`
+  message loop; workers (poll, scan, report) never touch the UI — their payloads
+  ride mutex-guarded snapshots and repaint only via `InvalidateRect` plus an
+  async `PostMessageW`.
+
+## Dependencies
+
+Every direct dependency is pinned to an exact version and `rust\Cargo.lock` is
+committed (never gitignored); `--locked` is the build norm. Deliberate
+exclusions, recorded in `rust\Cargo.toml`:
+
+- **No third-party Unicode / word-segmentation crate.** `titleclean` must
+  reproduce the JDK-11 tables exactly, so it carries that data ported verbatim
+  from `go\internal\titleclean`; a third-party Unicode table may not enter the
+  graph. The regex matcher is part of the port for the same reason.
+- `ureq` with `native-tls` (SChannel on Windows), so HTTPS needs no C toolchain
+  and no OpenSSL; rustls/ring is deliberately not in the graph.
+- CRC32 for the store is hand-rolled (table-driven IEEE), not a crate.
 
 ## Features
+
+The behaviour below is the app's **intended contract**, carried over from the
+Go reference. It is not yet proven for the Rust app: the app crate is being
+wired and has not yet produced a passing self-test, so treat every line here as
+the target, not a measured fact. *(To be filled at land — the one line to
+confirm: the Rust app's `--selftest` passes.)*
 
 - Clean titles always: codecs, tags, and release groups stripped, years
   parenthesized, `SxxEyy` parsed (a raw filename shows as a real title with
@@ -59,10 +178,10 @@ canonical names without credentials.
 ## Install
 
 1. Needs: **PotPlayer** open and playing, **Discord** desktop open.
-2. Build the exe (requires Go 1.27+):
+2. Build the exe (requires a Rust toolchain with `cargo`):
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1
+powershell -ExecutionPolicy Bypass -File tools\rust-build.ps1
 ```
 
 3. Run it (double-click `run.bat` works too):
@@ -96,36 +215,11 @@ gitignored) or set env `POTFLIX_CLIENT_ID` and restart. Resolution order:
 env `POTFLIX_CLIENT_ID` → `client-id.txt` → `config.properties` → built-in
 default. Only the source is ever logged, never the value.
 
-## Build from source
-
-Requires Go 1.27+ on Windows (stdlib only; no modules are downloaded). From
-the repo root:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\build.ps1   # -> dist\potflix.exe
-```
-
-That runs, from `go\`:
-
-```text
-go build -trimpath -buildvcs=false -ldflags "-H=windowsgui" -o ..\dist\potflix.exe .
-```
-
-Reproducible from any directory or commit, console-less tray app. Then, from
-`go\`:
-
-```powershell
-go vet ./...
-go test ./... -count=1
-```
-
-Or one gate from the root: `powershell -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest`. Tests are pure logic — no live PotPlayer or
-Discord needed. Diagnose one title: `go run ./cmd/metacheck [-offline] <rawTitle>` (exit 0 when resolved, 1 when not).
-
 ## Deviations from the Java reference
 
-The title cleaner is proven byte-identical to the frozen Java reference; the
-behaviour below is deliberately different, and mostly proven live:
+These are the frozen Go reference's deliberate deviations from the original
+Java flow; the Rust port targets the Go reference, so they are the behaviour it
+carries. Mostly proven live for the Go reference:
 
 1. Empty asset text is omitted, not sent empty. `go\internal\discord\activity.go:86-109`
    tags every text field `omitempty` (rationale at `activity.go:42-46`): Java
@@ -150,8 +244,8 @@ behaviour below is deliberately different, and mostly proven live:
    non-space character precedes it and it is not the last character of the
    extracted title, so `Spider-Man? Brand New Day (2026) ...` cleans to
    `Spider-Man: Brand New Day`; a mark that ends the title is a real question
-   mark and is kept. The parity CLI (`cmd\titleclean`) therefore diverges from
-   Java on titles carrying such a mark, by design.
+   mark and is kept. The parity CLI therefore diverges from Java on titles
+   carrying such a mark, by design.
 7. The client-id lookup also searches beside the exe. `go\clientid.go:57-66,80-100`
    looks in the executable's directory before the process working directory;
    Java opened `client-id.txt` / `config.properties` against the CWD only
@@ -171,9 +265,9 @@ behaviour below is deliberately different, and mostly proven live:
 
 ## Docs
 
-- [`go/README.md`](./go/README.md) — package layout, metadata design, scan-index tiers, rate limiter, M1–M4 status.
+- [`go/README.md`](./go/README.md) — the frozen Go reference: package layout, metadata design, scan-index tiers, rate limiter, M1–M4 status.
 - [`go/internal/titleclean/README.md`](./go/internal/titleclean/README.md) — the title-cleaner port and its parity method.
-- [`DECISION.md`](./DECISION.md) — why the Java flow was retired and what the Go port was proven against.
+- [`DECISION.md`](./DECISION.md) — why the Cleaner port chose Go, and why the app is being rewritten in Rust on a parity oracle.
 - [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) — upstream BSD-3-Clause text and the bundled logo-font notices.
 
 ## Status

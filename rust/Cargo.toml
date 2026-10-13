@@ -1,0 +1,60 @@
+# Potflix (Rust) -- Phase 0 workspace skeleton.
+#
+# Mirrors the Go module `potflix` in `..\go` (package layout: `go\README.md`).
+# Every direct dependency is PINNED to an exact version; `Cargo.lock` is
+# committed (never gitignored) and `--locked` is the build norm.
+#
+# Dependency policy (deliberate, do not relax without a recorded decision):
+#   * windows-sys -- raw Win32 FFI. The Rust equivalent of Go's
+#     syscall.NewLazyDLL / NewLazyProc. Feature-gated bindings, no C toolchain.
+#   * serde + serde_json -- provider JSON and the on-disk config/bundle formats.
+#   * ureq with `native-tls` (SChannel on Windows) -- HTTPS for the five keyless
+#     metadata providers (TVmaze, AniList, Jikan, iTunes, Wikipedia). OS-native
+#     TLS, so no C toolchain and no OpenSSL. rustls/ring is deliberately NOT in
+#     the graph.
+#   * NO Unicode / word-segmentation crate. `titleclean` must reproduce the
+#     JDK-11 tables exactly and ports that data verbatim from
+#     `go\internal\titleclean`, so no third-party Unicode tables may enter the
+#     dependency graph.
+#   * CRC32 for the crash-safe store is hand-rolled (table-driven IEEE), not a
+#     crate.
+#
+# Layout: one member crate per Go package under `crates\` -- a 1:1 map of
+# `go\internal\*` plus the split-up Go root package. Each crate owns its own
+# `src\lib.rs` and declares its own edges; versions live once, here.
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+# Tracks the Go app's own `appVersion` (go\settings_sections.go), which in turn
+# tracks the installer version (tools\potflix.iss MyAppVersion).
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace.dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+ureq = { version = "=3.4.2", default-features = false, features = ["native-tls"] }
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Ole",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

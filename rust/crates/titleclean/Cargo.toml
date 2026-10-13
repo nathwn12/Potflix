@@ -1,0 +1,15 @@
+# `titleclean` -- the Go package `go\internal\titleclean` and its CLI
+# `go\cmd\titleclean`.
+#
+# Dependency-free by policy: the JDK-11 Unicode tables are ported as data, never
+# as a crate (see the workspace dependency policy in `..\..\Cargo.toml`).
+
+[package]
+name = "titleclean"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "titleclean"
+path = "src/bin/titleclean.rs"

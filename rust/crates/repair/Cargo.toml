@@ -1,0 +1,17 @@
+# `repair` -- the Go package `go\internal\repair`: the needs-repair report and
+# the sanitized GitHub issue path.
+#
+# `serde` is here for `Report`/`Entry` only: the local JSON report is the same
+# wire shape as Go's `encoding/json` produced (field names `Path`, `Name`, ...,
+# `LastTry` as an RFC3339 string), so the derive carries explicit renames and the
+# timestamp type owns its own serde impl.
+
+[package]
+name = "repair"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
