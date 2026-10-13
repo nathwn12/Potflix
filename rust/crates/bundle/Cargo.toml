@@ -1,0 +1,24 @@
+# `bundle` -- the Go package `go\internal\bundle`: metadata-only cache bundles
+# (export / fill-missing import / count / clear).
+#
+# `metadata` is the whole dependency surface the Go package had: the cache is
+# read and written through `metadata::cache` (CacheForEach, CacheHas,
+# CachePutRaw, CacheFileNameFor, ClearCacheEntries), never by opening the store
+# file here. `serde_json`'s `raw_value` feature is enabled for one reason only:
+# an entry's `media` is opaque (Go's `json.RawMessage`) and must survive an
+# export/import round-trip byte for byte.
+#
+# `windows-sys` backs the reparse-attribute half of the reparse-point refusal
+# (`GetFileAttributesW & 0x400`), mirroring `reparse_windows.go`.
+
+[package]
+name = "bundle"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+metadata = { path = "../metadata" }
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+windows-sys.workspace = true

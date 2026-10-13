@@ -1,0 +1,323 @@
+//! `metadata::anilist` -- mirrors `go\internal\metadata\anilist.go`.
+//!
+//! AniList provider (anime branch, first half of the anime pair). One keyless
+//! GraphQL POST; episodes come from `streamingEpisodes`.
+//!
+//! Two behaviours that are contract:
+//!
+//! * the episode NUMBER is parsed from the entry's TITLE (`"Episode N - ..."`,
+//!   `"Episode N"`, `"Episode N.5"`, or a leading `"N - ..."`), and the
+//!   positional index is only the fallback when no number is present. Live
+//!   AniList media 21355 serves `streamingEpisodes` numbered 51..66 for an
+//!   episode-1 query, so a positional mapping would hand back a wrong title;
+//! * `Season` is always 0 (absolute numbering), so the resolver's number-exact
+//!   match must not require a season.
+
+use std::time::Duration;
+
+use metadata_core::types::{
+    Episode, Kind, Media, Query, join_genres, normalize_url, runtime_length,
+};
+use metadata_http::cancel::Cancel;
+use metadata_http::http::{HttpClient, decode_capped};
+use serde_json::json;
+
+use crate::Error;
+use crate::artwork::{cap_synopsis, first_non_empty, strip_html};
+use crate::serdeutil::null_default;
+
+/// The provider's default host.
+pub const ANILIST_DEFAULT_BASE: &str = "https://graphql.anilist.co";
+
+/// `anilistQuery`, verbatim: `type: ANIME` is inline, so no `media` filter is
+/// needed and the server-side default ranking is the only ranking.
+pub const ANILIST_QUERY: &str = "query ($search:String){Media(search:$search,type:ANIME){id idMal title{romaji english} season seasonYear episodes genres duration siteUrl description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}";
+
+/// `anilistSource`.
+pub struct AnilistSource {
+    base: String,
+    client: HttpClient,
+}
+
+impl AnilistSource {
+    /// A source pointed at `base` (`""` means [`ANILIST_DEFAULT_BASE`]).
+    pub fn new(base: impl Into<String>, client: HttpClient) -> AnilistSource {
+        AnilistSource {
+            base: base.into(),
+            client,
+        }
+    }
+
+    fn base_url(&self) -> &str {
+        if self.base.is_empty() {
+            ANILIST_DEFAULT_BASE
+        } else {
+            &self.base
+        }
+    }
+}
+
+impl Default for AnilistSource {
+    fn default() -> AnilistSource {
+        AnilistSource::new("", HttpClient::new(Duration::ZERO))
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistTitle {
+    #[serde(default, deserialize_with = "null_default")]
+    romaji: String,
+    #[serde(default, deserialize_with = "null_default")]
+    english: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistCover {
+    #[serde(rename = "extraLarge", default, deserialize_with = "null_default")]
+    extra_large: String,
+    #[serde(default, deserialize_with = "null_default")]
+    large: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistStreaming {
+    #[serde(default, deserialize_with = "null_default")]
+    title: String,
+    #[serde(default, deserialize_with = "null_default")]
+    url: String,
+    #[serde(default, deserialize_with = "null_default")]
+    thumbnail: String,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistMedia {
+    #[serde(default, deserialize_with = "null_default")]
+    id: i32,
+    #[serde(rename = "idMal", default, deserialize_with = "null_default")]
+    id_mal: i32,
+    #[serde(default, deserialize_with = "null_default")]
+    title: AnilistTitle,
+    #[serde(rename = "seasonYear", default)]
+    season_year: Option<i32>,
+    #[serde(default, deserialize_with = "null_default")]
+    genres: Vec<String>,
+    #[serde(default)]
+    duration: Option<i32>,
+    #[serde(rename = "siteUrl", default, deserialize_with = "null_default")]
+    site_url: String,
+    #[serde(default, deserialize_with = "null_default")]
+    description: String,
+    #[serde(rename = "coverImage", default)]
+    cover_image: Option<AnilistCover>,
+    #[serde(rename = "bannerImage", default, deserialize_with = "null_default")]
+    banner_image: String,
+    #[serde(
+        rename = "streamingEpisodes",
+        default,
+        deserialize_with = "null_default"
+    )]
+    streaming: Vec<AnilistStreaming>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistData {
+    #[serde(rename = "Media", default)]
+    media: Option<AnilistMedia>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistResp {
+    #[serde(default)]
+    data: Option<AnilistData>,
+}
+
+/// Go's `\s`, which `regexp` defines as `[\t\n\f\r ]`.
+fn is_go_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{000c}' | '\r' | ' ')
+}
+
+/// Java/Go's default `.`: any code point except a line terminator.
+fn is_line_terminator(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+fn strip_go_spaces(s: &str) -> &str {
+    s.trim_start_matches(is_go_space)
+}
+
+fn strip_go_spaces_plus(s: &str) -> Option<&str> {
+    let stripped = strip_go_spaces(s);
+    if stripped.len() == s.len() {
+        None
+    } else {
+        Some(stripped)
+    }
+}
+
+fn take_digits(s: &str) -> (&str, &str) {
+    let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    s.split_at(end)
+}
+
+fn positive(digits: &str) -> Option<i32> {
+    digits.parse::<i32>().ok().filter(|n| *n > 0)
+}
+
+/// `anilistEpNumRe = (?i)^episode\s+(\d+)(?:\.\d+)?\s*(?:-\s*(.*))?$`, hand-rolled
+/// because the workspace pins no regex crate and `titleclean`'s matcher (built
+/// for Java's pattern set) carries no `(?i)` flag, `\s` or `\b`.
+///
+/// `None` means the pattern did not match (which includes Go's `Atoi` guard
+/// failing on an over-long digit run). `Some((n, None))` is Go's
+/// NON-PARTICIPATING trailing group: the caller then keeps the whole title.
+fn match_episode_prefix(s: &str) -> Option<(i32, Option<&str>)> {
+    let head = s.get(.."episode".len())?;
+    if !head.eq_ignore_ascii_case("episode") {
+        return None;
+    }
+    let rest = strip_go_spaces_plus(&s["episode".len()..])?;
+    let (digits, rest) = take_digits(rest);
+    let number = positive(digits)?;
+    let rest = match rest.strip_prefix('.') {
+        Some(after_dot) => {
+            let (fraction, after_fraction) = take_digits(after_dot);
+            if fraction.is_empty() {
+                return None;
+            }
+            after_fraction
+        }
+        None => rest,
+    };
+    let rest = strip_go_spaces(rest);
+    if rest.is_empty() {
+        return Some((number, None));
+    }
+    let tail = strip_go_spaces(rest.strip_prefix('-')?);
+    if tail.chars().any(is_line_terminator) {
+        return None;
+    }
+    Some((number, Some(tail)))
+}
+
+/// `anilistLeadingNumRe = ^(\d{1,4})(?:\.\d+)?\s*-\s*(.+)$`.
+fn match_leading_number(s: &str) -> Option<(i32, &str)> {
+    let (digits, rest) = take_digits(s);
+    if digits.is_empty() || digits.len() > 4 {
+        return None;
+    }
+    let number = positive(digits)?;
+    let rest = match rest.strip_prefix('.') {
+        Some(after_dot) => {
+            let (fraction, after_fraction) = take_digits(after_dot);
+            if fraction.is_empty() {
+                return None;
+            }
+            after_fraction
+        }
+        None => rest,
+    };
+    let rest = strip_go_spaces(rest).strip_prefix('-')?;
+    let tail = strip_go_spaces(rest);
+    if tail.is_empty() || tail.chars().any(is_line_terminator) {
+        return None;
+    }
+    Some((number, tail))
+}
+
+/// `parseAnilistEpisode`: the episode number from the entry's title when it
+/// carries one, plus that prefix stripped for the display title. `fallback` (the
+/// running index) is returned only when no number is present.
+pub(crate) fn parse_anilist_episode(s: &str, fallback: i32) -> (i32, String) {
+    let trimmed = s.trim();
+    if let Some((number, tail)) = match_episode_prefix(trimmed) {
+        let rest = tail.map(|t| t.trim().to_string()).unwrap_or_default();
+        if rest.is_empty() {
+            return (number, trimmed.to_string());
+        }
+        return (number, rest);
+    }
+    if let Some((number, tail)) = match_leading_number(trimmed) {
+        return (number, tail.trim().to_string());
+    }
+    if fallback > 0 {
+        return (fallback, trimmed.to_string());
+    }
+    (0, trimmed.to_string())
+}
+
+impl crate::resolver::Source for AnilistSource {
+    fn name(&self) -> &str {
+        "anilist"
+    }
+
+    /// `Find`: the keyless GraphQL endpoint, absolute episodes built from
+    /// `streamingEpisodes`, sorted by Number for deterministic ordering.
+    fn find(&self, cancel: &Cancel, q: &Query) -> Result<Option<Media>, Error> {
+        if q.kind == Kind::MOVIE || q.title.is_empty() {
+            return Ok(None);
+        }
+        let payload = json!({
+            "query": ANILIST_QUERY,
+            "variables": {"search": q.title},
+        });
+        let response = self.client.post_json(cancel, self.base_url(), &payload)?;
+        let parsed: AnilistResp = decode_capped(response)?;
+        let Some(media) = parsed.data.and_then(|data| data.media) else {
+            return Ok(None);
+        };
+        if media.id == 0 {
+            return Ok(None);
+        }
+        let mut title = media.title.english.trim().to_string();
+        if title.is_empty() {
+            title = media.title.romaji.trim().to_string();
+        }
+        if title.is_empty() {
+            return Ok(None);
+        }
+        let year = media.season_year.unwrap_or(0);
+        let genres = join_genres(&media.genres);
+        let length = media.duration.map(runtime_length).unwrap_or_default();
+        let show_url = if media.id_mal > 0 {
+            format!("https://myanimelist.net/anime/{}", media.id_mal)
+        } else {
+            normalize_url(&media.site_url)
+        };
+        let mut episodes: Vec<Episode> = Vec::with_capacity(media.streaming.len());
+        for (i, entry) in media.streaming.iter().enumerate() {
+            let (number, title) = parse_anilist_episode(&entry.title, i as i32 + 1);
+            episodes.push(Episode {
+                season: 0,
+                number,
+                title,
+                artwork: entry.thumbnail.trim().to_string(),
+                url: normalize_url(&entry.url),
+                ..Episode::default()
+            });
+        }
+        episodes.sort_by_key(|episode| episode.number);
+        let artwork = match media.cover_image.as_ref() {
+            Some(cover) => {
+                first_non_empty(&[&cover.extra_large, &cover.large, &media.banner_image])
+            }
+            None => media.banner_image.trim().to_string(),
+        };
+        Ok(Some(Media {
+            source: "anilist".to_string(),
+            source_id: media.id.to_string(),
+            kind: Kind::SERIES,
+            title,
+            year,
+            artwork,
+            synopsis: cap_synopsis(&strip_html(&media.description)),
+            genres,
+            length,
+            show_url,
+            episode_url: String::new(),
+            movie_url: String::new(),
+            trailer_url: String::new(),
+            episodes,
+            fetched_at: crate::timefmt::now_rfc3339(),
+        }))
+    }
+}
