@@ -2020,6 +2020,9 @@ pub struct UiState {
     pub last_mx: i32,
     pub last_my: i32,
     pub have_mouse: bool,
+    /// A blocking UI action requested by the last dispatch, run by the wndproc
+    /// AFTER the `UI` guard is released (`run_blocking_ui`); see [`BlockingUi`].
+    pub pending_blocking: Option<BlockingUi>,
     pub report_done_text: Arc<Mutex<String>>,
 
     /// Injectable seams (`go\window.go:2581-2586`, `:1055-1061`).
@@ -2065,6 +2068,7 @@ impl Default for UiState {
             last_mx: 0,
             last_my: 0,
             have_mouse: false,
+            pending_blocking: None,
             report_done_text: Arc::new(Mutex::new(String::new())),
             arm_timer: Arc::new(default_arm_timer),
             kill_timer: Arc::new(default_kill_timer),
@@ -2131,6 +2135,25 @@ pub fn open_external_url(url: &str) -> bool {
         )
     };
     ret as isize > 32
+}
+
+/// A UI action that BLOCKS: it opens a modal dialog (`SHBrowseForFolderW`,
+/// `MessageBoxW`, `GetOpen/SaveFileNameW`) or shells out (`ShellExecuteW`) /
+/// shows a window (`ShowWindow`). Each pumps the message queue, so the OS
+/// re-enters `main_wnd_proc` on this same UI thread; its handlers
+/// (`paint_main_window`, ...) re-lock `UI` via `ui()`. The wndproc therefore
+/// returns one of these out of the `ui()` scope and runs it with the guard
+/// RELEASED (`run_blocking_ui`): under the non-reentrant `UI` guard it
+/// self-deadlocks the UI thread, the shipped "(Not Responding)" hang.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockingUi {
+    AddDir,
+    ClearMetadata,
+    ClearIndex,
+    ExportBundle,
+    ImportBundle,
+    OpenLogFolder,
+    HideWindow,
 }
 
 impl UiState {
@@ -2382,13 +2405,19 @@ impl UiState {
     }
 
     /// `releaseAt` (`go\window.go:852`).
-    pub fn release_at(&mut self, hwnd: HWND, x: i32, y: i32) {
+    ///
+    /// Returns a [`BlockingUi`] the wndproc must run with `UI` RELEASED: the
+    /// dispatched action opens a modal dialog / shows a window, which pumps the
+    /// queue and re-enters `main_wnd_proc`; holding the non-reentrant `UI`
+    /// guard across it self-deadlocks the UI thread.
+    #[must_use]
+    pub fn release_at(&mut self, hwnd: HWND, x: i32, y: i32) -> Option<BlockingUi> {
         match self.cur_view {
             View::Card => {
                 let Some(l) = self.layout_card(hwnd) else {
                     self.pressed_btn = 0;
                     self.pressed_x = -1;
-                    return;
+                    return None;
                 };
                 let pb = self.pressed_btn;
                 self.pressed_btn = 0;
@@ -2400,15 +2429,16 @@ impl UiState {
                     } else {
                         self.invalidate();
                     }
-                    return;
+                    return None;
                 }
                 self.invalidate();
+                None
             }
             View::Settings => {
                 let Some(l) = self.layout_settings(hwnd) else {
                     self.pressed_btn = 0;
                     self.pressed_x = -1;
-                    return;
+                    return None;
                 };
                 let pb = self.pressed_btn;
                 self.pressed_btn = 0;
@@ -2416,19 +2446,19 @@ impl UiState {
                 if pb != 0 {
                     if button_at_point(&l.btns, x, y) == pb {
                         self.focus_id = pb;
-                        self.do_settings_action(hwnd, pb);
-                    } else {
-                        self.invalidate();
+                        return self.do_settings_action(hwnd, pb);
                     }
-                    return;
+                    self.invalidate();
+                    return None;
                 }
                 self.invalidate();
+                None
             }
             View::Main => {
                 let Some(l) = self.layout(hwnd) else {
                     self.pressed_btn = 0;
                     self.pressed_x = -1;
-                    return;
+                    return None;
                 };
                 let (pb, px) = (self.pressed_btn, self.pressed_x);
                 self.pressed_btn = 0;
@@ -2440,7 +2470,7 @@ impl UiState {
                         } else {
                             self.invalidate();
                         }
-                        return;
+                        return None;
                     }
                     if pb == BTN_CARD {
                         if pt_in_rect(l.card_link, x, y) {
@@ -2448,20 +2478,19 @@ impl UiState {
                         } else {
                             self.invalidate();
                         }
-                        return;
+                        return None;
                     }
                     if button_at_point(&l.btns, x, y) == pb {
                         self.focus_id = pb;
-                        self.do_button_action(hwnd, pb);
-                    } else {
-                        self.invalidate();
+                        return self.do_button_action(hwnd, pb);
                     }
-                    return;
+                    self.invalidate();
+                    return None;
                 }
                 if px >= 0 {
                     if self.scan_active {
                         self.set_status_text(SCAN_BUSY_TEXT);
-                        return;
+                        return None;
                     }
                     let r = row_at_point(&l.rows, x, y);
                     if r == px
@@ -2472,7 +2501,7 @@ impl UiState {
                     } else {
                         self.invalidate();
                     }
-                    return;
+                    return None;
                 }
                 let r = row_at_point(&l.rows, x, y);
                 if r >= 0 {
@@ -2480,13 +2509,14 @@ impl UiState {
                         self.sel_row = r;
                         self.invalidate();
                     }
-                    return;
+                    return None;
                 }
                 let id = button_at_point(&l.btns, x, y);
                 if id != 0 {
                     self.focus_id = id;
-                    self.do_button_action(hwnd, id);
+                    return self.do_button_action(hwnd, id);
                 }
+                None
             }
         }
     }
@@ -2518,54 +2548,71 @@ impl UiState {
     }
 
     /// `doButtonAction` (`go\window.go:998`).
-    pub fn do_button_action(&mut self, hwnd: HWND, id: i32) {
+    ///
+    /// Returns a [`BlockingUi`] the wndproc must run with `UI` RELEASED; `None`
+    /// when the action is pure state work.
+    #[must_use]
+    pub fn do_button_action(&mut self, hwnd: HWND, id: i32) -> Option<BlockingUi> {
         let reason = self.scan_blocked_reason(id);
         if !reason.is_empty() {
             self.set_status_text(reason);
-            return;
+            return None;
         }
         match id {
-            BTN_ADD => self.on_add_dir(hwnd),
-            BTN_REMOVE => self.on_remove_selected(),
+            BTN_ADD => Some(BlockingUi::AddDir),
+            BTN_REMOVE => {
+                self.on_remove_selected();
+                None
+            }
             BTN_SCAN => {
                 if self.scan_active {
                     self.cancel_library_scan();
                 } else {
                     self.start_library_scan(hwnd, false);
                 }
+                None
             }
-            BTN_REFRESH => self.start_library_scan(hwnd, true),
+            BTN_REFRESH => {
+                self.start_library_scan(hwnd, true);
+                None
+            }
             BTN_REPORT => {
                 let path = repair_report_path();
                 self.on_report_at(hwnd, &path);
+                None
             }
-            BTN_CLOSE => {
-                // SAFETY: ShowWindow only hides the window.
-                unsafe {
-                    crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
-                }
-            }
-            _ => {}
+            BTN_CLOSE => Some(BlockingUi::HideWindow),
+            _ => None,
         }
     }
 
     /// `doSettingsAction` (`go\window.go:1395`).
-    pub fn do_settings_action(&mut self, hwnd: HWND, id: i32) {
+    ///
+    /// Returns a [`BlockingUi`] the wndproc must run with `UI` RELEASED.
+    #[must_use]
+    pub fn do_settings_action(&mut self, _hwnd: HWND, id: i32) -> Option<BlockingUi> {
         match id {
-            BTN_BACK => self.enter_main(),
+            BTN_BACK => {
+                self.enter_main();
+                None
+            }
             BTN_SCAN_GENTLE | BTN_SCAN_BALANCED | BTN_SCAN_TURBO => {
                 let profile = crate::settings::scan_profile_for_button(id);
                 if !profile.is_empty() {
                     self.on_select_scan_speed(profile);
                 }
+                None
             }
-            BTN_CLEAR_CACHE => self.on_clear_metadata(hwnd),
-            BTN_CLEAR_INDEX => self.on_clear_index(hwnd),
-            BTN_EXPORT => self.on_export_bundle(hwnd),
-            BTN_IMPORT => self.on_import_bundle(hwnd),
-            BTN_STARTUP => self.on_toggle_startup(),
-            BTN_OPEN_LOG => crate::settings::on_open_log_folder(),
-            _ => {}
+            BTN_CLEAR_CACHE => Some(BlockingUi::ClearMetadata),
+            BTN_CLEAR_INDEX => Some(BlockingUi::ClearIndex),
+            BTN_EXPORT => Some(BlockingUi::ExportBundle),
+            BTN_IMPORT => Some(BlockingUi::ImportBundle),
+            BTN_STARTUP => {
+                self.on_toggle_startup();
+                None
+            }
+            BTN_OPEN_LOG => Some(BlockingUi::OpenLogFolder),
+            _ => None,
         }
     }
 
@@ -2579,14 +2626,26 @@ impl UiState {
     }
 
     /// `activateFocused` (`go\window.go:1328`).
-    pub fn activate_focused(&mut self, hwnd: HWND, id: i32) {
+    ///
+    /// Returns a [`BlockingUi`] the wndproc must run with `UI` RELEASED.
+    #[must_use]
+    pub fn activate_focused(&mut self, hwnd: HWND, id: i32) -> Option<BlockingUi> {
         self.focus_id = id;
         match self.cur_view {
             View::Settings => self.do_settings_action(hwnd, id),
-            View::Card => self.do_card_action(hwnd, id),
+            View::Card => {
+                self.do_card_action(hwnd, id);
+                None
+            }
             View::Main => match id {
-                BTN_SETTINGS => self.enter_settings(),
-                BTN_CARD => self.enter_card(),
+                BTN_SETTINGS => {
+                    self.enter_settings();
+                    None
+                }
+                BTN_CARD => {
+                    self.enter_card();
+                    None
+                }
                 _ => self.do_button_action(hwnd, id),
             },
         }
@@ -2630,7 +2689,9 @@ impl UiState {
                     return false;
                 }
                 let id = self.focus_id;
-                self.activate_focused(hwnd, id);
+                // Stash the blocking action for the wndproc to run with `UI`
+                // RELEASED (`run_blocking_ui`); never run it under this guard.
+                self.pending_blocking = self.activate_focused(hwnd, id);
                 true
             }
             _ => false,
@@ -2681,14 +2742,11 @@ impl UiState {
         self.remove_dir_at(idx);
     }
 
-    /// `onAddDir` (`go\window.go:1757`).
-    pub fn on_add_dir(&mut self, owner: HWND) {
-        let path = crate::settings::browse_for_folder(owner);
-        if path.is_empty() {
-            return;
-        }
+    /// `onAddDir` (`go\window.go:1757`), post-dialog half only: the modal
+    /// `browse_for_folder` runs OUTSIDE the `UI` guard in `run_blocking_ui`.
+    fn apply_add_dir(&mut self, path: &str) {
         let mut cfg = app_support::config::load_config();
-        if !cfg.add_dir(&path) {
+        if !cfg.add_dir(path) {
             app_logf(&format!(
                 "config: dir already watched (count={})",
                 cfg.dirs.len()
@@ -2987,15 +3045,9 @@ impl UiState {
 
     // -- settings handlers (`go\settings_sections.go:594-694`) -----------------
 
-    /// `onClearMetadata` (`go\settings_sections.go:594`).
-    pub fn on_clear_metadata(&mut self, hwnd: HWND) {
-        if !crate::settings::confirm_clear(
-            hwnd,
-            "Potflix - Clear metadata",
-            crate::settings::clear_metadata_confirm_text(),
-        ) {
-            return;
-        }
+    /// `onClearMetadata` (`go\settings_sections.go:594`), post-confirm half only:
+    /// the modal `confirm_clear` runs OUTSIDE the `UI` guard in `run_blocking_ui`.
+    fn apply_clear_metadata(&mut self) {
         if let Err(e) = crate::settings::clear_metadata_cache(&crate::settings::metadata_dir()) {
             app_logf(&format!("library: clear metadata failed: {}", e.message()));
             self.set_status_text(fit_scan_status(&format!(
@@ -3009,15 +3061,9 @@ impl UiState {
         self.set_status_text(crate::settings::CLEAR_METADATA_STATUS);
     }
 
-    /// `onClearIndex` (`go\settings_sections.go:611`).
-    pub fn on_clear_index(&mut self, hwnd: HWND) {
-        if !crate::settings::confirm_clear(
-            hwnd,
-            "Potflix - Clear index",
-            crate::settings::clear_index_confirm_text(),
-        ) {
-            return;
-        }
+    /// `onClearIndex` (`go\settings_sections.go:611`), post-confirm half only:
+    /// the modal `confirm_clear` runs OUTSIDE the `UI` guard in `run_blocking_ui`.
+    fn apply_clear_index(&mut self) {
         let (records, err) = crate::settings::clear_scan_index(&crate::settings::scan_index_path());
         if let Err(e) = err {
             app_logf(&format!("library: clear index failed: {}", e.message()));
@@ -3033,21 +3079,19 @@ impl UiState {
         self.set_status_text(crate::settings::clear_index_status(records));
     }
 
-    /// `onExportBundle` (`go\settings_sections.go:628`).
-    pub fn on_export_bundle(&mut self, hwnd: HWND) {
-        let dest = crate::settings::save_bundle_dialog(hwnd);
-        if dest.is_empty() {
-            return;
-        }
+    /// `onExportBundle` (`go\settings_sections.go:628`), post-dialog half only:
+    /// the modal `save_bundle_dialog` runs OUTSIDE the `UI` guard in
+    /// `run_blocking_ui`.
+    fn apply_export_bundle(&mut self, dest: &str) {
         match crate::settings::export_bundle_to(
             &crate::settings::metadata_dir(),
-            &dest,
+            dest,
             metadata::cache::CACHE_SCHEMA,
             crate::settings::APP_VERSION,
         ) {
             Ok(n) => {
                 app_logf(&format!("library: exported (entries={n})"));
-                self.set_status_text(crate::settings::export_bundle_status(n, &dest));
+                self.set_status_text(crate::settings::export_bundle_status(n, dest));
             }
             Err(e) => {
                 app_logf(&format!("library: export failed: {}", e.message()));
@@ -3056,15 +3100,13 @@ impl UiState {
         }
     }
 
-    /// `onImportBundle` (`go\settings_sections.go:647`).
-    pub fn on_import_bundle(&mut self, hwnd: HWND) {
-        let src = crate::settings::open_bundle_dialog(hwnd);
-        if src.is_empty() {
-            return;
-        }
+    /// `onImportBundle` (`go\settings_sections.go:647`), post-dialog half only:
+    /// the modal `open_bundle_dialog` runs OUTSIDE the `UI` guard in
+    /// `run_blocking_ui`.
+    fn apply_import_bundle(&mut self, hwnd: HWND, src: &str) {
         match crate::settings::import_bundle_from(
             &crate::settings::metadata_dir(),
-            &src,
+            src,
             metadata::cache::CACHE_SCHEMA,
         ) {
             Ok(st) => {
@@ -4010,6 +4052,58 @@ pub fn ui() -> MutexGuard<'static, UiState> {
     UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Runs a [`BlockingUi`] action with `UI` RELEASED. Every arm either opens a
+/// modal dialog or makes a Win32 call that can pump/dispatch a message and
+/// re-enter `main_wnd_proc`; the guard must be dropped (never `ui()`) across
+/// that call, then re-taken only for the short, non-blocking apply step.
+fn run_blocking_ui(hwnd: HWND, action: BlockingUi) {
+    match action {
+        BlockingUi::AddDir => {
+            let path = crate::settings::browse_for_folder(hwnd);
+            if !path.is_empty() {
+                ui().apply_add_dir(&path);
+            }
+        }
+        BlockingUi::ClearMetadata => {
+            if crate::settings::confirm_clear(
+                hwnd,
+                "Potflix - Clear metadata",
+                crate::settings::clear_metadata_confirm_text(),
+            ) {
+                ui().apply_clear_metadata();
+            }
+        }
+        BlockingUi::ClearIndex => {
+            if crate::settings::confirm_clear(
+                hwnd,
+                "Potflix - Clear index",
+                crate::settings::clear_index_confirm_text(),
+            ) {
+                ui().apply_clear_index();
+            }
+        }
+        BlockingUi::ExportBundle => {
+            let dest = crate::settings::save_bundle_dialog(hwnd);
+            if !dest.is_empty() {
+                ui().apply_export_bundle(&dest);
+            }
+        }
+        BlockingUi::ImportBundle => {
+            let src = crate::settings::open_bundle_dialog(hwnd);
+            if !src.is_empty() {
+                ui().apply_import_bundle(hwnd, &src);
+            }
+        }
+        BlockingUi::OpenLogFolder => crate::settings::on_open_log_folder(),
+        BlockingUi::HideWindow => {
+            // SAFETY: ShowWindow only hides the window.
+            unsafe {
+                crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
+            }
+        }
+    }
+}
+
 /// `createMainWindow` (`go\window.go:284`).
 pub fn create_main_window() -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -4084,13 +4178,26 @@ pub fn create_main_window() -> Result<(), String> {
 
 /// `showMainWindow` (`go\window.go:346`).
 pub fn show_main_window() {
-    let mut st = ui();
-    if st.main_hwnd == 0 {
-        return;
-    }
-    let hwnd = st.main_hwnd as HWND;
-    if !st.ui_centered {
-        st.ui_centered = true;
+    // `UI` is RELEASED before every Win32 call below. `center_window`'s
+    // `MoveWindow` and `UpdateWindow` both synchronously re-enter
+    // `main_wnd_proc` (`WM_WINDOWPOSCHANGED`/`WM_SIZE`, `WM_PAINT`), whose
+    // handlers re-lock `UI` via `ui()`. Holding this non-reentrant guard across
+    // them self-deadlocks the UI thread -- the shipped blank-white "(Not
+    // Responding)" startup hang. Go's `showMainWindow` (`go\window.go:346`) holds
+    // no lock, so this is a port-introduced regression.
+    let (hwnd, needs_center) = {
+        let mut st = ui();
+        if st.main_hwnd == 0 {
+            return;
+        }
+        let hwnd = st.main_hwnd as HWND;
+        let needs_center = !st.ui_centered;
+        if needs_center {
+            st.ui_centered = true;
+        }
+        (hwnd as HWND, needs_center)
+    };
+    if needs_center {
         center_window(hwnd);
     }
     // SAFETY: ShowWindow/UpdateWindow/SetForegroundWindow only affect `hwnd`.
@@ -4196,7 +4303,13 @@ pub unsafe extern "system" fn main_wnd_proc(
         }
         crate::win32::WM_L_BUTTON_UP => {
             let (x, y) = mouse_xy(lparam as usize);
-            ui().release_at(hwnd, x, y);
+            // The action dispatch may open a modal dialog / show the window,
+            // which pumps the queue and re-enters this wndproc: the `UI` guard
+            // is dropped before `run_blocking_ui` (never held across it).
+            let blocking = ui().release_at(hwnd, x, y);
+            if let Some(b) = blocking {
+                run_blocking_ui(hwnd, b);
+            }
             return 0;
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
@@ -4205,10 +4318,18 @@ pub unsafe extern "system" fn main_wnd_proc(
         }
         WM_CHAR => return 0,
         WM_KEYDOWN => {
-            let mut st = ui();
-            let vk = wparam as u32;
-            if st.on_settings_key_down(hwnd, vk) {
-                st.invalidate();
+            let blocking = {
+                let mut st = ui();
+                let vk = wparam as u32;
+                if st.on_settings_key_down(hwnd, vk) {
+                    st.invalidate();
+                }
+                // `VK_RETURN` may focus a button whose action is blocking; run
+                // it after the guard drops (`run_blocking_ui`).
+                st.pending_blocking.take()
+            };
+            if let Some(b) = blocking {
+                run_blocking_ui(hwnd, b);
             }
             return 0;
         }
@@ -4725,6 +4846,22 @@ mod tests {
         assert!(st.on_settings_key_down_ex(NULL, VK_RETURN, false));
         assert_eq!(st.status_text, SCAN_BUSY_TEXT);
         assert!(st.scan_active);
+    }
+
+    #[test]
+    fn vk_return_defers_blocking_action_outside_ui_guard() {
+        // The global `UI` guard stands in for the wndproc's dispatch scope.
+        // Pre-fix, `BTN_ADD` here ran `browse_for_folder` (a modal
+        // `SHBrowseForFolderW`) while `UI` was still held by the caller -> the
+        // same-thread re-entrant `ui()` self-deadlock. The fix returns the
+        // request for the wndproc to run with `UI` RELEASED (`run_blocking_ui`).
+        let mut st = ui();
+        st.cur_view = View::Main;
+        st.scan_active = false;
+        st.focus_id = BTN_ADD;
+        assert!(st.on_settings_key_down_ex(NULL, VK_RETURN, false));
+        assert_eq!(st.pending_blocking, Some(BlockingUi::AddDir));
+        assert_eq!(st.pending_blocking.take(), Some(BlockingUi::AddDir));
     }
 
     #[test]
