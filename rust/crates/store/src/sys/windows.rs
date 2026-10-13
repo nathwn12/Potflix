@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn short_paths_are_untouched() {
         for path in [
-            r"C:\Users\nathan\Potflix\library.idx",
+            r"C:\Users\tester\Potflix\library.idx",
             r"index.pflx",
             r"\\srv\share\a.idx",
         ] {

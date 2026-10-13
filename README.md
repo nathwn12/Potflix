@@ -57,7 +57,7 @@ One member crate per Go package; each line is the crate's own ownership.
 | `bundle` | Metadata-only cache bundles: export, fill-missing import, count, clear. |
 | `app-support` | The non-Win32 support surface split out of the Go root package: client-id resolution, the settings/config store, the debug log, and the single-instance lock. |
 | `potflix-win` | The Win32 surface split out of the Go root package: the raw binding table, the tray window, and the settings window. |
-| `app` | The tray application — the Go root package `main` plus `selftest` — and the icon resource (`build.rs`); owns the workspace's `potflix` binary. |
+| `app` | The tray application — the Rust `app` crate's `main` and `selftest` binaries — and the icon resource (`build.rs`); owns the workspace's `potflix` binary. |
 
 ## Build and test
 
@@ -94,6 +94,21 @@ cargo fmt   -p <crate> -- --check
 
 Tests are pure logic — no live PotPlayer or Discord needed. Diagnose one title
 with the `metacheck` CLI.
+
+## Verification
+
+All of the following were run on 2026-10-13 on this machine and passed:
+
+- `pwsh -ExecutionPolicy Bypass -File tools\check.ps1` → PASS (clippy `-D warnings`, `cargo test --workspace --release --locked`, titleclean parity).
+- `pwsh -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest` → PASS; `dist\potflix.exe` produced, `--selftest` emitted `M1 SELFTEST PASS` (exit 0).
+- Build artifact: `dist\potflix.exe`, 3,593,216 bytes, SHA-256 `C73257FD92A7E9E7D1AFA347C9C25CAE221E7F6B7B6FEBE57A58159A5616C2F6` (rebuild 2026-10-13).
+- Go frozen reference: `go vet ./...` and `go test ./... -count=1` PASS (10 packages).
+- Hygiene: `gitleaks detect --no-git` reports 2 findings, both false positives in ignored build artifacts under `rust\target\`; tracked source is clean. The two content hits (a client id in `tools\epname-fix-report.md`, and a real first name in a test doc-example path in `rust\crates\store\src\sys\windows.rs`) were redacted before publication.
+- Rust `target\` and `dist\` remain untracked (gitignored).
+
+The self-test is headless: it proves the hidden window + tray add, log
+rotation, second-instance lock, and the full IPC round-trip against an
+in-process fake Discord pipe, with no live PotPlayer or Discord.
 
 ## The parity contract
 
@@ -144,10 +159,12 @@ exclusions, recorded in `rust\Cargo.toml`:
 ## Features
 
 The behaviour below is the app's **intended contract**, carried over from the
-Go reference. It is not yet proven for the Rust app: the app crate is being
-wired and has not yet produced a passing self-test, so treat every line here as
-the target, not a measured fact. *(To be filled at land — the one line to
-confirm: the Rust app's `--selftest` passes.)*
+Go reference and targeted by the Rust port. The Rust app builds and its headless
+self-test passes (see **Verification**, below), but those gates prove wiring
+and the title cleaner only — they do not prove feature-level behaviour. The
+features were implemented for the frozen Go reference and are carried into the Rust
+port unchanged, so they are expected to behave as described, but they are not
+re-verified live against PotPlayer or Discord on the Rust app, and no CI runs them.
 
 - Clean titles always: codecs, tags, and release groups stripped, years
   parenthesized, `SxxEyy` parsed (a raw filename shows as a real title with
@@ -211,7 +228,9 @@ running Potflix first — single-instance lock):
 .\dist\potflix.exe --selftest
 ```
 
-`--selftest` is the only command-line switch; everything else is ignored.
+`--selftest` (headless wiring proof) and `--minimized` (autostart: keep the
+main window hidden, tray only) are the only honoured switches; everything else is
+ignored.
 
 Your own Discord app name + logo (optional, ~2 min): without this, presence
 uses the built-in app and works out of the box. Create an application named
@@ -279,7 +298,9 @@ carries. Mostly proven live for the Go reference:
 
 ## Status
 
-**Unverified** — as-is, use at your own risk.
+**Build- and test-verified** — all gates below pass on this machine. Live
+PotPlayer/Discord end-to-end is not exercised by CI; run `--selftest` for the
+headless wiring check.
 
 ## Credits
 
@@ -290,7 +311,10 @@ carries. Mostly proven live for the Go reference:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Potflix's own code is MIT. It is a fork of
+`ayunami2000/PotPlayer-DiscordRPC` (BSD-3-Clause) — see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the upstream and font
+notices.
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">

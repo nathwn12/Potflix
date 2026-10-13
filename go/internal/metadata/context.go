@@ -59,7 +59,7 @@ var (
 
 // splitDirs splits a full path into components on either separator, drops the
 // trailing filename, and reports the index of the top folder under the volume
-// (the library root: M:\1ARCHIVE, Q:\2NEW ARCHIVE AND FILMS, ...). Both
+// (the library root, e.g. X:\Library1, Y:\Library2, ...). Both
 // separators are accepted so unit paths and live paths behave alike.
 func splitDirs(path string) (dirs []string, top int) {
 	parts := strings.FieldsFunc(path, func(r rune) bool { return r == '/' || r == '\\' })
