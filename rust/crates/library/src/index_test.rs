@@ -396,3 +396,55 @@ fn store_round_trip_season_above_i32_max() {
     let rec = reopened.file(&path).expect("record after reopen");
     assert_eq!(rec.season, big, "store round-trip clamped season");
 }
+
+/// Extra, non-committed signal: the REAL Go-written multi-MB store at
+/// `%LOCALAPPDATA%\Potflix\library.idx`, the same file `meta_idx_probe`
+/// (`crates\store\src\tests.rs`) probes for `meta.idx`. Read-only -- the path is
+/// derived from `migration_parity_real_index`'s resolution, `store::inspect`
+/// never writes or truncates, and every record payload is decoded into the
+/// library's own record types. `cargo test -p library --release -- --ignored
+/// --nocapture library_idx_probe`.
+#[test]
+#[ignore = "reads the owner's real cache read-only; run explicitly with --ignored"]
+fn library_idx_probe() {
+    let src = real_index_source();
+    if src.is_empty() {
+        eprintln!("library_idx_probe: LOCALAPPDATA unset; skipping");
+        return;
+    }
+    let path = index_store_path(&src);
+    if std::fs::metadata(&path).is_err() {
+        eprintln!("library_idx_probe: {path} absent; skipping");
+        return;
+    }
+    let insp = store::inspect(&path).expect("the real library.idx header validates");
+    let mut files = 0usize;
+    let mut folders = 0usize;
+    let mut titled = 0usize;
+    for (k, v) in &insp.records {
+        if k.starts_with(b"f|") {
+            let rec = decode_file_record(v).expect("a real library file record decodes");
+            files += 1;
+            if !rec.title.is_empty() {
+                titled += 1;
+            }
+        } else if k.starts_with(b"d|") {
+            decode_folder_record(v).expect("a real library folder record decodes");
+            folders += 1;
+        }
+    }
+    assert!(files + folders > 0, "the real store must have records");
+    assert_eq!(
+        insp.valid, insp.size,
+        "torn tail: last valid boundary != file size"
+    );
+    eprintln!(
+        "library.idx: {} bytes, {} records ({} files, {} folders), last valid boundary {}, {} files with a non-empty title",
+        insp.size,
+        insp.records.len(),
+        files,
+        folders,
+        insp.valid,
+        titled
+    );
+}
