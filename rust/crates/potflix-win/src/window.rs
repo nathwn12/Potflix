@@ -4052,11 +4052,26 @@ pub fn ui() -> MutexGuard<'static, UiState> {
     UI.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Test-only seam: when armed, [`run_blocking_ui`] hands the action to this
+/// callback instead of opening the real modal (`SHBrowseForFolderW` /
+/// `MessageBoxW`) or shelling out. The callback runs at exactly the point the
+/// real blocking call would, so it can observe whether the process-wide `UI`
+/// mutex is free there.
+#[cfg(test)]
+static TEST_BLOCKING_PROBE: Mutex<Option<fn(BlockingUi)>> = Mutex::new(None);
+
 /// Runs a [`BlockingUi`] action with `UI` RELEASED. Every arm either opens a
 /// modal dialog or makes a Win32 call that can pump/dispatch a message and
 /// re-enter `main_wnd_proc`; the guard must be dropped (never `ui()`) across
 /// that call, then re-taken only for the short, non-blocking apply step.
 fn run_blocking_ui(hwnd: HWND, action: BlockingUi) {
+    #[cfg(test)]
+    if let Some(probe) =
+        *TEST_BLOCKING_PROBE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        probe(action);
+        return;
+    }
     match action {
         BlockingUi::AddDir => {
             let path = crate::settings::browse_for_folder(hwnd);
@@ -4399,7 +4414,7 @@ mod tests {
     #![allow(clippy::field_reassign_with_default)]
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::time::Duration;
 
     struct Scratch {
@@ -4848,20 +4863,74 @@ mod tests {
         assert!(st.scan_active);
     }
 
+    /// Recorded from INSIDE the substituted blocking call.
+    static BLOCKING_PROBE_RAN: AtomicBool = AtomicBool::new(false);
+    static BLOCKING_PROBE_UI_UNLOCKED: AtomicBool = AtomicBool::new(false);
+
+    /// Stands in for `SHBrowseForFolderW`. Runs at the exact point the real
+    /// modal would pump the queue and re-enter `main_wnd_proc`: if a `UI` guard
+    /// is held there, `try_lock` fails (non-blocking, so no hang).
+    fn blocking_probe(_action: BlockingUi) {
+        BLOCKING_PROBE_UI_UNLOCKED.store(UI.try_lock().is_ok(), Ordering::SeqCst);
+        BLOCKING_PROBE_RAN.store(true, Ordering::SeqCst);
+    }
+
     #[test]
     fn vk_return_defers_blocking_action_outside_ui_guard() {
-        // The global `UI` guard stands in for the wndproc's dispatch scope.
-        // Pre-fix, `BTN_ADD` here ran `browse_for_folder` (a modal
-        // `SHBrowseForFolderW`) while `UI` was still held by the caller -> the
-        // same-thread re-entrant `ui()` self-deadlock. The fix returns the
-        // request for the wndproc to run with `UI` RELEASED (`run_blocking_ui`).
-        let mut st = ui();
-        st.cur_view = View::Main;
-        st.scan_active = false;
-        st.focus_id = BTN_ADD;
-        assert!(st.on_settings_key_down_ex(NULL, VK_RETURN, false));
-        assert_eq!(st.pending_blocking, Some(BlockingUi::AddDir));
-        assert_eq!(st.pending_blocking.take(), Some(BlockingUi::AddDir));
+        // FALSIFIABLE regression test for the re-entrant `UI` deadlock. Unlike
+        // the earlier intent-only assertion, this drives the REAL dispatcher
+        // end to end: it creates the actual main window so a real WNDPROC is
+        // installed, then sends `WM_KEYDOWN`/`VK_RETURN` through the real route
+        // (`SendMessageW`), re-entering `main_wnd_proc` and reaching
+        // `run_blocking_ui`. The modal is substituted by `TEST_BLOCKING_PROBE`,
+        // whose callback records whether `UI.try_lock()` SUCCEEDS *from inside
+        // the blocking call*. Re-introducing the bug (holding the guard across
+        // `run_blocking_ui`) makes `try_lock` fail -> this test fails. A
+        // watchdog (bounded `recv_timeout`) turns a pre-fix HANG into a failure.
+        BLOCKING_PROBE_RAN.store(false, Ordering::SeqCst);
+        BLOCKING_PROBE_UI_UNLOCKED.store(false, Ordering::SeqCst);
+        *TEST_BLOCKING_PROBE.lock().unwrap() = Some(blocking_probe);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                create_main_window()?;
+                let hwnd = ui().main_hwnd as HWND;
+                {
+                    let mut st = ui();
+                    st.cur_view = View::Main;
+                    st.scan_active = false;
+                    st.focus_id = BTN_ADD;
+                }
+                // SAFETY: the window is owned by this thread, so SendMessageW
+                // invokes the installed WNDPROC synchronously.
+                unsafe {
+                    crate::win32::SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN as usize, 0);
+                    crate::win32::DestroyWindow(hwnd);
+                }
+                Ok::<(), String>(())
+            });
+            let msg = match result {
+                Ok(r) => r,
+                Err(_) => Err("dispatch panicked".into()),
+            };
+            let _ = tx.send(msg);
+        });
+
+        let outcome = rx.recv_timeout(Duration::from_secs(15)).expect(
+            "deadlock: WM_KEYDOWN dispatch did not complete within 15s \
+             (a UI guard was held across the blocking call)",
+        );
+        *TEST_BLOCKING_PROBE.lock().unwrap() = None;
+        outcome.expect("real main-window creation failed");
+        assert!(
+            BLOCKING_PROBE_RAN.load(Ordering::SeqCst),
+            "the blocking path was never exercised - test is not proving anything"
+        );
+        assert!(
+            BLOCKING_PROBE_UI_UNLOCKED.load(Ordering::SeqCst),
+            "UI guard was HELD during the blocking call: the re-entrant deadlock is back"
+        );
     }
 
     #[test]
