@@ -61,9 +61,11 @@ pub struct FileRecord {
     pub mtime: i64,
     pub kind: String,
     pub title: String,
-    pub season: i32,
-    pub episode: i32,
-    pub year: i32,
+    /// Go `Season int` (`go\internal\library\index.go:127`): 64-bit, so a store
+    /// record written by Go with a value above `i32::MAX` decodes unchanged.
+    pub season: i64,
+    pub episode: i64,
+    pub year: i64,
     pub absolute: bool,
     pub meta_key: String,
     pub state: String,
@@ -84,9 +86,11 @@ impl FileRecord {
         metadata::Query {
             kind,
             title: self.title.clone(),
-            year: self.year,
-            season: self.season,
-            episode: self.episode,
+            // `metadata::Query` keeps `i32` (metadata-core is out of seam and Go's
+            // `int` fits it for every parsed value); the record itself is 64-bit.
+            year: self.year as i32,
+            season: self.season as i32,
+            episode: self.episode as i32,
             absolute: self.absolute,
         }
     }
@@ -813,13 +817,13 @@ pub(crate) fn decode_file_record(b: &[u8]) -> Option<FileRecord> {
     r.title = title;
     n = nn;
     let (v, nn) = get_uvarint(b, n)?;
-    r.season = v as i32;
+    r.season = v as i64;
     n = nn;
     let (v, nn) = get_uvarint(b, n)?;
-    r.episode = v as i32;
+    r.episode = v as i64;
     n = nn;
     let (v, nn) = get_uvarint(b, n)?;
-    r.year = v as i32;
+    r.year = v as i64;
     n = nn;
     let (meta_key, nn) = get_string(b, n)?;
     r.meta_key = meta_key;

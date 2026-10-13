@@ -113,9 +113,9 @@ pub(crate) fn scan_indexed(cancel: &crate::Cancel, opts: &Options) -> Result<Sta
             mtime: st.mtime,
             kind: record_kind(q.kind).to_string(),
             title: q.title.clone(),
-            season: q.season,
-            episode: q.episode,
-            year: q.year,
+            season: q.season as i64,
+            episode: q.episode as i64,
+            year: q.year as i64,
             absolute: q.absolute,
             state: STATE_RESOLVED.to_string(),
             ..FileRecord::default()

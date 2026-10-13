@@ -91,6 +91,19 @@ pub fn set_show_main_window(open: fn()) -> Result<(), fn()> {
     SHOW_MAIN_WINDOW.set(open)
 }
 
+/// Go `clearActivity` (`go\tray.go:24-29`): a package variable the app overrides
+/// at `go\main.go:197-200` with the dc-bound clear. Installed once by the app
+/// seam; until then [`clear_activity`] runs the M1 stub.
+static CLEAR_ACTIVITY: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+
+/// Installs the dc-bound clear (Go's `clearActivity = func() {...}` at
+/// `go\main.go:197`). Returns the rejected closure if one is already installed.
+pub fn set_clear_activity(
+    clear: Box<dyn Fn() + Send + Sync>,
+) -> Result<(), Box<dyn Fn() + Send + Sync>> {
+    CLEAR_ACTIVITY.set(clear)
+}
+
 /// Go `appLog.logf(...)` (`go\tray.go:28, :217`): a no-op until the app seam
 /// installs the logger.
 fn log_line(message: &str) {
@@ -461,17 +474,28 @@ pub unsafe fn show_tray_menu(hwnd: HWND) {
     }
 }
 
-/// Go `clearActivity` (`go\tray.go:27-29`): the M1 stub for the clear-on-exit
-/// deviation (fleet decision 6). M3 replaces this body with a real IPC clear.
+/// Calls the installed clear seam, or the M1 stub when none is installed
+/// (Go `clearActivity`, `go\tray.go:24-29`; the app installs the dc-bound
+/// override at `go\main.go:197-200`).
 pub fn clear_activity() {
-    log_line("cleared (exit)");
+    match CLEAR_ACTIVITY.get() {
+        Some(clear) => clear(),
+        None => log_line("cleared (exit)"),
+    }
+}
+
+/// `onExit` body before the terminal exit (`go\tray.go:216-219`): log the
+/// request, then fire `clearActivity`. Split from [`on_exit`] so the exit path's
+/// clear runs in a test without ending the test process.
+pub fn on_exit_steps() {
+    log_line("exit requested (tray menu)");
+    clear_activity();
 }
 
 /// `onExit` (`go\tray.go:216-220`): log, clear, and leave -- no `NIM_DELETE`,
 /// no `DestroyWindow`.
 pub fn on_exit() -> ! {
-    log_line("exit requested (tray menu)");
-    clear_activity();
+    on_exit_steps();
     std::process::exit(0);
 }
 
@@ -479,6 +503,8 @@ pub fn on_exit() -> ! {
 mod tests {
     use super::*;
     use core::mem::size_of;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// `go\tray_test.go:11-17` -- exactly what a real right-click delivers
     /// without `NIM_SETVERSION`: wParam = trayUID (1), lParam = WM_RBUTTONUP.
@@ -613,5 +639,28 @@ mod tests {
         assert_eq!(ICON_RESOURCE_VERSION, 0x0003_0000);
         assert_eq!(NIM_ADD, 0);
         assert_eq!(NIM_DELETE, 2);
+    }
+
+    /// The tray Exit path (`go\tray.go:216-219`, installed by the app at
+    /// `go\main.go:197-200`) FIRES an installed clear seam: the exit handler body
+    /// calls `clearActivity`, so the dc-bound closure runs. This proves the call
+    /// reaches the seam, not merely that a setter stored a value.
+    #[test]
+    fn installed_clear_fires_from_the_exit_path() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        assert!(
+            set_clear_activity(Box::new(move || {
+                h.fetch_add(1, Ordering::SeqCst);
+            }))
+            .is_ok(),
+            "the clear seam installs once"
+        );
+        on_exit_steps();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the exit path did not fire the installed clear"
+        );
     }
 }

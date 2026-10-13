@@ -24,9 +24,10 @@
 //!
 //! # Known deviations (recorded, not silent)
 //!
-//! * `tray::clear_activity` has no installable seam in `potflix-win` (only the
-//!   M1 stub), so the tray's "Exit Potflix" path logs `cleared (exit)` but does
-//!   not send the dc-bound IPC clear Go installs at `main.go:197-200`.
+//! * `tray::clear_activity` now has an installable seam
+//!   ([`tray::set_clear_activity`]); [`run_ui`] installs the dc-bound clear
+//!   exactly as Go does at `main.go:197-200`, so the tray's "Exit Potflix" path
+//!   sends the IPC clear instead of only logging.
 //! * `window::set_app_log` takes an owned [`Logger`], while `tray::set_logger`
 //!   takes a `&'static` one; only one handle may own the log file at a time, so
 //!   the app installs the `&'static` logger (tray memory events) and leaves the
@@ -113,12 +114,18 @@ fn meta_query_for(raw_title: &str) -> metadata::Query {
 /// the gate says so. A failed send is not fatal -- the supervisor reconnects and
 /// a later decision resends -- but it is never silent.
 ///
+/// `spec` is the stored Card view choice (`liveCardSpec`) and `record` is the
+/// preview sink (`recordPreview`), injected so this one implementation is both
+/// the production path the poll loop runs and the path the cardview tests drive.
+///
 /// The preview is recorded only AFTER a successful send (`main.go:391-392`).
 #[allow(clippy::too_many_arguments)]
 fn push_activity(
     log: &Logger,
     dc: &discord::Client,
     gate: &mut Gate,
+    spec: presence::CardSpec,
+    record: &mut dyn FnMut(presence::Activity),
     raw_title: &str,
     action: Option<&presence::Action>,
     ct: i64,
@@ -155,7 +162,6 @@ fn push_activity(
     }
     // Card view spec: a non-default preset overrides the two body lines; the
     // default spec reproduces the builders byte-for-byte, so it is skipped.
-    let spec = live_card_spec();
     if !spec.is_default() {
         let (details, state) = spec.render(raw_title, action, &res);
         card.details = details;
@@ -189,7 +195,7 @@ fn push_activity(
         buttons: Vec::new(),
     };
     match dc.set_activity(wire) {
-        Ok(()) => window::ui().record_preview(out),
+        Ok(()) => record(out),
         Err(err) => selftest::event_send_error(log, &err),
     }
 }
@@ -270,10 +276,13 @@ fn poll_loop(log: &Logger, dc: &discord::Client) -> ! {
             // re-anchor on divergence, fire the heartbeat, and log the verdict.
             let debounced = tracker.pending_debounce();
             if let Some(cur) = action.clone().or_else(|| tracker.current()) {
+                let mut record = |a: presence::Activity| window::ui().record_preview(a);
                 push_activity(
                     log,
                     dc,
                     &mut gate,
+                    live_card_spec(),
+                    &mut record,
                     &title,
                     Some(&cur),
                     ct,
@@ -376,6 +385,16 @@ fn run_ui(log: &'static Logger) {
     let poll_dc = Arc::clone(&dc);
     std::thread::spawn(move || poll_loop(log, &poll_dc));
 
+    // Fleet decision 6 (deviation): clear the Discord card before exiting. Go
+    // installs the dc-bound override at `go\main.go:197-200`, replacing the tray
+    // stub; the poll loop's own clears are already live, so this repairs only
+    // the tray Exit path.
+    let clear_dc = Arc::clone(&dc);
+    let _ = tray::set_clear_activity(Box::new(move || {
+        let _ = clear_dc.clear_activity();
+        log.log("cleared (exit)");
+    }));
+
     // Settings window: created hidden, shown on manual launch, kept hidden to
     // the tray on the autostart path. `--selftest` never reaches here.
     match window::create_main_window() {
@@ -441,6 +460,7 @@ fn main() {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::Instant;
 
     use player::control::PlayStatus;
 
@@ -528,10 +548,13 @@ mod tests {
                 let action = tracker.poll(IT_TITLE, status, ct, now);
                 let debounced = tracker.pending_debounce();
                 if let Some(cur) = action.clone().or_else(|| tracker.current()) {
+                    let mut record = |a: presence::Activity| window::ui().record_preview(a);
                     push_activity(
                         &log,
                         &dc,
                         &mut gate,
+                        live_card_spec(),
+                        &mut record,
                         IT_TITLE,
                         Some(&cur),
                         ct,
@@ -568,18 +591,23 @@ mod tests {
         // Positive control: force one push through the real path.
         gate.force_next();
         let cur = tracker.current();
-        push_activity(
-            &log,
-            &dc,
-            &mut gate,
-            IT_TITLE,
-            cur.as_ref(),
-            15250 + 250 * 120,
-            IT_TOTAL,
-            IT_N + 3250 + 250 * 120,
-            false,
-            false,
-        );
+        {
+            let mut record = |a: presence::Activity| window::ui().record_preview(a);
+            push_activity(
+                &log,
+                &dc,
+                &mut gate,
+                live_card_spec(),
+                &mut record,
+                IT_TITLE,
+                cur.as_ref(),
+                15250 + 250 * 120,
+                IT_TOTAL,
+                IT_N + 3250 + 250 * 120,
+                false,
+                false,
+            );
+        }
 
         std::thread::sleep(Duration::from_millis(200));
 
@@ -912,6 +940,222 @@ mod tests {
         wait_log_contains(&log_path, &want, Duration::from_secs(3));
 
         let _ = c.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cardview test, repointed to the APP's `pushActivity`
+    /// (`go\main.go:332-394`): drives the ONE production implementation over a
+    /// fake pipe and asserts preview-is-the-payload through the send, under the
+    /// stored Card view spec (`spec` param = `liveCardSpec`).
+    #[test]
+    fn preview_is_payload_through_send() {
+        let srv = discord::FakeServer::new(0);
+        let base = srv.base.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(srv.accept());
+        });
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: base,
+            retry_delay: Duration::from_millis(30),
+            ..Default::default()
+        });
+        dc.start();
+        let sc = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client connects")
+            .expect("accept");
+        let (op, _) = sc.read_frame().expect("handshake frame");
+        assert_eq!(op, discord::OP_HANDSHAKE);
+        sc.write_frame(
+            discord::OP_FRAME,
+            br#"{"cmd":"DISPATCH","evt":"READY","data":{"v":1}}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dc.generation() < 1 {
+            assert!(Instant::now() < deadline, "never became ready");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (ftx, frx) = mpsc::channel::<Vec<u8>>();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match sc.read_frame() {
+                    Ok((discord::OP_FRAME, payload)) => {
+                        if ftx.send(payload).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let dir = unique_dir("preview");
+        let log = Logger::new(dir.join("preview.log"), 0, 1);
+        let raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+        let now = 1_000_000_000_000i64;
+        let drive = |spec: presence::CardSpec,
+                     act: &presence::Action,
+                     ct: i64|
+         -> (presence::Activity, serde_json::Value, Vec<u8>) {
+            let mut st = window::UiState::default();
+            let mut gate = Gate::new();
+            let mut record = |a: presence::Activity| st.record_preview(a);
+            push_activity(
+                &log,
+                &dc,
+                &mut gate,
+                spec,
+                &mut record,
+                raw,
+                Some(act),
+                ct,
+                2_832_979,
+                now,
+                true,
+                false,
+            );
+            drop(record);
+            let payload = frx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("SET_ACTIVITY frame");
+            let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(v["cmd"], "SET_ACTIVITY");
+            assert!(!v["args"]["activity"].is_null());
+            let (got, have) = st.preview_activity();
+            assert!(have, "preview not recorded after a successful send");
+            (got, v, payload)
+        };
+        let check = |got: &presence::Activity, v: &serde_json::Value| {
+            let a = &v["args"]["activity"];
+            assert_eq!(got.name, a["name"].as_str().unwrap_or(""));
+            assert_eq!(got.details, a["details"].as_str().unwrap_or(""));
+            assert_eq!(got.state, a["state"].as_str().unwrap_or(""));
+            let assets = &a["assets"];
+            let mut want_large = got.large_image.clone();
+            if want_large != "logo" && !want_large.starts_with("http") {
+                want_large = "logo".into();
+            }
+            if want_large.is_empty() {
+                want_large = "logo".into();
+            }
+            assert_eq!(assets["large_image"].as_str().unwrap_or(""), want_large);
+            assert_eq!(assets["large_text"].as_str().unwrap_or(""), got.large_text);
+            if got.has_start {
+                assert_eq!(a["timestamps"]["start"].as_i64(), Some(got.start));
+                if got.end > 0 {
+                    assert_eq!(a["timestamps"]["end"].as_i64(), Some(got.end));
+                } else {
+                    assert!(a["timestamps"]["end"].is_null());
+                }
+            }
+            assert_eq!(
+                a["buttons"].as_array().map_or(0, Vec::len),
+                got.buttons.len()
+            );
+        };
+
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 1000,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        let (got, v, _) = drive(presence::cardspec::default_card_spec(), &act, 1000);
+        check(&got, &v);
+
+        let act2 = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 2000,
+            ct: 2000,
+            ..presence::Action::default()
+        };
+        let (got2, v2, _) = drive(
+            presence::CardSpec {
+                details: "title".into(),
+                state: "tag".into(),
+            },
+            &act2,
+            2000,
+        );
+        check(&got2, &v2);
+        assert!(!got2.details.is_empty() && !got2.state.is_empty());
+
+        let act3 = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 3000,
+            ct: 3000,
+            ..presence::Action::default()
+        };
+        let (got3, v3, frame) = drive(
+            presence::CardSpec {
+                details: "default".into(),
+                state: "none".into(),
+            },
+            &act3,
+            3000,
+        );
+        check(&got3, &v3);
+        assert_eq!(got3.state, "");
+        let env: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert!(
+            env["args"]["activity"].get("state").is_none(),
+            "empty state reached the wire"
+        );
+        assert_eq!(env["args"]["activity"]["details"], "Pilot");
+
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `window.rs` -> the failure-side cardview test, repointed to the APP's
+    /// `pushActivity`: a failed send records no preview.
+    #[test]
+    fn preview_not_recorded_on_send_failure() {
+        let dir = unique_dir("preview-fail");
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: format!("{}-no-pipe-", dir.display()),
+            retry_delay: Duration::from_secs(3600),
+            ..Default::default()
+        });
+        let log = Logger::new(dir.join("preview-fail.log"), 0, 1);
+        let mut st = window::UiState::default();
+        let mut gate = Gate::new();
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: 999,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        let mut record = |a: presence::Activity| st.record_preview(a);
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            presence::CardSpec::default(),
+            &mut record,
+            "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+            Some(&act),
+            1000,
+            2_832_979,
+            1_000_000_000_000,
+            true,
+            false,
+        );
+        drop(record);
+        assert!(
+            !st.preview_activity().1,
+            "preview recorded after a failed send"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

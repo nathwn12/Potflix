@@ -190,9 +190,9 @@ fn file_record_query_round_trip() {
             name: name.to_string(),
             kind: crate::scan::record_kind(q.kind).to_string(),
             title: q.title.clone(),
-            season: q.season,
-            episode: q.episode,
-            year: q.year,
+            season: q.season as i64,
+            episode: q.episode as i64,
+            year: q.year as i64,
             absolute: q.absolute,
             ..FileRecord::default()
         };
@@ -291,8 +291,8 @@ fn index_store_load_time() {
             mtime: i as i64 * 1_000_000,
             kind: crate::index::FILE_KIND_SERIES.into(),
             title,
-            season: k % 5 + 1,
-            episode: i % 24 + 1,
+            season: (k % 5 + 1) as i64,
+            episode: (i % 24 + 1) as i64,
             meta_key: format!("series|realshapeshow{k:04}|0|{}", k % 5 + 1),
             state: crate::index::STATE_PENDING.into(),
             ..FileRecord::default()
@@ -342,4 +342,57 @@ fn store_round_trip_files_above_i32_max() {
     let reopened = load_scan_index(&path);
     let rec = reopened.lookup(&dir_key).expect("record after reopen");
     assert_eq!(rec.files, big, "store round-trip clamped files");
+}
+
+/// The store record's `season`/`episode`/`year` are Go `int` (64-bit,
+/// `go\internal\library\index.go:127-129`): a value above `i32::MAX` must
+/// encode and decode unchanged, not negative and not clamped to zero.
+#[test]
+fn file_record_season_above_i32_max_round_trips() {
+    let big = 1_i64 << 31; // 2147483648
+    let rec = FileRecord {
+        path: "D:\\lib\\Show.S01E01.mkv".into(),
+        name: "Show.S01E01.mkv".into(),
+        ext: ".mkv".into(),
+        kind: crate::index::FILE_KIND_SERIES.into(),
+        title: "Show".into(),
+        season: big,
+        episode: big + 1,
+        year: big + 2,
+        meta_key: "k".into(),
+        state: STATE_RESOLVED.into(),
+        ..FileRecord::default()
+    };
+    let mut buf = Vec::new();
+    encode_file_record(&mut buf, &rec);
+    let got = decode_file_record(&buf).expect("decode");
+    assert_eq!(got.season, big, "season decoded negative or clamped");
+    assert_eq!(got.episode, big + 1, "episode decoded negative or clamped");
+    assert_eq!(got.year, big + 2, "year decoded negative or clamped");
+    assert_eq!(got, rec);
+}
+
+/// End-to-end store round-trip: write `season = 1<<31`, reopen, read it back.
+#[test]
+fn store_round_trip_season_above_i32_max() {
+    let dir = temp_dir("bigseason");
+    let big = 1_i64 << 31;
+    let index = index_path_in(&dir);
+    let ix = shared_index(&index).unwrap();
+    let path = crate::pathutil::join(&["D:\\lib", "Show.S01E01.mkv"]);
+    ix.put_file(FileRecord {
+        path: path.clone(),
+        name: "Show.S01E01.mkv".into(),
+        kind: crate::index::FILE_KIND_SERIES.into(),
+        title: "Show".into(),
+        season: big,
+        meta_key: "series|show|0|2147483648".into(),
+        state: STATE_RESOLVED.into(),
+        ..FileRecord::default()
+    });
+    ix.commit().unwrap();
+    close_index(&index).unwrap();
+    let reopened = shared_index(&index).unwrap();
+    let rec = reopened.file(&path).expect("record after reopen");
+    assert_eq!(rec.season, big, "store round-trip clamped season");
 }
