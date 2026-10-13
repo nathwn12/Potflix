@@ -24,13 +24,13 @@
 
 use std::sync::LazyLock;
 
-use titleclean::Regex;
 use titleclean::clean;
 use titleclean::javacompat::port_pattern;
+use titleclean::Regex;
 
 use crate::parse::{
-    POT_PLAYER_SUFFIX, extra_re_matches, group, has_ascii_letter, is_theme, is_year_num,
-    word_bounded_match,
+    extra_re_matches, group, has_ascii_letter, is_theme, is_year_num, word_bounded_match,
+    POT_PLAYER_SUFFIX,
 };
 use crate::types::{Kind, Query};
 
@@ -122,7 +122,7 @@ static EP_NUM_TAIL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// `splitDirs` splits a full path into components on either separator, drops the
 /// trailing filename, and reports the index of the top folder under the volume
-/// (the library root: M:\1ARCHIVE, Q:\2NEW ARCHIVE AND FILMS, ...). Both
+/// (the library root: e.g. X:\Library1, Y:\Library2, ...). Both
 /// separators are accepted so unit paths and live paths behave alike.
 pub(crate) fn split_dirs(path: &str) -> (Vec<&str>, usize) {
     let parts: Vec<&str> = path.split(['/', '\\']).filter(|p| !p.is_empty()).collect();

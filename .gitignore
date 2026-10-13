@@ -5,6 +5,7 @@ dist/*.log
 tools/titles-sample*.txt
 tools/batch-*.txt
 tools/*.orig
+target/
 
 # local / secrets-ish
 client-id.txt

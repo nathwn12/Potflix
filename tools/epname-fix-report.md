@@ -35,7 +35,7 @@ separately and neither reused the author's dumper.
 
 ## Live proof (this machine, shipped jar)
 ```
-connected clientId=1556352808964333628
+connected clientId=<redacted>
 push details=[Breaking Bad] state=[S3 E6 "Sunset"] ct=1948602 total=2833747
 ```
 Before: `push details=[Breaking Bad] state=[S3 E6]`.
