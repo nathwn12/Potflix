@@ -355,6 +355,46 @@ pub fn open(path: impl AsRef<Path>, opts: Options) -> Result<Db, Error> {
     })
 }
 
+/// A read-only inspection of a store file: its size, the offset of the last
+/// valid frame boundary, and every live record as a `(key, value)` pair in
+/// sorted key order.
+pub struct Inspection {
+    /// The file's size in bytes.
+    pub size: u64,
+    /// The offset of the last valid frame boundary.
+    pub valid: u64,
+    /// Live records, sorted by key.
+    pub records: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Inspects the store file at `path` WITHOUT modifying it: the handle is opened
+/// read-only and the file is never written, truncated, or created. Unlike
+/// [`open`], a torn tail is reported through [`Inspection::valid`] instead of
+/// being repaired in place, so this is the probe path for an owner's real cache.
+pub fn inspect(path: impl AsRef<Path>) -> Result<Inspection, Error> {
+    let path = path.as_ref();
+    let mut f = File::open(path).map_err(|e| Error::io("open", path, e))?;
+    let size = f.metadata().map_err(|e| Error::io("stat", path, e))?.len();
+    let mut hdr = [0u8; HEADER_SIZE];
+    read_header(path, &mut f, &mut hdr)?;
+    f.seek(SeekFrom::Start(HEADER_SIZE as u64))
+        .map_err(|e| Error::io("seek", path, e))?;
+    let mut records = Records::new();
+    let mut payload_buf = Vec::new();
+    let valid = {
+        let mut r = BufReader::with_capacity(REPLAY_BUF_SIZE, &mut f);
+        replay_frames(&mut r, size, &mut records, &mut payload_buf)
+    };
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> =
+        records.into_iter().map(|(k, v)| (k, v.to_vec())).collect();
+    out.sort();
+    Ok(Inspection {
+        size,
+        valid,
+        records: out,
+    })
+}
+
 impl Db {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         // A panicking `for_each` callback must not poison the store for every
