@@ -4060,6 +4060,13 @@ pub fn ui() -> MutexGuard<'static, UiState> {
 #[cfg(test)]
 static TEST_BLOCKING_PROBE: Mutex<Option<fn(BlockingUi)>> = Mutex::new(None);
 
+/// Test-only seam for the one blocking action NOT routed through
+/// [`run_blocking_ui`]: [`show_main_window`]'s `center_window`/`ShowWindow`
+/// step. When armed, the callback runs at that exact blocking point instead of
+/// making the Win32 calls, so a test can observe whether `UI` is free there.
+#[cfg(test)]
+static TEST_SHOW_PROBE: Mutex<Option<fn()>> = Mutex::new(None);
+
 /// Runs a [`BlockingUi`] action with `UI` RELEASED. Every arm either opens a
 /// modal dialog or makes a Win32 call that can pump/dispatch a message and
 /// re-enter `main_wnd_proc`; the guard must be dropped (never `ui()`) across
@@ -4212,6 +4219,13 @@ pub fn show_main_window() {
         }
         (hwnd as HWND, needs_center)
     };
+    #[cfg(test)]
+    if let Some(probe) =
+        *TEST_SHOW_PROBE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        probe();
+        return;
+    }
     if needs_center {
         center_window(hwnd);
     }
@@ -4866,71 +4880,212 @@ mod tests {
     /// Recorded from INSIDE the substituted blocking call.
     static BLOCKING_PROBE_RAN: AtomicBool = AtomicBool::new(false);
     static BLOCKING_PROBE_UI_UNLOCKED: AtomicBool = AtomicBool::new(false);
+    static BLOCKING_PROBE_ACTION: Mutex<Option<BlockingUi>> = Mutex::new(None);
 
-    /// Stands in for `SHBrowseForFolderW`. Runs at the exact point the real
-    /// modal would pump the queue and re-enter `main_wnd_proc`: if a `UI` guard
-    /// is held there, `try_lock` fails (non-blocking, so no hang).
-    fn blocking_probe(_action: BlockingUi) {
+    /// Stands in for whatever real modal / Win32 blocking call an action would
+    /// make (`SHBrowseForFolderW`, `MessageBoxW`, `GetOpen/SaveFileNameW`,
+    /// `ShellExecuteW`, `ShowWindow`). Runs at the exact point the real call
+    /// would pump the queue and re-enter `main_wnd_proc`: if a `UI` guard is
+    /// held there, `try_lock` fails (non-blocking, so no hang).
+    fn blocking_probe(action: BlockingUi) {
         BLOCKING_PROBE_UI_UNLOCKED.store(UI.try_lock().is_ok(), Ordering::SeqCst);
+        *BLOCKING_PROBE_ACTION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(action);
         BLOCKING_PROBE_RAN.store(true, Ordering::SeqCst);
     }
 
-    #[test]
-    fn vk_return_defers_blocking_action_outside_ui_guard() {
-        // FALSIFIABLE regression test for the re-entrant `UI` deadlock. Unlike
-        // the earlier intent-only assertion, this drives the REAL dispatcher
-        // end to end: it creates the actual main window so a real WNDPROC is
-        // installed, then sends `WM_KEYDOWN`/`VK_RETURN` through the real route
-        // (`SendMessageW`), re-entering `main_wnd_proc` and reaching
-        // `run_blocking_ui`. The modal is substituted by `TEST_BLOCKING_PROBE`,
-        // whose callback records whether `UI.try_lock()` SUCCEEDS *from inside
-        // the blocking call*. Re-introducing the bug (holding the guard across
-        // `run_blocking_ui`) makes `try_lock` fail -> this test fails. A
-        // watchdog (bounded `recv_timeout`) turns a pre-fix HANG into a failure.
-        BLOCKING_PROBE_RAN.store(false, Ordering::SeqCst);
-        BLOCKING_PROBE_UI_UNLOCKED.store(false, Ordering::SeqCst);
-        *TEST_BLOCKING_PROBE.lock().unwrap() = Some(blocking_probe);
+    /// `show_main_window`'s substituted `center_window`/`ShowWindow` step.
+    static SHOW_PROBE_RAN: AtomicBool = AtomicBool::new(false);
+    static SHOW_PROBE_UI_UNLOCKED: AtomicBool = AtomicBool::new(false);
 
-        let (tx, rx) = std::sync::mpsc::channel();
+    fn show_probe() {
+        SHOW_PROBE_UI_UNLOCKED.store(UI.try_lock().is_ok(), Ordering::SeqCst);
+        SHOW_PROBE_RAN.store(true, Ordering::SeqCst);
+    }
+
+    /// How a route reaches its action through the REAL dispatcher.
+    #[derive(Clone, Copy)]
+    enum Drive {
+        /// `WM_KEYDOWN`/`VK_RETURN` with `BTN_ADD` focused.
+        Key { vk: u32 },
+        /// A mouse click: `WM_L_BUTTON_DOWN`+`WM_L_BUTTON_UP` on a button.
+        Btn { view: View, btn: i32 },
+    }
+
+    /// Every fixed blocking action, with the real route that reaches it.
+    const ROUTES: &[(&str, Drive, BlockingUi)] = &[
+        ("AddDir (VK_RETURN keyboard)", Drive::Key { vk: VK_RETURN }, BlockingUi::AddDir),
+        ("AddDir (button)", Drive::Btn { view: View::Main, btn: BTN_ADD }, BlockingUi::AddDir),
+        ("HideWindow ('Close to tray' button)", Drive::Btn { view: View::Main, btn: BTN_CLOSE }, BlockingUi::HideWindow),
+        ("ClearMetadata ('Clear metadata' button)", Drive::Btn { view: View::Settings, btn: BTN_CLEAR_CACHE }, BlockingUi::ClearMetadata),
+        ("ClearIndex ('Clear index' button)", Drive::Btn { view: View::Settings, btn: BTN_CLEAR_INDEX }, BlockingUi::ClearIndex),
+        ("ExportBundle ('Export...' button)", Drive::Btn { view: View::Settings, btn: BTN_EXPORT }, BlockingUi::ExportBundle),
+        ("ImportBundle ('Import...' button)", Drive::Btn { view: View::Settings, btn: BTN_IMPORT }, BlockingUi::ImportBundle),
+        ("OpenLogFolder ('Open log folder' button)", Drive::Btn { view: View::Settings, btn: BTN_OPEN_LOG }, BlockingUi::OpenLogFolder),
+    ];
+
+    /// One route's observation, recorded from inside its blocking call.
+    struct Obs {
+        ran: bool,
+        unlocked: bool,
+        action: Option<BlockingUi>,
+    }
+
+    /// Pack a client `(x, y)` pair as a mouse `lParam`.
+    fn mouse_lparam(x: i32, y: i32) -> isize {
+        (((y as u32) & 0xFFFF) << 16 | ((x as u32) & 0xFFFF)) as isize
+    }
+
+    #[test]
+    fn blocking_actions_run_outside_ui_guard_all_routes() {
+        // FALSIFIABLE regression test for the re-entrant `UI` deadlock. It
+        // drives the REAL dispatcher end to end for EVERY fixed blocking
+        // action: it creates the actual main window so the real `main_wnd_proc`
+        // is installed, then routes each action through `SendMessageW` into that
+        // wndproc - mouse `WM_L_BUTTON_UP` -> `release_at` ->
+        // `do_button_action`/`do_settings_action` -> `run_blocking_ui`, and the
+        // keyboard route via `WM_KEYDOWN`/`VK_RETURN`. `show_main_window` (the
+        // one action with no dispatcher route) is driven directly. Every modal
+        // / Win32 blocking call is substituted by `TEST_BLOCKING_PROBE` (or
+        // `TEST_SHOW_PROBE`), whose callback records whether `UI.try_lock()`
+        // SUCCEEDS *from inside the blocking call*. Re-introducing the bug
+        // (holding the guard across `run_blocking_ui`) makes `try_lock` fail ->
+        // this test fails. A per-route watchdog (bounded `recv_timeout`) turns a
+        // pre-fix HANG into a failure.
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Obs, String>>();
+        *TEST_SHOW_PROBE.lock().unwrap() = Some(show_probe);
+        let tx_panic = tx.clone();
         std::thread::spawn(move || {
-            let result = std::panic::catch_unwind(|| {
-                create_main_window()?;
-                let hwnd = ui().main_hwnd as HWND;
-                {
-                    let mut st = ui();
-                    st.cur_view = View::Main;
-                    st.scan_active = false;
-                    st.focus_id = BTN_ADD;
+            *TEST_BLOCKING_PROBE.lock().unwrap() = Some(blocking_probe);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Err(e) = create_main_window() {
+                    let _ = tx.send(Err(e));
+                    return;
                 }
-                // SAFETY: the window is owned by this thread, so SendMessageW
-                // invokes the installed WNDPROC synchronously.
+                let hwnd = ui().main_hwnd as HWND;
+                for &(_, drive, _) in ROUTES {
+                    BLOCKING_PROBE_RAN.store(false, Ordering::SeqCst);
+                    BLOCKING_PROBE_UI_UNLOCKED.store(false, Ordering::SeqCst);
+                    *BLOCKING_PROBE_ACTION.lock().unwrap() = None;
+                    {
+                        let mut st = ui();
+                        st.scan_active = false;
+                        st.focus_id = 0;
+                        st.pressed_btn = 0;
+                        st.pressed_x = -1;
+                        match drive {
+                            Drive::Key { .. } => {
+                                st.cur_view = View::Main;
+                                st.focus_id = BTN_ADD;
+                            }
+                            Drive::Btn { view, .. } => st.cur_view = view,
+                        }
+                    }
+                    let sent = match drive {
+                        Drive::Key { vk } => {
+                            // SAFETY: owned by this thread -> synchronous WNDPROC.
+                            unsafe {
+                                crate::win32::SendMessageW(hwnd, WM_KEYDOWN, vk as usize, 0);
+                            }
+                            Ok(())
+                        }
+                        Drive::Btn { view, btn } => {
+                            let btns = {
+                                let st = ui();
+                                match view {
+                                    View::Settings => st.layout_settings(hwnd).map(|l| l.btns),
+                                    _ => st.layout(hwnd).map(|l| l.btns),
+                                }
+                            };
+                            match btns.and_then(|b| b.into_iter().find(|b| b.id == btn)) {
+                                Some(b) => {
+                                    let lp = mouse_lparam(
+                                        (b.rc.left + b.rc.right) / 2,
+                                        (b.rc.top + b.rc.bottom) / 2,
+                                    );
+                                    // SAFETY: same thread -> synchronous WNDPROC.
+                                    unsafe {
+                                        crate::win32::SendMessageW(
+                                            hwnd,
+                                            crate::win32::WM_L_BUTTON_DOWN,
+                                            0,
+                                            lp,
+                                        );
+                                        crate::win32::SendMessageW(
+                                            hwnd,
+                                            crate::win32::WM_L_BUTTON_UP,
+                                            0,
+                                            lp,
+                                        );
+                                    }
+                                    Ok(())
+                                }
+                                None => Err(format!("button {btn} missing from {view:?} layout")),
+                            }
+                        }
+                    };
+                    let obs = sent.map(|()| Obs {
+                        ran: BLOCKING_PROBE_RAN.load(Ordering::SeqCst),
+                        unlocked: BLOCKING_PROBE_UI_UNLOCKED.load(Ordering::SeqCst),
+                        action: *BLOCKING_PROBE_ACTION.lock().unwrap(),
+                    });
+                    let _ = tx.send(obs);
+                }
+                // show/center: no dispatcher route, driven directly.
+                SHOW_PROBE_RAN.store(false, Ordering::SeqCst);
+                SHOW_PROBE_UI_UNLOCKED.store(false, Ordering::SeqCst);
+                show_main_window();
+                let _ = tx.send(Ok(Obs {
+                    ran: SHOW_PROBE_RAN.load(Ordering::SeqCst),
+                    unlocked: SHOW_PROBE_UI_UNLOCKED.load(Ordering::SeqCst),
+                    action: None,
+                }));
+                // SAFETY: same thread created the window.
                 unsafe {
-                    crate::win32::SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN as usize, 0);
                     crate::win32::DestroyWindow(hwnd);
                 }
-                Ok::<(), String>(())
-            });
-            let msg = match result {
-                Ok(r) => r,
-                Err(_) => Err("dispatch panicked".into()),
-            };
-            let _ = tx.send(msg);
+            }));
+            if result.is_err() {
+                let _ = tx_panic.send(Err("dispatch panicked".into()));
+            }
         });
 
-        let outcome = rx.recv_timeout(Duration::from_secs(15)).expect(
-            "deadlock: WM_KEYDOWN dispatch did not complete within 15s \
-             (a UI guard was held across the blocking call)",
+        for &(label, _, expect) in ROUTES {
+            let got = rx.recv_timeout(Duration::from_secs(15)).unwrap_or_else(|_| {
+                panic!("deadlock: route `{label}` did not complete within 15s (a UI guard was held across the blocking call)")
+            });
+            let obs = got.unwrap_or_else(|e| panic!("route `{label}` failed: {e}"));
+            assert!(
+                obs.ran,
+                "route `{label}`: blocking path never exercised - test proves nothing"
+            );
+            assert_eq!(
+                obs.action,
+                Some(expect),
+                "route `{label}`: dispatcher requested {:?}, expected {:?}",
+                obs.action,
+                expect
+            );
+            assert!(
+                obs.unlocked,
+                "route `{label}`: UI guard was HELD during the blocking call: the re-entrant deadlock is back"
+            );
+        }
+        let show = rx
+            .recv_timeout(Duration::from_secs(15))
+            .expect("deadlock: show/center did not complete within 15s")
+            .unwrap_or_else(|e| panic!("show/center failed: {e}"));
+        assert!(
+            show.ran,
+            "show/center: blocking path never exercised - test proves nothing"
+        );
+        assert!(
+            show.unlocked,
+            "show/center: UI guard was HELD across center_window/ShowWindow: the re-entrant deadlock is back"
         );
         *TEST_BLOCKING_PROBE.lock().unwrap() = None;
-        outcome.expect("real main-window creation failed");
-        assert!(
-            BLOCKING_PROBE_RAN.load(Ordering::SeqCst),
-            "the blocking path was never exercised - test is not proving anything"
-        );
-        assert!(
-            BLOCKING_PROBE_UI_UNLOCKED.load(Ordering::SeqCst),
-            "UI guard was HELD during the blocking call: the re-entrant deadlock is back"
-        );
+        *TEST_SHOW_PROBE.lock().unwrap() = None;
     }
 
     #[test]
