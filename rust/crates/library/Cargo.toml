@@ -1,0 +1,21 @@
+# `library` -- the Go package `go\internal\library`. Owns `[[bin]] metawarm`
+# (`go\cmd\metawarm`).
+
+[package]
+name = "library"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+store = { path = "../store" }
+metadata = { path = "../metadata" }
+metadata-core = { path = "../metadata-core" }
+metadata-http = { path = "../metadata-http" }
+repair = { path = "../repair" }
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "metawarm"
+path = "src/bin/metawarm.rs"
