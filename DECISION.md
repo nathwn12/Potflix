@@ -1,4 +1,39 @@
-# DECISION: media-title cleaner port
+# DECISION
+
+## Rewrite: the app moves to Rust
+
+The app is being rewritten in Rust. The Go module in `go\` was the incumbent
+that shipped; `rust\` is now the implementation — a Cargo workspace whose member
+crates under `rust\crates\*` mirror the Go packages one-for-one — and `go\` is
+retired at merge.
+
+**Why.** The Go port proved the cleaner and shipped a working tray app, but the
+Rust port is the target for the same surface with a stricter static guarantee
+(`--locked` builds, `-D warnings` clippy as a gate), one toolchain for the whole
+tree, and no C toolchain on the Win32 FFI path (`windows-sys` feature-gated
+bindings). The port is a behavioural mirror, not a re-design: one crate per Go
+package, the same on-disk formats, the same wire shapes.
+
+**Why a parity oracle.** The cleaner is the one piece whose output is a
+byte-exact contract, and it was already proven byte-identical to the Java
+baseline by the Go port. The Rust rewrite therefore does not re-derive the Java
+golden set: it treats the frozen Go cleaner as the oracle and requires the Rust
+binary to reproduce its TSV output hash-for-hash on the same corpora. The
+committed contract is `rust\parity-golden.sha256` — a SHA-256 per corpus, with
+the corpora themselves deliberately absent (they carry real media filenames).
+The gate builds the Rust binary, runs it over the same corpora with the same
+arguments the Go reference used, and fails on a hash mismatch against the
+oracle, so parity is checked, not asserted.
+
+**Frozen reference.** `go\` and its original `src\main\java\me\potflix\rpc\Main.java`
+are retained as the frozen reference: `go\` is the oracle the cleaner is proven
+against and the behaviour the Rust port must match, and `Main.java` is the source
+of the original Java golden set. Neither is edited.
+
+The record below is the original cleaner-port bake-off, kept because the Rust
+parity oracle is derived from its Go result.
+
+## Record: media-title cleaner port (original bake-off)
 
 **Verdict: Go.**
 

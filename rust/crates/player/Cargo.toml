@@ -1,0 +1,11 @@
+# `player` -- the Go package `go\internal\player`: PotPlayer window discovery,
+# the `WM_USER` queries, the on-disk path query and transport control.
+
+[package]
+name = "player"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+windows-sys.workspace = true

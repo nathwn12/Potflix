@@ -1,0 +1,710 @@
+//! `win32` -- mirrors the Go root file `go\win32.go`.
+//!
+//! The raw Win32 surface: `user32`, `kernel32`, `shell32`, `gdi32`, `ole32` and
+//! the procedure pointers Go reaches through `syscall.NewLazyDLL` /
+//! `NewLazyProc`. In Rust this is `windows-sys` (feature-gated bindings), with
+//! the same DLLs and the same procedures -- no C toolchain, no `cc` dependency.
+//!
+//! # Layout law
+//!
+//! The Go port hands Win32 raw struct pointers, so every struct below is a
+//! byte-exact mirror of `go\win32.go`: pointer-sized fields are `uintptr`
+//! (`usize` here, 8 bytes on amd64), fixed fields stay `u32`/`i32`, and
+//! `#[repr(C)]` reproduces the two 4-byte pads Go inserts in `NOTIFYICONDATAW`
+//! (after `cbSize`, and after `uCallbackMessage`/`hIcon`). A wrong offset is a
+//! silent runtime failure -- `Shell_NotifyIconW` just returns FALSE -- so every
+//! struct carries a compile-time size assertion and `#[cfg(test)]` offset
+//! assertions: adding, removing, or reordering a field must break the build,
+//! never the tray. The field names are snake_case (Go's are camelCase); the
+//! offset assertions, not the names, are what pin the ABI.
+//!
+//! Measured with `go1.27.0` `unsafe.Sizeof` on amd64 and asserted below:
+//! `wndClassEx` 80, `guid` 16, `notifyIconData` 976, `point` 8, `msgT` 48,
+//! `rect` 16, `paintStruct` **72**, `browseInfoW` 64, `trackMouseEvent` 24.
+//!
+//! `paintStruct` is the one place the Go source comment is wrong: `win32.go:240`
+//! (and the port map) say "68 bytes on amd64", but 68 is the sum of the field
+//! widths, not the ABI size. Go rounds the struct up to its 8-byte alignment and
+//! reports 72, exactly like `PAINTSTRUCT` in the Windows headers -- so 72 is
+//! asserted here. A 68-byte buffer would be a stack overwrite by `BeginPaint`.
+//!
+//! 32-bit (x86) layouts are unverified (the port map flags them), so the size
+//! assertions are gated to `x86_64` rather than pretending to cover x86.
+//!
+//! # Value traps reproduced, not smoothed over
+//!
+//! * `cwUseDefault` (`win32.go:229`) is `CW_USEDEFAULT`, i.e. `(int)-2147483648`
+//!   -- see [`CW_USEDEFAULT`].
+//! * `attachParentProcess` / `stdOutputHandle` / `stdErrorHandle`
+//!   (`win32.go:75-78`) are Go's `^uintptr(n)` complement form -- see
+//!   [`ATTACH_PARENT_PROCESS`].
+
+use core::mem::size_of;
+
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+
+// ---------------------------------------------------------------------------
+// Binding table (`go\win32.go:8-36`).
+//
+// Each `pub use` IS the proc pointer Go builds with `NewLazyProc`: same DLL,
+// same entry point. A few user32 entries live in `windows-sys`'s `Gdi` module
+// because the header that documents them is `wingdi.h`, not because the DLL
+// differs.
+// ---------------------------------------------------------------------------
+
+// user32 (`go\win32.go:13-28`).
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetForegroundWindow, TrackPopupMenu, TranslateMessage,
+};
+
+// kernel32 (`go\win32.go:30-33`).
+pub use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+pub use windows_sys::Win32::System::Console::{AttachConsole, GetStdHandle};
+pub use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+
+// shell32 (`go\win32.go:35`).
+pub use windows_sys::Win32::UI::Shell::{
+    SHBrowseForFolderW, SHGetPathFromIDListW, Shell_NotifyIconW,
+};
+
+// ---------------------------------------------------------------------------
+// Settings-window bindings (`go\win32.go:140-172`): paint, show, message,
+// cursor, and folder-picker procs; gdi32 + ole32.
+// ---------------------------------------------------------------------------
+
+// user32 (`go\win32.go:141-151`; `BeginPaint`/`EndPaint`/`DrawTextW`/
+// `UpdateWindow` are declared under `Gdi` in `windows-sys` but still come from
+// `user32.dll`).
+pub use windows_sys::Win32::Graphics::Gdi::{BeginPaint, DrawTextW, EndPaint, UpdateWindow};
+pub use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetDlgItem, LoadCursorW, SendMessageW, SetWindowTextW, ShowWindow,
+};
+
+// shell32 (`go\win32.go:153-154`).
+// gdi32 + ole32 (`go\win32.go:156-171`).
+pub use windows_sys::Win32::Graphics::Gdi::{
+    BitBlt, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC, DeleteObject, RoundRect,
+    SelectObject, SetBkMode, SetTextColor,
+};
+pub use windows_sys::Win32::System::Com::CoTaskMemFree;
+pub use windows_sys::Win32::System::Ole::OleInitialize;
+
+// ---------------------------------------------------------------------------
+// Owner-drawn settings-window bindings, round 2 (`go\win32.go:270-286`): DPI,
+// geometry, mouse tracking, and GDI helpers.
+// ---------------------------------------------------------------------------
+
+pub use windows_sys::Win32::Graphics::Gdi::{
+    CreateCompatibleBitmap, CreatePen, FillRect, GetStockObject, InvalidateRect,
+};
+pub use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+pub use windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent;
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AdjustWindowRectEx, DrawIconEx, GetSystemMetrics, GetWindowRect, MoveWindow, SetCursor,
+};
+
+// ---------------------------------------------------------------------------
+// Window messages (`go\win32.go:38-49`).
+// ---------------------------------------------------------------------------
+
+pub const WM_NULL: u32 = 0x0000;
+pub const WM_DESTROY: u32 = 0x0002;
+pub const WM_CLOSE: u32 = 0x0010;
+pub const WM_RBUTTON_UP: u32 = 0x0205;
+pub const WM_CONTEXT_MENU: u32 = 0x007B;
+
+pub const WM_APP: u32 = 0x8000;
+/// `Shell_NotifyIconW` callback message (`go\win32.go:47`).
+pub const WM_APP_TRAY: u32 = WM_APP + 1;
+/// Self-posted: stop the message loop (`go\win32.go:48`).
+pub const WM_APP_QUIT: u32 = WM_APP + 2;
+
+// `NOTIFYICONDATAW` flags and `Shell_NotifyIconW` verbs (`go\win32.go:52-59`).
+pub const NIM_ADD: u32 = 0x00000000;
+pub const NIM_DELETE: u32 = 0x00000002;
+
+pub const NIF_MESSAGE: u32 = 0x00000001;
+pub const NIF_ICON: u32 = 0x00000002;
+pub const NIF_TIP: u32 = 0x00000004;
+
+// Menu / popup flags (`go\win32.go:62-67`).
+pub const MF_STRING: u32 = 0x00000000;
+pub const TPM_RIGHT_BUTTON: u32 = 0x0002;
+pub const TPM_BOTTOM_ALIGN: u32 = 0x0020;
+pub const TPM_RETURN_CMD: u32 = 0x0100;
+
+// `CreateIconFromResourceEx` / `CreateFileW` constants (`go\win32.go:70-79`).
+pub const ICON_RESOURCE_VERSION: u32 = 0x00030000;
+pub const GENERIC_WRITE: u32 = 0x40000000;
+pub const FILE_SHARE_READ_WRITE: u32 = 0x00000001 | 0x00000002;
+pub const OPEN_EXISTING: u32 = 3;
+
+/// Go `attachParentProcess = ^uintptr(0)` (`win32.go:75`): `(DWORD)-1`, the
+/// complement form. Spelled as the complement of zero, not as a literal, so the
+/// 32-bit parameter value is provably the same bits Go passes.
+pub const ATTACH_PARENT_PROCESS: u32 = !0;
+
+/// Go `stdOutputHandle = ^uintptr(10)` (`win32.go:77`): `(DWORD)-11`,
+/// `STD_OUTPUT_HANDLE`.
+pub const STD_OUTPUT_HANDLE: u32 = !10;
+
+/// Go `stdErrorHandle = ^uintptr(11)` (`win32.go:78`): `(DWORD)-12`,
+/// `STD_ERROR_HANDLE`.
+pub const STD_ERROR_HANDLE: u32 = !11;
+
+// Show / paint / icon messages (`go\win32.go:175-185`).
+pub const SW_HIDE: i32 = 0;
+pub const SW_SHOW: i32 = 5;
+
+pub const WM_PAINT: u32 = 0x000F;
+pub const WM_COMMAND: u32 = 0x0111;
+pub const WM_SET_ICON: u32 = 0x0080;
+
+pub const ICON_SMALL: u32 = 0;
+pub const ICON_BIG: u32 = 1;
+
+// Window / control styles used by the settings window (`go\win32.go:188-200`).
+pub const WS_CAPTION: u32 = 0x00C00000;
+pub const WS_SYS_MENU: u32 = 0x00080000;
+pub const WS_MINIMIZE_BOX: u32 = 0x00020000;
+pub const WS_CHILD: u32 = 0x40000000;
+pub const WS_VISIBLE: u32 = 0x10000000;
+pub const WS_BORDER: u32 = 0x00800000;
+pub const WS_V_SCROLL: u32 = 0x00200000;
+pub const WS_TAB_STOP: u32 = 0x00010000;
+
+pub const LBS_NOTIFY: u32 = 0x0001;
+pub const BN_CLICKED: u32 = 0;
+
+// List box messages used by the settings window (`go\win32.go:203-209`).
+pub const LB_ADD_STRING: u32 = 0x0180;
+pub const LB_DELETE_STRING: u32 = 0x0182;
+pub const LB_RESET_CONTENT: u32 = 0x0184;
+pub const LB_GET_CUR_SEL: u32 = 0x0188;
+pub const LB_GET_TEXT: u32 = 0x0189;
+
+// Paint constants used by the settings window (`go\win32.go:212-230`).
+pub const DT_LEFT: u32 = 0x0000;
+pub const DT_SINGLE_LINE: u32 = 0x0020;
+pub const DT_NO_PREFIX: u32 = 0x0800;
+
+pub const TRANSPARENT: i32 = 1;
+
+pub const FW_NORMAL: i32 = 400;
+pub const FW_BOLD: i32 = 700;
+
+pub const DEFAULT_CHARSET: u32 = 1;
+
+/// `MAKEINTRESOURCE(32512)`, `IDC_ARROW` (`go\win32.go:224`). The proc takes a
+/// `PCWSTR`, so a caller passes `IDC_ARROW as usize as *const u16`.
+pub const IDC_ARROW: u32 = 32512;
+
+pub const BIF_RETURN_ONLY_FS_DIRS: u32 = 0x0001;
+pub const BIF_NEW_DIALOG_STYLE: u32 = 0x0040;
+
+/// Go `cwUseDefault = uintptr(0x80000000)` (`win32.go:229`).
+///
+/// `CW_USEDEFAULT` is `(int)-2147483648`: the bit pattern `0x8000_0000` read as
+/// a **signed** 32-bit value. The trap is reproducing it as a `u32` and widening
+/// it zero-extended -- `0x0000_0000_8000_0000` is pixel 2147483648, not "let
+/// Windows pick the position". Kept as `i32` here, so every widening
+/// (`CW_USEDEFAULT as i64`) sign-extends to `0xFFFF_FFFF_8000_0000`, which is
+/// what an `INT` parameter receives on x64.
+pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
+
+// Owner-drawn window messages (`go\win32.go:289-298`).
+pub const WM_MOUSE_MOVE: u32 = 0x0200;
+pub const WM_L_BUTTON_DOWN: u32 = 0x0201;
+pub const WM_L_BUTTON_UP: u32 = 0x0202;
+pub const WM_SET_CURSOR: u32 = 0x0020;
+pub const WM_ERASE_BKGND: u32 = 0x0014;
+pub const WM_SIZE: u32 = 0x0005;
+pub const WM_DPI_CHANGED: u32 = 0x02E0;
+pub const WM_MOUSE_LEAVE: u32 = 0x02A3;
+
+// `DrawTextW` alignment/ellipsis flags for the owner-drawn UI
+// (`go\win32.go:301-306`).
+pub const DT_CENTER: u32 = 0x0001;
+pub const DT_RIGHT: u32 = 0x0002;
+pub const DT_V_CENTER: u32 = 0x0004;
+pub const DT_END_ELLIPSIS: u32 = 0x8000;
+
+// Pen, blit, icon, cursor, and metrics constants (`go\win32.go:309-326`).
+pub const PS_SOLID: i32 = 0;
+
+pub const SRCCOPY: u32 = 0x00CC0020;
+
+pub const DI_NORMAL: u32 = 0x0003;
+
+/// `MAKEINTRESOURCE(32649)`, `IDC_HAND` (`go\win32.go:316`).
+pub const IDC_HAND: u32 = 32649;
+
+pub const SM_CX_SCREEN: i32 = 0;
+pub const SM_CY_SCREEN: i32 = 1;
+
+pub const TME_LEAVE: u32 = 0x00000002;
+
+pub const FW_SEMI_BOLD: i32 = 600;
+
+pub const NULL_BRUSH_STOCK: i32 = 5;
+
+// ---------------------------------------------------------------------------
+// Structs (`go\win32.go:81-135, :232-265, :328-334`).
+// ---------------------------------------------------------------------------
+
+/// `WNDPROC`: the window-procedure signature both windows register.
+pub type WndProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT;
+
+/// Go `wndClassEx` (`win32.go:81-94`) -- `WNDCLASSEXW`, 80 bytes on amd64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct WndClassEx {
+    pub cb_size: u32,
+    pub style: u32,
+    pub lpfn_wnd_proc: usize,
+    pub cb_cls_extra: i32,
+    pub cb_wnd_extra: i32,
+    pub h_instance: usize,
+    pub h_icon: usize,
+    pub h_cursor: usize,
+    pub hbr_background: usize,
+    pub lpsz_menu_name: *const u16,
+    pub lpsz_class_name: *const u16,
+    pub h_icon_sm: usize,
+}
+
+/// Go `guid` (`win32.go:96-101`) -- 16 bytes, the same shape as
+/// `windows_sys::core::GUID`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Guid {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+/// Go `notifyIconData` (`win32.go:103-120`) -- `NOTIFYICONDATAW`, Vista+ layout,
+/// **976 bytes on amd64**.
+///
+/// The two pads are implicit in `#[repr(C)]` and asserted in the tests: 4 bytes
+/// after `cb_size` (so `h_wnd` lands on 8) and 4 bytes after `u_callback_message`
+/// (so `h_icon` lands on 32). `guid_item` is 4-aligned, which leaves
+/// `h_balloon_icon` at 968 with no extra pad.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct NotifyIconData {
+    pub cb_size: u32,
+    pub h_wnd: usize,
+    pub u_id: u32,
+    pub u_flags: u32,
+    pub u_callback_message: u32,
+    pub h_icon: usize,
+    pub sz_tip: [u16; 128],
+    pub dw_state: u32,
+    pub dw_state_mask: u32,
+    pub sz_info: [u16; 256],
+    pub u_timeout: u32,
+    pub sz_info_title: [u16; 64],
+    pub dw_info_flags: u32,
+    pub guid_item: Guid,
+    pub h_balloon_icon: usize,
+}
+
+/// Go `var nid notifyIconData` (`tray.go:102`): zeroed, then filled in.
+impl Default for NotifyIconData {
+    fn default() -> Self {
+        // SAFETY: every field is an integer, an integer array, or a raw pointer,
+        // so an all-zero value is valid for the type.
+        unsafe { core::mem::zeroed() }
+    }
+}
+
+/// Go `point` (`win32.go:122-125`) -- `POINT`, 8 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Point {
+    pub x: i32,
+    pub y: i32,
+}
+
+/// Go `msgT` (`win32.go:128-135`) -- `MSG`, 48 bytes on amd64.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MsgT {
+    pub hwnd: usize,
+    pub message: u32,
+    pub w_param: usize,
+    pub l_param: usize,
+    pub time: u32,
+    pub pt: Point,
+}
+
+/// Go `rect` (`win32.go:233-238`) -- `RECT`, 16 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// Go `paintStruct` (`win32.go:241-251`) -- `PAINTSTRUCT`, **72 bytes** on amd64
+/// (see the module doc: the Go comment's "68" is the field-width sum, not the
+/// ABI size).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PaintStruct {
+    pub hdc: usize,
+    pub erase: i32,
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+    pub restore: i32,
+    pub inc_update: i32,
+    pub reserved: [u8; 32],
+}
+
+/// Go `browseInfoW` (`win32.go:254-265`) -- `BROWSEINFOW`, 64 bytes on amd64.
+///
+/// Go names both explicit pads `_`; Rust has no blank field name, so they are
+/// `_pad0` / `_pad1` and are never read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct BrowseInfoW {
+    pub hwnd_owner: usize,
+    pub pidl_root: usize,
+    pub display_name: *const u16,
+    pub title: *const u16,
+    pub flags: u32,
+    pub _pad0: u32,
+    pub callback: usize,
+    pub l_param: usize,
+    pub image: i32,
+    pub _pad1: i32,
+}
+
+/// Go `trackMouseEvent` (`win32.go:329-334`) -- `TRACKMOUSEEVENT`, 24 bytes on
+/// amd64 (4 bytes of tail padding after `dw_hover_time`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrackMouseEvent {
+    pub cb_size: u32,
+    pub dw_flags: u32,
+    pub hwnd_track: usize,
+    pub dw_hover_time: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time size assertions: a field added or reordered here fails the
+// build, not `Shell_NotifyIconW`/`RegisterClassExW`/`BeginPaint` at runtime.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<WndClassEx>() == 80);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<Guid>() == 16);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<NotifyIconData>() == 976);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<Point>() == 8);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<MsgT>() == 48);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<Rect>() == 16);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<PaintStruct>() == 72);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<BrowseInfoW>() == 64);
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<TrackMouseEvent>() == 24);
+
+// ---------------------------------------------------------------------------
+// UTF-16 helpers (Go reaches for `syscall.UTF16PtrFromString` /
+// `syscall.StringToUTF16`, which Rust's std does not provide).
+// ---------------------------------------------------------------------------
+
+/// Go `syscall.UTF16PtrFromString(s)`: `s` as NUL-terminated UTF-16 units. The
+/// returned `Vec` owns the buffer; callers pass `.as_ptr()` and keep it alive
+/// across the call (Win32 only reads it during the call).
+pub fn utf16_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(core::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::mem::{offset_of, size_of};
+
+    use windows_sys::Win32::Graphics::Gdi as gdi;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse as kbm;
+    use windows_sys::Win32::UI::Shell as shell;
+    use windows_sys::Win32::UI::WindowsAndMessaging as wam;
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn struct_sizes_match_the_go_measurement() {
+        // `unsafe.Sizeof` on go1.27.0 amd64, one line per struct.
+        assert_eq!(size_of::<WndClassEx>(), 80);
+        assert_eq!(size_of::<Guid>(), 16);
+        assert_eq!(size_of::<NotifyIconData>(), 976);
+        assert_eq!(size_of::<Point>(), 8);
+        assert_eq!(size_of::<MsgT>(), 48);
+        assert_eq!(size_of::<Rect>(), 16);
+        // 68 is the field-width sum; Go's own Sizeof rounds it to the 8-byte
+        // alignment, and so does `#[repr(C)]`. `BeginPaint` writes 72 bytes.
+        assert_eq!(size_of::<PaintStruct>(), 72);
+        assert_eq!(size_of::<BrowseInfoW>(), 64);
+        assert_eq!(size_of::<TrackMouseEvent>(), 24);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn notify_icon_data_offsets_match_the_vista_layout() {
+        assert_eq!(offset_of!(NotifyIconData, cb_size), 0);
+        // 4-byte pad after cb_size, then the window handle.
+        assert_eq!(offset_of!(NotifyIconData, h_wnd), 8);
+        assert_eq!(offset_of!(NotifyIconData, u_id), 16);
+        assert_eq!(offset_of!(NotifyIconData, u_flags), 20);
+        assert_eq!(offset_of!(NotifyIconData, u_callback_message), 24);
+        // 4-byte pad after uCallbackMessage, then the icon handle.
+        assert_eq!(offset_of!(NotifyIconData, h_icon), 32);
+        assert_eq!(offset_of!(NotifyIconData, sz_tip), 40);
+        assert_eq!(offset_of!(NotifyIconData, dw_state), 296);
+        assert_eq!(offset_of!(NotifyIconData, dw_state_mask), 300);
+        assert_eq!(offset_of!(NotifyIconData, sz_info), 304);
+        assert_eq!(offset_of!(NotifyIconData, u_timeout), 816);
+        assert_eq!(offset_of!(NotifyIconData, sz_info_title), 820);
+        assert_eq!(offset_of!(NotifyIconData, dw_info_flags), 948);
+        assert_eq!(offset_of!(NotifyIconData, guid_item), 952);
+        assert_eq!(offset_of!(NotifyIconData, h_balloon_icon), 968);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn wnd_class_ex_offsets_match_the_go_field_order() {
+        assert_eq!(offset_of!(WndClassEx, cb_size), 0);
+        assert_eq!(offset_of!(WndClassEx, style), 4);
+        assert_eq!(offset_of!(WndClassEx, lpfn_wnd_proc), 8);
+        assert_eq!(offset_of!(WndClassEx, cb_cls_extra), 16);
+        assert_eq!(offset_of!(WndClassEx, cb_wnd_extra), 20);
+        assert_eq!(offset_of!(WndClassEx, h_instance), 24);
+        assert_eq!(offset_of!(WndClassEx, h_icon), 32);
+        assert_eq!(offset_of!(WndClassEx, h_cursor), 40);
+        assert_eq!(offset_of!(WndClassEx, hbr_background), 48);
+        assert_eq!(offset_of!(WndClassEx, lpsz_menu_name), 56);
+        assert_eq!(offset_of!(WndClassEx, lpsz_class_name), 64);
+        assert_eq!(offset_of!(WndClassEx, h_icon_sm), 72);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn paint_struct_offsets_match_the_go_field_order() {
+        assert_eq!(offset_of!(PaintStruct, hdc), 0);
+        assert_eq!(offset_of!(PaintStruct, erase), 8);
+        assert_eq!(offset_of!(PaintStruct, left), 12);
+        assert_eq!(offset_of!(PaintStruct, top), 16);
+        assert_eq!(offset_of!(PaintStruct, right), 20);
+        assert_eq!(offset_of!(PaintStruct, bottom), 24);
+        assert_eq!(offset_of!(PaintStruct, restore), 28);
+        assert_eq!(offset_of!(PaintStruct, inc_update), 32);
+        assert_eq!(offset_of!(PaintStruct, reserved), 36);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn msg_and_tracking_offsets_match_the_go_field_order() {
+        assert_eq!(offset_of!(MsgT, hwnd), 0);
+        assert_eq!(offset_of!(MsgT, message), 8);
+        assert_eq!(offset_of!(MsgT, w_param), 16);
+        assert_eq!(offset_of!(MsgT, l_param), 24);
+        assert_eq!(offset_of!(MsgT, time), 32);
+        assert_eq!(offset_of!(MsgT, pt), 36);
+        assert_eq!(offset_of!(TrackMouseEvent, cb_size), 0);
+        assert_eq!(offset_of!(TrackMouseEvent, dw_flags), 4);
+        assert_eq!(offset_of!(TrackMouseEvent, hwnd_track), 8);
+        assert_eq!(offset_of!(TrackMouseEvent, dw_hover_time), 16);
+        assert_eq!(offset_of!(BrowseInfoW, flags), 32);
+        assert_eq!(offset_of!(BrowseInfoW, _pad0), 36);
+        assert_eq!(offset_of!(BrowseInfoW, callback), 40);
+        assert_eq!(offset_of!(BrowseInfoW, l_param), 48);
+        assert_eq!(offset_of!(BrowseInfoW, image), 56);
+        assert_eq!(offset_of!(BrowseInfoW, _pad1), 60);
+    }
+
+    /// The mirrors are cast to the `windows-sys` structs at the call sites, so
+    /// they must be the same size as the bindings' own types. This is what makes
+    /// those casts sound.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn mirrors_are_the_same_size_as_the_windows_sys_structs() {
+        assert_eq!(size_of::<WndClassEx>(), size_of::<wam::WNDCLASSEXW>());
+        assert_eq!(
+            size_of::<NotifyIconData>(),
+            size_of::<shell::NOTIFYICONDATAW>()
+        );
+        assert_eq!(size_of::<MsgT>(), size_of::<wam::MSG>());
+        assert_eq!(
+            size_of::<Point>(),
+            size_of::<windows_sys::Win32::Foundation::POINT>()
+        );
+        assert_eq!(
+            size_of::<Rect>(),
+            size_of::<windows_sys::Win32::Foundation::RECT>()
+        );
+        assert_eq!(size_of::<PaintStruct>(), size_of::<gdi::PAINTSTRUCT>());
+        assert_eq!(
+            size_of::<TrackMouseEvent>(),
+            size_of::<kbm::TRACKMOUSEEVENT>()
+        );
+        assert_eq!(size_of::<BrowseInfoW>(), size_of::<shell::BROWSEINFOW>());
+        assert_eq!(size_of::<Guid>(), size_of::<windows_sys::core::GUID>());
+    }
+
+    #[test]
+    fn cw_use_default_sign_extends() {
+        assert_eq!(CW_USEDEFAULT, i32::MIN);
+        assert_eq!(CW_USEDEFAULT as u32, 0x8000_0000);
+        // Widening sign-extends -- what an INT parameter receives on x64.
+        assert_eq!(CW_USEDEFAULT as i64, -2147483648);
+        assert_eq!(CW_USEDEFAULT as i64 as u64, 0xFFFF_FFFF_8000_0000);
+        // The trap: the zero-extended form is a different value (pixel
+        // 2147483648, not "let Windows choose").
+        assert_ne!(CW_USEDEFAULT as i64 as u64, 0x0000_0000_8000_0000);
+        assert_ne!(
+            (CW_USEDEFAULT as u32) as i64 as u64,
+            CW_USEDEFAULT as i64 as u64
+        );
+        assert_eq!(CW_USEDEFAULT, wam::CW_USEDEFAULT);
+    }
+
+    #[test]
+    fn complement_constants_are_the_negative_dwords() {
+        // Go: ^uintptr(0), ^uintptr(10), ^uintptr(11) -- the low 32 bits are
+        // (DWORD)-1, (DWORD)-11, (DWORD)-12.
+        assert_eq!(ATTACH_PARENT_PROCESS, !0u32);
+        assert_eq!(STD_OUTPUT_HANDLE, !10u32);
+        assert_eq!(STD_ERROR_HANDLE, !11u32);
+        assert_eq!(ATTACH_PARENT_PROCESS, 0xFFFF_FFFF);
+        assert_eq!(STD_OUTPUT_HANDLE, 0xFFFF_FFF5);
+        assert_eq!(STD_ERROR_HANDLE, 0xFFFF_FFF4);
+        assert_eq!(STD_OUTPUT_HANDLE, -11i32 as u32);
+        assert_eq!(STD_ERROR_HANDLE, -12i32 as u32);
+    }
+
+    #[test]
+    fn message_ids_are_the_go_values() {
+        assert_eq!(WM_APP, 0x8000);
+        assert_eq!(WM_APP_TRAY, 0x8001);
+        assert_eq!(WM_APP_QUIT, 0x8002);
+        assert_eq!(WM_NULL, 0x0000);
+        assert_eq!(WM_DESTROY, 0x0002);
+        assert_eq!(WM_CLOSE, 0x0010);
+        assert_eq!(WM_RBUTTON_UP, 0x0205);
+        assert_eq!(WM_CONTEXT_MENU, 0x007B);
+        assert_eq!(WM_MOUSE_MOVE, 0x0200);
+        assert_eq!(WM_MOUSE_LEAVE, 0x02A3);
+        assert_eq!(WM_DPI_CHANGED, 0x02E0);
+        assert_eq!(WM_ERASE_BKGND, 0x0014);
+        assert_eq!(WM_SIZE, 0x0005);
+        assert_eq!(WM_SET_CURSOR, 0x0020);
+        assert_eq!(WM_SET_ICON, 0x0080);
+        assert_eq!(WM_PAINT, 0x000F);
+        assert_eq!(WM_COMMAND, 0x0111);
+    }
+
+    /// The declared values must be the values the bindings themselves use, or a
+    /// call goes out with the wrong flag.
+    #[test]
+    fn flag_and_style_constants_agree_with_windows_sys() {
+        assert_eq!(NIM_ADD, shell::NIM_ADD);
+        assert_eq!(NIM_DELETE, shell::NIM_DELETE);
+        assert_eq!(NIF_MESSAGE, shell::NIF_MESSAGE);
+        assert_eq!(NIF_ICON, shell::NIF_ICON);
+        assert_eq!(NIF_TIP, shell::NIF_TIP);
+        assert_eq!(BIF_RETURN_ONLY_FS_DIRS, shell::BIF_RETURNONLYFSDIRS);
+        assert_eq!(BIF_NEW_DIALOG_STYLE, shell::BIF_NEWDIALOGSTYLE);
+
+        assert_eq!(MF_STRING, wam::MF_STRING);
+        assert_eq!(TPM_RIGHT_BUTTON, wam::TPM_RIGHTBUTTON);
+        assert_eq!(TPM_BOTTOM_ALIGN, wam::TPM_BOTTOMALIGN);
+        assert_eq!(TPM_RETURN_CMD, wam::TPM_RETURNCMD);
+        assert_eq!(ICON_SMALL, wam::ICON_SMALL);
+        assert_eq!(ICON_BIG, wam::ICON_BIG);
+        assert_eq!(SW_HIDE, wam::SW_HIDE);
+        assert_eq!(SW_SHOW, wam::SW_SHOW);
+        assert_eq!(LBS_NOTIFY as i32, wam::LBS_NOTIFY);
+        assert_eq!(BN_CLICKED, wam::BN_CLICKED);
+        assert_eq!(WS_CAPTION, wam::WS_CAPTION);
+        assert_eq!(WS_SYS_MENU, wam::WS_SYSMENU);
+        assert_eq!(WS_MINIMIZE_BOX, wam::WS_MINIMIZEBOX);
+        assert_eq!(WS_CHILD, wam::WS_CHILD);
+        assert_eq!(WS_VISIBLE, wam::WS_VISIBLE);
+        assert_eq!(WS_BORDER, wam::WS_BORDER);
+        assert_eq!(WS_V_SCROLL, wam::WS_VSCROLL);
+        assert_eq!(WS_TAB_STOP, wam::WS_TABSTOP);
+        // Resource ids are passed as PCWSTR, so compare the integer value.
+        assert_eq!(IDC_ARROW as usize, wam::IDC_ARROW as usize);
+        assert_eq!(IDC_HAND as usize, wam::IDC_HAND as usize);
+        assert_eq!(WM_NULL, wam::WM_NULL);
+        assert_eq!(WM_DESTROY, wam::WM_DESTROY);
+        assert_eq!(WM_CLOSE, wam::WM_CLOSE);
+        assert_eq!(WM_RBUTTON_UP, wam::WM_RBUTTONUP);
+        assert_eq!(WM_CONTEXT_MENU, wam::WM_CONTEXTMENU);
+        assert_eq!(WM_APP, wam::WM_APP);
+        assert_eq!(WM_PAINT, wam::WM_PAINT);
+        assert_eq!(WM_COMMAND, wam::WM_COMMAND);
+        assert_eq!(WM_SET_ICON, wam::WM_SETICON);
+        assert_eq!(WM_MOUSE_MOVE, wam::WM_MOUSEMOVE);
+        assert_eq!(WM_L_BUTTON_DOWN, wam::WM_LBUTTONDOWN);
+        assert_eq!(WM_L_BUTTON_UP, wam::WM_LBUTTONUP);
+        assert_eq!(WM_SET_CURSOR, wam::WM_SETCURSOR);
+        assert_eq!(WM_ERASE_BKGND, wam::WM_ERASEBKGND);
+        assert_eq!(WM_SIZE, wam::WM_SIZE);
+        assert_eq!(WM_DPI_CHANGED, wam::WM_DPICHANGED);
+        assert_eq!(LB_ADD_STRING, wam::LB_ADDSTRING);
+        assert_eq!(LB_DELETE_STRING, wam::LB_DELETESTRING);
+        assert_eq!(LB_RESET_CONTENT, wam::LB_RESETCONTENT);
+        assert_eq!(LB_GET_CUR_SEL, wam::LB_GETCURSEL);
+        assert_eq!(LB_GET_TEXT, wam::LB_GETTEXT);
+
+        assert_eq!(DT_LEFT, gdi::DT_LEFT);
+        assert_eq!(DT_CENTER, gdi::DT_CENTER);
+        assert_eq!(DT_RIGHT, gdi::DT_RIGHT);
+        assert_eq!(DT_V_CENTER, gdi::DT_VCENTER);
+        assert_eq!(DT_SINGLE_LINE, gdi::DT_SINGLELINE);
+        assert_eq!(DT_NO_PREFIX, gdi::DT_NOPREFIX);
+        assert_eq!(DT_END_ELLIPSIS, gdi::DT_END_ELLIPSIS);
+        assert_eq!(PS_SOLID, gdi::PS_SOLID);
+        assert_eq!(SRCCOPY, gdi::SRCCOPY);
+        assert_eq!(DI_NORMAL, wam::DI_NORMAL);
+        assert_eq!(NULL_BRUSH_STOCK, gdi::NULL_BRUSH);
+        assert_eq!(DEFAULT_CHARSET as u8, gdi::DEFAULT_CHARSET);
+        assert_eq!(TRANSPARENT as u32, gdi::TRANSPARENT);
+        assert_eq!(FW_NORMAL as u32, gdi::FW_NORMAL);
+        assert_eq!(FW_BOLD as u32, gdi::FW_BOLD);
+        assert_eq!(FW_SEMI_BOLD as u32, gdi::FW_SEMIBOLD);
+        assert_eq!(SM_CX_SCREEN, wam::SM_CXSCREEN);
+        assert_eq!(SM_CY_SCREEN, wam::SM_CYSCREEN);
+        assert_eq!(TME_LEAVE, kbm::TME_LEAVE);
+        assert_eq!(ICON_RESOURCE_VERSION, 0x0003_0000);
+        assert_eq!(GENERIC_WRITE, windows_sys::Win32::Foundation::GENERIC_WRITE);
+        assert_eq!(FILE_SHARE_READ_WRITE, 3);
+        assert_eq!(
+            OPEN_EXISTING,
+            windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING
+        );
+    }
+
+    #[test]
+    fn utf16_z_is_nul_terminated() {
+        assert_eq!(utf16_z(""), [0]);
+        assert_eq!(utf16_z("Potflix"), [80, 111, 116, 102, 108, 105, 120, 0]);
+        assert_eq!(utf16_z("PotflixTrayWnd").len(), 14 + 1);
+    }
+}

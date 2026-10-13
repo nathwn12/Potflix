@@ -1,0 +1,21 @@
+# `metadata-core` -- the shared, network-free half of the Go package
+# `go\internal\metadata`: record types, filename parsing, candidate matching,
+# alternate titles and request context.
+#
+# `titleclean` is the only intra-repo edge: `parse.rs` and `context.rs` run
+# their transcribed Go patterns through its `Regex`/`port_pattern` (the
+# workspace pins no regex crate) and `match_.rs` reads its JDK-11 Mn table.
+# `metadata-http` and `metadata` build on this crate.
+
+[package]
+name = "metadata-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+titleclean = { path = "../titleclean" }
+
+[dev-dependencies]
+serde_json.workspace = true

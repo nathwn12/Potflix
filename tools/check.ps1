@@ -1,8 +1,10 @@
 # check.ps1 - one-command local verification gate for Potflix.
 #
-# Runs vet and the test suite from `go\`, and with the flags also rebuilds the
-# app and runs the headless self-test. Fails fast: the first failing step stops
-# the run with a non-zero exit code, so it is safe to use as a release gate.
+# Runs clippy and the release test suite from `rust\`, verifies the built
+# title-cleaner against the parity oracle (rust\parity-golden.sha256), and with
+# the flags also rebuilds the app and runs the headless self-test. Fails fast:
+# the first failing step stops the run with a non-zero exit code, so it is safe
+# to use as a release gate.
 #
 #   powershell -ExecutionPolicy Bypass -File tools\check.ps1
 #   powershell -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest
@@ -19,107 +21,184 @@ function Get-Literal([string]$Path) {
   return [WildcardPattern]::Escape($Path)
 }
 
-# Resolve the repo root from this script's own path (it lives in tools\), so the
-# gate behaves identically from any current directory. Same as tools\build.ps1.
-$root = Split-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) -Parent
-$goDir = Join-Path $root 'go'
+# The title-cleaner parity corpora, in oracle order. Only the corpora live here;
+# the expected hashes come from rust\parity-golden.sha256, so the oracle stays
+# the single source of truth for the contract.
+$parityCorpora = @('tools\titles-sample4.txt', 'tools\titles-sample.txt')
 
-# Preflight: every step below needs `go` on PATH. Exit with a distinct code so a
-# missing toolchain is never mistaken for a failing check. This runs before the
-# GOTMPDIR probe, which would itself fail as an unresolved command without it.
-if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
-  Write-Host 'ERROR: go not found on PATH (Potflix requires Go 1.27+).' -ForegroundColor Red
+# Compare one built output against its expected hash. Returns $true on a match;
+# on a mismatch it prints both hashes so the caller's failure carries them. It
+# is a function so the comparator itself can be exercised in isolation without
+# running the gate: dot-source this script, then call Test-ParityHash.
+function Test-ParityHash([string]$Expected, [string]$ActualPath) {
+  if (-not (Test-Path -LiteralPath $ActualPath)) {
+    Write-Host "  no output produced at $ActualPath"
+    return $false
+  }
+  $actual = (Get-FileHash -LiteralPath $ActualPath -Algorithm SHA256).Hash
+  if ($actual -eq $Expected.ToUpperInvariant()) {
+    Write-Host "  match $actual"
+    return $true
+  }
+  Write-Host "  expected $($Expected.ToUpperInvariant())"
+  Write-Host "  actual   $actual ($ActualPath)"
+  return $false
+}
+
+# Precondition for the self-test step. A missing binary is a real failure
+# (exit 1), not a missing toolchain (exit 2).
+function Assert-SelftestExe([string]$Exe) {
+  if (-not (Test-Path -LiteralPath $Exe)) {
+    Write-Host "CHECK FAILED: selftest ($Exe not found - run with -Build to produce it)" -ForegroundColor Red
+    exit 1
+  }
+}
+
+# The title-cleaner parity step: build the binary, run it over both corpora, and
+# require the frozen Go reference's hashes. The oracle holds hashes only (the
+# corpora are gitignored because they carry real media filenames), so a missing
+# oracle, a missing corpus, or an oracle line without a hash FAILS - none of
+# them is ever treated as "nothing to compare". It is a function so the guards
+# and the comparison can be exercised in isolation: dot-source this script,
+# then call Invoke-TitlecleanParity.
+function Invoke-TitlecleanParity([string]$Root, [string]$RustDir) {
+  Write-Host '[check] titleclean parity'
+
+  $oracle = Join-Path $RustDir 'parity-golden.sha256'
+  if (-not (Test-Path -LiteralPath $oracle)) {
+    Write-Host "CHECK FAILED: titleclean parity ($oracle not found)" -ForegroundColor Red
+    exit 1
+  }
+  $expected = @{}
+  foreach ($line in [IO.File]::ReadAllLines($oracle)) {
+    $t = $line.Trim()
+    if ($t -eq '' -or $t.StartsWith('#')) { continue }
+    if ($t -notmatch '^([0-9A-Fa-f]{64})\s+(\S.*)$') {
+      Write-Host "CHECK FAILED: titleclean parity ($oracle malformed data line: $t)" -ForegroundColor Red
+      exit 1
+    }
+    $expected[$Matches[2].Trim().Replace('\', '/')] = $Matches[1].ToUpperInvariant()
+  }
+  if ($expected.Count -eq 0) {
+    Write-Host "CHECK FAILED: titleclean parity ($oracle has no data lines)" -ForegroundColor Red
+    exit 1
+  }
+  foreach ($corpus in $parityCorpora) {
+    if (-not (Test-Path -LiteralPath (Join-Path $Root $corpus))) {
+      Write-Host "CHECK FAILED: titleclean parity ($corpus not found)" -ForegroundColor Red
+      exit 1
+    }
+    if (-not $expected.ContainsKey($corpus.Replace('\', '/'))) {
+      Write-Host "CHECK FAILED: titleclean parity ($oracle has no hash for $corpus)" -ForegroundColor Red
+      exit 1
+    }
+  }
+
+  $parityDir = Join-Path $Root 'build\parity'
+  if (-not (Test-Path -LiteralPath $parityDir -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path (Get-Literal $parityDir) | Out-Null
+  }
+
+  # Build the parity binary first, so a compile failure is reported as such.
+  Push-Location (Get-Literal $RustDir)
+  try {
+    cargo build --release --locked -p titleclean --bin titleclean
+    $buildCode = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+  if ($buildCode -ne 0) {
+    Write-Host "CHECK FAILED: titleclean parity (cargo build exited $buildCode)" -ForegroundColor Red
+    exit 1
+  }
+  $bin = Join-Path $RustDir 'target\release\titleclean.exe'
+
+  # Run from the repo root with repo-root-relative paths, exactly like the Go
+  # reference in the oracle header, so both binaries see the same arguments.
+  Push-Location (Get-Literal $Root)
+  try {
+    $mismatch = ''
+    foreach ($corpus in $parityCorpora) {
+      $out = Join-Path $parityDir ('actual-' + [IO.Path]::GetFileNameWithoutExtension($corpus) + '.tsv')
+      Write-Host "  titleclean -corpus $corpus -out build\parity\$([IO.Path]::GetFileName($out))"
+      & $bin -corpus $corpus -out $out
+      if ($LASTEXITCODE -ne 0) {
+        Write-Host "CHECK FAILED: titleclean parity (titleclean exited $LASTEXITCODE for $corpus)" -ForegroundColor Red
+        exit 1
+      }
+      if (-not (Test-ParityHash $expected[$corpus.Replace('\', '/')] $out)) {
+        if ($mismatch -eq '') { $mismatch = $corpus }
+      }
+    }
+  } finally {
+    Pop-Location
+  }
+  if ($mismatch -ne '') {
+    Write-Host "CHECK FAILED: titleclean parity (hash mismatch for $mismatch - expected and actual above)" -ForegroundColor Red
+    exit 1
+  }
+}
+
+# The steps below run when this file is invoked, never when it is dot-sourced:
+# dot-sourcing is how the comparators and guards above are exercised in isolation.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
+# Resolve the repo root from this script's own path (it lives in tools\), so the
+# gate behaves identically from any current directory. Same as tools\rust-build.ps1.
+$root = Split-Path (Split-Path $MyInvocation.MyCommand.Path -Parent) -Parent
+$rustDir = Join-Path $root 'rust'
+
+# Preflight: every step below needs `cargo` on PATH. Exit with a distinct code so
+# a missing toolchain is never mistaken for a failing check.
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+  Write-Host 'ERROR: cargo not found on PATH (Potflix builds with a Rust toolchain).' -ForegroundColor Red
   exit 2
 }
 
-# Go does not create GOTMPDIR; if a temp cleaner removes it, every go build/test
-# fails with "creating work dir: ... The system cannot find the file specified".
-# Create it when it is set and missing. No machine-specific path is hardcoded -
-# the directory is whatever `go env GOTMPDIR` reports. Go resolves a relative
-# GOTMPDIR against its own cwd, which this gate sets to go\, so resolve it the
-# same way here, and treat an existing file as not-a-directory.
-$goTmp = go env GOTMPDIR
-if (-not [string]::IsNullOrWhiteSpace($goTmp)) {
-  if (-not [IO.Path]::IsPathRooted($goTmp)) {
-    $goTmp = [IO.Path]::GetFullPath((Join-Path $goDir $goTmp))
-  } else {
-    $goTmp = [IO.Path]::GetFullPath($goTmp)
-  }
-  if (-not (Test-Path -LiteralPath $goTmp -PathType Container)) {
-    New-Item -ItemType Directory -Force -Path (Get-Literal $goTmp) | Out-Null
-  }
-}
-
-# go\embed.go resolves //go:embed relative to go\, so the compiled-in tray
-# icon is go\assets\icon.ico, not assets\icon.ico. design\make_logo.py writes
-# both; fail here if they ever drift apart again.
-Write-Host '[check] icon parity'
-$iconRoot = Join-Path $root 'assets\icon.ico'
-$iconGo = Join-Path $root 'go\assets\icon.ico'
-if (-not (Test-Path -LiteralPath $iconRoot)) {
-  Write-Host "CHECK FAILED: icon parity ($iconRoot not found)" -ForegroundColor Red
-  exit 1
-}
-if (-not (Test-Path -LiteralPath $iconGo)) {
-  Write-Host "CHECK FAILED: icon parity ($iconGo not found)" -ForegroundColor Red
-  exit 1
-}
-$iconA = [IO.File]::ReadAllBytes($iconRoot)
-$iconB = [IO.File]::ReadAllBytes($iconGo)
-$iconSame = ($iconA.Length -eq $iconB.Length) -and [Linq.Enumerable]::SequenceEqual($iconA, $iconB)
-if (-not $iconSame) {
-  Write-Host 'CHECK FAILED: icon parity (assets\icon.ico and go\assets\icon.ico differ; re-run python design\make_logo.py)' -ForegroundColor Red
+# rust\crates\app\build.rs embeds assets\icon.ico into the exe; fail here if it
+# ever goes missing rather than at build time.
+Write-Host '[check] icon'
+$icon = Join-Path $root 'assets\icon.ico'
+if (-not (Test-Path -LiteralPath $icon)) {
+  Write-Host "CHECK FAILED: icon ($icon not found)" -ForegroundColor Red
   exit 1
 }
 
-# `go version` is the first toolchain probe. A broken toolchain, or an inherited
-# GOFLAGS that go cannot even parse, must stop the run here rather than be
-# papered over by a later success.
-Write-Host '[check] go version'
-go version
-if ($LASTEXITCODE -ne 0) {
-  Write-Host "CHECK FAILED: go version (exit $LASTEXITCODE)" -ForegroundColor Red
-  exit 1
-}
-
-# An inherited GOFLAGS (`-n`, `-run=^$`, ...) can turn vet/test into no-ops
-# while still reporting success. Ignore it for those two checks, then restore
-# exactly what was there before.
-$savedGoFlags = $env:GOFLAGS
-$goFlagsWereSet = -not [string]::IsNullOrEmpty($env:GOFLAGS)
-if ($goFlagsWereSet) {
-  Write-Host "note: GOFLAGS='$savedGoFlags' is set and is ignored for this run."
-}
-$env:GOFLAGS = $null
-
-Push-Location (Get-Literal $goDir)
+Push-Location (Get-Literal $rustDir)
 try {
-  Write-Host '[check] go vet ./...'
-  go vet ./...
+  Write-Host '[check] clippy'
+  cargo clippy --workspace --all-targets -- -D warnings
   if ($LASTEXITCODE -ne 0) {
-    Write-Host "CHECK FAILED: vet (exit $LASTEXITCODE)" -ForegroundColor Red
+    Write-Host "CHECK FAILED: clippy (exit $LASTEXITCODE)" -ForegroundColor Red
     exit 1
   }
 
-  Write-Host '[check] go test ./... -count=1'
-  go test ./... -count=1
+  Write-Host '[check] test'
+  cargo test --workspace --release --locked
   if ($LASTEXITCODE -ne 0) {
     Write-Host "CHECK FAILED: test (exit $LASTEXITCODE)" -ForegroundColor Red
     exit 1
   }
 } finally {
   Pop-Location
-  $env:GOFLAGS = $savedGoFlags
 }
+
+Invoke-TitlecleanParity -Root $root -RustDir $rustDir
 
 if ($Build) {
   Write-Host '[check] build'
   try {
-    & (Join-Path $root 'tools\build.ps1')
+    # A stale $LASTEXITCODE from an earlier native command must not decide this.
+    $LASTEXITCODE = 0
+    & (Join-Path $root 'tools\rust-build.ps1')
   } catch {
     # A thrown cmdlet error leaves $LASTEXITCODE stale, so report the exception.
     Write-Host 'CHECK FAILED: build' -ForegroundColor Red
     Write-Host $_.Exception.Message
+    exit 1
+  }
+  if ($LASTEXITCODE -ne 0) {
+    Write-Host "CHECK FAILED: build (exit $LASTEXITCODE)" -ForegroundColor Red
     exit 1
   }
 }
@@ -127,15 +206,12 @@ if ($Build) {
 if ($Selftest) {
   $exe = Join-Path $root 'dist\potflix.exe'
   Write-Host '[check] selftest'
-  if (-not (Test-Path -LiteralPath $exe)) {
-    Write-Host "ERROR: $exe not found - run with -Build to produce it." -ForegroundColor Red
-    exit 1
-  }
+  Assert-SelftestExe $exe
 
   # Without -Build the exe may predate the current source; warn, never fail.
   if (-not $Build) {
     $exeTime = (Get-Item -LiteralPath $exe).LastWriteTimeUtc
-    $newest = Get-ChildItem -LiteralPath $goDir -Recurse -Filter *.go -File |
+    $newest = Get-ChildItem -LiteralPath $rustDir -Recurse -Filter *.rs -File |
       Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
     if ($newest -and $newest.LastWriteTimeUtc -gt $exeTime) {
       [Console]::Error.WriteLine("WARNING: $exe is older than $($newest.FullName); run with -Build to self-test the current source.")
@@ -143,15 +219,13 @@ if ($Selftest) {
   }
 
   # The app is built -H=windowsgui and, before it can run the self-test, takes
-  # the single-instance lock (go\main.go acquires it at :40-43 and exits 0 when
-  # 127.0.0.1:17843 is already held, before the selftest branch at :55-58). So a
-  # zero exit code alone cannot tell a real pass from a no-op. Capture both
-  # streams and require the success marker `M1 SELFTEST PASS` (go\selftest.go:567).
+  # the single-instance lock: a zero exit code alone cannot tell a real pass from
+  # a no-op. Capture both streams and require the success marker
+  # `M1 SELFTEST PASS`.
   #
   # The passing self-test deliberately spawns a second instance to prove the
-  # single-instance lock and echoes its message `Potflix is already running.`
-  # (go\main.go:29, printed by go\selftest.go:188), so that text is normal here
-  # and is never a failure on its own.
+  # single-instance lock and echoes its message `Potflix is already running.`,
+  # so that text is normal here and is never a failure on its own.
   #
   # Use a raw System.Diagnostics.Process, not Start-Process: under Windows
   # PowerShell 5.1 Start-Process with -RedirectStandard* leaves $proc.ExitCode

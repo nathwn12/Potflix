@@ -1,0 +1,27 @@
+# `presence` -- the Go package `go\internal\presence`: the presence state machine
+# and the activity payload builder.
+
+[package]
+name = "presence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+titleclean = { path = "../titleclean" }
+player = { path = "../player" }
+# `serde` carries `CardSpec` (`cardspec.go:41-44`), the stored config shape the
+# app crate embeds.
+serde.workspace = true
+
+[dev-dependencies]
+# Proves the `CardSpec` JSON contract (Go's `json:",omitempty"`) the app crate's
+# config store depends on.
+serde_json.workspace = true
+
+# The `metadata-core` edge the skeleton carried is dropped: `presence.go` /
+# `gate.go` / `cardspec.go` have no `internal/metadata` dependency (Go deps:
+# `internal/player`, `internal/titleclean` only) and nothing in this crate names
+# the crate, so the edge was unused - and it made this crate's own gate depend on
+# a sibling that was mid-edit. Re-add it with the conversion that actually needs
+# it.

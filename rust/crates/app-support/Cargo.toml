@@ -1,0 +1,15 @@
+# `app-support` -- the non-Win32 support surface split out of the Go root
+# package: `go\clientid.go`, `go\config.go`, `go\debuglog.go`, `go\instance.go`.
+
+[package]
+name = "app-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `presence` owns `CardSpec` (`go\internal\presence\cardspec.go`), the stored
+# card shape the config store embeds: one type, and one owner of `normalized()`.
+presence = { path = "../presence" }
+serde.workspace = true
+serde_json.workspace = true
