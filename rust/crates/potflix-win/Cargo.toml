@@ -18,6 +18,11 @@ rust-version.workspace = true
 # Features are additive, so this enables bindings for this crate only -- no
 # version, no other crate affected.
 windows-sys = { workspace = true, features = [
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_GdiPlus",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Storage_Xps",
+    "Win32_UI_Controls",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell_Common",
     "Win32_UI_Controls_Dialogs",

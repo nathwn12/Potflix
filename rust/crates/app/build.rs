@@ -13,6 +13,31 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+/// The exe manifest: `asInvoker`, Windows 10/11 compatibility, PerMonitorV2.
+/// `supportedOS` id `{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}` is Windows 10/11;
+/// the `dpiAwareness` element needs the `asm.v3` + SMI/2016 namespaces.
+const MANIFEST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>
+"#;
+
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo"));
@@ -39,9 +64,18 @@ fn main() {
         .unwrap_or_else(|err| panic!("cannot stage {}: {err}", icon.display()));
 
     // Resource id 1 -- the first ICON group, which is what Explorer and the tray
-    // loader pick (`win32.go` iconResourceVersion = 0x00030000).
+    // loader pick (`win32.go` iconResourceVersion = 0x00030000). Resource id 1
+    // type 24 is the exe manifest: PerMonitorV2 DPI awareness (no Toolkit, no
+    // runtime call -- the OS reads it at process start) so the owner-drawn
+    // client area gets real per-monitor pixels at 100-200% instead of a
+    // bitmap-stretched frame. Go declares no manifest (system-default
+    // awareness); the layout math is DPI-parameterised either way, so this
+    // changes crispness, not layout or behaviour.
+    let manifest = out_dir.join("potflix.manifest");
+    fs::write(&manifest, MANIFEST_XML).expect("cannot write the generated manifest");
     let rc = out_dir.join("potflix.rc");
-    fs::write(&rc, "1 ICON \"icon.ico\"\n").expect("cannot write the generated .rc");
+    fs::write(&rc, "1 ICON \"icon.ico\"\n1 24 \"potflix.manifest\"\n")
+        .expect("cannot write the generated .rc");
 
     match embed_resource::compile(&rc, embed_resource::NONE) {
         embed_resource::CompilationResult::Ok => {}
