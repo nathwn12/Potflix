@@ -785,6 +785,66 @@ mod tests {
         );
     }
 
+    /// The Go-compat golden guard: a fixture mirroring the Go-written config
+    /// shape (`go\config.go:22-30`) with SYNTHETIC values -- parse, round-trip,
+    /// assert no key is lost and no default silently changes. Fails first if a
+    /// real Go/Rust mismatch ever appears.
+    #[test]
+    fn go_written_shape_round_trips_without_key_loss() {
+        // Synthetic stand-in for a Go-written store: all four keys, non-default
+        // values on every field, key order as Go's Marshal emits it.
+        let fixture = r#"{"dirs":["/synth/movies","/synth/shows"],"start_with_windows":true,"scan_speed":"balanced","card":{"details":"title","state":"tag"}}"#;
+        let parsed: Config = serde_json::from_str(fixture).expect("parse Go shape");
+        assert_eq!(
+            parsed.dirs,
+            vec!["/synth/movies".to_string(), "/synth/shows".to_string()]
+        );
+        assert!(parsed.start_with_windows);
+        assert_eq!(parsed.effective_scan_speed(), SCAN_SPEED_BALANCED);
+        assert_eq!(
+            parsed.effective_card_spec(),
+            CardSpec {
+                details: CARD_DETAILS_TITLE.to_string(),
+                state: CARD_STATE_TAG.to_string(),
+            }
+        );
+
+        // Round-trip through the atomic write: the wire keeps exactly the Go
+        // key set, in Go's order, with every value intact.
+        let scratch = Scratch::new("config-golden");
+        let fixture_path = scratch.write("golden.json", fixture);
+        let loaded = load_config_from(&fixture_path).expect("loadConfigFrom");
+        let path = store_path(&scratch);
+        save_config_to(&path, &loaded).expect("saveConfigTo");
+        let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
+        assert_eq!(wire, fixture, "round-trip must be byte-identical");
+        let wire_value: serde_json::Value = serde_json::from_str(&wire).expect("wire JSON");
+        let mut keys: Vec<&str> = wire_value
+            .as_object()
+            .expect("wire object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["card", "dirs", "scan_speed", "start_with_windows"],
+            "wire key set is the Go contract, nothing added, nothing lost (byte order pinned above)"
+        );
+
+        // No default silently changed: a fresh store is still the exact Go
+        // schema with Go's defaults.
+        let fresh = Scratch::new("config-golden-fresh");
+        let fresh_path = store_path(&fresh);
+        save_config_to(&fresh_path, &Config::default()).expect("saveConfigTo");
+        let fresh_wire =
+            String::from_utf8(std::fs::read(&fresh_path).expect("read store")).expect("utf-8");
+        assert_eq!(
+            fresh_wire,
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{}}"#
+        );
+    }
+
     /// The write is atomic: no temp file survives, and the temp file is created
     /// beside the target so the rename is same-volume.
     #[test]
