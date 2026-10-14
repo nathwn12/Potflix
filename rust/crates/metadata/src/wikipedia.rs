@@ -358,6 +358,66 @@ struct WikiImageInfoResp {
     query: WikiImageInfoQuery,
 }
 
+/// `wikiDisambiguationKinds`: the trailing parentheticals Wikipedia appends to a
+/// page title to tell same-named works apart (`wikipedia.go` has no equivalent:
+/// the Go era stored the raw page title, so the card showed `Dune (2021 film)`
+/// and the movie line doubled the year as `Dune (2021 film) (2021)`).
+const WIKI_DISAMBIGUATION_KINDS: [&str; 17] = [
+    "film",
+    "movie",
+    "tv series",
+    "television series",
+    "tv program",
+    "tv show",
+    "series",
+    "miniseries",
+    "limited series",
+    "anime",
+    "novel",
+    "book",
+    "video game",
+    "song",
+    "album",
+    "play",
+    "musical",
+];
+
+/// `wikiStripDisambiguation`: drops a trailing Wikipedia-style disambiguation
+/// parenthetical — `(film)`, `(2021 film)`, `(TV series)` — so the card carries
+/// the bare title. ONLY a trailing parenthetical whose content is an optional
+/// 4-digit year plus one of [`WIKI_DISAMBIGUATION_KINDS`] (case-insensitive) is
+/// stripped; anything else (`Nymphomaniac (Director's Cut)`, `Heat (1995)`)
+/// survives untouched, because a real title must never be eaten. The year is
+/// derived separately by [`wiki_year`], which keeps reading the RAW page title,
+/// so this changes only the title string, never the year.
+pub(crate) fn strip_disambiguation(title: &str) -> String {
+    let trimmed = title.trim();
+    if !trimmed.ends_with(')') {
+        return trimmed.to_string();
+    }
+    let Some(open) = trimmed.rfind('(') else {
+        return trimmed.to_string();
+    };
+    let inner = trimmed[open + 1..trimmed.len() - 1].trim();
+    let mut rest = inner;
+    // An optional 4-digit year prefix (`2021 film`); a bare year with no kind
+    // word (`Heat (1995)`) is NOT disambiguation by this convention.
+    if rest.len() > 4
+        && rest.as_bytes()[..4].iter().all(|b| b.is_ascii_digit())
+        && rest.as_bytes()[4].is_ascii_whitespace()
+    {
+        rest = rest[4..].trim_start();
+    }
+    if !WIKI_DISAMBIGUATION_KINDS.contains(&rest.to_lowercase().as_str()) {
+        return trimmed.to_string();
+    }
+    let stem = trimmed[..open].trim();
+    if stem.is_empty() {
+        return trimmed.to_string();
+    }
+    stem.to_string()
+}
+
 /// `wikiPosterExtRank` ranks a plausible poster photo extension: `.jpg`/`.jpeg`
 /// first, then `.png`, then `.webp`. Anything else is implausible for a film
 /// poster and rejected.
@@ -421,8 +481,17 @@ fn is_ascii_letter(byte: u8) -> bool {
 }
 
 /// `wikiPickPoster`: the poster-like `File:` title from an article image list,
-/// or `""`. Deliberately strict -- a wrong poster is worse than none.
-pub(crate) fn wiki_pick_poster(titles: &[String]) -> String {
+/// or `""`. Deliberately strict -- a wrong poster is worse than none. First a
+/// file with a standalone "poster" word wins (ranked by photo extension); when
+/// no such file exists, a file named exactly like the article page (e.g.
+/// `File:Ready Player One (film).png` on the `Ready Player One (film)` page)
+/// is the infobox lead image, which for a film article IS the poster --
+/// MEASURED 2026-10-15: PageImages serves no page image for that article
+/// (fair-use posters are excluded), and the literal-word rule dropped the only
+/// poster file, so the card fell back to `logo` while `Backrooms (film)` rode
+/// its `*poster.jpg` file. The exact-title fallback carries the same photo
+/// extension and blocked-word guards, so a logo or cast photo never qualifies.
+pub(crate) fn wiki_pick_poster(titles: &[String], page: &str) -> String {
     let mut best = String::new();
     let mut best_rank = 0;
     let mut found = false;
@@ -439,6 +508,48 @@ pub(crate) fn wiki_pick_poster(titles: &[String]) -> String {
             continue;
         }
         if !wiki_poster_plausible(&lower) {
+            continue;
+        }
+        let Some(rank) = wiki_poster_ext_rank(&lower) else {
+            continue;
+        };
+        if !found || rank < best_rank {
+            best = name.to_string();
+            best_rank = rank;
+            found = true;
+        }
+    }
+    if found {
+        return best;
+    }
+    // No "poster"-word file: the infobox lead image named exactly like the page.
+    let want = page.trim().replace('_', " ").to_lowercase();
+    if want.is_empty() {
+        return String::new();
+    }
+    for title in titles {
+        let name = title.trim();
+        if name.is_empty() {
+            continue;
+        }
+        // The `File:` namespace prefix is not part of the comparison.
+        let stem = match name.split_once(':') {
+            Some((_, rest)) => rest,
+            None => name,
+        };
+        let stem = stem.trim();
+        // A photo extension is still required: the stem match replaces only
+        // the "poster"-word signal, never the format or blocked-word guards.
+        let dot = stem.rfind('.');
+        let core = match dot {
+            Some(i) => stem[..i].trim(),
+            None => continue,
+        };
+        if core.replace('_', " ").to_lowercase() != want {
+            continue;
+        }
+        let lower = name.to_lowercase();
+        if wiki_poster_blocked(&lower) {
             continue;
         }
         let Some(rank) = wiki_poster_ext_rank(&lower) else {
@@ -558,7 +669,7 @@ impl WikipediaSource {
                 names.push(image.title.clone());
             }
         }
-        let picked = wiki_pick_poster(&names);
+        let picked = wiki_pick_poster(&names, page);
         if picked.is_empty() {
             return String::new();
         }
@@ -695,10 +806,14 @@ impl crate::resolver::Source for WikipediaSource {
             return Ok(None);
         }
         let title = title.trim();
+        // The year is derived from the RAW page title first: `wiki_year` reads
+        // the parenthesized year (`Dune (2021 film)` -> 2021), which the
+        // disambiguation strip below removes.
+        let year = wiki_year(title, &extract);
         let title = if title.is_empty() {
             q.title.trim().to_string()
         } else {
-            title.to_string()
+            strip_disambiguation(title)
         };
         // Poster fallback, same host, at most two extra calls, ONLY for an
         // already-resolved page with no page image at all: a present page image
@@ -711,7 +826,7 @@ impl crate::resolver::Source for WikipediaSource {
             source: "wikipedia".to_string(),
             source_id: title.clone(),
             kind: Kind::MOVIE,
-            year: wiki_year(&title, &extract),
+            year,
             movie_url: self.wiki_page_url(&title),
             title,
             artwork: normalize_url(&artwork),
