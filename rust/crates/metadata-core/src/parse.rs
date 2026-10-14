@@ -210,7 +210,7 @@ pub fn parse(title: &str, episode_tag: &str, episode_name: &str) -> Query {
     if !tag.is_empty() {
         if SEASON_EPISODE_RE.is_match(tag) {
             let caps = SEASON_EPISODE_RE.captures(tag).expect("is_match agreed");
-            q.season = atoi(group(&caps, 1));
+            q.season = atoi64(group(&caps, 1));
             q.episode = atoi(group(&caps, 2));
             strong = true;
         } else if EPISODE_ONLY_RE.is_match(tag) {
@@ -333,7 +333,20 @@ pub(crate) fn is_year_num(n: i32) -> bool {
     (1900..=2100).contains(&n)
 }
 
-/// Go's `atoi`: a non-numeric string is 0. Every caller slices a `\d` capture.
+/// Go's `atoi` where the destination is Go's 64-bit `int` (the season fields):
+/// `strconv.Atoi` (`go\internal\metadata\parse.go:200`) drops the error, so a
+/// non-numeric capture is 0 and a digits-only capture above `i64::MAX` keeps
+/// `ParseInt`'s clamped `MaxInt64` instead of collapsing to 0.
+pub(crate) fn atoi64(s: &str) -> i64 {
+    match s.parse::<i64>() {
+        Ok(n) => n,
+        Err(_) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => i64::MAX,
+        Err(_) => 0,
+    }
+}
+
+/// Go's `atoi`: a non-numeric string is 0. Every caller slices a `\d` capture
+/// that is bounded by the pattern (`\d{1,4}` etc.), so the 32-bit parse holds.
 fn atoi(s: &str) -> i32 {
     s.parse().unwrap_or(0)
 }

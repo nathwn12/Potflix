@@ -11,12 +11,12 @@ use std::time::{Duration, Instant};
 use metadata::{Kind, Media, Query, Resolution};
 use metadata_http::cancel::Cancel;
 
-use crate::catchup::{CatchUpConfig, start_catch_up, stop_catch_up};
+use crate::catchup::{start_catch_up, stop_catch_up, CatchUpConfig};
 use crate::pathutil::{join as path_join, normalize_scan_dir};
 use crate::{
-    FilePlan, Options, Progress, ProgressFn, WalkCb, WalkEntry, WalkFn, WalkResult, collect_files,
-    collect_files_with_context, collect_indexed_public, collect_indexed_with_context, fetch_all,
-    load_scan_index, record_scan, scan, scan_with_options,
+    collect_files, collect_files_with_context, collect_indexed_public,
+    collect_indexed_with_context, fetch_all, load_scan_index, record_scan, scan, scan_with_options,
+    FilePlan, Options, Progress, ProgressFn, WalkCb, WalkEntry, WalkFn, WalkResult,
 };
 
 // --- serialization ---------------------------------------------------------
@@ -150,7 +150,7 @@ pub(crate) fn media_for(q: &Query, source: &str, tag: &str) -> Media {
     };
     if q.kind != Kind::MOVIE {
         m.episodes = vec![metadata::Episode {
-            season: q.season,
+            season: i32::try_from(q.season).expect("test query season fits i32"),
             number: q.episode,
             title: tag.to_string(),
             ..metadata::Episode::default()
@@ -896,13 +896,11 @@ fn index_missing_or_corrupt_is_full_walk() {
     .unwrap();
     let st2 = scan_with_options(&ctx, index_scan_opts(&dirs, &cache.path, &index, false)).unwrap();
     assert_eq!((st2.folders_scanned, st2.folders_skipped), (3, 0));
-    assert!(
-        std::fs::metadata(format!(
-            "{}.corrupt",
-            crate::index::index_store_path(&index)
-        ))
-        .is_ok()
-    );
+    assert!(std::fs::metadata(format!(
+        "{}.corrupt",
+        crate::index::index_store_path(&index)
+    ))
+    .is_ok());
 }
 
 #[test]

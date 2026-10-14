@@ -66,8 +66,10 @@ pub struct Query {
     pub title: String,
     /// 0 if unknown.
     pub year: i32,
-    /// 0 if unknown.
-    pub season: i32,
+    /// 0 if unknown. Go's `Query.Season` is an `int` (`types.go:27`), i.e. 64-bit,
+    /// and the season-folder capture is unbounded (`context.go:21`), so a
+    /// `Season <N>` folder number above `i32::MAX` must survive whole.
+    pub season: i64,
     pub episode: i32,
     /// True when [`Query::episode`] is an absolute anime number.
     pub absolute: bool,
@@ -170,7 +172,9 @@ pub struct Media {
 pub struct Resolution {
     pub series: String,
     pub episode: String,
-    pub season: i32,
+    /// Go's `Resolution.Season` is an `int` (`types.go:76`), so a season number
+    /// above `i32::MAX` reaches the caller unchanged.
+    pub season: i64,
     pub number: i32,
     pub found: bool,
     /// Series/movie poster only, else `""`.

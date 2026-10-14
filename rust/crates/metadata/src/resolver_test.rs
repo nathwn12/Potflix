@@ -1,23 +1,23 @@
 //! Ports `go\internal\metadata\resolver_test.go`.
 
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use metadata_core::types::{Episode, Kind, Media, Query};
 use metadata_http::cancel::Cancel;
 
 use crate::cache::{
-    CACHE_SCHEMA, CacheFile, NEGATIVE_TTL, cache_exists, cache_key, cache_live, cache_load,
-    cache_load_entry, cache_record, cache_store, cache_store_negative, with_cache,
+    cache_exists, cache_key, cache_live, cache_load, cache_load_entry, cache_record, cache_store,
+    cache_store_negative, with_cache, CacheFile, CACHE_SCHEMA, NEGATIVE_TTL,
 };
-use crate::resolver::{NEGATIVE_BACKOFF, Resolver, Source, match_episode};
+use crate::resolver::{match_episode, Resolver, Source, NEGATIVE_BACKOFF};
 use crate::testsupport::{
-    FakeSource, TempDir, correct_media, mislabeled_media, resolver_with, series_media,
+    correct_media, mislabeled_media, resolver_with, series_media, FakeSource, TempDir,
 };
 use crate::timefmt::{format_rfc3339, now_rfc3339};
 
-fn show_query(season: i32, episode: i32) -> Query {
+fn show_query(season: i64, episode: i32) -> Query {
     Query {
         kind: Kind::SERIES,
         title: "Show".to_string(),

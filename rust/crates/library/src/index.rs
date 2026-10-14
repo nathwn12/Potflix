@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::pathutil::{dir as path_dir, join as path_join, normalize_scan_dir};
-use crate::scanindex::{FolderRecord, LegacyCounts, read_legacy_scan_index, same_scan_record};
-use crate::{Error, file_exists};
+use crate::scanindex::{read_legacy_scan_index, same_scan_record, FolderRecord, LegacyCounts};
+use crate::{file_exists, Error};
 
 /// The store file lives beside the legacy index path.
 pub(crate) const INDEX_STORE_NAME: &str = "library.idx";
@@ -86,10 +86,12 @@ impl FileRecord {
         metadata::Query {
             kind,
             title: self.title.clone(),
-            // `metadata::Query` keeps `i32` (metadata-core is out of seam and Go's
-            // `int` fits it for every parsed value); the record itself is 64-bit.
+            // `metadata::Query` keeps Go's 64-bit `int` for `season` (the
+            // season-folder capture is unbounded), and the record is 64-bit
+            // too, so the value crosses unchanged; `year`/`episode` are
+            // bounded by their patterns.
             year: self.year as i32,
-            season: self.season as i32,
+            season: self.season,
             episode: self.episode as i32,
             absolute: self.absolute,
         }
