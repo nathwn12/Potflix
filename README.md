@@ -289,6 +289,31 @@ carries. Mostly proven live for the Go reference:
     renders `ED 3`; Java fell through to `buildDisplay` (`Main.java:372-377`,
     `:479-483`) and duplicated it as `ED 3 — ED 3`.
 
+## Departures from the frozen Go reference (Rust era)
+
+The Go module above is frozen; the Rust port under `rust\` deliberately goes
+further where the owner's live card proved the Go behaviour wrong:
+
+11. Wikipedia disambiguation suffixes are stripped. `rust\crates\metadata\src\wikipedia.rs`
+    (`strip_disambiguation`) drops a trailing `(film)` / `(2021 film)` /
+    `(TV series)`-style parenthetical from the provider title, so the card
+    shows `Ready Player One` with details `Ready Player One (2018)` instead
+    of `Ready Player One (film)` / `Ready Player One (film) (2018)`. Cached
+    records heal on decode (`rust\crates\metadata\src\cache.rs`,
+    `decode_cache_entry`, no schema bump). Go stored the raw page title
+    (`go\internal\metadata\wikipedia.go:504`).
+12. Truncated card lines end cleanly. `rust\crates\presence\src\lib.rs`
+    (`trim_word`, `smart_trim_synopsis`, the `large_text` build) cuts on word
+    boundaries, strips trailing `, ; : - – — ·` before the terminator, and ends
+    with `…` when cut; the tooltip no longer hard-cuts mid-word. Go kept the
+    cut punctuation and hard-cut the tooltip
+    (`go\internal\presence\presence.go:573-644,673-675`).
+13. Wikipedia artwork accepts the article's own file. `rust\crates\metadata\src\wikipedia.rs`
+    (`wiki_pick_poster`) falls back to a file named exactly like the page
+    (`File:Ready Player One (film).png`) when no PageImages image and no
+    `*poster*` file exist; Go only accepted a literal `poster` word and left
+    the card on `logo`.
+
 ## Docs
 
 - [`go/README.md`](./go/README.md) — the frozen Go reference: package layout, metadata design, scan-index tiers, rate limiter, M1–M4 status.
