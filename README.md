@@ -48,7 +48,7 @@ One member crate per Go package; each line is the crate's own ownership.
 | `store` | The crash-safe single-file append-only key/value store behind the library index and the metadata cache; hand-rolled CRC32, `CreateFileW` for the share flags. |
 | `metadata-core` | The network-free half of metadata: record types, filename parsing, candidate matching, alternate titles, request context. |
 | `metadata-http` | The transport half: the shared HTTP client / fetch helpers (ureq over `native-tls`) and the per-host rate limiter. |
-| `metadata` | The provider chain, the five keyless providers (TVmaze, AniList, Jikan, iTunes, Wikipedia) and the permanent on-disk cache; owns the `metacheck` CLI. |
+| `metadata` | The provider chain, the four keyless providers (TVmaze, AniList, Cinemeta, Wikipedia) and the permanent on-disk cache; owns the `metacheck` CLI. |
 | `library` | The shared walk + diff loop behind Scan / Refresh, the background metadata catch-up, and `metawarm`; the store-backed `library.idx`; owns the `metawarm` CLI. |
 | `discord` | Local Discord IPC pipe transport over `\\.\pipe\discord-ipc-0..9`: handshake, `SET_ACTIVITY`, `READY` gating, reply matching. |
 | `player` | PotPlayer window discovery (`EnumWindows`), the `WM_USER` time/status queries, and the `WM_COPYDATA` play-file path query. |
@@ -174,8 +174,8 @@ re-verified live against PotPlayer or Discord on the Rust app, and no CI runs th
   `Browsing` / `Idle` when idle.
 - Quiet while paused: the paused card is sent once and held; not even the
   30 s heartbeat re-pushes it until resume.
-- Canonical names, keyless: TVmaze for TV, AniList + Jikan for anime, iTunes
-  for movies. Found titles cache permanently, misses cache for 30 days, all
+- Canonical names, keyless: TVmaze for TV, AniList + Cinemeta for anime,
+  Cinemeta for movies. Found titles cache permanently, misses cache for 30 days, all
   under `%LOCALAPPDATA%\Potflix\meta`; offline it shows the clean filename
   title.
 - Library window: media folders (`Add folder` / `Remove`), incremental
@@ -313,6 +313,14 @@ further where the owner's live card proved the Go behaviour wrong:
     (`File:Ready Player One (film).png`) when no PageImages image and no
     `*poster*` file exist; Go only accepted a literal `poster` word and left
     the card on `logo`.
+14. Movies come from Cinemeta, not iTunes; Jikan is gone.
+    `rust\crates\metadata\src\cinemeta.rs` (Stremio's keyless catalog addon)
+    is first for movies and third for series, replacing the iTunes leg —
+    which returned the first `feature-movie` row with no title or year check
+    (`Inception` answered as `Ring of Fire`) — and the Jikan leg (dead since
+    2026-10-01). A Cinemeta pick must match the query title (house-ranked)
+    and any known query year, or it is a miss rather than a wrong card. The
+    frozen Go keeps the old TVmaze/AniList/Jikan/iTunes chain.
 
 ## Docs
 

@@ -4,7 +4,16 @@
 //! provider, one bounded retry, and a capped decoder.
 //!
 //! In Rust this is `ureq` with the `native-tls` provider (SChannel on
-//! Windows) -- OS-native TLS, no C toolchain. `ureq`'s defaults are the
+//! Windows) -- OS-native TLS, no C toolchain -- rooted in the platform
+//! verifier (`RootCerts::PlatformVerifier`: the OS trust store, exactly like
+//! Go's `http.Client`). `TlsConfig::builder()` starts from
+//! `TlsConfig::default()`, whose `root_certs` default is `WebPki` (the
+//! vendored Mozilla set, meant for the rustls provider); for the native-tls
+//! backend that default switches the OS store OFF (`disable_built_in_roots`),
+//! so the provider MUST be paired with `PlatformVerifier` or chains the OS
+//! already trusts stop verifying (Cloudflare/Google-Trust hosts failed while
+//! curl and .NET succeeded). Verification is never disabled: no
+//! `disable_verification`, no `danger_*`. `ureq`'s other defaults are the
 //! deliberate match for Go's `http.Client` here: `http_status_as_error(false)`
 //! so a 429 reaches the retry instead of surfacing as a transport error, and
 //! `timeout_global` as the whole-request budget. `gzip` is off (the workspace
@@ -23,7 +32,7 @@ use std::time::{Duration, SystemTime};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use ureq::http::{Response, StatusCode, Uri};
-use ureq::tls::{TlsConfig, TlsProvider};
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::Body;
 
 use crate::cancel::{Cancel, CancelError};
@@ -114,6 +123,11 @@ impl HttpClient {
             .tls_config(
                 TlsConfig::builder()
                     .provider(TlsProvider::NativeTls)
+                    // PlatformVerifier is the OS trust store (SChannel here),
+                    // i.e. Go's `http.Client` posture. Without it the builder
+                    // keeps ureq's `WebPki` default, which for native-tls
+                    // disables the OS roots and breaks chains the OS trusts.
+                    .root_certs(RootCerts::PlatformVerifier)
                     .build(),
             )
             // Go's `client.Do` hands back every status; non-2xx is

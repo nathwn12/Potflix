@@ -809,7 +809,7 @@ mod tests {
         // never rewritten by a Wikipedia convention.
         for (source, title) in [
             ("wikipedia", "Nymphomaniac (Director's Cut)"),
-            ("itunes", "Dune (2021 film)"),
+            ("cinemeta", "Dune (2021 film)"),
         ] {
             let mut stored = record.clone();
             stored.media.source = source.to_string();
