@@ -1127,6 +1127,147 @@ fn trim_word_cases() {
     assert_eq!(trim_word("", 128), "", "trim_word empty");
 }
 
+/// The punctuation rule every truncated card line owes: an ellipsis-terminated
+/// cut ends on a word character (never `,` `;` `:` `-` `–` `—` `·` or blank),
+/// and the cut lands on a word boundary (the source resumes at whitespace, at
+/// a stripped cut mark, or not at all).
+fn assert_clean_cut(full: &str, got: &str) {
+    assert!(
+        got.ends_with('\u{2026}'),
+        "cut line must end with U+2026: {got:?}"
+    );
+    assert!(!got.contains("..."), "never three dots: {got:?}");
+    let body = got.trim_end_matches('\u{2026}');
+    assert!(!body.is_empty(), "empty cut body: {got:?}");
+    let last = body.chars().next_back().unwrap();
+    assert!(
+        !last.is_whitespace()
+            && !matches!(last, ',' | ';' | ':' | '-' | '–' | '—' | '·'),
+        "cut leaves trailing punctuation: {got:?}"
+    );
+    let tail = full
+        .strip_prefix(body)
+        .unwrap_or_else(|| panic!("cut body is not a source prefix: {got:?}"));
+    let next = tail
+        .chars()
+        .next()
+        .unwrap_or_else(|| panic!("cut text was not cut: {got:?}"));
+    assert!(
+        next.is_whitespace() || matches!(next, ',' | ';' | ':' | '-' | '–' | '—' | '·'),
+        "cut ends mid-word (source resumes with {next:?}): {got:?}"
+    );
+}
+
+/// A truncated `trim_word` line strips the cut punctuation too: `word, next`
+/// cut at the space ends `word…`, never `word,…`.
+#[test]
+fn trim_word_strips_cut_punctuation() {
+    let s = format!("{}stop, {}", "filler ".repeat(20), "rest ".repeat(20));
+    let got = trim_word(&s, 128);
+    assert_clean_cut(&s, &got);
+    // The 128-unit budget fits 18 whole fillers: the cut lands on the word
+    // boundary, never inside `filler` or the `stop,` tail.
+    let want = format!("{}\u{2026}", "filler ".repeat(18).trim());
+    assert_eq!(got, want, "trim_word cut");
+}
+
+/// The live comma-cut shape (`…Majin Buu,` on the wire): a movie card whose
+/// synopsis cuts at a clause comma ends on the word with U+2026.
+#[test]
+fn movie_state_comma_cut_ends_clean() {
+    const MOVIE_RAW: &str = "Dragon.Ball.Movie.1990.1080p.mkv - PotPlayer";
+    let run_act = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let syn = "Years after the battle with Earth's greatest enemy, Majin Buu, the world faces a new threat from beyond the stars and more";
+    let got = build_activity_resolved(
+        MOVIE_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Dragon Ball".to_string(),
+            year: 1990,
+            is_movie: true,
+            synopsis: syn.to_string(),
+            ..Resolved::default()
+        },
+    );
+    let want = "Years after the battle with Earth's greatest enemy, Majin Buu\u{2026}";
+    assert_eq!(got.state, want, "state");
+    assert_clean_cut(syn, &got.state);
+}
+
+/// The live semicolon-cut shape (`…meet Elliot;` on the wire): a series card
+/// whose synopsis cuts at a clause semicolon ends on the word with U+2026.
+#[test]
+fn series_state_semicolon_cut_ends_clean() {
+    const TV_RAW: &str = "Show.S02E04.Episode.1080p.mkv - PotPlayer";
+    let run_act = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let syn = "Allsafe is controlled; the Dark Army is ready to meet Elliot; the fsociety plan falls apart at midnight somehow";
+    let got = build_activity_resolved(
+        TV_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Show".to_string(),
+            synopsis: syn.to_string(),
+            ..Resolved::default()
+        },
+    );
+    let want =
+        "S2 E4 \u{b7} Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}";
+    assert_eq!(got.state, want, "state");
+    assert_clean_cut(&format!("S2 E4 \u{b7} {syn}"), &got.state);
+}
+
+/// The live tooltip shape (`…Zak Penn and Ernest` on the wire): a cut hover
+/// line ends on a whole word with U+2026, never mid-word with no terminator.
+#[test]
+fn hover_tooltip_cut_ends_clean() {
+    const MOVIE_RAW: &str = "Movie.mkv - PotPlayer";
+    let run_act = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let syn = "Ready Player One is a 2018 American science fiction action film directed by Steven Spielberg and cowritten with Zak Penn alongside Ernest Cline. Based on the novel, Wade hunts the prize.";
+    let got = build_activity_resolved(
+        MOVIE_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Ready Player One".to_string(),
+            year: 2018,
+            is_movie: true,
+            synopsis: syn.to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(got.name, "Ready Player One", "name");
+    assert_eq!(got.details, "Ready Player One (2018)", "details");
+    // The tooltip cut lands on a whole word with the U+2026 terminator: the
+    // live card hard-cut the same text to `...Zak Penn and Ernest`, mid-word
+    // with no terminator.
+    let want = "Ready Player One is a 2018 American science fiction action film directed by Steven Spielberg and cowritten with Zak Penn\u{2026}";
+    assert_eq!(got.large_text, want, "large_text");
+    assert_clean_cut(syn, &got.large_text);
+    let n = got.large_text.encode_utf16().count();
+    assert!(
+        n <= 128,
+        "large_text length {n} exceeds 128: {:?}",
+        got.large_text
+    );
+}
+
 #[test]
 fn build_activity_resolved_movie() {
     const MOVIE_RAW: &str = "Dune.Part.Two.2024.1080p.mkv - PotPlayer";
@@ -1443,10 +1584,12 @@ fn smart_trim_synopsis_clause_ellipsis() {
         "clause cut should end with U+2026: {got:?}"
     );
     assert!(!got.contains("..."), "never three dots: {got:?}");
-    assert!(
-        got.contains(','),
-        "clause cut should keep the comma: {got:?}"
-    );
+    // The clause comma is a cut mark, not content: the live card carried it
+    // into the ellipsis (`Buu,…`), so the cut strips trailing punctuation and
+    // the base ends on the word (`first…`).
+    let want = format!("{}first\u{2026}", "word ".repeat(10));
+    assert_eq!(got, want, "clause cut");
+    assert_clean_cut(&s, &got);
     let n = java_units(&got);
     assert!(
         n <= STATE_SYNOPSIS_BUDGET,

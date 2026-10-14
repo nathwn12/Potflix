@@ -482,7 +482,12 @@ pub(crate) fn cache_load_entry(dir: &str, key: &str) -> Option<CacheEntry> {
 
 /// `decodeCacheEntry`: applies the cache's validity gates to one stored record:
 /// the schema and key must match, a negative must still be fresh, and a positive
-/// must carry a `source`.
+/// must carry a `source`. A positive Wikipedia record additionally heals its
+/// title on decode: records written before the disambiguation strip carry
+/// `Ready Player One (film)`, and normalizing here (no schema bump, no rewrite,
+/// no refetch) lets the owner's permanent cache heal in place. The normalizer
+/// is deliberately narrow -- a real parenthesized title survives -- so healing
+/// cannot corrupt a legitimate record.
 pub(crate) fn decode_cache_entry(data: &[u8], key: &str) -> Option<CacheEntry> {
     let record: CacheFile = serde_json::from_slice(data).ok()?;
     if record.key != key || record.schema != CACHE_SCHEMA {
@@ -501,8 +506,13 @@ pub(crate) fn decode_cache_entry(data: &[u8], key: &str) -> Option<CacheEntry> {
     if record.media.source.is_empty() {
         return None;
     }
+    let mut media = record.media;
+    if media.source == "wikipedia" {
+        media.title = crate::wikipedia::strip_disambiguation(&media.title);
+        media.source_id = crate::wikipedia::strip_disambiguation(&media.source_id);
+    }
     Some(CacheEntry {
-        media: Some(record.media),
+        media: Some(media),
         not_found: false,
         checked_at: record.checked_at,
     })
@@ -767,6 +777,49 @@ mod tests {
         assert_eq!(name.len(), 21);
         assert!(name.ends_with(".json"));
         assert!(name[..16].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn decode_heals_wikipedia_disambiguation_title() {
+        // A record written before the disambiguation strip (the owner's live
+        // cache carries `Ready Player One (film)`) decodes to the clean title
+        // with no schema bump, no rewrite and no refetch.
+        let key = "movie|ready player one|2018";
+        let record = CacheFile {
+            key: key.to_string(),
+            schema: CACHE_SCHEMA,
+            media: Media {
+                source: "wikipedia".to_string(),
+                source_id: "Ready Player One (film)".to_string(),
+                kind: Kind::MOVIE,
+                title: "Ready Player One (film)".to_string(),
+                year: 2018,
+                ..Media::default()
+            },
+            not_found: false,
+            checked_at: String::new(),
+        };
+        let data = serde_json::to_vec(&record).expect("encode record");
+        let entry = decode_cache_entry(&data, key).expect("entry");
+        let media = entry.media.expect("media");
+        assert_eq!(media.title, "Ready Player One");
+        assert_eq!(media.source_id, "Ready Player One");
+        assert_eq!(media.year, 2018);
+        // A real parenthesized title heals to itself, and other providers are
+        // never rewritten by a Wikipedia convention.
+        for (source, title) in [
+            ("wikipedia", "Nymphomaniac (Director's Cut)"),
+            ("itunes", "Dune (2021 film)"),
+        ] {
+            let mut stored = record.clone();
+            stored.media.source = source.to_string();
+            stored.media.title = title.to_string();
+            stored.media.source_id = title.to_string();
+            let data = serde_json::to_vec(&stored).expect("encode record");
+            let entry = decode_cache_entry(&data, key).expect("entry");
+            let media = entry.media.expect("media");
+            assert_eq!(media.title, title, "source = {source}");
+        }
     }
 
     #[test]

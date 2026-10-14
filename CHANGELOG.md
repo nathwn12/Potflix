@@ -142,6 +142,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Wikipedia disambiguation suffixes no longer reach the card: a page title
+  like `Ready Player One (film)` / `Dune (2021 film)` / `Backrooms (film)` is
+  stored and shown as the bare title (`Ready Player One`), so the movie line
+  reads `Ready Player One (2018)` instead of `Ready Player One (film) (2018)`.
+  Only a trailing parenthetical holding an optional year plus a media kind word
+  (`film`, `movie`, `TV series`, …) is stripped -- `Nymphomaniac (Director's
+  Cut)` survives. Cached records written before the strip heal on decode (no
+  schema bump, no refetch). Deliberate departure from the frozen Go reference
+  (`go\internal\metadata\wikipedia.go:504`), which stored the raw page title.
+- Truncated card lines now end cleanly: every cut lands on a word boundary,
+  strips trailing `, ; : - – — ·` before the terminator, and ends with U+2026
+  when cut (nothing extra when whole). The live card carried `Majin Buu,…` /
+  `meet Elliot;…` in `state` and a mid-word `…Zak Penn and Ernest` in
+  `large_text`. Deliberate departure from the frozen Go reference
+  (`go\internal\presence\presence.go:573-644,673-675`), which kept the cut
+  punctuation and hard-cut the tooltip.
+- Wikipedia artwork fallback now also accepts the article's own file: when no
+  PageImages image and no `*poster*` file exist, a file named exactly like the
+  page (`File:Ready Player One (film).png`) resolves via `imageinfo` -- the
+  live article carries that poster while PageImages serves none (fair-use), so
+  the card showed `logo`. Measured live 2026-10-15.
+
 - Arc-suffixed series filenames (`Show - Arc - NN`, e.g. `Dragon Ball
   Super - Beerus - 01`) now resolve: when the full title matches nothing,
   the lookup normalizes the separator (` - ` -> `: `) instead of truncating

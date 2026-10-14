@@ -594,6 +594,13 @@ pub(crate) fn rp_text(s: &str, max: usize) -> String {
 /// as-is; otherwise the prefix fitting in `max-1` units is cut at its last space
 /// and a single U+2026 is appended, so a synopsis never ends mid-word. With no
 /// space in the prefix it falls back to `rp_text`'s hard cut.
+///
+/// DEPARTURE from the frozen reference (`presence.go:454`): the cut base is
+/// stripped of trailing punctuation before the ellipsis is appended. Go kept
+/// the comma/semicolon the clause cut stopped at, so the wire carried
+/// `Majin Buu,…` / `meet Elliot;…` (and a mid-word `…and Ernest` rode the
+/// tooltip's hard cut at the call site); here every truncated line ends on a
+/// word character plus U+2026, or on nothing extra when nothing was cut.
 pub(crate) fn trim_word(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -621,9 +628,33 @@ pub(crate) fn trim_word(s: &str, max: usize) -> String {
         && let Some(idx) = prefix.rfind(' ')
         && idx > 0
     {
-        return format!("{}\u{2026}", &prefix[..idx]);
+        let base = strip_cut_trail(&prefix[..idx]);
+        if base.is_empty() {
+            return "\u{2026}".to_string();
+        }
+        return format!("{base}\u{2026}");
     }
     rp_text(s, max)
+}
+
+/// Trailing marks stripped from a cut BEFORE the U+2026 terminator is appended:
+/// the clause separators (`,`, `;`, `:`), the dash family (`-`, `–`, `—`), the
+/// middle dot joiner (`·`), and surrounding whitespace. A cut that stopped at
+/// `Majin Buu,` or `meet Elliot;` therefore ends `Buu…` / `Elliot…`, never
+/// `,…` / `;…`. Sentence-terminal `.`/`!`/`?` are deliberately NOT in this set:
+/// the sentence-end path returns a complete sentence with its own terminator
+/// and no ellipsis, and must keep it.
+fn strip_cut_trail(s: &str) -> &str {
+    let mut out = s;
+    loop {
+        let trimmed = out.trim_end_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '–' | '—' | '·')
+        });
+        if trimmed.len() == out.len() {
+            return out;
+        }
+        out = trimmed;
+    }
 }
 
 /// Words that must never dangle before the ellipsis (`presence.go:490-497`):
@@ -713,6 +744,10 @@ fn utf16_units(s: &str) -> usize {
 /// in the back half with NO ellipsis; else last clause boundary (, ; space-dash
 /// variants) in the back half plus U+2026; else last word boundary plus U+2026
 /// (dangling connectors stripped first); never mid-word, never "...".
+///
+/// DEPARTURE from the frozen reference (`presence.go:573-644`): every cut that
+/// takes the ellipsis also strips trailing punctuation first (see
+/// [`trim_word`]), so the wire carries `Buu…`, never `Buu,…`.
 pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -750,7 +785,10 @@ pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
             && i + 1 < runes.len()
             && runes[i + 1].is_whitespace()
         {
-            let base = strip_dangling_connector(runes[..=i].iter().collect::<String>().trim());
+            let cleaned = strip_dangling_connector(
+                runes[..=i].iter().collect::<String>().trim(),
+            );
+            let base = strip_cut_trail(&cleaned);
             if base.is_empty() {
                 return "\u{2026}".to_string();
             }
@@ -764,8 +802,10 @@ pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
         {
             let start = i - 1;
             if start >= half_ell && start < end_ell {
-                let base =
-                    strip_dangling_connector(runes[..start].iter().collect::<String>().trim());
+                let cleaned = strip_dangling_connector(
+                    runes[..start].iter().collect::<String>().trim(),
+                );
+                let base = strip_cut_trail(&cleaned);
                 if base.is_empty() {
                     return "\u{2026}".to_string();
                 }
@@ -775,7 +815,9 @@ pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
     }
     for i in (0..end_ell).rev() {
         if runes[i] == ' ' {
-            let base = strip_dangling_connector(runes[..i].iter().collect::<String>().trim());
+            let cleaned =
+                strip_dangling_connector(runes[..i].iter().collect::<String>().trim());
+            let base = strip_cut_trail(&cleaned);
             if base.is_empty() {
                 return "\u{2026}".to_string();
             }
@@ -804,9 +846,11 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
     // Hover slot: assets.large_text is the poster tooltip. `name` already carries
     // the series title as the card header, so repeating it here wastes the slot;
     // carry the complete short synopsis instead (capped at Discord's 128-unit
-    // asset-text cap, so it arrives whole). No synopsis: keep today's fallback
+    // asset-text cap, so it arrives whole). The cap is word-aware with a U+2026
+    // terminator when cut (never the hard mid-word cut `rp_text` does: the live
+    // card showed `...Zak Penn and Ernest`). No synopsis: keep today's fallback
     // (series title when known, else "PotFlix").
-    let s = rp_text(&r.synopsis, 128);
+    let s = trim_word(&r.synopsis, 128);
     if !s.is_empty() {
         act.large_text = s;
     }

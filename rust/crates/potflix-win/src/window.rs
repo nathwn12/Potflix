@@ -1702,6 +1702,17 @@ impl UiScanError {
     }
 }
 
+/// The worker-published scan snapshot (`go\window.go:161-163`): `scanMu` plus
+/// the progress/stats/err package vars. The worker owns THIS lock and posts
+/// `WM_APP_SCAN_PROGRESS` / `WM_APP_SCAN_DONE`; it must never lock the
+/// process-wide `UI` mutex, which tests hold while a worker runs.
+#[derive(Clone, Debug, Default)]
+pub struct ScanSnapshot {
+    pub progress: Progress,
+    pub stats: Stats,
+    pub err: Option<UiScanError>,
+}
+
 /// `scanResultText` (`go\window.go:2014`).
 #[must_use]
 pub fn scan_result_text(kind: &str, s: &Stats, err: Option<&UiScanError>) -> String {
@@ -2281,23 +2292,21 @@ pub fn report_issue_status(
 // Process-wide debug log (`go\window.go:3491`).
 // ---------------------------------------------------------------------------
 
-static APP_LOG: std::sync::LazyLock<Mutex<Option<app_support::debuglog::Logger>>> =
-    std::sync::LazyLock::new(|| Mutex::new(None));
+static APP_LOG: std::sync::OnceLock<&'static app_support::debuglog::Logger> =
+    std::sync::OnceLock::new();
 
 /// Install the process log the UI writes to (`appLog = log`).
-pub fn set_app_log(log: app_support::debuglog::Logger) {
-    *APP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(log);
+///
+/// Takes a `&'static` reference -- the same logger the tray holds via
+/// `tray::set_logger` -- so both seams write to one logger with no second
+/// file handle. Returns the rejected logger if one is already installed.
+pub fn set_app_log(log: &'static app_support::debuglog::Logger) -> Result<(), &'static app_support::debuglog::Logger> {
+    APP_LOG.set(log)
 }
 
 /// `appLogf` (`go\window.go:3491`).
 pub fn app_logf(message: &str) {
-    if let Some(l) = APP_LOG
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-    {
+    if let Some(l) = APP_LOG.get() {
         l.log(message);
     }
 }
@@ -2335,6 +2344,9 @@ pub struct UiState {
     pub scan_last_paint: Instant,
     pub scan_resolve_start: Option<Instant>,
     pub scan_resolve_base: i64,
+    /// The worker-published snapshot slot: the worker writes here under this
+    /// lock and the wndproc arms publish it onto `UiState`.
+    pub scan_shared: Arc<Mutex<ScanSnapshot>>,
 
     pub startup_state: bool,
     pub scan_speed_state: String,
@@ -2360,6 +2372,17 @@ pub struct UiState {
     pub create_issue:
         Arc<dyn Fn(&repair::report::Report) -> (String, Option<repair::Error>) + Send + Sync>,
     pub open_url: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// `startLibraryScan` runner seam (`go\window.go:2662`
+    /// `library.ScanWithOptions`): the default runs the real scan; tests inject
+    /// a fake so no network is touched.
+    #[allow(clippy::type_complexity)]
+    pub scan_run:
+        Arc<dyn Fn(&library::Cancel, library::Options) -> Result<library::Stats, library::Error>
+            + Send
+            + Sync>,
+    /// `startLibraryScan` dirs seam (`go\window.go:2646` `loadConfig().Dirs`):
+    /// the default reads the live store; tests inject a temp dir.
+    pub scan_dirs: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
 }
 
 impl Default for UiState {
@@ -2386,6 +2409,7 @@ impl Default for UiState {
             scan_last_paint: Instant::now(),
             scan_resolve_start: None,
             scan_resolve_base: 0,
+            scan_shared: Arc::new(Mutex::new(ScanSnapshot::default())),
             startup_state: false,
             scan_speed_state: app_support::config::SCAN_SPEED_TURBO.to_string(),
             card_spec_state: CardSpec::default(),
@@ -2403,6 +2427,8 @@ impl Default for UiState {
             kill_timer: Arc::new(default_kill_timer),
             create_issue: Arc::new(default_create_issue),
             open_url: Arc::new(default_open_url),
+            scan_run: Arc::new(default_scan_run),
+            scan_dirs: Arc::new(default_scan_dirs),
         }
     }
 }
@@ -2442,6 +2468,19 @@ fn default_create_issue(r: &repair::report::Report) -> (String, Option<repair::E
 /// `reportOpenURL` default (`go\window.go:1061`).
 fn default_open_url(url: &str) -> bool {
     open_external_url(url)
+}
+
+/// `library.ScanWithOptions` default for the [`UiState::scan_run`] seam.
+fn default_scan_run(
+    cancel: &library::Cancel,
+    opts: library::Options,
+) -> Result<library::Stats, library::Error> {
+    library::scan_with_options(cancel, opts)
+}
+
+/// `loadConfig().Dirs` default for the [`UiState::scan_dirs`] seam.
+fn default_scan_dirs() -> Vec<String> {
+    app_support::config::load_config().dirs
 }
 
 /// `openExternalURL` (`go\window.go:1120`).
@@ -3230,6 +3269,31 @@ impl UiState {
         self.scan_resolve_base = 0;
     }
 
+    /// Publish the worker's progress snapshot onto the UI state. The
+    /// `WM_APP_SCAN_PROGRESS` arm runs this before `refresh_scan_live_text`,
+    /// exactly as Go's arm reads the mutex-guarded package var.
+    pub fn publish_scan_progress(&mut self) {
+        self.scan_progress = self
+            .scan_shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .progress
+            .clone();
+    }
+
+    /// Publish the worker's terminal snapshot onto the UI state. The
+    /// `WM_APP_SCAN_DONE` arm runs this before `on_scan_done`, exactly as Go's
+    /// arm reads the mutex-guarded package vars.
+    pub fn publish_scan_done(&mut self) {
+        let snap = self
+            .scan_shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.scan_stats = snap.stats;
+        self.scan_err = snap.err;
+    }
+
     /// `beginScanRun` (`go\window.go:2598`): the UI-thread half of scan start.
     pub fn begin_scan_run(
         &mut self,
@@ -3332,6 +3396,12 @@ impl UiState {
             ));
         } else if let Some(e) = &err {
             app_logf(&format!("{lname}: failed: {}", e.message));
+        } else {
+            // `onScanDone` (`go\window.go:2749`).
+            app_logf(&format!(
+                "{lname}: complete files={} skipped={} unique={} resolved={} cached={} fetched={} not-found={} errors={} denied={} foldersScanned={} foldersSkipped={} filesSkipped={}",
+                stats.files, stats.skipped, stats.unique, stats.resolved, stats.cached, stats.fetched, stats.not_found, stats.errors, stats.denied, stats.folders_scanned, stats.folders_skipped, stats.files_skipped
+            ));
         }
     }
 
@@ -3356,7 +3426,7 @@ impl UiState {
         if self.scan_active {
             return;
         }
-        let dirs = app_support::config::load_config().dirs;
+        let dirs = (self.scan_dirs)();
         let lname = if force { "refresh" } else { "scan" };
         if dirs.is_empty() {
             self.set_status_text("No folders configured - Add folder first.");
@@ -3370,13 +3440,68 @@ impl UiState {
             "{lname}: started (dirs={} force={force})",
             dirs.len()
         ));
-        // Worker thread: it may never touch the UI; it publishes a snapshot and
-        // posts an async message (production wiring posts to `hwnd`).
+        // Worker thread: it may never touch the UI nor lock the process-wide
+        // `UI` mutex; it publishes a snapshot and posts async messages
+        // (production wiring posts to `hwnd`).
         let cancel_clone = cancel.clone();
+        let shared = self.scan_shared.clone();
+        let run = self.scan_run.clone();
+        let hwnd_raw = hwnd as usize;
         std::thread::spawn(move || {
-            let opts = build_scan_options(dirs, force, None);
-            let _ = cancel_clone;
-            let _ = opts;
+            let shared_progress = shared.clone();
+            let opts = build_scan_options(
+                dirs,
+                force,
+                Some(Arc::new(move |p: Progress| {
+                    shared_progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .progress = p;
+                    if hwnd_raw != 0 {
+                        // SAFETY: async post only; the worker never touches a control.
+                        unsafe {
+                            crate::win32::PostMessageW(
+                                hwnd_raw as HWND,
+                                WM_APP_SCAN_PROGRESS,
+                                0,
+                                0,
+                            );
+                        }
+                    }
+                })),
+            );
+            let outcome = run(&cancel_clone, opts);
+            {
+                let mut snap = shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match outcome {
+                    Ok(stats) => {
+                        snap.stats = stats;
+                        snap.err = None;
+                    }
+                    Err(e) => {
+                        let message = e.message().to_string();
+                        // `library::Error` carries only a message and no
+                        // cancel flag, so a failed run is a cancel exactly
+                        // when the cancel fired.
+                        let cancelled = cancel_clone.is_cancelled();
+                        snap.stats = Stats {
+                            cancelled,
+                            ..Stats::default()
+                        };
+                        snap.err = Some(if cancelled {
+                            UiScanError::cancelled()
+                        } else {
+                            UiScanError::other(&message)
+                        });
+                    }
+                }
+            }
+            // SAFETY: async post only; the worker never touches a control.
+            unsafe {
+                crate::win32::PostMessageW(hwnd_raw as HWND, WM_APP_SCAN_DONE, 0, 0);
+            }
         });
     }
 
@@ -4884,6 +5009,12 @@ static TEST_BLOCKING_PROBE: Mutex<Option<fn(BlockingUi)>> = Mutex::new(None);
 #[cfg(test)]
 static TEST_SHOW_PROBE: Mutex<Option<fn()>> = Mutex::new(None);
 
+/// Serializes the tests that drive the process-wide `UI` global through the
+/// real wndproc: they set `scan_active` and the shared snapshot on `ui()`,
+/// which any concurrent global-state test would observe mid-flight.
+#[cfg(test)]
+static UI_GLOBAL_SERIAL: Mutex<()> = Mutex::new(());
+
 /// Runs a [`BlockingUi`] action with `UI` RELEASED. Every arm either opens a
 /// modal dialog or makes a Win32 call that can pump/dispatch a message and
 /// re-enter `main_wnd_proc`; the guard must be dropped (never `ui()`) across
@@ -5234,7 +5365,9 @@ pub unsafe extern "system" fn main_wnd_proc(
             return unsafe { crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam) };
         }
         WM_APP_SCAN_PROGRESS => {
-            ui().refresh_scan_live_text(hwnd, ScanLifecycleEvent::Progress, Instant::now());
+            let mut st = ui();
+            st.publish_scan_progress();
+            st.refresh_scan_live_text(hwnd, ScanLifecycleEvent::Progress, Instant::now());
             return 0;
         }
         WM_TIMER => {
@@ -5247,7 +5380,9 @@ pub unsafe extern "system" fn main_wnd_proc(
             }
         }
         WM_APP_SCAN_DONE => {
-            ui().on_scan_done(hwnd);
+            let mut st = ui();
+            st.publish_scan_done();
+            st.on_scan_done(hwnd);
             return 0;
         }
         WM_APP_REPORT_DONE => {
@@ -6078,6 +6213,9 @@ mod tests {
         // (holding the guard across `run_blocking_ui`) makes `try_lock` fail ->
         // this test fails. A per-route watchdog (bounded `recv_timeout`) turns a
         // pre-fix HANG into a failure.
+        let _ui_serial = UI_GLOBAL_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = std::sync::mpsc::channel::<Result<Obs, String>>();
         *TEST_SHOW_PROBE.lock().unwrap() = Some(show_probe);
         let tx_panic = tx.clone();
@@ -7992,5 +8130,229 @@ mod tests {
     #[test]
     fn mouse_xy_splits_lparam() {
         assert_eq!(mouse_xy(0x00C8_0064), (0x64, 0x00C8));
+    }
+
+    /// The Scan/Refresh worker is real (`go\window.go:2661-2674`): with a fake
+    /// runner (no network) over a temp dir, `start_library_scan` invokes the
+    /// runner with options built from the configured dirs, the progress
+    /// callback publishes into the shared snapshot, and the UI-thread landing
+    /// clears `scan_active`/`scan_cancel` with a terminal line and honest
+    /// counters. Reverting the worker body to the stub leaves the runner
+    /// uninvoked and the snapshot empty, so this test goes red.
+    #[test]
+    fn library_scan_worker_runs_runner_and_lands_done() {
+        let tmp = Scratch::new("libscan");
+        tmp.write("Show.S01E02.Pilot.1080p.mkv", "x");
+        let dir = tmp.path().to_string_lossy().into_owned();
+
+        let mut st = UiState::default();
+        st.arm_timer = Arc::new(|_| {});
+        st.kill_timer = Arc::new(|_| {});
+        let d = dir.clone();
+        st.scan_dirs = Arc::new(move || vec![d.clone()]);
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen_dirs = Arc::new(Mutex::new(Vec::new()));
+        let seen_force = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        let sd = seen_dirs.clone();
+        let sf = seen_force.clone();
+        st.scan_run = Arc::new(move |_cancel: &library::Cancel, opts: library::Options| {
+            r.store(true, Ordering::SeqCst);
+            *sd.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = opts.dirs.clone();
+            sf.store(opts.force, Ordering::SeqCst);
+            if let Some(progress) = &opts.progress {
+                progress(Progress {
+                    keys_total: 4,
+                    keys_done: 1,
+                    keys_cached: 1,
+                    folders_scanned: 1,
+                    ..Progress::default()
+                });
+            }
+            Ok(Stats {
+                keys: 4,
+                keys_done: 4,
+                keys_cached: 4,
+                files: 1,
+                unique: 1,
+                resolved: 1,
+                cached: 1,
+                folders_scanned: 1,
+                ..Stats::default()
+            })
+        });
+
+        st.start_library_scan(NULL, false);
+        assert!(st.scan_active, "run must latch active until done lands");
+        assert!(st.scan_cancel.is_some());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let landed = st
+                .scan_shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .stats
+                .keys
+                == 4;
+            if landed || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ran.load(Ordering::SeqCst), "worker must invoke the runner");
+        assert_eq!(
+            *seen_dirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![dir],
+            "options must be built from the configured dirs"
+        );
+        assert!(!seen_force.load(Ordering::SeqCst));
+
+        // The real progress callback published into the shared snapshot.
+        assert_eq!(
+            st.scan_shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .progress
+                .keys_done,
+            1
+        );
+
+        // The UI-thread landing, exactly as the wndproc arms run it.
+        st.publish_scan_progress();
+        assert_eq!(st.scan_progress.keys_done, 1);
+        assert_eq!(st.scan_progress.keys_total, 4);
+        st.publish_scan_done();
+        assert_eq!(st.scan_stats.keys, 4);
+        st.on_scan_done(NULL);
+        assert!(!st.scan_active, "done must unlatch the run");
+        assert!(st.scan_cancel.is_none());
+        assert!(st.scan_stats.keys > 0, "counters must be honest");
+        assert_eq!(st.status_text, scan_done_text("Scan", &st.scan_stats));
+    }
+
+    /// The `WM_APP_SCAN_PROGRESS` / `WM_APP_SCAN_DONE` arms publish the shared
+    /// snapshot before doing their existing work, driven through the REAL
+    /// `main_wnd_proc` against the process-wide `UI` global. This is the
+    /// real-path proof the headless `--selftest` cannot carry: a live scan
+    /// ends in `start_catch_up`, whose background thread performs live
+    /// provider lookups and writes the owner's real index/cache, so neither
+    /// `--selftest` nor `cargo test` may run the default runner. Assertions
+    /// cover the full terminal state, never the status line alone.
+    #[test]
+    fn scan_messages_land_through_real_wndproc() {
+        let _ui_serial = UI_GLOBAL_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        {
+            let mut st = ui();
+            st.arm_timer = Arc::new(|_| {});
+            st.kill_timer = Arc::new(|_| {});
+            st.scan_active = true;
+            st.scan_cancel = Some(library::Cancel::background());
+            st.scan_force = false;
+            st.scan_start = now - Duration::from_secs(30);
+            st.scan_last_paint = now - Duration::from_secs(3600);
+            st.scan_resolve_start = None;
+            st.scan_resolve_base = 0;
+            st.scan_progress = Progress::default();
+            st.scan_stats = Stats::default();
+            st.scan_err = None;
+            *st.scan_shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ScanSnapshot {
+                progress: Progress {
+                    keys_total: 4,
+                    keys_done: 1,
+                    keys_cached: 1,
+                    folders_scanned: 1,
+                    ..Progress::default()
+                },
+                stats: Stats::default(),
+                err: None,
+            };
+            st.status_text = "Scan starting...".into();
+        }
+        // SAFETY: scan arms touch no controls; NULL posts are no-ops.
+        unsafe {
+            main_wnd_proc(NULL, WM_APP_SCAN_PROGRESS, 0, 0);
+        }
+        {
+            let st = ui();
+            assert_eq!(st.scan_progress.keys_done, 1);
+            assert_eq!(st.scan_progress.keys_total, 4);
+            assert!(
+                st.status_text.starts_with("Scan "),
+                "live line, got {:?}",
+                st.status_text
+            );
+            assert!(st.scan_active);
+        }
+        let terminal = Stats {
+            keys: 4,
+            keys_done: 4,
+            keys_cached: 4,
+            files: 1,
+            unique: 1,
+            resolved: 1,
+            cached: 1,
+            folders_scanned: 1,
+            ..Stats::default()
+        };
+        {
+            let st = ui();
+            *st.scan_shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = ScanSnapshot {
+                progress: Progress {
+                    keys_total: 4,
+                    keys_done: 4,
+                    keys_cached: 4,
+                    folders_scanned: 1,
+                    ..Progress::default()
+                },
+                stats: terminal,
+                err: None,
+            };
+        }
+        // SAFETY: scan arms touch no controls; NULL posts are no-ops.
+        unsafe {
+            main_wnd_proc(NULL, WM_APP_SCAN_DONE, 0, 0);
+        }
+        {
+            let st = ui();
+            assert!(!st.scan_active, "done must unlatch the run");
+            assert!(st.scan_cancel.is_none());
+            assert_eq!(st.scan_stats.keys, 4);
+            assert!(st.scan_stats.keys_done > 0, "counters must be honest");
+            assert_eq!(st.status_text, scan_done_text("Scan", &terminal));
+        }
+        // Leave the global pristine for the next serial holder.
+        {
+            let mut st = ui();
+            st.arm_timer = Arc::new(default_arm_timer);
+            st.kill_timer = Arc::new(default_kill_timer);
+            st.scan_run = Arc::new(default_scan_run);
+            st.scan_dirs = Arc::new(default_scan_dirs);
+            st.scan_shared = Arc::new(Mutex::new(ScanSnapshot::default()));
+            st.scan_active = false;
+            if let Some(c) = st.scan_cancel.take() {
+                c.cancel();
+            }
+            st.scan_force = false;
+            st.scan_progress = Progress::default();
+            st.scan_stats = Stats::default();
+            st.scan_err = None;
+            st.scan_resolve_start = None;
+            st.scan_resolve_base = 0;
+            st.scan_start = Instant::now();
+            st.scan_last_paint = Instant::now();
+            st.status_text = "Ready".into();
+        }
     }
 }

@@ -28,11 +28,10 @@
 //!   ([`tray::set_clear_activity`]); [`run_ui`] installs the dc-bound clear
 //!   exactly as Go does at `main.go:197-200`, so the tray's "Exit Potflix" path
 //!   sends the IPC clear instead of only logging.
-//! * `window::set_app_log` takes an owned [`Logger`], while `tray::set_logger`
-//!   takes a `&'static` one; only one handle may own the log file at a time, so
-//!   the app installs the `&'static` logger (tray memory events) and leaves the
-//!   UI's `app_logf` slot empty rather than opening a second handle on the same
-//!   file.
+//! * `window::set_app_log` and `tray::set_logger` both take a `&'static`
+//!   [`Logger`]; [`run_ui`] installs the same logger in both seams, so the
+//!   tray and the UI write to one shared log with no second file handle
+//!   (Go's `appLog = log` at `main.go:121`).
 
 #![windows_subsystem = "windows"]
 
@@ -444,8 +443,10 @@ fn main() {
     let (_, source) = clientid::resolve_client_id();
     clientid::log_client_id_source(log, source);
 
-    // `appLog = log` for the tray window's message/menu callbacks.
+    // `appLog = log` for the tray window's message/menu callbacks and the
+    // settings window's `app_logf` (Go `main.go:121`: one shared logger).
     let _ = tray::set_logger(log);
+    let _ = window::set_app_log(log);
     let _ = tray::set_show_main_window(window::show_main_window);
 
     if selftest_run {
