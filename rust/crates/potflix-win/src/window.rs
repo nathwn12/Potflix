@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::Graphics::Gdi;
 
+use crate::brand;
 use crate::win32::{Rect, utf16_z};
 
 use library::{Progress, Stats};
@@ -137,20 +138,16 @@ pub const SW_SHOW_NORMAL: i32 = 1;
 pub const DT_WORD_BREAK: u32 = 0x0010;
 
 // ---------------------------------------------------------------------------
-// Dark palette (`go\window.go:178-191`), packed as COLORREF `0x00BBGGRR`.
+// Palette -- the repo's own brand system (`brand`, ported from
+// `design\make_logo.py`).
 //
-// The hue stays exactly as ported: a red-on-near-black identity (Netflix red
-// `#E50914` on `#0E0E0E`, the same pair Netflix ships on its own dark surface).
-// What the redesign adds is the missing STEP between each existing value so a
-// full state set exists, plus semantic aliases so paint sites name the state
-// they want, not a literal. No existing value is re-hued and none is changed
-// except the documented contrast fix at `COL_ON_ACCENT` (pure white for text on accent, pinned by `palette_contrast`).
+// The incumbent ramp was an ad-hoc grey ladder with the Netflix red dropped in:
+// it carried the red but none of the identity, because the identity lives in
+// `design\` and nothing read it. Every value below is now a brand token, and
+// every pair the app paints is measured in `brand`'s `brand_contrast_gate`.
 //
-// Reference for the surface ramp and state model: Fluent 2 dark
-// theming (`https://fluent2.microsoft.design/color`, accessed 2026-10-14) and
-// Material 3 dark elevation (a surface is raised by a luminance step, never a
-// shadow drop, because a shadow is invisible on a near-black canvas --
-// accessed 2026-10-14).
+// The roles are kept (canvas / chrome / panel / control / text) so no paint site
+// had to change shape; only the values moved to the brand palette.
 // ---------------------------------------------------------------------------
 
 /// `rgb(r, g, b)` (`go\window.go:3487`).
@@ -161,45 +158,55 @@ pub const fn rgb(r: u32, g: u32, b: u32) -> u32 {
 
 // --- Surfaces: the elevation ladder, darkest first. -------------------------
 
-/// The canvas (`elevation 0`). Also the window's own background brush, so the
-/// DWM caption and the client area meet with no seam.
-pub const COL_BG: u32 = rgb(0x14, 0x14, 0x14);
-/// One step of chrome above the canvas: header/footer bands (`elevation 1`).
-pub const COL_SURFACE: u32 = rgb(0x17, 0x17, 0x17);
-/// A raised panel (`elevation 2`): the folders card, the preview panel.
-pub const COL_CARD: u32 = rgb(0x1C, 0x1C, 0x1C);
-/// A control resting on a panel (`elevation 3`): a row, a subtle button.
-pub const COL_ROW: u32 = rgb(0x24, 0x24, 0x24);
-/// The same control, hovered.
-pub const COL_ROW_HOVER: u32 = rgb(0x2E, 0x2E, 0x2E);
-/// A hairline that separates two surfaces.
-pub const COL_BORDER: u32 = rgb(0x33, 0x33, 0x33);
-/// A hairline that must read as an edge, not a seam: card and control outlines.
-pub const COL_BORDER_STRONG: u32 = rgb(0x44, 0x44, 0x44);
+/// The canvas: brand `BLACK #0B0B0B`. Also the window's own background brush, so
+/// the DWM caption and the client area meet with no seam.
+pub const COL_BG: u32 = brand::BLACK;
+/// The chrome band (header and tab strip) and the list panel: the identity
+/// pass's own sheet background `#1A1B1E`, one luminance step above the canvas.
+pub const COL_SURFACE: u32 = brand::CHROME;
+/// A raised panel / a row chip: the brand card surface `#232428`.
+pub const COL_CARD: u32 = brand::CARD;
+/// A control resting on a panel (`elevation 3`): the card surface itself.
+pub const COL_ROW: u32 = brand::CARD;
+/// The same control, hovered or selected: one luminance step up.
+pub const COL_ROW_HOVER: u32 = brand::CARD_HOVER;
+/// A control BOUNDARY: the hairline that identifies a secondary control's shape
+/// (`4.09:1` on the canvas, `3.22:1` on the card surface -- measured).
+pub const COL_BORDER: u32 = brand::EDGE;
+/// The same hairline under hover. The brand has one boundary weight; hover is
+/// carried by the fill step, so this aliases the boundary rather than inventing
+/// a second grey.
+pub const COL_BORDER_STRONG: u32 = brand::EDGE;
 
 // --- Text: one step per role, each contrast-checked against its surface. ----
 
-/// Body text (`15.04:1` on `COL_BG`, `12.67:1` on `COL_ROW`; see `palette_contrast`).
-pub const COL_TEXT: u32 = rgb(0xE8, 0xE8, 0xE8);
-/// Text ON an accent fill, where `COL_TEXT` fails AA: pure white is `4.79:1` on
-/// `COL_ACCENT` against `3.91:1` for `COL_TEXT`.
-pub const COL_ON_ACCENT: u32 = rgb(0xFF, 0xFF, 0xFF);
-/// Secondary text: labels, hints, status (`6.55:1` on `COL_BG`).
-pub const COL_MUTED: u32 = rgb(0x9A, 0x9A, 0x9A);
-/// Disabled text (`4.00:1` on `COL_BG`): readable, clearly out of play.
-pub const COL_MUTED_DIM: u32 = rgb(0x75, 0x75, 0x75);
+/// Body text: the brand card header `#F2F3F5` (`13.96:1` on the card surface,
+/// `17.73:1` on the canvas; see `brand_contrast_gate`).
+pub const COL_TEXT: u32 = brand::CARD_HDR;
+/// Text ON an accent fill: brand `WHITE` (`4.79:1` on `RED`).
+pub const COL_ON_ACCENT: u32 = brand::WHITE;
+/// Secondary text: labels, hints, status. The brand card muted `#B5BAC1`
+/// (`7.94:1` on the card surface, `10.08:1` on the canvas).
+pub const COL_MUTED: u32 = brand::CARD_MUT;
+/// Disabled text (`#8A8F98`): still readable (`4.77:1` on the card surface,
+/// `6.06:1` on the canvas), clearly out of play. Derived rather than taken from
+/// the card quartet, whose muted step IS the secondary-text step, so a disabled
+/// control cannot read as an enabled one.
+pub const COL_MUTED_DIM: u32 = brand::DISABLED_TEXT;
 
 // --- Accent: the brand red, three interaction steps. -----------------------
 
-pub const COL_ACCENT: u32 = rgb(0xE5, 0x09, 0x14);
-pub const COL_ACCENT_HOV: u32 = rgb(0xF6, 0x12, 0x1D);
-pub const COL_ACCENT_DOWN: u32 = rgb(0xB0, 0x07, 0x10);
-/// A 15% accent wash over `COL_CARD`: the selection bar's backing and the
-/// selected-row tint. Never carries text.
-pub const COL_ACCENT_WASH: u32 = rgb(0x39, 0x15, 0x17);
+pub const COL_ACCENT: u32 = brand::RED;
+pub const COL_ACCENT_HOV: u32 = brand::RED_HOVER;
+pub const COL_ACCENT_DOWN: u32 = brand::DARK;
+/// The selection bar's backing and the selected-row tint: the accent over the
+/// card surface. Never carries text.
+pub const COL_ACCENT_WASH: u32 = rgb(0x3A, 0x1C, 0x21);
 
-/// Destructive text (Remove, and the clear actions' labels).
-pub const COL_DANGER: u32 = rgb(0xC0, 0x66, 0x66);
+/// Destructive text (Remove, and the clear actions' labels): the brand red
+/// lifted until it clears the body gate on every surface it lands on
+/// (`4.97:1` on the card surface, `6.31:1` on the canvas).
+pub const COL_DANGER: u32 = brand::DANGER_TEXT;
 
 // --- The named state set: every control paints from these, never a literal. --
 
@@ -207,10 +214,10 @@ pub const COL_DANGER: u32 = rgb(0xC0, 0x66, 0x66);
 pub const STATE_BG: u32 = COL_ROW;
 /// Control, hover.
 pub const STATE_BG_HOVER: u32 = COL_ROW_HOVER;
-/// Control, pressed (deeper than default: pressed reads as pushed in, not lit).
-pub const STATE_BG_PRESSED: u32 = rgb(0x1A, 0x1A, 0x1A);
+/// Control, pressed: the receding plane, one step down from the card surface.
+pub const STATE_BG_PRESSED: u32 = brand::CHROME;
 /// Control, disabled.
-pub const STATE_BG_DISABLED: u32 = rgb(0x1A, 0x1A, 0x1A);
+pub const STATE_BG_DISABLED: u32 = brand::CHROME;
 /// Control outline, default / hover / focused.
 pub const STATE_BORDER: u32 = COL_BORDER;
 pub const STATE_BORDER_HOVER: u32 = COL_BORDER_STRONG;
@@ -220,7 +227,7 @@ pub const STATE_TEXT_DISABLED: u32 = COL_MUTED_DIM;
 /// The keyboard focus ring and the selection bar share the accent.
 pub const STATE_FOCUS: u32 = COL_ACCENT;
 
-// --- Geometry tokens: a 4px grid, and the full radius set. ------------------
+// --- Geometry tokens: a 4px grid, and the house squircle. -------------------
 
 /// Spacing grid, logical px at 96 DPI. Every layout number is one of these.
 pub const SP_1: i32 = 4;
@@ -231,10 +238,19 @@ pub const SP_5: i32 = 20;
 pub const SP_6: i32 = 24;
 pub const SP_8: i32 = 32;
 
-/// Corner radii, logical px at 96 DPI.
-pub const R_BAR: i32 = 4;
-pub const R_CTRL: i32 = 8;
-pub const R_PANEL: i32 = 12;
+/// The control height every radius below is derived from.
+pub const BTN_H: i32 = 36;
+
+/// Corner radii. Each is the house squircle fraction (`brand::squircle`, the
+/// app icon's own 112/512) applied to the square it rounds: a control rounds
+/// like a `BTN_H` tile, a row like a `BTN_H` chip, a panel like a 64px tile, the
+/// scan bar like an 18px one. No radius is a free-hand number.
+pub const R_CTRL: i32 = brand::squircle(BTN_H);
+pub const R_ROW: i32 = brand::squircle(BTN_H);
+pub const R_PANEL: i32 = brand::squircle(64);
+pub const R_BAR: i32 = brand::squircle(18);
+/// The mark tile in the header: a 32px square.
+pub const R_TILE: i32 = brand::squircle(32);
 
 /// Stroke widths, logical px at 96 DPI.
 pub const STROKE_HAIR: i32 = 1;
@@ -244,7 +260,7 @@ pub const STROKE_FOCUS: i32 = 2;
 pub const FOCUS_INSET: i32 = 3;
 /// The selection bar down the left edge of a selected row.
 pub const SELECT_BAR_W: i32 = 3;
-/// The list scrollbar: track/thumb width, its inset from the card's right edge,
+/// The list scrollbar: track/thumb width, its inset from the panel's right edge,
 /// and the minimum thumb length (a long list must still show a grabbable thumb).
 pub const SCROLLBAR_W: i32 = 5;
 pub const SCROLLBAR_INSET: i32 = 6;
@@ -252,16 +268,20 @@ pub const SCROLLBAR_MIN_THUMB: i32 = 24;
 
 // --- Type scale: logical px at 96 DPI, one size per role. ------------------
 
-/// The masthead (`POTFLIX`) and a view's title.
-pub const FS_TITLE: i32 = 22;
-/// Rows and button labels.
-pub const FS_BODY: i32 = 14;
+/// The wordmark (`POTFLIX`), in Archivo Black, tracked.
+pub const FS_WORDMARK: i32 = brand::FS_WORDMARK;
+/// A view's own heading.
+pub const FS_TITLE: i32 = brand::FS_TITLE;
+/// Rows, labels, values.
+pub const FS_BODY: i32 = brand::FS_BODY;
+/// A control's label.
+pub const FS_CONTROL: i32 = brand::FS_CONTROL;
 /// Field hints and the status line.
-pub const FS_HINT: i32 = 12;
-/// Uppercase section labels.
-pub const FS_LABEL: i32 = 12;
-/// Tooltips and the `+N more` overflow line.
-pub const FS_SMALL: i32 = 11;
+pub const FS_HINT: i32 = brand::FS_HINT;
+/// A section's micro-label: tiny, uppercase, letter-spaced.
+pub const FS_LABEL: i32 = brand::FS_LABEL;
+/// The count badge's numeral.
+pub const FS_BADGE: i32 = brand::FS_BADGE;
 
 // Button paint styles (`go\window.go:194-200`).
 pub const BTN_SUBTLE: i32 = 0;
@@ -269,6 +289,13 @@ pub const BTN_ACCENT: i32 = 1;
 pub const BTN_OUTLINE: i32 = 2;
 pub const BTN_TEXT: i32 = 3;
 pub const BTN_DANGER: i32 = 4;
+/// A segment of a segmented control or a row of mutually-exclusive choices (the
+/// tab strip, the scan-speed segments, the card presets): an unlit segment.
+pub const BTN_TAB: i32 = 5;
+/// The same segment, lit. The lit state is a fill step plus a red indicator under
+/// the label -- never a second accent FILL, because each view has exactly one
+/// primary control (`Scan`) and selection is not a primary action.
+pub const BTN_TAB_SEL: i32 = 6;
 
 // ---------------------------------------------------------------------------
 // Types.
@@ -303,6 +330,14 @@ pub struct UiLayout {
     pub overflow: i32,
     pub settings: Rect,
     pub card_link: Rect,
+    /// The chrome header band (mark, wordmark, subtitle).
+    pub header: Rect,
+    /// The tab strip's outer rect; the two segments are [`UiLayout::card_link`]
+    /// (Card) and [`UiLayout::settings`] (Settings).
+    pub tab_strip: Rect,
+    /// The section micro-label's line (the folder count's badge sits at its
+    /// right end).
+    pub section: Rect,
     /// The first visible folder index (`0` when the list fits).
     pub list_top: i32,
     /// How many folders the viewport can show.
@@ -326,6 +361,13 @@ impl UiLayout {
 pub struct SettingsLayout {
     pub status: Rect,
     pub btns: Vec<UiButton>,
+    /// The section micro-labels, in paint order. Owned by the layout so the
+    /// label a paint call draws and the rect the audit measures cannot drift.
+    pub labels: Vec<NamedTextRect>,
+    /// The scan-speed hint's wrapped text block.
+    pub hint: Rect,
+    /// The dead-cache line.
+    pub dead: Rect,
 }
 
 impl SettingsLayout {
@@ -343,6 +385,11 @@ pub struct CardLayout {
     pub rows: Vec<Rect>,
     pub status: Rect,
     pub btns: Vec<UiButton>,
+    /// The section micro-labels, in paint order (the preview heading and the two
+    /// preset-row headings).
+    pub labels: Vec<NamedTextRect>,
+    /// The explanatory line under the preset rows.
+    pub hint: Rect,
 }
 
 impl CardLayout {
@@ -364,6 +411,35 @@ pub struct NamedTextRect {
 pub const MAIN_CLIENT_W: i32 = 460;
 pub const MAIN_CLIENT_H: i32 = 680;
 pub const MAIN_MARGIN: i32 = 20;
+
+// --- The main view's vertical stack, logical px at 96 DPI. ------------------
+//
+// These are the composition's skeleton, shared by `compute_layout_total` (the
+// hit-test table) and the paint path, so a rect can never disagree with what is
+// drawn in it.
+
+/// The chrome header band: mark, wordmark, subtitle.
+pub const HEADER_H_L: i32 = 64;
+/// The tab strip's top edge and height.
+pub const TAB_TOP_L: i32 = 76;
+pub const TAB_H_L: i32 = 34;
+/// A section micro-label's line height.
+pub const SECTION_H_L: i32 = 18;
+/// The folder panel's inner padding.
+pub const PAD_L: i32 = 10;
+/// A folder row's height and the gap between rows.
+pub const ROW_H_L: i32 = 36;
+pub const ROW_GAP_L: i32 = 8;
+/// The `+N more` line's reserved height.
+pub const OVERFLOW_H_L: i32 = 22;
+/// The action grid: one column gap, one row gap, three rows.
+pub const BTN_GAP_L: i32 = 12;
+pub const FOOTER_ROWS_L: i32 = 3;
+/// The status line's height and the bottom margin below it.
+pub const STATUS_H_L: i32 = 20;
+pub const BOTTOM_L: i32 = 14;
+/// The header mark tile's side.
+pub const MARK_TILE_L: i32 = 32;
 
 // ---------------------------------------------------------------------------
 // Pure geometry (`go\window.go:3466-3472, :470-492`).
@@ -454,6 +530,57 @@ pub fn scrollbar_thumb(track: Rect, total: i32, capacity: i32, top: i32, min_thu
     }
 }
 
+/// The tab strip's two segments as `(card, settings)`, in every view.
+///
+/// One function owns the strip's geometry so the three views cannot drift: the
+/// strip is the same control, in the same place, on every view, and switching
+/// views never moves the control the user just clicked.
+#[must_use]
+pub fn tab_strip_rects(cw: i32, dpi: i32) -> (Rect, Rect) {
+    let sc = |v: i32| scale_px(dpi, v);
+    let margin = sc(MAIN_MARGIN);
+    let content_w = (cw - margin * 2).max(sc(100));
+    let top = sc(TAB_TOP_L);
+    let bottom = top + sc(TAB_H_L);
+    // Equal segments with one gap: the same rule the action grid uses, so both
+    // segments are exactly equal at every DPI.
+    let seg_w = (content_w - sc(SP_2)) / 2;
+    (
+        Rect {
+            left: margin,
+            top,
+            right: margin + seg_w,
+            bottom,
+        },
+        Rect {
+            left: margin + seg_w + sc(SP_2),
+            top,
+            right: margin + seg_w + sc(SP_2) + seg_w,
+            bottom,
+        },
+    )
+}
+
+/// The two tab-strip segments as controls, for any view's button table.
+#[must_use]
+pub fn tab_strip_buttons(cw: i32, dpi: i32) -> Vec<UiButton> {
+    let (card, settings) = tab_strip_rects(cw, dpi);
+    vec![
+        UiButton {
+            id: BTN_CARD,
+            label: "Card".into(),
+            style: BTN_TAB,
+            rc: card,
+        },
+        UiButton {
+            id: BTN_SETTINGS,
+            label: "Settings".into(),
+            style: BTN_TAB,
+            rc: settings,
+        },
+    ]
+}
+
 /// The same table with the list scrolled to `top` (the index of the first visible
 /// folder). `top` is clamped to the real scroll range, and the card keeps the
 /// height of a full viewport once the list overflows, so scrolling never resizes
@@ -475,27 +602,61 @@ pub fn compute_layout_from(
 pub fn compute_layout_total(total: i32, cw: i32, ch: i32, dpi: i32, top: i32) -> UiLayout {
     let sc = |v: i32| scale_px(dpi, v);
     let margin = sc(MAIN_MARGIN);
-    let card_left = margin;
-    let mut card_w = cw - margin * 2;
-    if card_w < sc(100) {
-        card_w = sc(100);
-    }
+    let content_w = (cw - margin * 2).max(sc(100));
 
     let mut l = UiLayout::default();
+    // --- The vertical stack -------------------------------------------------
+    //
+    // One column, top to bottom: chrome header, tab strip, section micro-label,
+    // the folder panel, then the action grid and the status line. Every number
+    // is a token or a sum of tokens, so the composition moves as one piece and
+    // the panel's height is whatever the grid leaves it.
+    let header_h = sc(HEADER_H_L);
+    let tab_top = sc(TAB_TOP_L);
+    let tab_h = sc(TAB_H_L);
+    let section_top = tab_top + tab_h + sc(SP_3);
+    let section_h = sc(SECTION_H_L);
+    let panel_top = section_top + section_h + sc(SP_2);
 
-    const CARD_TOP_L: i32 = 118;
-    const MAX_CARD_H_L: i32 = 262;
-    const PAD_L: i32 = 10;
-    const ROW_H_L: i32 = 36;
-    const GAP_L: i32 = 8;
-    const OVERFLOW_H_L: i32 = 22;
-
-    let card_top = sc(CARD_TOP_L);
-    let max_card_h = sc(MAX_CARD_H_L);
     let pad = sc(PAD_L);
     let row_h = sc(ROW_H_L);
-    let gap = sc(GAP_L);
-    let avail = max_card_h - pad * 2;
+    let gap = sc(ROW_GAP_L);
+
+    let btn_h = sc(BTN_H);
+    let btn_gap = sc(BTN_GAP_L);
+    let footer_h = FOOTER_ROWS_L * btn_h + (FOOTER_ROWS_L - 1) * btn_gap;
+    let status_h = sc(STATUS_H_L);
+    let bottom = sc(BOTTOM_L);
+    let status_top = ch - bottom - status_h;
+    let footer_top = status_top - sc(SP_3) - footer_h;
+    let panel_max_h = (footer_top - sc(SP_4) - panel_top).max(sc(80));
+
+    l.header = Rect {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: header_h,
+    };
+
+    // --- The tab strip ------------------------------------------------------
+    let (card_tab, settings_tab) = tab_strip_rects(cw, dpi);
+    l.tab_strip = Rect {
+        left: card_tab.left,
+        top: card_tab.top,
+        right: settings_tab.right,
+        bottom: card_tab.bottom,
+    };
+    l.card_link = card_tab;
+    l.settings = settings_tab;
+    l.section = Rect {
+        left: margin,
+        top: section_top,
+        right: margin + content_w,
+        bottom: section_top + section_h,
+    };
+
+    // --- The folder panel ---------------------------------------------------
+    let avail = panel_max_h - pad * 2;
     let mut max_rows = (avail + gap) / (row_h + gap);
     if max_rows < 1 {
         max_rows = 1;
@@ -513,31 +674,31 @@ pub fn compute_layout_total(total: i32, cw: i32, ch: i32, dpi: i32, top: i32) ->
     l.list_top = top;
     l.list_capacity = max_rows;
     // The viewport is full-height once anything is hidden, whichever offset the
-    // list is scrolled to: the `+N more` line's height is reserved whenever
-    // the list overflows at all, so scrolling never resizes the card (and its
+    // list is scrolled to: the `+N more` line's height is reserved whenever the
+    // list overflows at all, so scrolling never resizes the panel (and its
     // scrollbar track) under the pointer. The line itself still paints only
     // while something hides below (`l.overflow > 0` at the paint site).
     let viewport = if total > max_rows { max_rows } else { vis };
-    let mut card_h = pad * 2 + row_h;
+    let mut panel_h = pad * 2 + row_h;
     if viewport > 0 {
-        card_h = pad * 2 + viewport * row_h + (viewport - 1) * gap;
+        panel_h = pad * 2 + viewport * row_h + (viewport - 1) * gap;
         if total > max_rows {
-            card_h += sc(OVERFLOW_H_L);
+            panel_h += sc(OVERFLOW_H_L);
         }
     }
-    if card_h > max_card_h {
-        card_h = max_card_h;
+    if panel_h > panel_max_h {
+        panel_h = panel_max_h;
     }
     l.card = Rect {
-        left: card_left,
-        top: card_top,
-        right: card_left + card_w,
-        bottom: card_top + card_h,
+        left: margin,
+        top: panel_top,
+        right: margin + content_w,
+        bottom: panel_top + panel_h,
     };
-    let row_x = card_left + pad;
-    let row_w = card_w - pad * 2;
+    let row_x = l.card.left + pad;
+    let row_w = content_w - pad * 2;
     for i in 0..vis {
-        let y = card_top + pad + i * (row_h + gap);
+        let y = panel_top + pad + i * (row_h + gap);
         l.rows.push(Rect {
             left: row_x,
             top: y,
@@ -552,7 +713,7 @@ pub fn compute_layout_total(total: i32, cw: i32, ch: i32, dpi: i32, top: i32) ->
             bottom: y + row_h,
         });
     }
-    // The scrollbar lives inside the card's right padding gutter, so it never
+    // The scrollbar lives inside the panel's right padding gutter, so it never
     // overlaps a row or the `+N more` line. Gated on real overflow (`total >
     // max_rows`), not on `l.overflow` (hidden-below): the track must persist
     // at the last viewport too, or it blinks out exactly when reached.
@@ -566,116 +727,88 @@ pub fn compute_layout_total(total: i32, cw: i32, ch: i32, dpi: i32, top: i32) ->
             bottom: l.card.bottom - pad,
         };
         l.scrollbar = track;
-        l.thumb = scrollbar_thumb(
-            track,
-            total,
-            max_rows,
-            top,
-            sc(SCROLLBAR_MIN_THUMB),
-        );
+        l.thumb = scrollbar_thumb(track, total, max_rows, top, sc(SCROLLBAR_MIN_THUMB));
     }
 
-    const BTN_H_L: i32 = 36;
-    const BTN_GAP_L: i32 = 12;
-    let btn_top = card_top + max_card_h + sc(16);
-    let btn_h = sc(BTN_H_L);
-    let btn_gap = sc(BTN_GAP_L);
-    let btn_w = (card_w - btn_gap) / 2;
-    let x0 = card_left;
-    let x1 = card_left + btn_w + btn_gap;
-    let y0 = btn_top;
-    let y1 = btn_top + btn_h + btn_gap;
+    // --- The action grid ----------------------------------------------------
+    //
+    // ONE grid for every action, all three rows of it. Equal columns
+    // (`col_w = (content_w - gap) / 2`), one gap between columns and one between
+    // rows, and exactly one primary control (`Scan`, accent) -- the rest are
+    // secondary. This replaces the incumbent's two off-grid columns plus a
+    // right-aligned bare `Close to tray` text and a stray left-aligned `Report`
+    // on a fourth, unaligned row.
+    let col_w = (content_w - btn_gap) / 2;
+    let (x0, x1) = (margin, margin + col_w + btn_gap);
+    let y_of = |row: i32| footer_top + row * (btn_h + btn_gap);
+    let cell = |x: i32, y: i32| Rect {
+        left: x,
+        top: y,
+        right: x + col_w,
+        bottom: y + btn_h,
+    };
     l.btns = vec![
+        // The tab strip's two segments are controls too, so they hover, press,
+        // focus and paint through the same machinery as the grid above.
         UiButton {
-            id: BTN_ADD,
-            label: "Add folder".into(),
-            style: BTN_SUBTLE,
-            rc: Rect {
-                left: x0,
-                top: y0,
-                right: x0 + btn_w,
-                bottom: y0 + btn_h,
-            },
+            id: BTN_CARD,
+            label: "Card".into(),
+            style: BTN_TAB,
+            rc: l.card_link,
         },
         UiButton {
-            id: BTN_REMOVE,
-            label: "Remove".into(),
-            style: BTN_SUBTLE,
-            rc: Rect {
-                left: x1,
-                top: y0,
-                right: x1 + btn_w,
-                bottom: y0 + btn_h,
-            },
+            id: BTN_SETTINGS,
+            label: "Settings".into(),
+            style: BTN_TAB,
+            rc: l.settings,
         },
+        // Row 1: the run controls. `Scan` is the view's single primary.
         UiButton {
             id: BTN_SCAN,
             label: "Scan".into(),
             style: BTN_ACCENT,
-            rc: Rect {
-                left: x0,
-                top: y1,
-                right: x0 + btn_w,
-                bottom: y1 + btn_h,
-            },
+            rc: cell(x0, y_of(0)),
         },
         UiButton {
             id: BTN_REFRESH,
             label: "Refresh".into(),
             style: BTN_OUTLINE,
-            rc: Rect {
-                left: x1,
-                top: y1,
-                right: x1 + btn_w,
-                bottom: y1 + btn_h,
-            },
+            rc: cell(x1, y_of(0)),
+        },
+        // Row 2: the folder controls.
+        UiButton {
+            id: BTN_ADD,
+            label: "Add folder".into(),
+            style: BTN_OUTLINE,
+            rc: cell(x0, y_of(1)),
+        },
+        UiButton {
+            id: BTN_REMOVE,
+            label: "Remove".into(),
+            style: BTN_OUTLINE,
+            rc: cell(x1, y_of(1)),
+        },
+        // Row 3: the two window actions, same anatomy as every other control.
+        UiButton {
+            id: BTN_REPORT,
+            label: report_button_label().into(),
+            style: BTN_OUTLINE,
+            rc: cell(x0, y_of(2)),
+        },
+        UiButton {
+            id: BTN_CLOSE,
+            label: "Close to tray".into(),
+            style: BTN_OUTLINE,
+            rc: cell(x1, y_of(2)),
         },
     ];
-    let (close_w, close_h) = (sc(120), sc(28));
-    l.btns.push(UiButton {
-        id: BTN_CLOSE,
-        label: "Close to tray".into(),
-        style: BTN_TEXT,
-        rc: Rect {
-            left: card_left + card_w - close_w,
-            top: y1 + btn_h + sc(8),
-            right: card_left + card_w,
-            bottom: y1 + btn_h + sc(8) + close_h,
-        },
-    });
-    l.btns.push(UiButton {
-        id: BTN_REPORT,
-        label: crate::window::report_button_label().into(),
-        style: BTN_OUTLINE,
-        rc: Rect {
-            left: x0,
-            top: y1 + btn_h + btn_gap,
-            right: x0 + btn_w,
-            bottom: y1 + btn_h + btn_gap + btn_h,
-        },
-    });
-
-    let (set_w, set_h) = (sc(120), sc(28));
-    l.settings = Rect {
-        left: cw - margin - set_w,
-        top: sc(56),
-        right: cw - margin,
-        bottom: sc(56) + set_h,
-    };
-    let (card_lnk_w, card_lnk_h) = (sc(100), sc(24));
-    l.card_link = Rect {
-        left: l.settings.left - card_lnk_w,
-        top: sc(68),
-        right: l.settings.left,
-        bottom: sc(68) + card_lnk_h,
-    };
 
     let st_h = sc(20);
     l.status = Rect {
         left: margin,
-        top: ch - sc(14) - st_h,
-        right: cw - margin,
-        bottom: ch - sc(14),
+        top: status_top,
+        right: margin + content_w,
+        bottom: status_top + st_h,
     };
     l
 }
@@ -692,133 +825,143 @@ pub fn compute_settings_layout(
 ) -> SettingsLayout {
     let sc = |v: i32| scale_px(dpi, v);
     let margin = sc(MAIN_MARGIN);
+    let content_w = (cw - margin * 2).max(sc(100));
 
     let mut l = SettingsLayout::default();
 
-    let (back_w, back_h) = (sc(80), sc(28));
-    let back = Rect {
+    // The same vertical stack and the same two-column grid the main view uses:
+    // header band, tab strip, then one labelled group per concern, then the
+    // footer row. `label_top` is the first section label's top edge, which is
+    // exactly where the tab strip ends.
+    let label_top = sc(TAB_TOP_L) + sc(TAB_H_L) + sc(SP_3);
+    let row_pitch = sc(BTN_H) + sc(BTN_GAP_L);
+    let group_gap = sc(SP_4);
+    let label_h = sc(SECTION_H_L);
+    let after_label = label_h + sc(SP_2);
+
+    let lib_row1 = label_top + after_label;
+    let lib_row2 = lib_row1 + row_pitch;
+    let startup_label = lib_row2 + sc(BTN_H) + group_gap;
+    let startup_row = startup_label + after_label;
+    let scan_label = startup_row + sc(BTN_H) + group_gap;
+    let scan_row = scan_label + after_label;
+    let hint_top = scan_row + sc(BTN_H) + sc(SP_2) + sc(SP_1);
+    let hint_h = sc(48);
+    let dead_top = hint_top + hint_h + sc(SP_1);
+
+    l.labels = vec![
+        NamedTextRect {
+            id: "settings.lib".into(),
+            rc: Rect {
+                left: margin,
+                top: lib_row1 - after_label,
+                right: margin + content_w,
+                bottom: lib_row1 - after_label + label_h,
+            },
+        },
+        NamedTextRect {
+            id: "settings.startup".into(),
+            rc: Rect {
+                left: margin,
+                top: startup_label,
+                right: margin + content_w,
+                bottom: startup_label + label_h,
+            },
+        },
+        NamedTextRect {
+            id: "settings.scan".into(),
+            rc: Rect {
+                left: margin,
+                top: scan_label,
+                right: margin + content_w,
+                bottom: scan_label + label_h,
+            },
+        },
+    ];
+    l.hint = Rect {
         left: margin,
-        top: sc(16),
-        right: margin + back_w,
-        bottom: sc(16) + back_h,
+        top: hint_top,
+        right: margin + content_w,
+        bottom: hint_top + hint_h,
+    };
+    l.dead = Rect {
+        left: margin,
+        top: dead_top,
+        right: margin + content_w,
+        bottom: dead_top + label_h,
     };
 
-    let lib_top = sc(100);
-    let lib_h = sc(32);
-    let lib_w = (cw - margin * 2 - sc(12) * 3) / 4;
-    let clear_meta_rc = Rect {
-        left: margin,
-        top: lib_top,
-        right: margin + lib_w,
-        bottom: lib_top + lib_h,
-    };
-    let clear_idx_rc = Rect {
-        left: margin + lib_w + sc(12),
-        top: lib_top,
-        right: margin + lib_w * 2 + sc(12),
-        bottom: lib_top + lib_h,
-    };
-    let export_rc = Rect {
-        left: margin + lib_w * 2 + sc(24),
-        top: lib_top,
-        right: margin + lib_w * 3 + sc(24),
-        bottom: lib_top + lib_h,
-    };
-    let import_rc = Rect {
-        left: margin + lib_w * 3 + sc(36),
-        top: lib_top,
-        right: cw - margin,
-        bottom: lib_top + lib_h,
+    // The same two-column grid as the main view: equal columns, one gap.
+    let col_w = (content_w - sc(BTN_GAP_L)) / 2;
+    let (x0, x1) = (margin, margin + col_w + sc(BTN_GAP_L));
+    let cell = |x: i32, y: i32| Rect {
+        left: x,
+        top: y,
+        right: x + col_w,
+        bottom: y + sc(BTN_H),
     };
 
-    let start_top = sc(172);
-    let start_h = sc(32);
-    let toggle_w = sc(230);
-    let toggle_rc = Rect {
-        left: margin,
-        top: start_top,
-        right: margin + toggle_w,
-        bottom: start_top + start_h,
-    };
-    let log_rc = Rect {
-        left: margin + toggle_w + sc(12),
-        top: start_top,
-        right: cw - margin,
-        bottom: start_top + start_h,
+    // The scan-speed segments: three equal cells, the last absorbing the
+    // remainder so the group ends exactly on the content edge.
+    let seg_gap = sc(SP_2);
+    let seg_w = (content_w - seg_gap * 2) / 3;
+    let seg = |i: i32| {
+        let left = margin + i * (seg_w + seg_gap);
+        Rect {
+            left,
+            top: scan_row,
+            right: if i == 2 { margin + content_w } else { left + seg_w },
+            bottom: scan_row + sc(BTN_H),
+        }
     };
 
-    let scan_top = sc(244);
-    let scan_h = sc(32);
-    let scan_w = (cw - margin * 2 - sc(12) * 2) / 3;
-    let cur_scan = app_support::config::normalize_scan_speed(scan_speed);
-    let gentle_rc = Rect {
-        left: margin,
-        top: scan_top,
-        right: margin + scan_w,
-        bottom: scan_top + scan_h,
-    };
-    let balanced_rc = Rect {
-        left: margin + scan_w + sc(12),
-        top: scan_top,
-        right: margin + scan_w * 2 + sc(12),
-        bottom: scan_top + scan_h,
-    };
-    let turbo_rc = Rect {
-        left: margin + scan_w * 2 + sc(24),
-        top: scan_top,
-        right: cw - margin,
-        bottom: scan_top + scan_h,
-    };
-
-    let st_h = sc(20);
+    let status_h = sc(STATUS_H_L);
+    let status_top = ch - sc(BOTTOM_L) - status_h;
+    let footer_top = status_top - sc(SP_3) - sc(BTN_H);
     l.status = Rect {
         left: margin,
-        top: ch - sc(14) - st_h,
-        right: cw - margin,
-        bottom: ch - sc(14),
+        top: status_top,
+        right: margin + content_w,
+        bottom: status_top + status_h,
     };
-    l.btns = vec![
-        UiButton {
-            id: BTN_BACK,
-            label: "Back".into(),
-            style: BTN_TEXT,
-            rc: back,
-        },
+
+    let cur_scan = app_support::config::normalize_scan_speed(scan_speed);
+    l.btns = tab_strip_buttons(cw, dpi);
+    l.btns.extend([
         UiButton {
             id: BTN_CLEAR_CACHE,
             label: "Clear metadata".into(),
             style: BTN_DANGER,
-            rc: clear_meta_rc,
+            rc: cell(x0, lib_row1),
         },
         UiButton {
             id: BTN_CLEAR_INDEX,
             label: "Clear index".into(),
             style: BTN_DANGER,
-            rc: clear_idx_rc,
+            rc: cell(x1, lib_row1),
         },
         UiButton {
             id: BTN_EXPORT,
             label: "Export...".into(),
-            style: BTN_SUBTLE,
-            rc: export_rc,
+            style: BTN_OUTLINE,
+            rc: cell(x0, lib_row2),
         },
         UiButton {
             id: BTN_IMPORT,
             label: "Import...".into(),
-            style: BTN_SUBTLE,
-            rc: import_rc,
+            style: BTN_OUTLINE,
+            rc: cell(x1, lib_row2),
         },
         UiButton {
             id: BTN_STARTUP,
             label: crate::settings::startup_toggle_label(startup).into(),
-            style: BTN_SUBTLE,
-            rc: toggle_rc,
-        },
-        UiButton {
-            id: BTN_OPEN_LOG,
-            label: "Open log folder".into(),
             style: BTN_OUTLINE,
-            rc: log_rc,
+            rc: Rect {
+                left: margin,
+                top: startup_row,
+                right: margin + content_w,
+                bottom: startup_row + sc(BTN_H),
+            },
         },
         UiButton {
             id: BTN_SCAN_GENTLE,
@@ -827,7 +970,7 @@ pub fn compute_settings_layout(
                 app_support::config::SCAN_SPEED_GENTLE,
                 cur_scan,
             ),
-            rc: gentle_rc,
+            rc: seg(0),
         },
         UiButton {
             id: BTN_SCAN_BALANCED,
@@ -836,7 +979,7 @@ pub fn compute_settings_layout(
                 app_support::config::SCAN_SPEED_BALANCED,
                 cur_scan,
             ),
-            rc: balanced_rc,
+            rc: seg(1),
         },
         UiButton {
             id: BTN_SCAN_TURBO,
@@ -845,9 +988,21 @@ pub fn compute_settings_layout(
                 app_support::config::SCAN_SPEED_TURBO,
                 cur_scan,
             ),
-            rc: turbo_rc,
+            rc: seg(2),
         },
-    ];
+        UiButton {
+            id: BTN_BACK,
+            label: "Back".into(),
+            style: BTN_OUTLINE,
+            rc: cell(x0, footer_top),
+        },
+        UiButton {
+            id: BTN_OPEN_LOG,
+            label: "Open log folder".into(),
+            style: BTN_OUTLINE,
+            rc: cell(x1, footer_top),
+        },
+    ]);
     l
 }
 
@@ -855,7 +1010,8 @@ pub fn compute_settings_layout(
 // Text-rect tables (`go\window.go:666-727`, `:1602-1635`).
 // ---------------------------------------------------------------------------
 
-/// `mainTextRects` (`go\window.go:674`).
+/// `mainTextRects` (`go\window.go:674`): the stable audit id for every string
+/// the main view paints, in the same rect the paint path draws it in.
 #[must_use]
 pub fn main_text_rects(
     cw: i32,
@@ -867,42 +1023,43 @@ pub fn main_text_rects(
     let sc = |v: i32| scale_px(dpi, v);
     let mut out = vec![
         NamedTextRect {
-            id: "main.title".into(),
+            id: "main.wordmark".into(),
             rc: Rect {
-                left: sc(20),
-                top: sc(16),
-                right: cw - sc(72),
-                bottom: sc(48),
+                left: l.header.left + sc(MAIN_MARGIN) + sc(MARK_TILE_L) + sc(SP_3),
+                top: l.header.top + sc(SP_3),
+                right: l.header.right - sc(MAIN_MARGIN),
+                bottom: l.header.top + sc(SP_3) + sc(26),
             },
         },
         NamedTextRect {
             id: "main.subtitle".into(),
             rc: Rect {
-                left: sc(20),
-                top: sc(48),
-                right: cw - sc(20) - sc(120) - sc(8),
-                bottom: sc(68),
+                left: l.header.left + sc(MAIN_MARGIN) + sc(MARK_TILE_L) + sc(SP_3),
+                top: l.header.top + sc(SP_3) + sc(26),
+                right: l.header.right - sc(MAIN_MARGIN),
+                bottom: l.header.bottom - sc(SP_2),
             },
         },
         NamedTextRect {
             id: "main.section".into(),
             rc: Rect {
-                left: sc(20),
-                top: sc(92),
-                right: cw - sc(60),
-                bottom: sc(110),
+                left: l.section.left,
+                top: l.section.top,
+                right: l.section.right - sc(18) - sc(STROKE_FOCUS) - sc(SP_2),
+                bottom: l.section.bottom,
             },
         },
         NamedTextRect {
-            id: "main.count".into(),
+            id: "main.badge".into(),
             rc: Rect {
-                left: cw - sc(60),
-                top: sc(92),
-                right: cw - sc(20),
-                bottom: sc(110),
+                left: l.section.right - sc(18) - sc(STROKE_FOCUS),
+                top: l.section.top + (l.section.bottom - l.section.top - sc(18)) / 2,
+                right: l.section.right,
+                bottom: l.section.top + (l.section.bottom - l.section.top - sc(18)) / 2 + sc(18),
             },
         },
     ];
+    let _ = dir_count;
     if l.rows.is_empty() {
         out.push(NamedTextRect {
             id: "main.empty".into(),
@@ -910,11 +1067,11 @@ pub fn main_text_rects(
         });
     } else {
         for (i, r) in l.rows.iter().enumerate() {
-            let text_right = r.right - sc(12);
+            let text_right = r.right - sc(SP_3);
             out.push(NamedTextRect {
                 id: format!("main.row-{i}"),
                 rc: Rect {
-                    left: r.left + sc(12),
+                    left: r.left + sc(SP_3),
                     top: r.top,
                     right: text_right,
                     bottom: r.bottom,
@@ -925,10 +1082,10 @@ pub fn main_text_rects(
             out.push(NamedTextRect {
                 id: "main.overflow".into(),
                 rc: Rect {
-                    left: l.card.left,
-                    top: l.card.bottom - sc(22),
-                    right: l.card.right - sc(12),
-                    bottom: l.card.bottom - sc(6),
+                    left: l.card.left + sc(SP_3),
+                    top: l.card.bottom - sc(OVERFLOW_H_L),
+                    right: l.card.right - sc(SP_3),
+                    bottom: l.card.bottom - sc(SP_1),
                 },
             });
         }
@@ -940,82 +1097,25 @@ pub fn main_text_rects(
         });
     }
     out.push(NamedTextRect {
-        id: "main.settings".into(),
-        rc: l.settings,
-    });
-    out.push(NamedTextRect {
-        id: "main.card".into(),
-        rc: l.card_link,
-    });
-    out.push(NamedTextRect {
         id: "main.status".into(),
         rc: l.status,
     });
-    let _ = dir_count;
-    let _ = ch;
+    let _ = (cw, ch);
     out
 }
 
 /// `settingsTextRects` (`go\window.go:711`).
 #[must_use]
 pub fn settings_text_rects(cw: i32, ch: i32, dpi: i32, l: &SettingsLayout) -> Vec<NamedTextRect> {
-    let sc = |v: i32| scale_px(dpi, v);
-    let mut out = vec![
-        NamedTextRect {
-            id: "settings.title".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(48),
-                right: cw - sc(20),
-                bottom: sc(80),
-            },
-        },
-        NamedTextRect {
-            id: "settings.lib".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(80),
-                right: cw - sc(20),
-                bottom: sc(98),
-            },
-        },
-        NamedTextRect {
-            id: "settings.startup".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(150),
-                right: cw - sc(20),
-                bottom: sc(168),
-            },
-        },
-        NamedTextRect {
-            id: "settings.scan".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(222),
-                right: cw - sc(20),
-                bottom: sc(240),
-            },
-        },
-        NamedTextRect {
-            id: "settings.hint".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(280),
-                right: cw - sc(20),
-                bottom: sc(328),
-            },
-        },
-        NamedTextRect {
-            id: "settings.dead".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(332),
-                right: cw - sc(20),
-                bottom: sc(350),
-            },
-        },
-    ];
+    let mut out = l.labels.clone();
+    out.push(NamedTextRect {
+        id: "settings.hint".into(),
+        rc: l.hint,
+    });
+    out.push(NamedTextRect {
+        id: "settings.dead".into(),
+        rc: l.dead,
+    });
     for b in &l.btns {
         out.push(NamedTextRect {
             id: format!("settings.btn-{}", b.id),
@@ -1026,7 +1126,7 @@ pub fn settings_text_rects(cw: i32, ch: i32, dpi: i32, l: &SettingsLayout) -> Ve
         id: "settings.status".into(),
         rc: l.status,
     });
-    let _ = (cw, ch);
+    let _ = (cw, ch, dpi);
     out
 }
 
@@ -1034,35 +1134,38 @@ pub fn settings_text_rects(cw: i32, ch: i32, dpi: i32, l: &SettingsLayout) -> Ve
 // Focus model (`go\window.go:1244-1316`).
 // ---------------------------------------------------------------------------
 
-/// `mainFocusOrder` (`go\window.go:1244`).
+/// `mainFocusOrder` (`go\window.go:1244`), in visual order: the tab strip first
+/// (it is the topmost control row), then the action grid row by row.
 #[must_use]
 pub fn main_focus_order() -> Vec<i32> {
     vec![
-        BTN_ADD,
-        BTN_REMOVE,
+        BTN_CARD,
+        BTN_SETTINGS,
         BTN_SCAN,
         BTN_REFRESH,
+        BTN_ADD,
+        BTN_REMOVE,
         BTN_REPORT,
         BTN_CLOSE,
-        BTN_SETTINGS,
-        BTN_CARD,
     ]
 }
 
-/// `settingsFocusOrder` (`go\window.go:1249`).
+/// `settingsFocusOrder` (`go\window.go:1249`), in visual order.
 #[must_use]
 pub fn settings_focus_order() -> Vec<i32> {
     vec![
-        BTN_BACK,
+        BTN_CARD,
+        BTN_SETTINGS,
         BTN_CLEAR_CACHE,
         BTN_CLEAR_INDEX,
         BTN_EXPORT,
         BTN_IMPORT,
         BTN_STARTUP,
-        BTN_OPEN_LOG,
         BTN_SCAN_GENTLE,
         BTN_SCAN_BALANCED,
         BTN_SCAN_TURBO,
+        BTN_BACK,
+        BTN_OPEN_LOG,
     ]
 }
 
@@ -1078,10 +1181,11 @@ pub fn card_state_button(i: i32) -> i32 {
     BTN_CARD_STATE_AT + i
 }
 
-/// `cardFocusOrder` (`go\window.go:1256`).
+/// `cardFocusOrder` (`go\window.go:1256`), in visual order: the strip, the way
+/// back, then the two preset rows.
 #[must_use]
 pub fn card_focus_order() -> Vec<i32> {
-    let mut order = vec![BTN_CARD_BACK];
+    let mut order = vec![BTN_CARD, BTN_SETTINGS, BTN_CARD_BACK];
     for i in 0..4 {
         order.push(card_details_button(i));
     }
@@ -1121,19 +1225,12 @@ pub fn move_focus(cur: i32, dir: i32, order: &[i32]) -> i32 {
     order[0]
 }
 
-/// `mainFocusRect` (`go\window.go:1303`).
+/// `mainFocusRect` (`go\window.go:1303`). The tab strip's two segments are
+/// controls in the same table as the action grid, so one lookup covers every
+/// focus stop -- there is no second, rect-less focus vocabulary any more.
 #[must_use]
 pub fn main_focus_rect(l: &UiLayout, id: i32) -> Option<Rect> {
-    if let Some(b) = l.btns.iter().find(|b| b.id == id) {
-        return Some(b.rc);
-    }
-    if id == BTN_SETTINGS {
-        return Some(l.settings);
-    }
-    if id == BTN_CARD {
-        return Some(l.card_link);
-    }
-    None
+    l.btns.iter().find(|b| b.id == id).map(|b| b.rc)
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,17 +1252,16 @@ pub fn card_preset_for_button(id: i32) -> Option<(i32, String)> {
     None
 }
 
-/// `cardPresetStyle` (`go\window.go:1476`): active preset accent, else subtle.
+/// `cardPresetStyle` (`go\window.go:1476`): the active preset is a LIT segment,
+/// not an accent fill. Each view has exactly one primary control, and a preset
+/// selection is not an action.
 #[must_use]
 pub fn card_preset_style(line: i32, id: &str, spec: &CardSpec) -> i32 {
     let spec = spec.normalized();
-    if line == 0 && id == spec.details {
-        return BTN_ACCENT;
+    if (line == 0 && id == spec.details) || (line == 1 && id == spec.state) {
+        return BTN_TAB_SEL;
     }
-    if line == 1 && id == spec.state {
-        return BTN_ACCENT;
-    }
-    BTN_SUBTLE
+    BTN_TAB
 }
 
 /// `computeCardLayout` (`go\window.go:1546`). The spec only flips button styles.
@@ -1173,46 +1269,88 @@ pub fn card_preset_style(line: i32, id: &str, spec: &CardSpec) -> i32 {
 pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardLayout {
     let sc = |v: i32| scale_px(dpi, v);
     let margin = sc(MAIN_MARGIN);
+    let content_w = (cw - margin * 2).max(sc(100));
 
     let mut l = CardLayout::default();
 
-    let (back_w, back_h) = (sc(80), sc(28));
-    let back = Rect {
-        left: margin,
-        top: sc(16),
-        right: margin + back_w,
-        bottom: sc(16) + back_h,
-    };
+    // Same stack, same grid: header band, tab strip, then the preview panel and
+    // the two preset rows, each under its own micro-label.
+    let label_top = sc(TAB_TOP_L) + sc(TAB_H_L) + sc(SP_3);
+    let label_h = sc(SECTION_H_L);
+    let after_label = label_h + sc(SP_2);
 
-    let (prev_top, prev_bottom) = (sc(100), sc(400));
-    let prev_pad = sc(10);
+    let prev_top = label_top + after_label;
+    let prev_h = sc(254);
+    let prev_pad = sc(SP_3);
     let (row_h, row_pitch) = (sc(20), sc(22));
     l.preview = Rect {
         left: margin,
         top: prev_top,
-        right: cw - margin,
-        bottom: prev_bottom,
+        right: margin + content_w,
+        bottom: prev_top + prev_h,
     };
     for i in 0..5 {
         let top = prev_top + prev_pad + i * row_pitch;
         l.rows.push(Rect {
             left: margin + prev_pad,
             top,
-            right: cw - margin - prev_pad,
+            right: margin + content_w - prev_pad,
             bottom: top + row_h,
         });
     }
 
-    let row_w = (cw - margin * 2 - sc(12) * 3) / 4;
+    let det_label = prev_top + prev_h + sc(SP_4);
+    let det_row = det_label + after_label;
+    let state_label = det_row + sc(BTN_H) + sc(SP_4);
+    let state_row = state_label + after_label;
+    let hint_top = state_row + sc(BTN_H) + sc(SP_2);
+    l.labels = vec![
+        NamedTextRect {
+            id: "card.preview-label".into(),
+            rc: Rect {
+                left: margin,
+                top: label_top,
+                right: margin + content_w,
+                bottom: label_top + label_h,
+            },
+        },
+        NamedTextRect {
+            id: "card.line1".into(),
+            rc: Rect {
+                left: margin,
+                top: det_label,
+                right: margin + content_w,
+                bottom: det_label + label_h,
+            },
+        },
+        NamedTextRect {
+            id: "card.line2".into(),
+            rc: Rect {
+                left: margin,
+                top: state_label,
+                right: margin + content_w,
+                bottom: state_label + label_h,
+            },
+        },
+    ];
+    l.hint = Rect {
+        left: margin,
+        top: hint_top,
+        right: margin + content_w,
+        bottom: hint_top + sc(SP_4),
+    };
+
+    // The preset rows are a segmented control per line: mutually exclusive
+    // choices, one row of equal cells, so they carry the segment anatomy rather
+    // than the accent fill (which belongs to the view's single primary action).
+    let seg_gap = sc(SP_2);
     let seg = |top: i32, line: i32, presets: &[CardPreset]| -> Vec<UiButton> {
+        let n = presets.len() as i32;
+        let w = (content_w - seg_gap * (n - 1)) / n;
         let mut out = Vec::with_capacity(presets.len());
         for (i, p) in presets.iter().enumerate() {
             let i = i as i32;
-            let left = margin + i * (row_w + sc(12));
-            let mut right = left + row_w;
-            if i == presets.len() as i32 - 1 {
-                right = cw - margin;
-            }
+            let left = margin + i * (w + seg_gap);
             let id = if line == 0 {
                 card_details_button(i)
             } else {
@@ -1225,30 +1363,39 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
                 rc: Rect {
                     left,
                     top,
-                    right,
-                    bottom: top + sc(32),
+                    right: if i == n - 1 { margin + content_w } else { left + w },
+                    bottom: top + sc(BTN_H),
                 },
             });
         }
         out
     };
     let (dets, states) = presence::cardspec::card_presets();
+    l.btns = tab_strip_buttons(cw, dpi);
+    l.btns.extend(seg(det_row, 0, &dets));
+    l.btns.extend(seg(state_row, 1, &states));
+
+    let status_h = sc(STATUS_H_L);
+    let status_top = ch - sc(BOTTOM_L) - status_h;
+    let footer_top = status_top - sc(SP_3) - sc(BTN_H);
+    l.status = Rect {
+        left: margin,
+        top: status_top,
+        right: margin + content_w,
+        bottom: status_top + status_h,
+    };
+    let col_w = (content_w - sc(BTN_GAP_L)) / 2;
     l.btns.push(UiButton {
         id: BTN_CARD_BACK,
         label: "Back".into(),
-        style: BTN_TEXT,
-        rc: back,
+        style: BTN_OUTLINE,
+        rc: Rect {
+            left: margin,
+            top: footer_top,
+            right: margin + col_w,
+            bottom: footer_top + sc(BTN_H),
+        },
     });
-    l.btns.extend(seg(sc(434), 0, &dets));
-    l.btns.extend(seg(sc(500), 1, &states));
-
-    let st_h = sc(20);
-    l.status = Rect {
-        left: margin,
-        top: ch - sc(14) - st_h,
-        right: cw - margin,
-        bottom: ch - sc(14),
-    };
     l
 }
 
@@ -1256,53 +1403,9 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
 #[must_use]
 pub fn card_text_rects(cw: i32, ch: i32, dpi: i32, l: &CardLayout) -> Vec<NamedTextRect> {
     let sc = |v: i32| scale_px(dpi, v);
-    let mut out = vec![
-        NamedTextRect {
-            id: "card.title".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(48),
-                right: cw - sc(20),
-                bottom: sc(80),
-            },
-        },
-        NamedTextRect {
-            id: "card.preview".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(80),
-                right: cw - sc(20),
-                bottom: sc(98),
-            },
-        },
-        NamedTextRect {
-            id: "card.details".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(412),
-                right: cw - sc(20),
-                bottom: sc(430),
-            },
-        },
-        NamedTextRect {
-            id: "card.state".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(478),
-                right: cw - sc(20),
-                bottom: sc(496),
-            },
-        },
-        NamedTextRect {
-            id: "card.hint".into(),
-            rc: Rect {
-                left: sc(20),
-                top: sc(544),
-                right: cw - sc(20),
-                bottom: sc(562),
-            },
-        },
-    ];
+    let margin = sc(MAIN_MARGIN);
+    let content_w = (cw - margin * 2).max(sc(100));
+    let mut out = l.labels.clone();
     for (i, r) in l.rows.iter().enumerate() {
         out.push(NamedTextRect {
             id: format!("card.row-{i}"),
@@ -1310,20 +1413,25 @@ pub fn card_text_rects(cw: i32, ch: i32, dpi: i32, l: &CardLayout) -> Vec<NamedT
         });
     }
     {
-        let margin = sc(MAIN_MARGIN);
-        let (prev_top, prev_pad) = (sc(100), sc(10));
-        let (row_h, row_pitch) = (sc(20), sc(22));
-        let tip_top = prev_top + prev_pad + 5 * row_pitch;
+        // The tooltip line is the sixth preview row: the panel reserves five
+        // rows, and `paint_preview_rows` draws the tooltip into the sixth slot
+        // the layout's pitch defines.
+        let (prev_pad, row_h, row_pitch) = (sc(SP_3), sc(20), sc(22));
+        let tip_top = l.preview.top + prev_pad + 5 * row_pitch;
         out.push(NamedTextRect {
             id: "card.row-5".into(),
             rc: Rect {
-                left: margin + prev_pad,
+                left: l.preview.left + prev_pad,
                 top: tip_top,
-                right: cw - margin - prev_pad,
+                right: l.preview.right - prev_pad,
                 bottom: tip_top + row_h,
             },
         });
     }
+    out.push(NamedTextRect {
+        id: "card.hint".into(),
+        rc: l.hint,
+    });
     for b in &l.btns {
         out.push(NamedTextRect {
             id: format!("card.btn-{}", b.id),
@@ -1334,7 +1442,7 @@ pub fn card_text_rects(cw: i32, ch: i32, dpi: i32, l: &CardLayout) -> Vec<NamedT
         id: "card.status".into(),
         rc: l.status,
     });
-    let _ = ch;
+    let _ = (ch, content_w);
     out
 }
 
@@ -3470,38 +3578,19 @@ fn wr(rc: Rect) -> windows_sys::Win32::Foundation::RECT {
     }
 }
 
-/// `createUIFont` (`go\window.go:3476`): Segoe UI at a negative pixel height.
+/// The app's one font factory: the brand UI face (Inter, `design\fonts\
+/// Inter-Variable.ttf`, embedded and installed by `brand::install_fonts`) at a
+/// negative pixel height, `OUT_TT_PRECIS` + `CLEARTYPE_QUALITY`.
 ///
-/// Text quality is the redesign's fix here, not a behavior change: the port
-/// passed `0` for `iOutPrecision` and `iQuality`, i.e. `OUT_DEFAULT_PRECIS` +
-/// `DEFAULT_QUALITY` ("appearance of the font does not matter"). This asks for
-/// `OUT_TT_PRECIS` + `CLEARTYPE_QUALITY`, so GDI picks a TrueType outline face
-/// and renders it with subpixel antialiasing instead of whatever the system
-/// smoothing default happens to be
+/// The port originally asked for Segoe UI at `OUT_DEFAULT_PRECIS` +
+/// `DEFAULT_QUALITY` ("appearance of the font does not matter"). The identity
+/// pass ships the app's own face, so the client area now renders in it -- and
+/// the quality pair keeps subpixel antialiasing on the TrueType outline.
 /// (learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-createfontw,
-/// accessed 2026-10-14).
+/// accessed 2026-10-14.)
 #[must_use]
 pub fn create_ui_font(height: i32, weight: i32) -> Gdi::HFONT {
-    let face = utf16_z("Segoe UI");
-    // SAFETY: `face` outlives the call.
-    unsafe {
-        Gdi::CreateFontW(
-            height,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            crate::win32::DEFAULT_CHARSET,
-            crate::win32::OUT_TT_PRECIS,
-            crate::win32::CLIP_DEFAULT_PRECIS,
-            crate::win32::CLEARTYPE_QUALITY,
-            0,
-            face.as_ptr(),
-        )
-    }
+    brand::ui(height.abs(), weight)
 }
 
 // ---------------------------------------------------------------------------
@@ -3891,12 +3980,335 @@ pub fn break_row(hdc: Gdi::HDC, s: &str, w: i32) -> String {
 }
 
 /// `paintButton` (`go\window.go:3319`).
+/// A solid rectangular fill, no rounding (the chrome band, the panel).
+fn fill_rect_solid(hdc: Gdi::HDC, rc: Rect, color: u32) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    // SAFETY: brush created and released within the call; FillRect takes it as a
+    // borrowed handle.
+    unsafe {
+        let br = Gdi::CreateSolidBrush(color);
+        let r = wr(rc);
+        Gdi::FillRect(hdc, &r, br);
+        Gdi::DeleteObject(br);
+    }
+}
+
+/// `DrawTextW` with GDI's own inter-character spacing (`SetTextCharacterExtra`),
+/// then the previous spacing restored. The brand's wordmark and micro-labels are
+/// letter-spaced (`design\make_logo.py` tracks the lockup at 0.08em); this is the
+/// only letter-spacing control GDI offers, and it is uniform, which is exactly
+/// what the brand uses.
+fn draw_ui_text_tracked(
+    hdc: Gdi::HDC,
+    s: &str,
+    rc: Rect,
+    format: u32,
+    font: Gdi::HFONT,
+    color: u32,
+    extra_px: i32,
+) {
+    // SAFETY: the spacing value is restored before returning.
+    let old = unsafe { crate::win32::SetTextCharacterExtra(hdc, extra_px) };
+    draw_ui_text(hdc, s, rc, format, font, color);
+    // SAFETY: restores the caller's spacing.
+    unsafe {
+        crate::win32::SetTextCharacterExtra(hdc, old);
+    }
+}
+
+/// Tracking in logical px for a face of `size_px` at `em` em.
+#[must_use]
+fn tracked_px(size_px: i32, em: f32) -> i32 {
+    (size_px as f32 * em).round() as i32
+}
+
+/// The chrome header band: the Ribbon-P mark on its tile, the Archivo Black
+/// wordmark, and the Inter subtitle.
+///
+/// The mark is drawn from the SAME `HICON` the window applies to its class and
+/// `WM_SETICON` slots (`brand::mark_icon`), so the mark in the header, in the
+/// titlebar and in the taskbar is one asset, not three approximations.
+fn paint_header(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_rect_solid(hdc, rc, COL_SURFACE);
+    // A hairline under the band so the chrome and the canvas meet on a line, not
+    // a guess.
+    fill_rect_solid(
+        hdc,
+        Rect {
+            left: rc.left,
+            top: rc.bottom - sc(STROKE_HAIR),
+            right: rc.right,
+            bottom: rc.bottom,
+        },
+        COL_CARD,
+    );
+
+    let tile = sc(MARK_TILE_L);
+    let tile_rc = Rect {
+        left: rc.left + sc(MAIN_MARGIN),
+        top: rc.top + sc(SP_4),
+        right: rc.left + sc(MAIN_MARGIN) + tile,
+        bottom: rc.top + sc(SP_4) + tile,
+    };
+    let icon = brand::mark_icon();
+    if !icon.is_null() {
+        // SAFETY: `icon` is the process's live mark handle; DrawIconEx reads it.
+        unsafe {
+            crate::win32::DrawIconEx(
+                hdc,
+                tile_rc.left,
+                tile_rc.top,
+                icon,
+                tile,
+                tile,
+                0,
+                std::ptr::null_mut(),
+                crate::win32::DI_NORMAL,
+            );
+        }
+    }
+
+    let word_font = brand::display(sc(FS_WORDMARK));
+    let sub_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let fmt = crate::win32::DT_LEFT
+        | crate::win32::DT_SINGLE_LINE
+        | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER;
+    let text_left = tile_rc.right + sc(SP_3);
+    draw_ui_text_tracked(
+        hdc,
+        "POTFLIX",
+        Rect {
+            left: text_left,
+            top: rc.top + sc(SP_3),
+            right: rc.right - sc(MAIN_MARGIN),
+            bottom: rc.top + sc(SP_3) + sc(26),
+        },
+        fmt,
+        word_font,
+        COL_TEXT,
+        tracked_px(sc(FS_WORDMARK), brand::TRACK_WORDMARK),
+    );
+    draw_ui_text(
+        hdc,
+        "Discord Rich Presence for PotPlayer",
+        Rect {
+            left: text_left,
+            top: rc.top + sc(SP_3) + sc(26),
+            right: rc.right - sc(MAIN_MARGIN),
+            bottom: rc.bottom - sc(SP_2),
+        },
+        fmt,
+        sub_font,
+        COL_MUTED,
+    );
+
+    // SAFETY: fonts created above are deleted here.
+    unsafe {
+        Gdi::DeleteObject(word_font);
+        Gdi::DeleteObject(sub_font);
+    }
+}
+
+/// A section micro-label -- tiny, uppercase, letter-spaced, in **Archivo
+/// Black** (the brand's display face, and the brief's own instruction that it
+/// drives the wordmark and section headings) -- with the count badge V1 at the
+/// line's right end.
+///
+/// The badge is the brand's own disc system (`design\preview\badges-variants.png`
+/// V1: black disc + red ring): a black disc with a 2px red ring and the count
+/// centred in it. The numeral is `COL_TEXT` rather than V1's red glyph, because
+/// red on the disc measures `4.11:1` and a NUMERAL is text, which the gate holds
+/// at `4.5:1`; the ring keeps the red, so V1's structure survives and the gate
+/// passes. Both numbers are in `brand_contrast_gate`.
+fn paint_section_label(hdc: Gdi::HDC, rc: Rect, dpi: i32, label: &str, count: i32) {
+    let sc = |v: i32| scale_px(dpi, v);
+    let label_font = brand::display(sc(FS_LABEL));
+    let fmt = crate::win32::DT_LEFT
+        | crate::win32::DT_SINGLE_LINE
+        | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER;
+
+    let disc = sc(18);
+    let ring = sc(STROKE_FOCUS);
+    let gap = sc(SP_2);
+    let badge_left = rc.right - disc - ring;
+    let text_right = badge_left - gap;
+
+    draw_ui_text_tracked(
+        hdc,
+        &label.to_uppercase(),
+        Rect {
+            left: rc.left,
+            top: rc.top,
+            right: text_right,
+            bottom: rc.bottom,
+        },
+        fmt,
+        label_font,
+        COL_MUTED,
+        tracked_px(sc(FS_LABEL), brand::TRACK_LABEL),
+    );
+
+    // A count of zero has nothing to report; the badge appears with the first
+    // folder and the section header alone is the empty state.
+    if count > 0 {
+        let badge = Rect {
+            left: badge_left,
+            top: rc.top + (rc.bottom - rc.top - disc) / 2,
+            right: badge_left + disc,
+            bottom: rc.top + (rc.bottom - rc.top - disc) / 2 + disc,
+        };
+        let r = disc / 2;
+        fill_round_rect(hdc, badge, brand::BLACK, r);
+        stroke_round_rect_w(hdc, badge, brand::RED, r, ring);
+        let num_font = brand::display(sc(FS_BADGE));
+        let num = count.to_string();
+        draw_ui_text(
+            hdc,
+            &num,
+            badge,
+            crate::win32::DT_CENTER
+                | crate::win32::DT_SINGLE_LINE
+                | crate::win32::DT_NO_PREFIX
+                | crate::win32::DT_V_CENTER,
+            num_font,
+            COL_TEXT,
+        );
+        // SAFETY: font created above.
+        unsafe {
+            Gdi::DeleteObject(num_font);
+        }
+    }
+
+    // SAFETY: font created above.
+    unsafe {
+        Gdi::DeleteObject(label_font);
+    }
+}
+
+/// The folder panel: a `CHROME` well holding one `CARD`-surface chip per folder,
+/// the `+N more` line, and the proportional scrollbar in its right gutter.
+fn paint_panel(hdc: Gdi::HDC, l: &UiLayout, dpi: i32, st: &UiState) {
+    let sc = |v: i32| scale_px(dpi, v);
+    let body_font = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
+    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let fmt_left = crate::win32::DT_LEFT
+        | crate::win32::DT_SINGLE_LINE
+        | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER
+        | crate::win32::DT_END_ELLIPSIS;
+    let fmt_right = fmt_left | crate::win32::DT_RIGHT;
+    let fmt_center = fmt_left | crate::win32::DT_CENTER;
+
+    fill_round_rect(hdc, l.card, COL_SURFACE, sc(R_PANEL));
+
+    if l.rows.is_empty() {
+        draw_ui_text(
+            hdc,
+            "No folders yet - add one below",
+            l.card,
+            fmt_center,
+            hint_font,
+            COL_MUTED,
+        );
+    } else {
+        for (i, r) in l.rows.iter().enumerate() {
+            // Absolute folder index: the viewport row plus the scroll offset.
+            // `abs` is below `ui_dirs.len()` by construction (`vis` rows from
+            // `list_top` cover `list_top..list_top + vis`, clamped to `total`).
+            let abs = l.list_top + i as i32;
+            let selected = abs == st.sel_row;
+            let mut fill = COL_ROW;
+            if abs == st.hover_row || selected {
+                fill = COL_ROW_HOVER;
+            }
+            fill_round_rect(hdc, *r, fill, sc(R_ROW));
+            if selected {
+                // The selection indicator is the accent bar down the row's left
+                // edge (`4.11:1` on the panel) plus the fill step -- two cues, so
+                // selection never rests on colour alone.
+                fill_round_rect(
+                    hdc,
+                    Rect {
+                        left: r.left,
+                        top: r.top,
+                        right: r.left + sc(SELECT_BAR_W),
+                        bottom: r.bottom,
+                    },
+                    COL_ACCENT,
+                    sc(R_ROW),
+                );
+            }
+            let mut text_right = r.right - sc(SP_3);
+            if abs == st.hover_row && i < l.xbtns.len() {
+                draw_ui_text(
+                    hdc,
+                    "Remove",
+                    l.xbtns[i],
+                    fmt_center,
+                    hint_font,
+                    COL_DANGER,
+                );
+                text_right = l.xbtns[i].left - sc(SP_1);
+            }
+            draw_ui_text(
+                hdc,
+                &st.ui_dirs[abs as usize],
+                Rect {
+                    left: r.left + sc(SP_3),
+                    top: r.top,
+                    right: text_right,
+                    bottom: r.bottom,
+                },
+                fmt_left,
+                body_font,
+                COL_TEXT,
+            );
+        }
+        if l.overflow > 0 {
+            draw_ui_text(
+                hdc,
+                &format!("+{} more", l.overflow),
+                Rect {
+                    left: l.card.left + sc(SP_3),
+                    top: l.card.bottom - sc(OVERFLOW_H_L),
+                    right: l.card.right - sc(SP_3),
+                    bottom: l.card.bottom - sc(SP_1),
+                },
+                fmt_right,
+                hint_font,
+                COL_MUTED,
+            );
+        }
+        if l.scrolled() {
+            // Position-only scrollbar in the panel's right gutter: the track
+            // plus the proportional thumb mirroring `list_top`. Wheel,
+            // PageUp/PageDown, Home/End scroll; the thumb is paint, not drag.
+            fill_round_rect(hdc, l.scrollbar, brand::TRACK, sc(R_BAR));
+            if l.thumb.right > l.thumb.left && l.thumb.bottom > l.thumb.top {
+                fill_round_rect(hdc, l.thumb, COL_MUTED, sc(R_BAR));
+            }
+        }
+    }
+
+    // SAFETY: fonts created above.
+    unsafe {
+        Gdi::DeleteObject(body_font);
+        Gdi::DeleteObject(hint_font);
+    }
+}
+
+/// The scan progress bar over the status line: an unfilled `TRACK` well with the
+/// brand red as the fill, both rounded by the house squircle.
 fn paint_button(
     hdc: Gdi::HDC,
     b: &UiButton,
     dpi: i32,
     button_font: Gdi::HFONT,
-    small_font: Gdi::HFONT,
     st: &UiState,
 ) {
     let sc = |v: i32| scale_px(dpi, v);
@@ -3908,59 +4320,83 @@ fn paint_button(
         | crate::win32::DT_NO_PREFIX
         | crate::win32::DT_V_CENTER
         | crate::win32::DT_END_ELLIPSIS;
+    let r = sc(R_CTRL);
     match b.style {
         BTN_ACCENT => {
-            let mut fill = COL_ACCENT;
-            if disabled {
-                fill = COL_ROW;
+            // The view's one primary control. Resting: the brand red. Hover: one
+            // step up. Pressed: the receding plane INSIDE a red edge -- the
+            // Ribbon P's own two-facet language, and the reason the silhouette
+            // stays red (`4.11:1` on the canvas) while the interior recedes.
+            let fill = if disabled {
+                COL_SURFACE
             } else if pressed {
-                fill = COL_ACCENT_DOWN;
-            } else if hovered {
-                fill = COL_ACCENT_HOV;
-            }
-            fill_round_rect(hdc, b.rc, fill, sc(8));
-            let tc = if disabled { COL_MUTED } else { COL_TEXT };
-            draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
-        }
-        BTN_OUTLINE => {
-            let fill = if hovered && !disabled {
-                COL_CARD
-            } else {
-                COL_BG
-            };
-            fill_round_rect(hdc, b.rc, fill, sc(8));
-            stroke_round_rect(hdc, b.rc, COL_BORDER, sc(8));
-            let tc = if disabled { COL_MUTED } else { COL_TEXT };
-            draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
-        }
-        BTN_TEXT => {
-            let tc = if hovered || pressed {
-                COL_TEXT
-            } else {
-                COL_MUTED
-            };
-            draw_ui_text(hdc, &b.label, b.rc, fmt, small_font, tc);
-        }
-        BTN_DANGER => {
-            let tc = if pressed {
                 COL_ACCENT_DOWN
             } else if hovered {
                 COL_ACCENT_HOV
             } else {
-                COL_DANGER
+                COL_ACCENT
             };
-            draw_ui_text(hdc, &b.label, b.rc, fmt, small_font, tc);
+            fill_round_rect(hdc, b.rc, fill, r);
+            if pressed && !disabled {
+                stroke_round_rect_w(hdc, b.rc, COL_ACCENT, r, sc(STROKE_FOCUS));
+            }
+            let tc = if disabled { COL_MUTED_DIM } else { COL_ON_ACCENT };
+            draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
+        }
+        BTN_TAB | BTN_TAB_SEL => {
+            // A segment of a segmented control: one anatomy for the tab strip,
+            // the scan-speed segments and the card presets. Lit = the card fill
+            // plus the red indicator under the label; unlit = flat on the canvas
+            // with the boundary hairline and muted text.
+            let lit = b.style == BTN_TAB_SEL;
+            if lit || (hovered && !disabled) {
+                fill_round_rect(hdc, b.rc, COL_ROW, r);
+            }
+            if !lit {
+                stroke_round_rect(hdc, b.rc, COL_BORDER, r);
+            }
+            let tc = if disabled {
+                COL_MUTED_DIM
+            } else if lit || hovered || pressed {
+                COL_TEXT
+            } else {
+                COL_MUTED
+            };
+            draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
+            if lit {
+                let ind = Rect {
+                    left: b.rc.left + sc(SP_4),
+                    top: b.rc.bottom - sc(SP_1),
+                    right: b.rc.right - sc(SP_4),
+                    bottom: b.rc.bottom - sc(SP_1) + sc(STROKE_FOCUS),
+                };
+                fill_round_rect(hdc, ind, COL_ACCENT, sc(R_BAR));
+            }
+        }
+        BTN_DANGER => {
+            // A destructive action is still a real control on the grid; only its
+            // label carries the warning, in a red that clears the body gate.
+            let fill = if pressed { COL_SURFACE } else if hovered { COL_ROW_HOVER } else { COL_CARD };
+            fill_round_rect(hdc, b.rc, fill, r);
+            stroke_round_rect(hdc, b.rc, COL_BORDER, r);
+            let tc = if disabled { COL_MUTED_DIM } else { COL_DANGER };
+            draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
         }
         _ => {
-            let mut fill = COL_ROW;
-            if pressed && !disabled {
-                fill = COL_CARD;
-            } else if hovered && !disabled {
-                fill = COL_ROW_HOVER;
-            }
-            fill_round_rect(hdc, b.rc, fill, sc(8));
+            // BTN_OUTLINE / BTN_SUBTLE: the secondary control. The fill is the
+            // card surface and the EDGE hairline is the boundary that carries the
+            // non-text gate (`4.09:1` on the canvas).
+            let fill = if disabled || pressed {
+                COL_SURFACE
+            } else if hovered {
+                COL_ROW_HOVER
+            } else {
+                COL_CARD
+            };
+            fill_round_rect(hdc, b.rc, fill, r);
+            stroke_round_rect(hdc, b.rc, COL_BORDER, r);
             let dim = disabled || (b.id == BTN_REMOVE && !st.remove_has_target());
-            let tc = if dim { COL_MUTED } else { COL_TEXT };
+            let tc = if dim { COL_MUTED_DIM } else { COL_TEXT };
             draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
         }
     }
@@ -4014,8 +4450,8 @@ fn paint_preview_rows(hdc: Gdi::HDC, dpi: i32, region: Rect, rows: &[String], fo
             right: region.right,
             bottom: used_bottom + pad,
         },
-        COL_CARD,
-        sc(12),
+        COL_SURFACE,
+        sc(R_PANEL),
     );
 
     y = region.top + pad;
@@ -4055,7 +4491,7 @@ fn paint_scan_bar(hdc: Gdi::HDC, status: Rect, dpi: i32, st: &UiState) {
         return;
     }
     let sc = |v: i32| scale_px(dpi, v);
-    fill_round_rect(hdc, bar, COL_ROW, sc(4));
+    fill_round_rect(hdc, bar, brand::TRACK, sc(R_BAR));
     let (show, determinate, frac) = scan_bar_progress(&st.scan_progress, st.scan_active);
     if !show {
         return;
@@ -4206,140 +4642,31 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     let (cw, ch) = (rc.right - rc.left, rc.bottom - rc.top);
     fill_background(hdc, rc);
 
-    let title_font = create_ui_font(-sc(22), crate::win32::FW_SEMI_BOLD);
-    let section_font = create_ui_font(-sc(12), crate::win32::FW_NORMAL);
-    let body_font = create_ui_font(-sc(14), crate::win32::FW_NORMAL);
-    let button_font = create_ui_font(-sc(14), crate::win32::FW_BOLD);
+    let mut l = compute_layout_from(&st.ui_dirs, cw, ch, dpi, st.scroll_top);
+    // The tab strip's lit segment is a function of the CURRENT view, not of the
+    // layout, so it is resolved in one place for both segments.
+    for b in l.btns.iter_mut() {
+        if b.style == BTN_TAB || b.style == BTN_TAB_SEL {
+            let lit = (b.id == BTN_CARD && st.cur_view == View::Card)
+                || (b.id == BTN_SETTINGS && st.cur_view == View::Settings);
+            b.style = if lit { BTN_TAB_SEL } else { BTN_TAB };
+        }
+    }
+
+    let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
+    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
     let fmt_left = crate::win32::DT_LEFT
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
         | crate::win32::DT_V_CENTER
         | crate::win32::DT_END_ELLIPSIS;
-    let fmt_right = fmt_left | crate::win32::DT_RIGHT;
-    let fmt_center = fmt_left | crate::win32::DT_CENTER;
 
-    draw_ui_text(
-        hdc,
-        "POTFLIX",
-        Rect {
-            left: sc(20),
-            top: sc(16),
-            right: cw - sc(72),
-            bottom: sc(48),
-        },
-        fmt_left,
-        title_font,
-        COL_ACCENT,
-    );
-    draw_ui_text(
-        hdc,
-        "Discord Rich Presence for PotPlayer",
-        Rect {
-            left: sc(20),
-            top: sc(48),
-            right: cw - sc(20) - sc(120) - sc(8),
-            bottom: sc(68),
-        },
-        fmt_left,
-        section_font,
-        COL_MUTED,
-    );
-    draw_ui_text(
-        hdc,
-        "MEDIA FOLDERS",
-        Rect {
-            left: sc(20),
-            top: sc(92),
-            right: cw - sc(60),
-            bottom: sc(110),
-        },
-        fmt_left,
-        section_font,
-        COL_MUTED,
-    );
-    draw_ui_text(
-        hdc,
-        &st.ui_dirs.len().to_string(),
-        Rect {
-            left: cw - sc(60),
-            top: sc(92),
-            right: cw - sc(20),
-            bottom: sc(110),
-        },
-        fmt_right,
-        section_font,
-        COL_MUTED,
-    );
-
-    let l = compute_layout_from(&st.ui_dirs, cw, ch, dpi, st.scroll_top);
-    fill_round_rect(hdc, l.card, COL_CARD, sc(12));
-    if l.rows.is_empty() {
-        draw_ui_text(
-            hdc,
-            "No folders yet - add one below",
-            l.card,
-            fmt_center,
-            body_font,
-            COL_MUTED,
-        );
-    } else {
-        for (i, r) in l.rows.iter().enumerate() {
-            // Absolute folder index: the viewport row plus the scroll offset.
-            // `abs` is below `ui_dirs.len()` by construction (`vis` rows from
-            // `list_top` cover `list_top..list_top + vis`, clamped to `total`).
-            let abs = l.list_top + i as i32;
-            let mut fill = COL_ROW;
-            if abs == st.hover_row || abs == st.sel_row {
-                fill = COL_ROW_HOVER;
-            }
-            fill_round_rect(hdc, *r, fill, sc(8));
-            if abs == st.sel_row {
-                stroke_round_rect(hdc, *r, COL_BORDER, sc(8));
-            }
-            let mut text_right = r.right - sc(12);
-            if abs == st.hover_row && i < l.xbtns.len() {
-                draw_ui_text(hdc, "x", l.xbtns[i], fmt_center, body_font, COL_MUTED);
-                text_right = l.xbtns[i].left - sc(4);
-            }
-            draw_ui_text(
-                hdc,
-                &st.ui_dirs[abs as usize],
-                Rect {
-                    left: r.left + sc(12),
-                    top: r.top,
-                    right: text_right,
-                    bottom: r.bottom,
-                },
-                fmt_left,
-                body_font,
-                COL_TEXT,
-            );
-        }
-        if l.overflow > 0 {
-            draw_ui_text(
-                hdc,
-                &format!("+{} more", l.overflow),
-                Rect {
-                    left: l.card.left,
-                    top: l.card.bottom - sc(22),
-                    right: l.card.right - sc(12),
-                    bottom: l.card.bottom - sc(6),
-                },
-                fmt_right,
-                section_font,
-                COL_MUTED,
-            );
-        }
-        if l.scrolled() {
-            // Position-only scrollbar in the card's right gutter: the track
-            // plus the proportional thumb mirroring `list_top`. Wheel,
-            // PageUp/PageDown, Home/End scroll; the thumb is paint, not drag.
-            fill_round_rect(hdc, l.scrollbar, COL_BORDER, sc(SCROLLBAR_W));
-            if l.thumb.right > l.thumb.left && l.thumb.bottom > l.thumb.top {
-                fill_round_rect(hdc, l.thumb, COL_MUTED, sc(SCROLLBAR_W));
-            }
-        }
-    }
+    paint_header(hdc, l.header, dpi);
+    // The folder count lives badged on the section header it counts, which is
+    // where it belongs; the incumbent painted it as a bare right-aligned
+    // numeral 340px from the label it described.
+    paint_section_label(hdc, l.section, dpi, "Media folders", st.ui_dirs.len() as i32);
+    paint_panel(hdc, &l, dpi, st);
 
     for b in &l.btns {
         let mut label = b.label.clone();
@@ -4347,20 +4674,8 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
             label = scan_button_label(true).to_string();
         }
         let bb = UiButton { label, ..b.clone() };
-        paint_button(hdc, &bb, dpi, button_font, section_font, st);
+        paint_button(hdc, &bb, dpi, button_font, st);
     }
-    let tc = if st.hover_btn == BTN_SETTINGS || st.pressed_btn == BTN_SETTINGS {
-        COL_TEXT
-    } else {
-        COL_MUTED
-    };
-    draw_ui_text(hdc, "Settings", l.settings, fmt_right, section_font, tc);
-    let tc = if st.hover_btn == BTN_CARD || st.pressed_btn == BTN_CARD {
-        COL_TEXT
-    } else {
-        COL_MUTED
-    };
-    draw_ui_text(hdc, "Card", l.card_link, fmt_right, section_font, tc);
     if let Some(frc) = main_focus_rect(&l, st.focus_id) {
         draw_focus_ring(hdc, frc, dpi);
     }
@@ -4369,17 +4684,15 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         &st.status_text,
         l.status,
         fmt_left,
-        section_font,
+        hint_font,
         COL_MUTED,
     );
     paint_scan_bar(hdc, l.status, dpi, st);
 
     // SAFETY: fonts created above are deleted here.
     unsafe {
-        Gdi::DeleteObject(title_font);
-        Gdi::DeleteObject(section_font);
-        Gdi::DeleteObject(body_font);
         Gdi::DeleteObject(button_font);
+        Gdi::DeleteObject(hint_font);
     }
 }
 
@@ -4389,90 +4702,73 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     let (cw, ch) = (rc.right - rc.left, rc.bottom - rc.top);
     fill_background(hdc, rc);
 
-    let title_font = create_ui_font(-sc(22), crate::win32::FW_SEMI_BOLD);
-    let section_font = create_ui_font(-sc(12), crate::win32::FW_NORMAL);
-    let button_font = create_ui_font(-sc(14), crate::win32::FW_BOLD);
+    let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
+    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
     let fmt_left = crate::win32::DT_LEFT
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
         | crate::win32::DT_V_CENTER
         | crate::win32::DT_END_ELLIPSIS;
 
-    let l = compute_settings_layout(cw, ch, dpi, st.startup_state, &st.scan_speed_state);
-    draw_ui_text(
-        hdc,
-        "Settings",
-        Rect {
-            left: sc(20),
-            top: sc(48),
-            right: cw - sc(20),
-            bottom: sc(80),
-        },
-        fmt_left,
-        title_font,
-        COL_TEXT,
-    );
-    for (label, top) in [("LIBRARY", 80), ("STARTUP", 150), ("SCAN", 222)] {
-        draw_ui_text(
-            hdc,
-            label,
-            Rect {
-                left: sc(20),
-                top: sc(top),
-                right: cw - sc(20),
-                bottom: sc(top + 18),
-            },
-            fmt_left,
-            section_font,
-            COL_MUTED,
-        );
+    let mut l = compute_settings_layout(cw, ch, dpi, st.startup_state, &st.scan_speed_state);
+    // The tab strip's lit segment is the current view's, resolved once.
+    for b in l.btns.iter_mut() {
+        if b.style == BTN_TAB || b.style == BTN_TAB_SEL {
+            b.style = if b.id == BTN_SETTINGS { BTN_TAB_SEL } else { BTN_TAB };
+        }
+    }
+
+    let header = Rect {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: sc(HEADER_H_L),
+    };
+    paint_header(hdc, header, dpi);
+
+    for lab in &l.labels {
+        let text = match lab.id.as_str() {
+            "settings.lib" => "Library",
+            "settings.startup" => "Startup",
+            _ => "Scan speed",
+        };
+        paint_section_label(hdc, lab.rc, dpi, text, 0);
     }
     draw_ui_text_wrapped(
         hdc,
         crate::settings::SCAN_HINT_TEXT,
-        Rect {
-            left: sc(20),
-            top: sc(280),
-            right: cw - sc(20),
-            bottom: sc(328),
-        },
-        section_font,
+        l.hint,
+        hint_font,
+        COL_MUTED,
+    );
+    draw_ui_text(
+        hdc,
+        &crate::settings::dead_cache_label(st.dead_cache_count),
+        l.dead,
+        fmt_left,
+        hint_font,
         COL_MUTED,
     );
     for b in &l.btns {
-        paint_button(hdc, b, dpi, button_font, section_font, st);
+        paint_button(hdc, b, dpi, button_font, st);
     }
     if let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id) {
         draw_focus_ring(hdc, b.rc, dpi);
     }
     draw_ui_text(
         hdc,
-        &crate::settings::dead_cache_label(st.dead_cache_count),
-        Rect {
-            left: sc(20),
-            top: sc(332),
-            right: cw - sc(20),
-            bottom: sc(350),
-        },
-        fmt_left,
-        section_font,
-        COL_MUTED,
-    );
-    draw_ui_text(
-        hdc,
         &st.status_text,
         l.status,
         fmt_left,
-        section_font,
+        hint_font,
         COL_MUTED,
     );
     paint_scan_bar(hdc, l.status, dpi, st);
 
     // SAFETY: fonts created above are deleted here.
     unsafe {
-        Gdi::DeleteObject(title_font);
-        Gdi::DeleteObject(section_font);
         Gdi::DeleteObject(button_font);
+        Gdi::DeleteObject(hint_font);
     }
 }
 
@@ -4482,16 +4778,21 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     let (cw, ch) = (rc.right - rc.left, rc.bottom - rc.top);
     fill_background(hdc, rc);
 
-    let title_font = create_ui_font(-sc(22), crate::win32::FW_SEMI_BOLD);
-    let section_font = create_ui_font(-sc(12), crate::win32::FW_NORMAL);
-    let button_font = create_ui_font(-sc(14), crate::win32::FW_BOLD);
+    let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
+    let body_font = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
+    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
     let fmt_left = crate::win32::DT_LEFT
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
         | crate::win32::DT_V_CENTER
         | crate::win32::DT_END_ELLIPSIS;
 
-    let l = compute_card_layout(cw, ch, dpi, &st.card_spec_state);
+    let mut l = compute_card_layout(cw, ch, dpi, &st.card_spec_state);
+    for b in l.btns.iter_mut() {
+        if b.style == BTN_TAB || b.style == BTN_TAB_SEL {
+            b.style = if b.id == BTN_CARD { BTN_TAB_SEL } else { BTN_TAB };
+        }
+    }
     let (act, have) = st.preview_activity();
     let rows = preview_rows(&act, have);
     let full = [
@@ -4503,63 +4804,32 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         preview_tooltip(&act, have),
     ];
 
-    draw_ui_text(
-        hdc,
-        "Card",
-        Rect {
-            left: sc(20),
-            top: sc(48),
-            right: cw - sc(20),
-            bottom: sc(80),
-        },
-        fmt_left,
-        title_font,
-        COL_TEXT,
-    );
-    draw_ui_text(
-        hdc,
-        "PREVIEW - EXACT DISCORD PAYLOAD",
-        Rect {
-            left: sc(20),
-            top: sc(80),
-            right: cw - sc(20),
-            bottom: sc(98),
-        },
-        fmt_left,
-        section_font,
-        COL_MUTED,
-    );
-    paint_preview_rows(hdc, dpi, l.preview, &full, section_font);
-    for (label, top) in [("LINE 1 - DETAILS", 412), ("LINE 2 - STATE", 478)] {
-        draw_ui_text(
-            hdc,
-            label,
-            Rect {
-                left: sc(20),
-                top: sc(top),
-                right: cw - sc(20),
-                bottom: sc(top + 18),
-            },
-            fmt_left,
-            section_font,
-            COL_MUTED,
-        );
+    let header = Rect {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: sc(HEADER_H_L),
+    };
+    paint_header(hdc, header, dpi);
+    for lab in &l.labels {
+        let text = match lab.id.as_str() {
+            "card.preview-label" => "Preview - exact Discord payload",
+            "card.line1" => "Line 1 - details",
+            _ => "Line 2 - state",
+        };
+        paint_section_label(hdc, lab.rc, dpi, text, 0);
     }
+    paint_preview_rows(hdc, dpi, l.preview, &full, body_font);
     draw_ui_text(
         hdc,
         "Preview shows the exact values handed to Discord.",
-        Rect {
-            left: sc(20),
-            top: sc(544),
-            right: cw - sc(20),
-            bottom: sc(562),
-        },
+        l.hint,
         fmt_left,
-        section_font,
+        hint_font,
         COL_MUTED,
     );
     for b in &l.btns {
-        paint_button(hdc, b, dpi, button_font, section_font, st);
+        paint_button(hdc, b, dpi, button_font, st);
     }
     if st.focus_id != 0
         && let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id)
@@ -4571,16 +4841,16 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         &st.status_text,
         l.status,
         fmt_left,
-        section_font,
+        hint_font,
         COL_MUTED,
     );
     paint_scan_bar(hdc, l.status, dpi, st);
 
     // SAFETY: fonts created above are deleted here.
     unsafe {
-        Gdi::DeleteObject(title_font);
-        Gdi::DeleteObject(section_font);
         Gdi::DeleteObject(button_font);
+        Gdi::DeleteObject(body_font);
+        Gdi::DeleteObject(hint_font);
     }
 }
 
@@ -4691,6 +4961,12 @@ pub fn create_main_window() -> Result<(), String> {
         )
     };
     let bg = unsafe { crate::win32::CreateSolidBrush(COL_BG) };
+    // The Ribbon P, loaded from the embedded `.ico` BEFORE the class is
+    // registered: a class's icon slots are read at registration, and a class
+    // that declares none gets the generic application icon from the window
+    // manager -- which is exactly the defect this fixes.
+    let mark = brand::mark_icon();
+    let mark_small = brand::mark_icon_small();
 
     let mut wc: WNDCLASSEXW = unsafe { std::mem::zeroed() };
     wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
@@ -4698,6 +4974,8 @@ pub fn create_main_window() -> Result<(), String> {
     wc.hInstance = hinst;
     wc.hCursor = cursor;
     wc.hbrBackground = bg;
+    wc.hIcon = mark;
+    wc.hIconSm = if mark_small.is_null() { mark } else { mark_small };
     wc.lpszClassName = class.as_ptr();
     if unsafe { RegisterClassExW(&wc) } == 0 {
         return Err("RegisterClassExW failed".into());
@@ -4744,11 +5022,26 @@ pub fn create_main_window() -> Result<(), String> {
     // nothing to this wndproc, so this is NOT a re-entrant site -- no `UI`
     // guard or regression-test change (cf. `run_blocking_ui`).
     crate::win32::apply_dark_caption(hwnd, COL_BG, COL_TEXT);
+    // Apply the mark to the WINDOW slots as well as the class slots. The class
+    // slots are what `GetClassLongPtrW(GCLP_HICON)` reports; `WM_SETICON` is
+    // what the titlebar, alt-tab and the taskbar actually read, and the two are
+    // separate. Both are set from the one asset, and the handle the write
+    // produced is recorded so the proof can quote it.
+    let class_icon = brand::apply_window_icon(hwnd);
     {
         let mut st = ui();
         st.main_hwnd = hwnd as usize;
+        st.ui_icon = class_icon as usize;
         st.refresh_dir_list();
     }
+    if class_icon.is_null() {
+        return Err("the Ribbon P could not be applied to the window".into());
+    }
+    app_logf(&format!(
+        "window icon: class HICON={class_icon:p} brand={} fonts={}",
+        brand::DISPLAY_FAMILY,
+        brand::fonts_installed()
+    ));
     Ok(())
 }
 
@@ -5124,7 +5417,9 @@ mod tests {
     #[test]
     fn compute_layout_buttons() {
         let l = compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
-        assert_eq!(l.btns.len(), 6);
+        // Six actions on the grid plus the tab strip's two segments, which are
+        // real controls in the same table.
+        assert_eq!(l.btns.len(), 8);
         let mut seen = std::collections::HashSet::new();
         for b in &l.btns {
             assert!(seen.insert(b.id), "duplicate id {}", b.id);
@@ -5177,6 +5472,110 @@ mod tests {
         }
     }
 
+    /// The action grid is ONE grid: equal columns, one column gap, one row gap,
+    /// all six actions on it, and exactly one primary control.
+    #[test]
+    fn action_grid_is_one_grid() {
+        for dpi in [96, 120, 144, 192] {
+            let cw = scale_px(dpi, MAIN_CLIENT_W);
+            let ch = scale_px(dpi, MAIN_CLIENT_H);
+            let l = compute_layout(&dirs(2), cw, ch, dpi);
+            let sc = |v: i32| scale_px(dpi, v);
+            let margin = sc(MAIN_MARGIN);
+            let want_w = ((cw - margin * 2) - sc(BTN_GAP_L)) / 2;
+            let want_h = sc(BTN_H);
+            let gap = sc(BTN_GAP_L);
+
+            let mut rows: Vec<Vec<&UiButton>> = Vec::new();
+            for b in l.btns.iter().filter(|b| b.style != BTN_TAB && b.style != BTN_TAB_SEL) {
+                match rows.iter_mut().find(|r| r[0].rc.top == b.rc.top) {
+                    Some(r) => r.push(b),
+                    None => rows.push(vec![b]),
+                }
+            }
+            rows.sort_by_key(|r| r[0].rc.top);
+            assert_eq!(rows.len() as i32, FOOTER_ROWS_L, "dpi {dpi}: {rows:?}");
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(row.len(), 2, "dpi {dpi}: row {i} is not two columns");
+                let (a, b) = (row[0], row[1]);
+                // Equal widths, on the grid's own column pitch.
+                assert_eq!(a.rc.right - a.rc.left, want_w, "dpi {dpi}: col 0 width");
+                assert_eq!(b.rc.right - b.rc.left, want_w, "dpi {dpi}: col 1 width");
+                assert_eq!(a.rc.bottom - a.rc.top, want_h);
+                assert_eq!(b.rc.bottom - b.rc.top, want_h);
+                assert_eq!(a.rc.left, margin, "dpi {dpi}: row {i} col 0 left");
+                assert_eq!(b.rc.left, margin + want_w + gap, "dpi {dpi}: row {i} col 1");
+                assert_eq!(b.rc.right, margin + want_w * 2 + gap, "dpi {dpi}: row {i} right edge");
+                assert_eq!(a.rc.top, b.rc.top, "dpi {dpi}: row {i} is not level");
+                assert_eq!(a.rc.bottom, b.rc.bottom);
+                if i > 0 {
+                    assert_eq!(
+                        a.rc.top - rows[i - 1][0].rc.bottom,
+                        gap,
+                        "dpi {dpi}: row gap"
+                    );
+                }
+            }
+            // Exactly one primary, and it is `Scan`.
+            let primaries: Vec<i32> = l
+                .btns
+                .iter()
+                .filter(|b| b.style == BTN_ACCENT)
+                .map(|b| b.id)
+                .collect();
+            assert_eq!(primaries, vec![BTN_SCAN], "dpi {dpi}");
+        }
+    }
+
+    /// The tab strip is a segmented control: two equal segments spanning the
+    /// content width, contiguous, in the strip band -- not the incumbent's two
+    /// bare right-aligned text links.
+    #[test]
+    fn tab_strip_is_a_segmented_control() {
+        for dpi in [96, 120, 144, 192] {
+            let cw = scale_px(dpi, MAIN_CLIENT_W);
+            let ch = scale_px(dpi, MAIN_CLIENT_H);
+            let l = compute_layout(&dirs(2), cw, ch, dpi);
+            let sc = |v: i32| scale_px(dpi, v);
+            let margin = sc(MAIN_MARGIN);
+            let _ = cw;
+            let card = l.card_link;
+            let settings = l.settings;
+            assert_eq!(card.left, margin, "dpi {dpi}");
+            assert_eq!(
+                settings.right,
+                margin + (card.right - card.left) * 2 + sc(SP_2),
+                "dpi {dpi}: the strip spans both segments plus the one gap"
+            );
+            assert_eq!(
+                card.right + sc(SP_2),
+                settings.left,
+                "dpi {dpi}: one gap between the segments"
+            );
+            assert_eq!(
+                card.right - card.left,
+                settings.right - settings.left,
+                "dpi {dpi}: segments are equal"
+            );
+            assert_eq!(card.top, sc(TAB_TOP_L), "dpi {dpi}");
+            assert_eq!(card.bottom, sc(TAB_TOP_L) + sc(TAB_H_L), "dpi {dpi}");
+            // The strip sits below the header band and above the section label.
+            assert!(card.top >= l.header.bottom, "dpi {dpi}");
+            assert!(card.bottom <= l.section.top, "dpi {dpi}");
+            for b in l.btns.iter().filter(|b| b.style == BTN_TAB || b.style == BTN_TAB_SEL) {
+                let want = if b.id == BTN_CARD { card } else { settings };
+                assert!(r_eq(b.rc, want), "dpi {dpi}: segment {} off the strip", b.id);
+            }
+            // The folder count's badge shares the section line, at its right end.
+            let rects = main_text_rects(cw, ch, dpi, &l, 2);
+            let sec = rects.iter().find(|r| r.id == "main.section").unwrap();
+            let badge = rects.iter().find(|r| r.id == "main.badge").unwrap();
+            assert_eq!(badge.rc.right, l.section.right, "dpi {dpi}");
+            assert!(sec.rc.right < badge.rc.left, "dpi {dpi}: label and badge overlap");
+            assert!(!rects_intersect(sec.rc, badge.rc));
+        }
+    }
+
     #[test]
     fn compute_layout_card_follows_rows() {
         let card_h = |n: usize| {
@@ -5191,8 +5590,20 @@ mod tests {
         assert!(l1.rows.len() == 1 && l4.rows.len() == 4);
         let (l20, h20) = card_h(20);
         let (_, h5) = card_h(5);
-        assert_eq!(h20, h5 + 22);
-        assert!(l20.rows.len() == 5 && l20.overflow == 15);
+        // The panel grows to the height the action grid leaves it, then clamps:
+        // the viewport holds `list_capacity` rows and the rest is `+N more`.
+        assert!(h20 > h5, "the 20-folder panel {h20} must exceed the 5-folder {h5}");
+        assert_eq!(l20.rows.len(), l20.list_capacity as usize);
+        assert_eq!(l20.list_capacity, 7, "the grid leaves room for 7 rows");
+        assert_eq!(l20.overflow, 20 - 7);
+        let grid_top = l20
+            .btns
+            .iter()
+            .filter(|b| b.style != BTN_TAB && b.style != BTN_TAB_SEL)
+            .map(|b| b.rc.top)
+            .min()
+            .unwrap();
+        assert!(l20.card.bottom <= grid_top, "panel overruns the grid");
         for (i, r) in l20.rows.iter().enumerate() {
             assert_eq!(
                 row_at_point(&l20.rows, (r.left + r.right) / 2, (r.top + r.bottom) / 2),
@@ -5208,15 +5619,25 @@ mod tests {
     #[test]
     fn main_settings_affordance() {
         let l = compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
-        assert_eq!(l.btns.len(), 6);
+        assert_eq!(l.btns.len(), 8);
         let s = l.settings;
         assert!(s.right <= MAIN_CLIENT_W && s.bottom <= MAIN_CLIENT_H && s.left >= 0 && s.top >= 0);
         assert!(s.right > s.left && s.bottom > s.top);
         assert!(
-            s.top >= 52 && s.bottom <= 92,
-            "settings {s:?} leaves the header strip"
+            s.top >= TAB_TOP_L && s.bottom <= TAB_TOP_L + TAB_H_L,
+            "settings tab {s:?} leaves the tab strip"
         );
-        for b in &l.btns {
+        assert!(
+            s.top >= l.header.bottom,
+            "the tab strip must sit below the header band"
+        );
+        // The tab segment is itself a control, so it is excluded from the
+        // overlap scan the way every other control is compared.
+        for b in l
+            .btns
+            .iter()
+            .filter(|b| b.style != BTN_TAB && b.style != BTN_TAB_SEL)
+        {
             assert!(
                 !rects_intersect(s, b.rc),
                 "settings overlaps button {}",
@@ -5243,7 +5664,7 @@ mod tests {
     #[test]
     fn settings_hit_test() {
         let l = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "balanced");
-        assert_eq!(l.btns.len(), 10);
+        assert_eq!(l.btns.len(), 12);
         for id in [
             BTN_BACK,
             BTN_CLEAR_CACHE,
@@ -5293,12 +5714,25 @@ mod tests {
         );
         for id in [BTN_CLEAR_CACHE, BTN_CLEAR_INDEX, BTN_EXPORT, BTN_IMPORT] {
             let rc = l.settings_btn(id).unwrap();
-            assert!(rc.top >= 100 && rc.bottom <= 140, "library {id} {rc:?}");
+            assert!(
+                rc.top >= l.labels[0].rc.bottom && rc.top < l.labels[1].rc.top,
+                "library {id} {rc:?} left the LIBRARY group"
+            );
         }
-        for id in [BTN_STARTUP, BTN_OPEN_LOG] {
-            let rc = l.settings_btn(id).unwrap();
-            assert!(rc.top >= 172 && rc.bottom <= 212, "startup {id} {rc:?}");
-        }
+        // The startup toggle spans the content width, one row under its label.
+        let rc = l.settings_btn(BTN_STARTUP).unwrap();
+        assert_eq!(rc.left, l.labels[1].rc.left);
+        assert_eq!(rc.right, l.labels[1].rc.right);
+        assert!(rc.top >= l.labels[1].rc.bottom && rc.top < l.labels[2].rc.top);
+        // The footer row holds Back and Open log folder on the shared grid.
+        let back = l.settings_btn(BTN_BACK).unwrap();
+        let log = l.settings_btn(BTN_OPEN_LOG).unwrap();
+        assert_eq!(back.top, log.top);
+        assert_eq!(back.bottom, log.bottom);
+        assert_eq!(back.right - back.left, log.right - log.left);
+        assert_eq!(back.left, l.status.left);
+        assert_eq!(log.right, l.status.right);
+        assert!(back.bottom <= l.status.top);
     }
 
     #[test]
@@ -5373,8 +5807,8 @@ mod tests {
     fn focus_order_covers_rect_table() {
         for (order, want_len) in [
             (main_focus_order(), 8usize),
-            (settings_focus_order(), 10),
-            (card_focus_order(), 9),
+            (settings_focus_order(), 12),
+            (card_focus_order(), 11),
         ] {
             assert_eq!(order.len(), want_len);
             let mut seen = std::collections::HashSet::new();
@@ -5383,8 +5817,8 @@ mod tests {
             }
         }
         assert_eq!(focus_order_for_view(View::Main).len(), 8);
-        assert_eq!(focus_order_for_view(View::Settings).len(), 10);
-        assert_eq!(focus_order_for_view(View::Card).len(), 9);
+        assert_eq!(focus_order_for_view(View::Settings).len(), 12);
+        assert_eq!(focus_order_for_view(View::Card).len(), 11);
         for id in [
             BTN_ADD,
             BTN_REMOVE,
@@ -5396,6 +5830,40 @@ mod tests {
             BTN_CARD,
         ] {
             assert!(main_focus_order().contains(&id), "missing {id}");
+        }
+        // The focus order IS the rect table: every control in every view's table
+        // has exactly one focus stop, and every focus stop has a rect.
+        for (order, ids) in [
+            (
+                main_focus_order(),
+                compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96)
+                    .btns
+                    .iter()
+                    .map(|b| b.id)
+                    .collect::<Vec<i32>>(),
+            ),
+            (
+                settings_focus_order(),
+                compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "turbo")
+                    .btns
+                    .iter()
+                    .map(|b| b.id)
+                    .collect::<Vec<i32>>(),
+            ),
+            (
+                card_focus_order(),
+                compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &CardSpec::default())
+                    .btns
+                    .iter()
+                    .map(|b| b.id)
+                    .collect::<Vec<i32>>(),
+            ),
+        ] {
+            let mut a = order.clone();
+            let mut b = ids;
+            a.sort_unstable();
+            b.sort_unstable();
+            assert_eq!(a, b, "focus order and rect table disagree");
         }
     }
 
@@ -5511,15 +5979,15 @@ mod tests {
         st.cur_view = View::Main;
         st.focus_id = 0;
         assert!(st.on_settings_key_down_ex(NULL, VK_TAB, false));
-        assert_eq!(st.focus_id, BTN_ADD);
+        assert_eq!(st.focus_id, BTN_CARD);
         assert!(st.on_settings_key_down_ex(NULL, VK_TAB, false));
-        assert_eq!(st.focus_id, BTN_REMOVE);
+        assert_eq!(st.focus_id, BTN_SETTINGS);
         assert!(st.on_settings_key_down_ex(NULL, VK_TAB, true));
-        assert_eq!(st.focus_id, BTN_ADD);
+        assert_eq!(st.focus_id, BTN_CARD);
         assert!(st.on_settings_key_down_ex(NULL, VK_DOWN, false));
-        assert_eq!(st.focus_id, BTN_REMOVE);
+        assert_eq!(st.focus_id, BTN_SETTINGS);
         assert!(st.on_settings_key_down_ex(NULL, VK_UP, false));
-        assert_eq!(st.focus_id, BTN_ADD);
+        assert_eq!(st.focus_id, BTN_CARD);
         assert!(!st.on_settings_key_down_ex(NULL, VK_ESCAPE, false));
     }
 
@@ -6859,7 +7327,7 @@ mod tests {
             },
         ] {
             let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &spec);
-            assert_eq!(l.btns.len(), 9);
+            assert_eq!(l.btns.len(), 11);
             for id in [
                 BTN_CARD_BACK,
                 card_details_button(0),
@@ -6959,8 +7427,8 @@ mod tests {
         let s = l.card_link;
         assert!(s.right <= MAIN_CLIENT_W && s.bottom <= MAIN_CLIENT_H && s.left >= 0 && s.top >= 0);
         assert!(s.right > s.left && s.bottom > s.top);
-        assert!(s.top >= 68 && s.bottom <= 92);
-        assert_eq!(s.right, l.settings.left);
+        assert!(s.top >= TAB_TOP_L && s.bottom <= TAB_TOP_L + TAB_H_L);
+        assert_eq!(s.right + scale_px(96, SP_2), l.settings.left);
         let rects = main_text_rects(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &l, 2);
         for (i, a) in rects.iter().enumerate() {
             for b in rects.iter().skip(i + 1) {
@@ -6998,17 +7466,17 @@ mod tests {
         };
         for p in &dets {
             let want = if p.id == "episode" {
-                BTN_ACCENT
+                BTN_TAB_SEL
             } else {
-                BTN_SUBTLE
+                BTN_TAB
             };
             assert_eq!(card_preset_style(0, &p.id, &spec), want);
         }
         for p in &states {
             let want = if p.id == "none" {
-                BTN_ACCENT
+                BTN_TAB_SEL
             } else {
-                BTN_SUBTLE
+                BTN_TAB
             };
             assert_eq!(card_preset_style(1, &p.id, &spec), want);
         }
@@ -7445,7 +7913,7 @@ mod tests {
     #[test]
     fn settings_scan_hit_test() {
         let l = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "balanced");
-        assert_eq!(l.btns.len(), 10);
+        assert_eq!(l.btns.len(), 12);
         for id in [BTN_SCAN_GENTLE, BTN_SCAN_BALANCED, BTN_SCAN_TURBO] {
             let rc = l
                 .settings_btn(id)
@@ -7473,7 +7941,10 @@ mod tests {
         }
         for id in [BTN_SCAN_GENTLE, BTN_SCAN_BALANCED, BTN_SCAN_TURBO] {
             let rc = l.settings_btn(id).unwrap();
-            assert!(rc.top >= 204 && rc.bottom <= 340, "scan {id} {rc:?}");
+            assert!(
+                rc.top >= l.labels[2].rc.bottom && rc.bottom <= l.hint.top,
+                "scan {id} {rc:?} left the SCAN SPEED group"
+            );
         }
     }
 
@@ -7494,7 +7965,7 @@ mod tests {
         assert_eq!(crate::settings::scan_profile_for_button(BTN_BACK), "");
         for cur in ["gentle", "balanced", "turbo"] {
             for seg in ["gentle", "balanced", "turbo"] {
-                let want = if seg == cur { BTN_ACCENT } else { BTN_SUBTLE };
+                let want = if seg == cur { BTN_TAB_SEL } else { BTN_TAB };
                 assert_eq!(crate::settings::scan_segment_style(seg, cur), want);
             }
         }
@@ -7505,11 +7976,11 @@ mod tests {
             );
             assert_eq!(
                 crate::settings::scan_segment_style("turbo", cur),
-                BTN_ACCENT
+                BTN_TAB_SEL
             );
             assert_eq!(
                 crate::settings::scan_segment_style("balanced", cur),
-                BTN_SUBTLE
+                BTN_TAB
             );
         }
         assert!(

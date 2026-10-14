@@ -154,9 +154,9 @@ pub fn scan_segment_style(seg: &str, current: &str) -> i32 {
     if app_support::config::normalize_scan_speed(seg)
         == app_support::config::normalize_scan_speed(current)
     {
-        return crate::window::BTN_ACCENT;
+        return crate::window::BTN_TAB_SEL;
     }
-    crate::window::BTN_SUBTLE
+    crate::window::BTN_TAB
 }
 
 /// `onSelectScanSpeed` (`go\settings_sections.go:177`): the window-free core of
