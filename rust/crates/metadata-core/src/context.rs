@@ -29,7 +29,7 @@ use titleclean::javacompat::port_pattern;
 use titleclean::Regex;
 
 use crate::parse::{
-    extra_re_matches, group, has_ascii_letter, is_theme, is_year_num, word_bounded_match,
+    atoi64, extra_re_matches, group, has_ascii_letter, is_theme, is_year_num, word_bounded_match,
     POT_PLAYER_SUFFIX,
 };
 use crate::types::{Kind, Query};
@@ -181,7 +181,7 @@ pub(crate) fn under_extras_folder(path: &str) -> bool {
 /// looks like a root (no lowercase: MOVIES, SHOWS, ...), season and generic
 /// folders are skipped, and the survivor is titleclean-normalised (dots become
 /// spaces). `("", 0)` when nothing usable remains.
-pub fn context_from_path(path: &str) -> (String, i32) {
+pub fn context_from_path(path: &str) -> (String, i64) {
     if path.trim().is_empty() {
         return (String::new(), 0);
     }
@@ -192,11 +192,11 @@ pub fn context_from_path(path: &str) -> (String, i32) {
     let mut season = 0;
     for d in &dirs {
         if let Some(caps) = SEASON_DIR_RE.captures(d) {
-            season = atoi(group(&caps, 1));
+            season = atoi64(group(&caps, 1));
             break;
         }
         if let Some(caps) = SEASON_SHORT_RE.captures(d) {
-            season = atoi(group(&caps, 1));
+            season = atoi64(group(&caps, 1));
             break;
         }
     }
@@ -205,7 +205,7 @@ pub fn context_from_path(path: &str) -> (String, i32) {
             if let Some(caps) = SEASON_EMBEDDED_RE.captures(d) {
                 let s = group(&caps, 1);
                 let s = if s.is_empty() { group(&caps, 2) } else { s };
-                let n = atoi(s);
+                let n = atoi64(s);
                 if n > 0 {
                     season = n;
                     break;
@@ -365,7 +365,8 @@ pub fn resolve_query(raw_title: &str, path: &str) -> Query {
     }
 }
 
-/// Go's `atoi`: a non-numeric capture is 0.
+/// Go's `atoi` for the bounded `\d{1,4}` episode captures: a non-numeric
+/// capture is 0.
 fn atoi(s: &str) -> i32 {
     s.parse().unwrap_or(0)
 }

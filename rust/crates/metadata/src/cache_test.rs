@@ -8,15 +8,15 @@ use metadata_core::types::{Episode, Kind, Media, Query};
 use metadata_http::cancel::Cancel;
 
 use crate::cache::{
-    CACHE_MAX_VALUE_SIZE, CACHE_SCHEMA, CacheEntry, CacheFile, NEGATIVE_TTL, cache_exists,
-    cache_file_name, cache_for_each, cache_has, cache_index_path, cache_key, cache_live,
-    cache_load, cache_load_entry, cache_put_raw, cache_record, cache_store, cache_store_negative,
-    checked_at_instant, clear_cache, clear_cache_entries, count_negatives, decode_cache_entry,
-    default_cache_dir, legacy_cache_files, migrate_legacy_cache, resolve_cache_dir, with_cache,
-    with_cache_write,
+    cache_exists, cache_file_name, cache_for_each, cache_has, cache_index_path, cache_key,
+    cache_live, cache_load, cache_load_entry, cache_put_raw, cache_record, cache_store,
+    cache_store_negative, checked_at_instant, clear_cache, clear_cache_entries, count_negatives,
+    decode_cache_entry, default_cache_dir, legacy_cache_files, migrate_legacy_cache,
+    resolve_cache_dir, with_cache, with_cache_write, CacheEntry, CacheFile, CACHE_MAX_VALUE_SIZE,
+    CACHE_SCHEMA, NEGATIVE_TTL,
 };
 use crate::resolver::NEGATIVE_BACKOFF;
-use crate::testsupport::{FakeSource, TempDir, resolver_with};
+use crate::testsupport::{resolver_with, FakeSource, TempDir};
 use crate::timefmt::format_rfc3339;
 
 /// `storeRawRecord`: writes one encoded record straight into `dir`'s store.
@@ -28,7 +28,7 @@ pub(crate) fn store_raw_record(dir: &str, key: &str, data: &[u8]) {
     .expect("store record");
 }
 
-fn series_query(title: &str, season: i32) -> Query {
+fn series_query(title: &str, season: i64) -> Query {
     Query {
         kind: Kind::SERIES,
         title: title.to_string(),

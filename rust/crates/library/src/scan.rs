@@ -8,14 +8,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::catchup::{CatchUpConfig, start_catch_up};
+use crate::catchup::{start_catch_up, CatchUpConfig};
 use crate::index::{
-    FILE_KIND_MOVIE, FILE_KIND_SERIES, FILE_KIND_UNKNOWN, FileRecord, STATE_PENDING,
-    STATE_RESOLVED, shared_index,
+    shared_index, FileRecord, FILE_KIND_MOVIE, FILE_KIND_SERIES, FILE_KIND_UNKNOWN, STATE_PENDING,
+    STATE_RESOLVED,
 };
 use crate::pathutil::{base as path_base, ext as path_ext, normalize_scan_dir};
 use crate::scanindex::ScanIndex;
-use crate::{Error, Options, Progress, Stats, collect_indexed, current_parse, record_index_keys};
+use crate::{collect_indexed, current_parse, record_index_keys, Error, Options, Progress, Stats};
 
 /// One walked file's filesystem identity for the diff.
 struct FileStamp {
@@ -113,7 +113,7 @@ pub(crate) fn scan_indexed(cancel: &crate::Cancel, opts: &Options) -> Result<Sta
             mtime: st.mtime,
             kind: record_kind(q.kind).to_string(),
             title: q.title.clone(),
-            season: q.season as i64,
+            season: q.season,
             episode: q.episode as i64,
             year: q.year as i64,
             absolute: q.absolute,

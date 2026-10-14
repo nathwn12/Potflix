@@ -782,7 +782,7 @@ pub(crate) fn match_episode(eps: &[Episode], q: &Query) -> Option<Episode> {
     if q.season > 0 {
         return eps
             .iter()
-            .find(|e| e.season == q.season && e.number == q.episode)
+            .find(|e| i64::from(e.season) == q.season && e.number == q.episode)
             .cloned();
     }
     eps.iter().find(|e| e.number == q.episode).cloned()
@@ -815,7 +815,7 @@ pub(crate) fn resolve_from_media(media: &Media, q: &Query) -> Resolution {
         return resolution;
     }
     if let Some(ep) = match_episode(&media.episodes, q) {
-        resolution.season = ep.season;
+        resolution.season = i64::from(ep.season);
         resolution.number = ep.number;
         resolution.episode = ep.title.clone();
         let synopsis = first_non_empty(&[&ep.synopsis, &media.synopsis]);

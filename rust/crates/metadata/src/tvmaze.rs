@@ -261,7 +261,7 @@ impl crate::resolver::Source for TvmazeSource {
             let seasons: Vec<TvmazeSeason> = decode_capped(response)?;
             let mut season_id = -1;
             for season in &seasons {
-                if season.number == q.season {
+                if i64::from(season.number) == q.season {
                     season_id = season.id;
                     break;
                 }

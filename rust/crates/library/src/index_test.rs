@@ -4,15 +4,16 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Instant;
 
 use crate::index::{
-    FileRecord, LEGACY_BAK_SUFFIX, STATE_RESOLVED, close_index, decode_file_record,
-    decode_folder_record, encode_file_record, encode_folder_record, index_store_path, shared_index,
+    close_index, decode_file_record, decode_folder_record, encode_file_record,
+    encode_folder_record, index_store_path, shared_index, FileRecord, LEGACY_BAK_SUFFIX,
+    STATE_RESOLVED,
 };
 use crate::library_test::{
-    ParseScope, ResolverScope, index_path_in, index_scan_opts, meta_cache_dir, seed_index_corpus,
-    temp_dir,
+    index_path_in, index_scan_opts, meta_cache_dir, seed_index_corpus, temp_dir, ParseScope,
+    ResolverScope,
 };
-use crate::scanindex::{FolderRecord, load_scan_index, same_scan_record};
-use crate::{Options, scan_with_options};
+use crate::scanindex::{load_scan_index, same_scan_record, FolderRecord};
+use crate::{scan_with_options, Options};
 use metadata_http::cancel::Cancel;
 
 static PARSE_CALLS: AtomicI32 = AtomicI32::new(0);
@@ -190,7 +191,7 @@ fn file_record_query_round_trip() {
             name: name.to_string(),
             kind: crate::scan::record_kind(q.kind).to_string(),
             title: q.title.clone(),
-            season: q.season as i64,
+            season: q.season,
             episode: q.episode as i64,
             year: q.year as i64,
             absolute: q.absolute,

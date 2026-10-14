@@ -8,9 +8,9 @@ use metadata_core::context::resolve_query;
 use metadata_core::types::{Episode, Kind, Media, Query};
 use metadata_http::cancel::Cancel;
 
-use crate::Error;
 use crate::resolver::{Options, Resolver, Source};
-use crate::testsupport::{TempDir, dead_url, http_client, wiki_client};
+use crate::testsupport::{dead_url, http_client, wiki_client, TempDir};
+use crate::Error;
 use crate::{anilist::AnilistSource, itunes::ItunesSource, jikan::JikanSource};
 use crate::{tvmaze::TvmazeSource, wikipedia::WikipediaSource};
 
@@ -83,7 +83,7 @@ fn series_answer(q: &Query) -> Media {
     Media {
         title: q.title.clone(),
         episodes: vec![Episode {
-            season: q.season,
+            season: i32::try_from(q.season).expect("test query season fits i32"),
             number: q.episode,
             title: "Pilot".to_string(),
             ..Episode::default()
