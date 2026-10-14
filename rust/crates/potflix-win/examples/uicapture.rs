@@ -94,6 +94,12 @@ fn leave_hidden_desktop(desk: usize, prev: usize) {
     }
 }
 
+fn dirs(n: usize) -> Vec<String> {
+    (0..n)
+        .map(|i| format!("{}:\\Media", char::from(b'A' + (i % 26) as u8)))
+        .collect()
+}
+
 fn view_of(s: &str) -> Result<window::View, String> {
     match s {
         "main" => Ok(window::View::Main),
@@ -512,6 +518,175 @@ fn mode_trace() -> Result<(), String> {
     r
 }
 
+/// `hold <view> [empty]` -- render one view on the hidden desktop and HOLD the
+/// window open so an external runner (`scripts\desktop-headless.ps1`) can drive
+/// and capture it. The window is the REAL one: same `create_main_window`, same
+/// wndproc, same paint.
+///
+/// `empty` clears the folder list (used with a scratch `LOCALAPPDATA`), so the
+/// empty state is a real state and not a mock.
+fn mode_hold(args: &[String]) -> Result<(), String> {
+    let view = view_of(&args.get(2).cloned().unwrap_or("main".into()))?;
+    let empty = args.get(3).is_some_and(|a| a == "empty");
+    let hold_ms: u64 = args
+        .get(4)
+        .map(|s| s.parse().unwrap_or(60_000))
+        .unwrap_or(60_000);
+    // NO `enter_hidden_desktop` here: the launcher (`desktop-headless.ps1`)
+    // already started this process on its own private desktop via
+    // `STARTUPINFO.lpDesktop`, and switching this thread to a SECOND desktop
+    // would put the window somewhere the launcher cannot see it.
+    window::create_main_window().map_err(|e| format!("create_main_window: {e}"))?;
+    {
+        let mut st = window::ui();
+        st.cur_view = view;
+        st.focus_id = 0;
+        st.refresh_dir_list();
+        if empty {
+            st.ui_dirs.clear();
+            st.sel_row = -1;
+            st.scroll_top = 0;
+        }
+    }
+    let hwnd = window::ui().main_hwnd as HWND;
+    println!("HOLD view={view:?} empty={empty} hwnd={hwnd:p}");
+    println!(
+        "HOLD class-icon=0x{:X}",
+        potflix_win::brand::class_icon(hwnd) as usize
+    );
+    // SAFETY: ShowWindow/UpdateWindow only affect `hwnd`.
+    unsafe {
+        win32::ShowWindow(hwnd, win32::SW_SHOW);
+        win32::UpdateWindow(hwnd);
+    }
+    // Pump this thread's queue so the window is live and responsive; the runner
+    // posts WM_CLOSE (which parks the window, never destroys it) and then ends
+    // the process.
+    let end = std::time::Instant::now() + std::time::Duration::from_millis(hold_ms);
+    while std::time::Instant::now() < end {
+        pump(100);
+    }
+    Ok(())
+}
+
+/// `facts` -- the redesign's own measurements, read from the real code path:
+/// the class-icon handle, the face each brand font actually selects, the action
+/// grid's numbers, and the palette's contrast ratios.
+fn mode_facts() -> Result<(), String> {
+    let (desk, prev) = enter_hidden_desktop("facts")?;
+    let r = (|| {
+        window::create_main_window().map_err(|e| format!("create_main_window: {e}"))?;
+        let hwnd = window::ui().main_hwnd as HWND;
+        if hwnd.is_null() {
+            return Err("no main window".into());
+        }
+        let sc = |v: i32| window::scale_px(96, v);
+
+        // --- the icon -------------------------------------------------------
+        let cls = potflix_win::brand::class_icon(hwnd);
+        println!("FACT class-icon GCLP_HICON=0x{:X} non-zero={}", cls as usize, !cls.is_null());
+        let small = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClassLongPtrW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::GCLP_HICONSM,
+            )
+        };
+        println!("FACT class-icon GCLP_HICONSM=0x{small:X} non-zero={}", small != 0);
+        // WM_GETICON answers the WINDOW slots (what the titlebar and alt-tab read).
+        for (name, which) in [("ICON_BIG", win32::ICON_BIG), ("ICON_SMALL", win32::ICON_SMALL)] {
+            let h = unsafe {
+                win32::SendMessageW(hwnd, win32::WM_GET_ICON, which as usize, 0)
+            };
+            println!("FACT window-icon {name}=0x{h:X} non-zero={}", h != 0);
+        }
+
+        // --- the faces ------------------------------------------------------
+        let hdc = unsafe { windows_sys::Win32::Graphics::Gdi::GetDC(hwnd) };
+        let display = potflix_win::brand::display(sc(20));
+        let ui = potflix_win::brand::ui(sc(13), potflix_win::brand::UI_WEIGHT);
+        println!(
+            "FACT face wordmark={:?} want={:?}",
+            potflix_win::brand::face_of(hdc, display),
+            potflix_win::brand::DISPLAY_FAMILY
+        );
+        println!(
+            "FACT face ui={:?} want={:?}",
+            potflix_win::brand::face_of(hdc, ui),
+            potflix_win::brand::UI_FAMILY
+        );
+        // SAFETY: the fonts and DC were created above.
+        unsafe {
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(display);
+            windows_sys::Win32::Graphics::Gdi::DeleteObject(ui);
+            windows_sys::Win32::Graphics::Gdi::ReleaseDC(hwnd, hdc);
+        }
+
+        // --- the grid -------------------------------------------------------
+        let (cw, ch) = (sc(window::MAIN_CLIENT_W), sc(window::MAIN_CLIENT_H));
+        let l = window::compute_layout(&dirs(4), cw, ch, 96);
+        let mut grid: Vec<&window::UiButton> = l
+            .btns
+            .iter()
+            .filter(|b| b.style != window::BTN_TAB && b.style != window::BTN_TAB_SEL)
+            .collect();
+        grid.sort_by_key(|b| (b.rc.top, b.rc.left));
+        for b in &grid {
+            println!(
+                "FACT grid id={} x=[{},{}] y=[{},{}] w={} h={}",
+                b.id,
+                b.rc.left,
+                b.rc.right,
+                b.rc.top,
+                b.rc.bottom,
+                b.rc.right - b.rc.left,
+                b.rc.bottom - b.rc.top
+            );
+        }
+        let widths: std::collections::HashSet<i32> =
+            grid.iter().map(|b| b.rc.right - b.rc.left).collect();
+        let heights: std::collections::HashSet<i32> =
+            grid.iter().map(|b| b.rc.bottom - b.rc.top).collect();
+        let xs: std::collections::HashSet<i32> = grid.iter().map(|b| b.rc.left).collect();
+        println!(
+            "FACT grid equal-width={} distinct-widths={widths:?} distinct-heights={heights:?} distinct-x={xs:?}",
+            widths.len() == 1
+        );
+        let tabs = window::tab_strip_rects(cw, 96);
+        println!(
+            "FACT tabstrip card=[{},{}] settings=[{},{}] gap={} equal-width={}",
+            tabs.0.left,
+            tabs.0.right,
+            tabs.1.left,
+            tabs.1.right,
+            tabs.1.left - tabs.0.right,
+            (tabs.0.right - tabs.0.left) == (tabs.1.right - tabs.1.left)
+        );
+        println!(
+            "FACT panel rows_visible={} overflow={} panel=[{},{},{}]",
+            l.list_capacity, l.overflow, l.card.top, l.card.bottom, l.card.right
+        );
+
+        // --- contrast -------------------------------------------------------
+        use potflix_win::brand as b;
+        for (name, fg, bg) in [
+            ("CARD_HDR/BLACK", b::CARD_HDR, b::BLACK),
+            ("CARD_HDR/CARD", b::CARD_HDR, b::CARD),
+            ("CARD_MUT/BLACK", b::CARD_MUT, b::BLACK),
+            ("WHITE/RED", b::WHITE, b::RED),
+            ("DANGER_TEXT/CARD", b::DANGER_TEXT, b::CARD),
+            ("RED/BLACK", b::RED, b::BLACK),
+            ("EDGE/BLACK", b::EDGE, b::BLACK),
+            ("TRACK/BLACK", b::TRACK, b::BLACK),
+        ] {
+            println!("FACT contrast {name}={:.2}:1", b::contrast(fg, bg));
+        }
+        println!("FACTS-OK");
+        Ok(())
+    })();
+    leave_hidden_desktop(desk, prev);
+    r
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mode = args.get(1).cloned().unwrap_or_default();
@@ -520,7 +695,9 @@ fn main() {
         "menu" => mode_menu(&args),
         "offscreen" => mode_offscreen(&args),
         "trace" => mode_trace(),
-        _ => Err("usage: uicapture (window|menu|offscreen|trace) ...".into()),
+        "hold" => mode_hold(&args),
+        "facts" => mode_facts(),
+        _ => Err("usage: uicapture (window|menu|offscreen|trace|hold|facts) ...".into()),
     };
     if let Err(e) = r {
         eprintln!("UICAPTURE-FAIL: {e}");
