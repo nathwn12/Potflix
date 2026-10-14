@@ -40,13 +40,15 @@ use windows_sys::Win32::UI::Shell::NOTIFYICONDATAW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{HICON, MSG, WNDCLASSEXW};
 
 use crate::win32::{
-    AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    utf16_z, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, GetModuleHandleW,
-    ICON_RESOURCE_VERSION, MF_STRING, MsgT, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NotifyIconData, Point, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    Shell_NotifyIconW, TPM_BOTTOM_ALIGN, TPM_RETURN_CMD, TPM_RIGHT_BUTTON, TrackPopupMenu,
-    TranslateMessage, WM_APP_QUIT, WM_APP_TRAY, WM_CLOSE, WM_CONTEXT_MENU, WM_DESTROY, WM_NULL,
-    WM_RBUTTON_UP, WndClassEx, WndProc, utf16_z,
+    MsgT, NotifyIconData, Point, PostMessageW, PostQuitMessage, RegisterClassExW,
+    SetForegroundWindow, Shell_NotifyIconW, TrackPopupMenu, TranslateMessage, WndClassEx, WndProc,
+    DRAWITEMSTRUCT, ICON_RESOURCE_VERSION, MEASUREITEMSTRUCT, MENUINFO, MENUITEMINFOW,
+    MENU_INFO_BACKGROUND, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    MIIM_STRING, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, ODS_SELECTED, ODT_MENU,
+    TPM_BOTTOM_ALIGN, TPM_RETURN_CMD, TPM_RIGHT_BUTTON, WM_APP_QUIT, WM_APP_TRAY, WM_CLOSE,
+    WM_CONTEXT_MENU, WM_DESTROY, WM_DRAWITEM, WM_MEASUREITEM, WM_NULL, WM_RBUTTON_UP,
 };
 
 /// Go `trayClassName` (`go\tray.go:18`).
@@ -414,6 +416,30 @@ unsafe extern "system" fn wnd_proc(
             unsafe { PostQuitMessage(0) };
             0
         }
+        WM_MEASUREITEM => {
+            // Owner-drawn tray items only: `wParam` is 0 for menus and
+            // `lParam` is the `MEASUREITEMSTRUCT`. Anything else belongs to a
+            // control this window does not own.
+            if wparam == 0 && lparam != 0 {
+                let mis = unsafe { &mut *(lparam as *mut MEASUREITEMSTRUCT) };
+                if mis.CtlType == ODT_MENU {
+                    measure_menu_item(mis, mis.itemData, crate::window::system_dpi());
+                    return 1;
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_DRAWITEM => {
+            // Owner-drawn tray items only; see `draw_menu_item`.
+            if lparam != 0 {
+                let dis = lparam as *const DRAWITEMSTRUCT;
+                if unsafe { (*dis).CtlType } == ODT_MENU {
+                    unsafe { draw_menu_item(dis) };
+                    return 1;
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_CLOSE => {
             unsafe { DestroyWindow(hwnd) };
             0
@@ -426,8 +452,158 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// The tray popup's items in display order: the label and the stable dispatch
+/// id. Ids, labels, order and dispatch are the Go contract (`go\tray.go`):
+/// only the PAINT is new (owner-drawn dark instead of the stock white popup).
+/// `dwItemData` carries the index into this table.
+pub fn tray_menu_items() -> [(&'static str, usize); 2] {
+    [
+        ("Open Potflix", MENU_ITEM_OPEN),
+        ("Exit Potflix", MENU_ITEM_EXIT),
+    ]
+}
+
+/// Menu-item height: the body type size plus vertical padding, at `dpi`.
+/// Width is measured from the label; see [`measure_menu_item`].
+pub fn menu_item_height(dpi: i32) -> i32 {
+    crate::window::scale_px(dpi, crate::window::FS_BODY + 2 * 6)
+}
+
+/// Measure one owner-drawn item's text width at `dpi` with a screen DC, like
+/// [`crate::window::measure_scan_status_width`]: `None` when no DC/font is
+/// available (the caller then falls back to a fixed width).
+#[must_use]
+pub fn menu_text_width(dpi: i32, label: &str) -> Option<i32> {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
+    };
+    if label.is_empty() {
+        return Some(0);
+    }
+    // SAFETY: a screen DC + a created font, both released below.
+    unsafe {
+        let hdc = GetDC(null_mut());
+        if hdc.is_null() {
+            return None;
+        }
+        let font = crate::window::create_ui_font(
+            -crate::window::scale_px(dpi, crate::window::FS_BODY),
+            crate::win32::FW_NORMAL,
+        );
+        if font.is_null() {
+            ReleaseDC(null_mut(), hdc);
+            return None;
+        }
+        let old = SelectObject(hdc, font);
+        let u: Vec<u16> = label.encode_utf16().collect();
+        let mut sz = SIZE { cx: 0, cy: 0 };
+        let r = GetTextExtentPoint32W(hdc, u.as_ptr(), u.len() as i32, &mut sz);
+        SelectObject(hdc, old);
+        DeleteObject(font);
+        ReleaseDC(null_mut(), hdc);
+        if r == 0 {
+            None
+        } else {
+            Some(sz.cx)
+        }
+    }
+}
+
+/// Fill a `MEASUREITEMSTRUCT` for item-data `index`: label width plus the
+/// check-margin and horizontal padding, at `dpi`. Pure math around
+/// [`menu_text_width`]; falls back to a fixed width when unmeasurable.
+pub fn measure_menu_item(mis: &mut MEASUREITEMSTRUCT, index: usize, dpi: i32) {
+    let items = tray_menu_items();
+    let label = items.get(index).map_or("", |(s, _)| *s);
+    let pad = crate::window::scale_px(dpi, 28);
+    let w = menu_text_width(dpi, label).unwrap_or(crate::window::scale_px(dpi, 140));
+    mis.itemWidth = (w + pad) as u32;
+    mis.itemHeight = menu_item_height(dpi) as u32;
+}
+
+/// Paint one owner-drawn item from its `DRAWITEMSTRUCT`: palette fill (hover =
+/// raised + accent bar), palette text in the ClearType body font. Restores
+/// every selected GDI object; draws only inside `rcItem`.
+///
+/// # Safety
+///
+/// `dis` must point to a live `DRAWITEMSTRUCT` from `WM_DRAWITEM` (its `hDC`
+/// and `rcItem` are read; nothing is retained).
+pub unsafe fn draw_menu_item(dis: *const DRAWITEMSTRUCT) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode, SetTextColor,
+    };
+    // SAFETY: caller guarantees a live struct; all GDI objects are released.
+    unsafe {
+        let dis = &*dis;
+        if dis.CtlType != ODT_MENU {
+            return;
+        }
+        let items = tray_menu_items();
+        let label = items.get(dis.itemData).map_or("", |(s, _)| *s);
+        let dpi = crate::window::system_dpi();
+        let selected = dis.itemState & ODS_SELECTED != 0;
+        let bg = CreateSolidBrush(if selected {
+            crate::window::COL_ROW_HOVER
+        } else {
+            crate::window::COL_CARD
+        });
+        FillRect(dis.hDC, &dis.rcItem, bg);
+        DeleteObject(bg);
+        if selected {
+            // Selection bar down the item's left edge, like the folder list.
+            let bar = windows_sys::Win32::Foundation::RECT {
+                left: dis.rcItem.left,
+                top: dis.rcItem.top,
+                right: dis.rcItem.left + crate::window::scale_px(dpi, crate::window::SELECT_BAR_W),
+                bottom: dis.rcItem.bottom,
+            };
+            let accent = CreateSolidBrush(crate::window::COL_ACCENT);
+            FillRect(dis.hDC, &bar, accent);
+            DeleteObject(accent);
+        }
+        let font = crate::window::create_ui_font(
+            -crate::window::scale_px(dpi, crate::window::FS_BODY),
+            crate::win32::FW_NORMAL,
+        );
+        if !font.is_null() {
+            SetTextColor(dis.hDC, crate::window::COL_TEXT);
+            SetBkMode(dis.hDC, crate::win32::TRANSPARENT);
+            let old = SelectObject(dis.hDC, font);
+            let u = utf16_z(label);
+            let gutter = crate::window::scale_px(dpi, 14);
+            let mut bx = windows_sys::Win32::Foundation::RECT {
+                left: dis.rcItem.left + gutter,
+                top: dis.rcItem.top,
+                right: dis.rcItem.right - gutter,
+                bottom: dis.rcItem.bottom,
+            };
+            DrawTextW(
+                dis.hDC,
+                u.as_ptr(),
+                -1,
+                &mut bx,
+                crate::win32::DT_LEFT
+                    | crate::win32::DT_SINGLE_LINE
+                    | crate::win32::DT_NO_PREFIX
+                    | crate::win32::DT_V_CENTER,
+            );
+            SelectObject(dis.hDC, old);
+            DeleteObject(font);
+        }
+    }
+}
+
 /// `showTrayMenu` (`go\tray.go:186-214`): one popup, `Open Potflix` = 2,
 /// `Exit Potflix` = 1, and the selection dispatch.
+///
+/// Rust-only paint: the popup interior is pinned dark (`SetMenuInfo` /
+/// `MIM_BACKGROUND`) and both items are `MFT_OWNERDRAW`, measured in
+/// `WM_MEASUREITEM` and painted in `WM_DRAWITEM` by this tray window (its own
+/// wndproc, which holds no lock -- `TrackPopupMenu`'s modal loop re-enters it,
+/// so there is no `UI`-guard discipline to keep and no re-entrant site to
+/// register). Ids, labels, order, flags and dispatch match Go exactly.
 ///
 /// # Safety
 ///
@@ -440,11 +616,32 @@ pub unsafe fn show_tray_menu(hwnd: HWND) {
         return;
     }
 
-    let open_label = utf16_z("Open Potflix");
-    let exit_label = utf16_z("Exit Potflix");
+    // Dark popup interior for the menu's own lifetime (deleted below).
+    let bg = unsafe { crate::win32::CreateSolidBrush(crate::window::COL_CARD) };
     unsafe {
-        AppendMenuW(menu, MF_STRING, MENU_ITEM_OPEN, open_label.as_ptr());
-        AppendMenuW(menu, MF_STRING, MENU_ITEM_EXIT, exit_label.as_ptr());
+        let mut info: MENUINFO = core::mem::zeroed();
+        info.cbSize = core::mem::size_of::<MENUINFO>() as u32;
+        info.fMask = MENU_INFO_BACKGROUND;
+        info.hbrBack = bg;
+        crate::win32::SetMenuInfo(menu, &info);
+
+        for (i, (label, id)) in tray_menu_items().iter().enumerate() {
+            let text = utf16_z(label);
+            let mut item: MENUITEMINFOW = core::mem::zeroed();
+            item.cbSize = core::mem::size_of::<MENUITEMINFOW>() as u32;
+            item.fMask = MIIM_STRING | MIIM_ID | MIIM_FTYPE | MIIM_STATE | MIIM_DATA;
+            item.fType = MFT_OWNERDRAW;
+            item.fState = MFS_ENABLED;
+            item.wID = *id as u32;
+            // `dwTypeData` is unread for `MFT_OWNERDRAW` (the label travels in
+            // `dwItemData`); it is passed anyway for debuggers and tests.
+            item.dwTypeData = text.as_ptr() as *mut u16;
+            item.cch = label.len() as u32;
+            item.dwItemData = i;
+            // `text` outlives this call; the system copies nothing for
+            // owner-draw items and never reads it back.
+            crate::win32::InsertMenuItemW(menu, i as u32, 1, &item);
+        }
 
         let mut cursor = Point::default();
         GetCursorPos(&mut cursor as *mut Point as *mut POINT);
@@ -471,6 +668,7 @@ pub unsafe fn show_tray_menu(hwnd: HWND) {
             _ => {}
         }
         DestroyMenu(menu);
+        crate::win32::DeleteObject(bg);
     }
 }
 
@@ -503,8 +701,8 @@ pub fn on_exit() -> ! {
 mod tests {
     use super::*;
     use core::mem::size_of;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// `go\tray_test.go:11-17` -- exactly what a real right-click delivers
     /// without `NIM_SETVERSION`: wParam = trayUID (1), lParam = WM_RBUTTONUP.
@@ -632,13 +830,49 @@ mod tests {
         assert_eq!(TRAY_CLASS_NAME, "PotflixTrayWnd");
         assert_eq!(MENU_ITEM_OPEN, 2);
         assert_eq!(MENU_ITEM_EXIT, 1);
-        assert_eq!(MF_STRING, 0);
+        assert_eq!(crate::win32::MF_STRING, 0);
         assert_eq!(TPM_RIGHT_BUTTON | TPM_BOTTOM_ALIGN | TPM_RETURN_CMD, 0x0122);
         assert_eq!(WM_APP_TRAY, 0x8001);
         assert_eq!(WM_APP_QUIT, 0x8002);
         assert_eq!(ICON_RESOURCE_VERSION, 0x0003_0000);
         assert_eq!(NIM_ADD, 0);
         assert_eq!(NIM_DELETE, 2);
+    }
+
+    /// The owner-drawn popup keeps the Go contract: same order, same labels,
+    /// same dispatch ids; `dwItemData` is the index into this table.
+    #[test]
+    fn menu_model_matches_go() {
+        let items = tray_menu_items();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], ("Open Potflix", MENU_ITEM_OPEN));
+        assert_eq!(items[1], ("Exit Potflix", MENU_ITEM_EXIT));
+        assert_eq!(MENU_ITEM_OPEN, 2);
+        assert_eq!(MENU_ITEM_EXIT, 1);
+    }
+
+    /// The owner-draw measure path sizes every item positively at 96 and 144
+    /// DPI and grows with the label: a zero-size item would be untouchable.
+    #[test]
+    fn menu_measure_sizes_items() {
+        for dpi in [96, 144] {
+            for (i, (label, _)) in tray_menu_items().iter().enumerate() {
+                let mut mis: MEASUREITEMSTRUCT = unsafe { core::mem::zeroed() };
+                mis.CtlType = ODT_MENU;
+                measure_menu_item(&mut mis, i, dpi);
+                println!(
+                    "menu item {i} ({label}) at {dpi}dpi: {}x{}",
+                    mis.itemWidth, mis.itemHeight
+                );
+                assert!(mis.itemWidth > 0, "item {i} width at {dpi}dpi");
+                assert!(mis.itemHeight > 0, "item {i} height at {dpi}dpi");
+            }
+            // Unknown index still sizes (fallback width): the menu never
+            // collapses on a bad `dwItemData`.
+            let mut mis: MEASUREITEMSTRUCT = unsafe { core::mem::zeroed() };
+            measure_menu_item(&mut mis, 99, dpi);
+            assert!(mis.itemWidth > 0 && mis.itemHeight > 0);
+        }
     }
 
     /// The tray Exit path (`go\tray.go:216-219`, installed by the app at

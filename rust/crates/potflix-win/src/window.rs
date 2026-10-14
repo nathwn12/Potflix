@@ -124,6 +124,10 @@ pub const VK_TAB: u32 = 0x09;
 pub const VK_RETURN: u32 = 0x0D;
 pub const VK_SPACE: u32 = 0x20;
 pub const VK_SHIFT: u32 = 0x10;
+pub const VK_PRIOR: u32 = 0x21;
+pub const VK_NEXT: u32 = 0x22;
+pub const VK_END: u32 = 0x23;
+pub const VK_HOME: u32 = 0x24;
 pub const VK_LEFT: u32 = 0x25;
 pub const VK_UP: u32 = 0x26;
 pub const VK_RIGHT: u32 = 0x27;
@@ -134,6 +138,19 @@ pub const DT_WORD_BREAK: u32 = 0x0010;
 
 // ---------------------------------------------------------------------------
 // Dark palette (`go\window.go:178-191`), packed as COLORREF `0x00BBGGRR`.
+//
+// The hue stays exactly as ported: a red-on-near-black identity (Netflix red
+// `#E50914` on `#0E0E0E`, the same pair Netflix ships on its own dark surface).
+// What the redesign adds is the missing STEP between each existing value so a
+// full state set exists, plus semantic aliases so paint sites name the state
+// they want, not a literal. No existing value is re-hued and none is changed
+// except the documented contrast fix at `COL_ON_ACCENT` (pure white for text on accent, pinned by `palette_contrast`).
+//
+// Reference for the surface ramp and state model: Fluent 2 dark
+// theming (`https://fluent2.microsoft.design/color`, accessed 2026-10-14) and
+// Material 3 dark elevation (a surface is raised by a luminance step, never a
+// shadow drop, because a shadow is invisible on a near-black canvas --
+// accessed 2026-10-14).
 // ---------------------------------------------------------------------------
 
 /// `rgb(r, g, b)` (`go\window.go:3487`).
@@ -142,17 +159,109 @@ pub const fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | (g << 8) | (b << 16)
 }
 
+// --- Surfaces: the elevation ladder, darkest first. -------------------------
+
+/// The canvas (`elevation 0`). Also the window's own background brush, so the
+/// DWM caption and the client area meet with no seam.
 pub const COL_BG: u32 = rgb(0x14, 0x14, 0x14);
+/// One step of chrome above the canvas: header/footer bands (`elevation 1`).
+pub const COL_SURFACE: u32 = rgb(0x17, 0x17, 0x17);
+/// A raised panel (`elevation 2`): the folders card, the preview panel.
 pub const COL_CARD: u32 = rgb(0x1C, 0x1C, 0x1C);
+/// A control resting on a panel (`elevation 3`): a row, a subtle button.
 pub const COL_ROW: u32 = rgb(0x24, 0x24, 0x24);
+/// The same control, hovered.
 pub const COL_ROW_HOVER: u32 = rgb(0x2E, 0x2E, 0x2E);
+/// A hairline that separates two surfaces.
 pub const COL_BORDER: u32 = rgb(0x33, 0x33, 0x33);
+/// A hairline that must read as an edge, not a seam: card and control outlines.
+pub const COL_BORDER_STRONG: u32 = rgb(0x44, 0x44, 0x44);
+
+// --- Text: one step per role, each contrast-checked against its surface. ----
+
+/// Body text (`15.04:1` on `COL_BG`, `12.67:1` on `COL_ROW`; see `palette_contrast`).
 pub const COL_TEXT: u32 = rgb(0xE8, 0xE8, 0xE8);
+/// Text ON an accent fill, where `COL_TEXT` fails AA: pure white is `4.79:1` on
+/// `COL_ACCENT` against `3.91:1` for `COL_TEXT`.
+pub const COL_ON_ACCENT: u32 = rgb(0xFF, 0xFF, 0xFF);
+/// Secondary text: labels, hints, status (`6.55:1` on `COL_BG`).
 pub const COL_MUTED: u32 = rgb(0x9A, 0x9A, 0x9A);
+/// Disabled text (`4.00:1` on `COL_BG`): readable, clearly out of play.
+pub const COL_MUTED_DIM: u32 = rgb(0x75, 0x75, 0x75);
+
+// --- Accent: the brand red, three interaction steps. -----------------------
+
 pub const COL_ACCENT: u32 = rgb(0xE5, 0x09, 0x14);
 pub const COL_ACCENT_HOV: u32 = rgb(0xF6, 0x12, 0x1D);
 pub const COL_ACCENT_DOWN: u32 = rgb(0xB0, 0x07, 0x10);
+/// A 15% accent wash over `COL_CARD`: the selection bar's backing and the
+/// selected-row tint. Never carries text.
+pub const COL_ACCENT_WASH: u32 = rgb(0x39, 0x15, 0x17);
+
+/// Destructive text (Remove, and the clear actions' labels).
 pub const COL_DANGER: u32 = rgb(0xC0, 0x66, 0x66);
+
+// --- The named state set: every control paints from these, never a literal. --
+
+/// Control, default.
+pub const STATE_BG: u32 = COL_ROW;
+/// Control, hover.
+pub const STATE_BG_HOVER: u32 = COL_ROW_HOVER;
+/// Control, pressed (deeper than default: pressed reads as pushed in, not lit).
+pub const STATE_BG_PRESSED: u32 = rgb(0x1A, 0x1A, 0x1A);
+/// Control, disabled.
+pub const STATE_BG_DISABLED: u32 = rgb(0x1A, 0x1A, 0x1A);
+/// Control outline, default / hover / focused.
+pub const STATE_BORDER: u32 = COL_BORDER;
+pub const STATE_BORDER_HOVER: u32 = COL_BORDER_STRONG;
+/// Text, default / hover / pressed / disabled.
+pub const STATE_TEXT: u32 = COL_TEXT;
+pub const STATE_TEXT_DISABLED: u32 = COL_MUTED_DIM;
+/// The keyboard focus ring and the selection bar share the accent.
+pub const STATE_FOCUS: u32 = COL_ACCENT;
+
+// --- Geometry tokens: a 4px grid, and the full radius set. ------------------
+
+/// Spacing grid, logical px at 96 DPI. Every layout number is one of these.
+pub const SP_1: i32 = 4;
+pub const SP_2: i32 = 8;
+pub const SP_3: i32 = 12;
+pub const SP_4: i32 = 16;
+pub const SP_5: i32 = 20;
+pub const SP_6: i32 = 24;
+pub const SP_8: i32 = 32;
+
+/// Corner radii, logical px at 96 DPI.
+pub const R_BAR: i32 = 4;
+pub const R_CTRL: i32 = 8;
+pub const R_PANEL: i32 = 12;
+
+/// Stroke widths, logical px at 96 DPI.
+pub const STROKE_HAIR: i32 = 1;
+pub const STROKE_FOCUS: i32 = 2;
+/// The focus ring's inset from its control's edge: the ring never touches the
+/// control outline, so a focused control reads as focused and not as re-outlined.
+pub const FOCUS_INSET: i32 = 3;
+/// The selection bar down the left edge of a selected row.
+pub const SELECT_BAR_W: i32 = 3;
+/// The list scrollbar: track/thumb width, its inset from the card's right edge,
+/// and the minimum thumb length (a long list must still show a grabbable thumb).
+pub const SCROLLBAR_W: i32 = 5;
+pub const SCROLLBAR_INSET: i32 = 6;
+pub const SCROLLBAR_MIN_THUMB: i32 = 24;
+
+// --- Type scale: logical px at 96 DPI, one size per role. ------------------
+
+/// The masthead (`POTFLIX`) and a view's title.
+pub const FS_TITLE: i32 = 22;
+/// Rows and button labels.
+pub const FS_BODY: i32 = 14;
+/// Field hints and the status line.
+pub const FS_HINT: i32 = 12;
+/// Uppercase section labels.
+pub const FS_LABEL: i32 = 12;
+/// Tooltips and the `+N more` overflow line.
+pub const FS_SMALL: i32 = 11;
 
 // Button paint styles (`go\window.go:194-200`).
 pub const BTN_SUBTLE: i32 = 0;
@@ -194,6 +303,22 @@ pub struct UiLayout {
     pub overflow: i32,
     pub settings: Rect,
     pub card_link: Rect,
+    /// The first visible folder index (`0` when the list fits).
+    pub list_top: i32,
+    /// How many folders the viewport can show.
+    pub list_capacity: i32,
+    /// The scrollbar track in the card's right gutter; empty when the list fits.
+    pub scrollbar: Rect,
+    /// The scrollbar thumb inside [`UiLayout::scrollbar`]; empty when it fits.
+    pub thumb: Rect,
+}
+
+impl UiLayout {
+    /// Whether the list has anything hidden and therefore shows a scrollbar.
+    #[must_use]
+    pub fn scrolled(&self) -> bool {
+        self.scrollbar.right > self.scrollbar.left && self.scrollbar.bottom > self.scrollbar.top
+    }
 }
 
 /// The settings-view hit-test table (`go\window.go:263-269`).
@@ -289,9 +414,65 @@ pub fn rects_intersect(a: Rect, b: Rect) -> bool {
 // computeLayout (`go\window.go:503-604`).
 // ---------------------------------------------------------------------------
 
-/// Build the main-view hit-test table for `dirs`, client size and DPI.
+/// Build the main-view hit-test table for `dirs`, client size and DPI, with the
+/// list viewport at its top (`list_top = 0`).
 #[must_use]
 pub fn compute_layout(dirs: &[String], cw: i32, ch: i32, dpi: i32) -> UiLayout {
+    compute_layout_from(dirs, cw, ch, dpi, 0)
+}
+
+/// The scrollbar thumb inside `track`, or an empty rect when nothing is hidden.
+///
+/// Pure so it can be pinned: the thumb's length is the visible fraction of the
+/// list, never shorter than `min_thumb` (a 200-folder list must still offer a
+/// grabbable thumb), and its offset is the scroll fraction of the thumb's travel.
+#[must_use]
+pub fn scrollbar_thumb(track: Rect, total: i32, capacity: i32, top: i32, min_thumb: i32) -> Rect {
+    let h = track.bottom - track.top;
+    if total <= capacity || capacity <= 0 || h <= 0 {
+        return Rect::default();
+    }
+    let mut th = h * capacity / total;
+    if th > h {
+        th = h;
+    }
+    if th < min_thumb {
+        th = min_thumb.min(h);
+    }
+    let travel = h - th;
+    let max_top = total - capacity;
+    let off = if max_top > 0 {
+        (top.clamp(0, max_top) * travel) / max_top
+    } else {
+        0
+    };
+    Rect {
+        left: track.left,
+        top: track.top + off,
+        right: track.right,
+        bottom: track.top + off + th,
+    }
+}
+
+/// The same table with the list scrolled to `top` (the index of the first visible
+/// folder). `top` is clamped to the real scroll range, and the card keeps the
+/// height of a full viewport once the list overflows, so scrolling never resizes
+/// the card under the pointer.
+#[must_use]
+pub fn compute_layout_from(
+    dirs: &[String],
+    cw: i32,
+    ch: i32,
+    dpi: i32,
+    top: i32,
+) -> UiLayout {
+    compute_layout_total(dirs.len() as i32, cw, ch, dpi, top)
+}
+
+/// The same table from a folder COUNT instead of the folders: the scroll
+/// clamp for [`UiState::scroll_list`], which owns no folder slice. Pure.
+#[must_use]
+pub fn compute_layout_total(total: i32, cw: i32, ch: i32, dpi: i32, top: i32) -> UiLayout {
     let sc = |v: i32| scale_px(dpi, v);
     let margin = sc(MAIN_MARGIN);
     let card_left = margin;
@@ -319,15 +500,28 @@ pub fn compute_layout(dirs: &[String], cw: i32, ch: i32, dpi: i32) -> UiLayout {
     if max_rows < 1 {
         max_rows = 1;
     }
-    let mut vis = dirs.len() as i32;
+
+    let top = top.clamp(0, (total - max_rows).max(0));
+    let mut vis = total - top;
     if vis > max_rows {
         l.overflow = vis - max_rows;
         vis = max_rows;
     }
+    if vis < 0 {
+        vis = 0;
+    }
+    l.list_top = top;
+    l.list_capacity = max_rows;
+    // The viewport is full-height once anything is hidden, whichever offset the
+    // list is scrolled to: the `+N more` line's height is reserved whenever
+    // the list overflows at all, so scrolling never resizes the card (and its
+    // scrollbar track) under the pointer. The line itself still paints only
+    // while something hides below (`l.overflow > 0` at the paint site).
+    let viewport = if total > max_rows { max_rows } else { vis };
     let mut card_h = pad * 2 + row_h;
-    if vis > 0 {
-        card_h = pad * 2 + vis * row_h + (vis - 1) * gap;
-        if l.overflow > 0 {
+    if viewport > 0 {
+        card_h = pad * 2 + viewport * row_h + (viewport - 1) * gap;
+        if total > max_rows {
             card_h += sc(OVERFLOW_H_L);
         }
     }
@@ -357,6 +551,28 @@ pub fn compute_layout(dirs: &[String], cw: i32, ch: i32, dpi: i32) -> UiLayout {
             right: row_x + row_w,
             bottom: y + row_h,
         });
+    }
+    // The scrollbar lives inside the card's right padding gutter, so it never
+    // overlaps a row or the `+N more` line. Gated on real overflow (`total >
+    // max_rows`), not on `l.overflow` (hidden-below): the track must persist
+    // at the last viewport too, or it blinks out exactly when reached.
+    if total > max_rows {
+        let sb_w = sc(SCROLLBAR_W);
+        let inset = sc(SCROLLBAR_INSET);
+        let track = Rect {
+            left: l.card.right - inset,
+            top: l.card.top + pad,
+            right: l.card.right - inset + sb_w,
+            bottom: l.card.bottom - pad,
+        };
+        l.scrollbar = track;
+        l.thumb = scrollbar_thumb(
+            track,
+            total,
+            max_rows,
+            top,
+            sc(SCROLLBAR_MIN_THUMB),
+        );
     }
 
     const BTN_H_L: i32 = 36;
@@ -1996,6 +2212,10 @@ pub struct UiState {
     pub pressed_btn: i32,
     pub pressed_x: i32,
     pub focus_id: i32,
+    /// First visible folder index in the Main list (`0` when the list fits).
+    /// Selection (`sel_row`) and hover (`hover_row`) stay ABSOLUTE folder
+    /// indices; only the viewport moves, so scrolling never retargets them.
+    pub scroll_top: i32,
 
     pub scan_active: bool,
     pub scan_cancel: Option<library::Cancel>,
@@ -2047,6 +2267,7 @@ impl Default for UiState {
             pressed_btn: 0,
             pressed_x: -1,
             focus_id: 0,
+            scroll_top: 0,
             scan_active: false,
             scan_cancel: None,
             scan_force: false,
@@ -2236,6 +2457,58 @@ impl UiState {
         self.open_card();
     }
 
+    /// Rows per wheel notch (the `SPI_GETWHEELSCROLLLINES` default): one notch
+    /// moves three folder rows.
+    pub const WHEEL_SCROLL_ROWS: i32 = 3;
+
+    /// Scroll the Main folder list by `rows` (positive = toward the end),
+    /// clamped to the real scroll range; clears the transient row hover so a
+    /// highlight never silently points at a different folder after the
+    /// viewport moves. Selection (`sel_row`) is an absolute folder index and
+    /// survives scrolling. Returns whether the viewport moved. Only
+    /// `InvalidateRect` (asynchronous, never dispatches `WM_PAINT`) runs here,
+    /// so this is NOT a re-entrant site: no guard or regression-test change.
+    pub fn scroll_list(&mut self, hwnd: HWND, rows: i32) -> bool {
+        if self.cur_view != View::Main || rows == 0 {
+            return false;
+        }
+        let rc = get_client_rect(hwnd);
+        let (cw, ch) = (rc.right - rc.left, rc.bottom - rc.top);
+        if cw <= 0 || ch <= 0 {
+            return false;
+        }
+        let total = self.ui_dirs.len() as i32;
+        let want = self.scroll_top.saturating_add(rows);
+        let top = compute_layout_total(total, cw, ch, window_dpi(hwnd), want).list_top;
+        if top == self.scroll_top {
+            return false;
+        }
+        self.scroll_top = top;
+        self.hover_row = -1;
+        self.hover_x = false;
+        self.invalidate();
+        true
+    }
+
+    /// One viewport of folder rows at the window's DPI: the PageUp/PageDown
+    /// step.
+    fn page_rows(&self, hwnd: HWND) -> i32 {
+        let rc = get_client_rect(hwnd);
+        let (cw, ch) = (rc.right - rc.left, rc.bottom - rc.top);
+        if cw <= 0 || ch <= 0 {
+            return 1;
+        }
+        compute_layout_total(
+            self.ui_dirs.len() as i32,
+            cw,
+            ch,
+            window_dpi(hwnd),
+            self.scroll_top,
+        )
+        .list_capacity
+        .max(1)
+    }
+
     /// `layoutForHwnd` (`go\window.go:731`).
     #[must_use]
     pub fn layout(&self, hwnd: HWND) -> Option<UiLayout> {
@@ -2244,7 +2517,7 @@ impl UiState {
         if cw <= 0 || ch <= 0 {
             return None;
         }
-        Some(compute_layout(&self.ui_dirs, cw, ch, window_dpi(hwnd)))
+        Some(compute_layout_from(&self.ui_dirs, cw, ch, window_dpi(hwnd), self.scroll_top))
     }
 
     /// `layoutForSettings` (`go\window.go:744`).
@@ -2340,11 +2613,14 @@ impl UiState {
                 {
                     nx = true;
                 }
-                if nb == self.hover_btn && nr == self.hover_row && nx == self.hover_x {
+                // Absolute: the viewport row plus the scroll offset, so the
+                // highlight tracks the folder, not the slot.
+                let want = if nr >= 0 { l.list_top + nr } else { -1 };
+                if nb == self.hover_btn && want == self.hover_row && nx == self.hover_x {
                     return false;
                 }
                 self.hover_btn = nb;
-                self.hover_row = nr;
+                self.hover_row = want;
                 self.hover_x = nx;
                 true
             }
@@ -2396,7 +2672,7 @@ impl UiState {
                         && (r as usize) < l.xbtns.len()
                         && pt_in_rect(l.xbtns[r as usize], x, y)
                     {
-                        self.pressed_x = r;
+                        self.pressed_x = l.list_top + r;
                     }
                 }
                 self.invalidate();
@@ -2493,11 +2769,11 @@ impl UiState {
                         return None;
                     }
                     let r = row_at_point(&l.rows, x, y);
-                    if r == px
+                    if l.list_top + r == px
                         && (r as usize) < l.xbtns.len()
                         && pt_in_rect(l.xbtns[r as usize], x, y)
                     {
-                        self.remove_dir_at(r);
+                        self.remove_dir_at(px);
                     } else {
                         self.invalidate();
                     }
@@ -2505,8 +2781,9 @@ impl UiState {
                 }
                 let r = row_at_point(&l.rows, x, y);
                 if r >= 0 {
-                    if self.sel_row != r {
-                        self.sel_row = r;
+                    let abs = l.list_top + r;
+                    if self.sel_row != abs {
+                        self.sel_row = abs;
                         self.invalidate();
                     }
                     return None;
@@ -2680,6 +2957,10 @@ impl UiState {
                 self.focus_id = move_focus(self.focus_id, -1, &focus_order_for_view(self.cur_view));
                 true
             }
+            VK_PRIOR => self.scroll_list(hwnd, -self.page_rows(hwnd)),
+            VK_NEXT => self.scroll_list(hwnd, self.page_rows(hwnd)),
+            VK_HOME => self.scroll_list(hwnd, -i32::MAX),
+            VK_END => self.scroll_list(hwnd, i32::MAX),
             VK_RIGHT | VK_DOWN => {
                 self.focus_id = move_focus(self.focus_id, 1, &focus_order_for_view(self.cur_view));
                 true
@@ -3190,6 +3471,15 @@ fn wr(rc: Rect) -> windows_sys::Win32::Foundation::RECT {
 }
 
 /// `createUIFont` (`go\window.go:3476`): Segoe UI at a negative pixel height.
+///
+/// Text quality is the redesign's fix here, not a behavior change: the port
+/// passed `0` for `iOutPrecision` and `iQuality`, i.e. `OUT_DEFAULT_PRECIS` +
+/// `DEFAULT_QUALITY` ("appearance of the font does not matter"). This asks for
+/// `OUT_TT_PRECIS` + `CLEARTYPE_QUALITY`, so GDI picks a TrueType outline face
+/// and renders it with subpixel antialiasing instead of whatever the system
+/// smoothing default happens to be
+/// (learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-createfontw,
+/// accessed 2026-10-14).
 #[must_use]
 pub fn create_ui_font(height: i32, weight: i32) -> Gdi::HFONT {
     let face = utf16_z("Segoe UI");
@@ -3205,17 +3495,160 @@ pub fn create_ui_font(height: i32, weight: i32) -> Gdi::HFONT {
             0,
             0,
             crate::win32::DEFAULT_CHARSET,
-            0,
-            0,
-            0,
+            crate::win32::OUT_TT_PRECIS,
+            crate::win32::CLIP_DEFAULT_PRECIS,
+            crate::win32::CLEARTYPE_QUALITY,
             0,
             face.as_ptr(),
         )
     }
 }
 
-/// `fillRoundRect` (`go\window.go:3397`).
+// ---------------------------------------------------------------------------
+// Antialiased geometry (GDI+).
+//
+// The whole client area is already painted into one memory DC and blitted, so
+// one GDI+ `Graphics` wrapped around that DC's HDC smooths every rounded fill
+// and ring in the frame. It lives in a thread-local because the paint is
+// single-threaded on the UI thread and because `fill_round_rect` is called from
+// a dozen paint sites that have no business threading a context through.
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    /// The current frame's `GpGraphics*` as a raw address (0 = none).
+    static PAINT_GRAPHICS: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Start GDI+ once per process. `false` (no GDI+ available) is a supported
+/// state: every helper below falls back to plain GDI.
+fn gdiplus_start() -> bool {
+    use std::sync::OnceLock;
+    static STARTED: OnceLock<bool> = OnceLock::new();
+    *STARTED.get_or_init(|| {
+        let mut token: usize = 0;
+        let input = crate::win32::GdiplusStartupInput::default();
+        // SAFETY: `input`/`token` outlive the call; GDI+ copies the input and
+        // writes only the token. The output struct is optional.
+        let status = unsafe {
+            crate::win32::GdiplusStartup(
+                std::ptr::from_mut(&mut token),
+                std::ptr::from_ref(&input).cast(),
+                std::ptr::null_mut(),
+            )
+        };
+        status == 0
+    })
+}
+
+/// Wrap `hdc` in a smoothing `Graphics` for the duration of `f`, then restore
+/// the previous context. Nested calls (there are none today) restore correctly.
+fn with_antialias<R>(hdc: Gdi::HDC, f: impl FnOnce() -> R) -> R {
+    use windows_sys::Win32::Graphics::GdiPlus as gp;
+    if !gdiplus_start() || hdc.is_null() {
+        return f();
+    }
+    let mut g: *mut gp::GpGraphics = std::ptr::null_mut();
+    // SAFETY: `g` is written only by GDI+ on success and checked before use.
+    let ok = unsafe { gp::GdipCreateFromHDC(hdc, std::ptr::from_mut(&mut g)) } == 0 && !g.is_null();
+    if !ok {
+        return f();
+    }
+    // SAFETY: a live Graphics from the call above; the mode is a documented const.
+    unsafe {
+        gp::GdipSetSmoothingMode(g, gp::SmoothingModeAntiAlias);
+    }
+    let prev = PAINT_GRAPHICS.with(|c| c.replace(g as isize));
+    let out = f();
+    PAINT_GRAPHICS.with(|c| c.set(prev));
+    // SAFETY: the Graphics was created above and is released exactly once.
+    unsafe {
+        gp::GdipDeleteGraphics(g);
+    }
+    out
+}
+
+/// A `COLORREF` (`0x00BBGGRR`) as GDI+'s `ARGB` (`0xAARRGGBB`), fully opaque.
+fn argb(color: u32) -> u32 {
+    let r = color & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = (color >> 16) & 0xFF;
+    0xFF00_0000 | (r << 16) | (g << 8) | b
+}
+
+/// Fill a rounded rect through the current GDI+ context, if there is one.
+/// Returns `false` when the caller must fall back to GDI.
+fn gdip_fill_round_rect(rc: Rect, color: u32, radius: i32) -> bool {
+    use windows_sys::Win32::Graphics::GdiPlus as gp;
+    let g = PAINT_GRAPHICS.with(|c| c.get()) as *mut gp::GpGraphics;
+    if g.is_null() {
+        return false;
+    }
+    let r = radius.clamp(0, (rc.right - rc.left).min(rc.bottom - rc.top) / 2);    // SAFETY: every handle is created and released within this call, and `g` is
+    // the frame's live Graphics while the paint is in flight.
+    unsafe {
+        let mut path: *mut gp::GpPath = std::ptr::null_mut();
+        if gp::GdipCreatePath(gp::FillModeAlternate, std::ptr::from_mut(&mut path)) != 0 {
+            return false;
+        }
+        if r <= 0 {
+            let pts = [
+                gp::Point { X: rc.left, Y: rc.top },
+                gp::Point { X: rc.right, Y: rc.top },
+                gp::Point { X: rc.right, Y: rc.bottom },
+                gp::Point { X: rc.left, Y: rc.bottom },
+            ];
+            let kinds = [0u8, 1, 1, 3];
+            gp::GdipDeletePath(path);
+            let mut poly: *mut gp::GpPath = std::ptr::null_mut();
+            if gp::GdipCreatePath2I(
+                pts.as_ptr(),
+                kinds.as_ptr(),
+                pts.len() as i32,
+                gp::FillModeAlternate,
+                std::ptr::from_mut(&mut poly),
+            ) != 0
+            {
+                return false;
+            }
+            let mut br: *mut gp::GpSolidFill = std::ptr::null_mut();
+            let ok = gp::GdipCreateSolidFill(argb(color), std::ptr::from_mut(&mut br)) == 0;
+            if ok {
+                gp::GdipFillPath(g, br as *mut gp::GpBrush, poly);
+            }
+            if !br.is_null() {
+                gp::GdipDeleteBrush(br as *mut gp::GpBrush);
+            }
+            gp::GdipDeletePath(poly);
+            return true;
+        }
+        let (l, t, rt, b) = (rc.left, rc.top, rc.right, rc.bottom);
+        let d = r * 2;
+        gp::GdipAddPathArcI(path, l, t, d, d, 180.0, 90.0);
+        gp::GdipAddPathArcI(path, rt - d, t, d, d, 270.0, 90.0);
+        gp::GdipAddPathArcI(path, rt - d, b - d, d, d, 0.0, 90.0);
+        gp::GdipAddPathArcI(path, l, b - d, d, d, 90.0, 90.0);
+        gp::GdipClosePathFigure(path);
+        let mut br: *mut gp::GpSolidFill = std::ptr::null_mut();
+        let ok = gp::GdipCreateSolidFill(argb(color), std::ptr::from_mut(&mut br)) == 0;
+        if ok {
+            gp::GdipFillPath(g, br as *mut gp::GpBrush, path);
+        }
+        if !br.is_null() {
+            gp::GdipDeleteBrush(br as *mut gp::GpBrush);
+        }
+        gp::GdipDeletePath(path);
+    }
+    true
+}
+
+/// `fillRoundRect` (`go\window.go:3397`), antialiased when GDI+ is live.
 fn fill_round_rect(hdc: Gdi::HDC, rc: Rect, color: u32, radius: i32) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    if gdip_fill_round_rect(rc, color, radius) {
+        return;
+    }
     // SAFETY: brushes/pens created and deleted within the call.
     unsafe {
         let br = Gdi::CreateSolidBrush(color);
@@ -3230,11 +3663,77 @@ fn fill_round_rect(hdc: Gdi::HDC, rc: Rect, color: u32, radius: i32) {
     }
 }
 
-/// `strokeRoundRect` (`go\window.go:3410`).
+/// `strokeRoundRect` (`go\window.go:3410`) at the hairline width.
 fn stroke_round_rect(hdc: Gdi::HDC, rc: Rect, color: u32, radius: i32) {
+    stroke_round_rect_w(hdc, rc, color, radius, STROKE_HAIR);
+}
+
+/// A rounded outline of `width` logical px, antialiased when GDI+ is live.
+fn stroke_round_rect_w(hdc: Gdi::HDC, rc: Rect, color: u32, radius: i32, width: i32) {
+    use windows_sys::Win32::Graphics::GdiPlus as gp;
+    if rc.right <= rc.left || rc.bottom <= rc.top || width <= 0 {
+        return;
+    }
+    let g = PAINT_GRAPHICS.with(|c| c.get()) as *mut gp::GpGraphics;
+    if !g.is_null() {
+        let r = radius.clamp(0, (rc.right - rc.left).min(rc.bottom - rc.top) / 2);
+        // SAFETY: path/pen created and released within the call.
+        unsafe {
+            let mut path: *mut gp::GpPath = std::ptr::null_mut();
+            if gp::GdipCreatePath(gp::FillModeAlternate, std::ptr::from_mut(&mut path)) != 0 {
+                return;
+            }
+            let (l, t, rt, b) = (rc.left, rc.top, rc.right, rc.bottom);
+            if r <= 0 {
+                let pts = [
+                    gp::Point { X: l, Y: t },
+                    gp::Point { X: rt, Y: t },
+                    gp::Point { X: rt, Y: b },
+                    gp::Point { X: l, Y: b },
+                ];
+                let kinds = [0u8, 1, 1, 3];
+                gp::GdipDeletePath(path);
+                let mut poly: *mut gp::GpPath = std::ptr::null_mut();
+                if gp::GdipCreatePath2I(
+                    pts.as_ptr(),
+                    kinds.as_ptr(),
+                    pts.len() as i32,
+                    gp::FillModeAlternate,
+                    std::ptr::from_mut(&mut poly),
+                ) != 0
+                {
+                    return;
+                }
+                let mut pen: *mut gp::GpPen = std::ptr::null_mut();
+                if gp::GdipCreatePen1(argb(color), width as f32, gp::UnitPixel, std::ptr::from_mut(&mut pen)) == 0 {
+                    gp::GdipDrawPath(g, pen, poly);
+                }
+                if !pen.is_null() {
+                    gp::GdipDeletePen(pen);
+                }
+                gp::GdipDeletePath(poly);
+                return;
+            }
+            let d = r * 2;
+            gp::GdipAddPathArcI(path, l, t, d, d, 180.0, 90.0);
+            gp::GdipAddPathArcI(path, rt - d, t, d, d, 270.0, 90.0);
+            gp::GdipAddPathArcI(path, rt - d, b - d, d, d, 0.0, 90.0);
+            gp::GdipAddPathArcI(path, l, b - d, d, d, 90.0, 90.0);
+            gp::GdipClosePathFigure(path);
+            let mut pen: *mut gp::GpPen = std::ptr::null_mut();
+            if gp::GdipCreatePen1(argb(color), width as f32, gp::UnitPixel, std::ptr::from_mut(&mut pen)) == 0 {
+                gp::GdipDrawPath(g, pen, path);
+            }
+            if !pen.is_null() {
+                gp::GdipDeletePen(pen);
+            }
+            gp::GdipDeletePath(path);
+        }
+        return;
+    }
     // SAFETY: pen created/deleted; NULL_BRUSH keeps the interior.
     unsafe {
-        let pen = Gdi::CreatePen(crate::win32::PS_SOLID, 1, color);
+        let pen = Gdi::CreatePen(crate::win32::PS_SOLID, width, color);
         let old_pen = Gdi::SelectObject(hdc, pen);
         Gdi::SetBkMode(hdc, crate::win32::TRANSPARENT);
         let null_brush = Gdi::GetStockObject(crate::win32::NULL_BRUSH_STOCK);
@@ -3244,6 +3743,29 @@ fn stroke_round_rect(hdc: Gdi::HDC, rc: Rect, color: u32, radius: i32) {
         Gdi::SelectObject(hdc, old_pen);
         Gdi::DeleteObject(pen);
     }
+}
+
+/// The keyboard focus ring: a 2px accent rounded outline inset inside `rc` so it
+/// never collides with the control's own edge. Drawn for mouse focus too -- the
+/// ring is the app's single focus affordance.
+fn draw_focus_ring(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
+    let inset = scale_px(dpi, FOCUS_INSET);
+    let ring = Rect {
+        left: rc.left + inset,
+        top: rc.top + inset,
+        right: rc.right - inset,
+        bottom: rc.bottom - inset,
+    };
+    if ring.right <= ring.left || ring.bottom <= ring.top {
+        return;
+    }
+    stroke_round_rect_w(
+        hdc,
+        ring,
+        STATE_FOCUS,
+        scale_px(dpi, R_CTRL),
+        scale_px(dpi, STROKE_FOCUS),
+    );
 }
 
 /// `drawUIText` (`go\window.go:3429`).
@@ -3629,7 +4151,7 @@ pub fn paint_main_window(hwnd: HWND) {
         let bmp = CreateCompatibleBitmap(hdc, w, h);
         if !mem.is_null() && !bmp.is_null() {
             let old = SelectObject(mem, bmp);
-            paint_view(mem, rc, dpi, &st);
+            with_antialias(mem, || paint_view(mem, rc, dpi, &st));
             BitBlt(hdc, 0, 0, w, h, mem, 0, 0, crate::win32::SRCCOPY);
             SelectObject(mem, old);
             DeleteObject(bmp);
@@ -3641,10 +4163,22 @@ pub fn paint_main_window(hwnd: HWND) {
             if !bmp.is_null() {
                 DeleteObject(bmp);
             }
-            paint_view(hdc, rc, dpi, &st);
+            with_antialias(hdc, || paint_view(hdc, rc, dpi, &st));
         }
         EndPaint(hwnd, &ps);
     }
+}
+
+/// Paint the current view into any memory DC at any DPI: the offscreen twin of
+/// [`paint_main_window`] minus `BeginPaint`/`EndPaint`, for captures and
+/// high-DPI proof renders. Holds `UI` only across GDI blits (never across a
+/// dispatching call), exactly like `paint_main_window`: NOT a re-entrant site.
+pub fn paint_to_hdc(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
+    if hdc.is_null() {
+        return;
+    }
+    let st = ui();
+    with_antialias(hdc, || paint_view(hdc, rc, dpi, &st));
 }
 
 fn paint_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
@@ -3737,7 +4271,7 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         COL_MUTED,
     );
 
-    let l = compute_layout(&st.ui_dirs, cw, ch, dpi);
+    let l = compute_layout_from(&st.ui_dirs, cw, ch, dpi, st.scroll_top);
     fill_round_rect(hdc, l.card, COL_CARD, sc(12));
     if l.rows.is_empty() {
         draw_ui_text(
@@ -3750,22 +4284,26 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         );
     } else {
         for (i, r) in l.rows.iter().enumerate() {
+            // Absolute folder index: the viewport row plus the scroll offset.
+            // `abs` is below `ui_dirs.len()` by construction (`vis` rows from
+            // `list_top` cover `list_top..list_top + vis`, clamped to `total`).
+            let abs = l.list_top + i as i32;
             let mut fill = COL_ROW;
-            if i as i32 == st.hover_row || i as i32 == st.sel_row {
+            if abs == st.hover_row || abs == st.sel_row {
                 fill = COL_ROW_HOVER;
             }
             fill_round_rect(hdc, *r, fill, sc(8));
-            if i as i32 == st.sel_row {
+            if abs == st.sel_row {
                 stroke_round_rect(hdc, *r, COL_BORDER, sc(8));
             }
             let mut text_right = r.right - sc(12);
-            if i as i32 == st.hover_row && i < l.xbtns.len() {
+            if abs == st.hover_row && i < l.xbtns.len() {
                 draw_ui_text(hdc, "x", l.xbtns[i], fmt_center, body_font, COL_MUTED);
                 text_right = l.xbtns[i].left - sc(4);
             }
             draw_ui_text(
                 hdc,
-                &st.ui_dirs[i],
+                &st.ui_dirs[abs as usize],
                 Rect {
                     left: r.left + sc(12),
                     top: r.top,
@@ -3792,6 +4330,15 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
                 COL_MUTED,
             );
         }
+        if l.scrolled() {
+            // Position-only scrollbar in the card's right gutter: the track
+            // plus the proportional thumb mirroring `list_top`. Wheel,
+            // PageUp/PageDown, Home/End scroll; the thumb is paint, not drag.
+            fill_round_rect(hdc, l.scrollbar, COL_BORDER, sc(SCROLLBAR_W));
+            if l.thumb.right > l.thumb.left && l.thumb.bottom > l.thumb.top {
+                fill_round_rect(hdc, l.thumb, COL_MUTED, sc(SCROLLBAR_W));
+            }
+        }
     }
 
     for b in &l.btns {
@@ -3815,7 +4362,7 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     };
     draw_ui_text(hdc, "Card", l.card_link, fmt_right, section_font, tc);
     if let Some(frc) = main_focus_rect(&l, st.focus_id) {
-        stroke_round_rect(hdc, frc, COL_TEXT, sc(8));
+        draw_focus_ring(hdc, frc, dpi);
     }
     draw_ui_text(
         hdc,
@@ -3896,7 +4443,7 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         paint_button(hdc, b, dpi, button_font, section_font, st);
     }
     if let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id) {
-        stroke_round_rect(hdc, b.rc, COL_TEXT, sc(8));
+        draw_focus_ring(hdc, b.rc, dpi);
     }
     draw_ui_text(
         hdc,
@@ -4017,7 +4564,7 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     if st.focus_id != 0
         && let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id)
     {
-        stroke_round_rect(hdc, b.rc, COL_TEXT, sc(8));
+        draw_focus_ring(hdc, b.rc, dpi);
     }
     draw_ui_text(
         hdc,
@@ -4190,6 +4737,13 @@ pub fn create_main_window() -> Result<(), String> {
     if hwnd.is_null() {
         return Err("CreateWindowExW failed".into());
     }
+    // Rust-only chrome: pin the OS caption, title text and 1px frame to the
+    // dark palette so the stock white title bar never appears. `WS_CAPTION`
+    // stays (custom-drawn chrome would re-open the reentrancy class of
+    // `3503ddb`): `DwmSetWindowAttribute` copies four bytes and dispatches
+    // nothing to this wndproc, so this is NOT a re-entrant site -- no `UI`
+    // guard or regression-test change (cf. `run_blocking_ui`).
+    crate::win32::apply_dark_caption(hwnd, COL_BG, COL_TEXT);
     {
         let mut st = ui();
         st.main_hwnd = hwnd as usize;
@@ -4339,6 +4893,14 @@ pub unsafe extern "system" fn main_wnd_proc(
             if let Some(b) = blocking {
                 run_blocking_ui(hwnd, b);
             }
+            return 0;
+        }
+        crate::win32::WM_MOUSEWHEEL => {
+            // Wheel over the folder list scrolls it; anywhere else (or an
+            // unscrollable list) it is a no-op. `scroll_list` only
+            // invalidates (async), so this is NOT a re-entrant site.
+            let notches = crate::win32::wheel_delta(wparam) / crate::win32::WHEEL_DELTA;
+            ui().scroll_list(hwnd, -notches * UiState::WHEEL_SCROLL_ROWS);
             return 0;
         }
         WM_SETFOCUS | WM_KILLFOCUS => {
@@ -4846,6 +5408,101 @@ mod tests {
         assert_eq!(move_focus(BTN_ADD, -1, &order), BTN_SCAN);
         assert_eq!(move_focus(BTN_ADD, 1, &order), BTN_REMOVE);
         assert_eq!(move_focus(0, 1, &[]), 0);
+    }
+
+    /// `Rect` has no `PartialEq` (it is a byte-exact ABI mirror); compare fields.
+    fn rect_same(a: Rect, b: Rect) -> bool {
+        a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+    }
+
+    /// sRGB channel (0-255) to linear light (WCAG 2.1 relative luminance).
+    fn lin(c: u32) -> f64 {
+        let s = c as f64 / 255.0;
+        if s <= 0.04045 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    /// WCAG 2.1 contrast ratio of two `rgb()` COLORREFs, darkest-first.
+    fn contrast(a: u32, b: u32) -> f64 {
+        let lum = |c: u32| {
+            0.2126 * lin(c & 0xFF) + 0.7152 * lin((c >> 8) & 0xFF) + 0.0722 * lin((c >> 16) & 0xFF)
+        };
+        let (lo, hi) = if lum(a) < lum(b) {
+            (lum(a), lum(b))
+        } else {
+            (lum(b), lum(a))
+        };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// Every text-on-background pair in the palette, computed from the actual
+    /// `rgb()` constants (WCAG 2.1; AA body text needs 4.5:1, large/disabled
+    /// 3:1). Prints the ratios so the proof carries the numbers, not just the
+    /// verdict.
+    #[test]
+    fn palette_contrast() {
+        let pairs = [
+            ("COL_TEXT/COL_BG", COL_TEXT, COL_BG, 7.0),
+            ("COL_TEXT/COL_ROW", COL_TEXT, COL_ROW, 7.0),
+            ("COL_MUTED/COL_BG", COL_MUTED, COL_BG, 4.5),
+            ("COL_MUTED/COL_CARD", COL_MUTED, COL_CARD, 4.5),
+            ("COL_MUTED_DIM/COL_BG", COL_MUTED_DIM, COL_BG, 3.0),
+            ("COL_ON_ACCENT/COL_ACCENT", COL_ON_ACCENT, COL_ACCENT, 4.5),
+            ("COL_TEXT/COL_ACCENT_HOV", COL_TEXT, COL_ACCENT_HOV, 3.0),
+            ("COL_DANGER/COL_BG", COL_DANGER, COL_BG, 3.0),
+        ];
+        for (name, fg, bg, floor) in pairs {
+            let r = contrast(fg, bg);
+            println!("contrast {name} = {r:.2}:1 (floor {floor})");
+            assert!(r >= floor, "{name} = {r:.2}:1, below {floor}:1");
+        }
+        // The contrast fix the palette comment records: pure white beats
+        // `COL_TEXT` on the brand red.
+        assert!(contrast(COL_ON_ACCENT, COL_ACCENT) > contrast(COL_TEXT, COL_ACCENT));
+    }
+
+    /// The scroll clamp is exact: `list_top` never exceeds the last full
+    /// viewport, the card keeps full height while scrolled, and the thumb is
+    /// empty exactly when the list fits.
+    #[test]
+    fn scroll_clamp_and_thumb() {
+        for dpi in [96, 144] {
+            // Fits: no scrollbar, no offset.
+            let l = compute_layout_total(2, MAIN_CLIENT_W, MAIN_CLIENT_H, dpi, 0);
+            assert!(!l.scrolled(), "dpi {dpi}: 2 rows must not scroll");
+            assert_eq!(l.list_top, 0);
+            assert!(rect_same(l.thumb, Rect::default()));
+            // Overflow: clamped to the last viewport, thumb present.
+            let full = compute_layout_total(40, MAIN_CLIENT_W, MAIN_CLIENT_H, dpi, 0);
+            assert!(full.scrolled(), "dpi {dpi}: 40 rows must scroll");
+            assert!(full.list_capacity >= 1);
+            let max_top = 40 - full.list_capacity;
+            let over = compute_layout_total(40, MAIN_CLIENT_W, MAIN_CLIENT_H, dpi, max_top + 9);
+            assert_eq!(over.list_top, max_top, "dpi {dpi}: clamp to last viewport");
+            assert!(rect_same(over.card, full.card), "dpi {dpi}: scrolled card keeps full height");
+            assert!(over.thumb.bottom > over.thumb.top, "dpi {dpi}: thumb visible");
+            let thumb = scrollbar_thumb(over.scrollbar, 40, over.list_capacity, 0, 24);
+            assert!(
+                thumb.top <= over.thumb.top,
+                "dpi {dpi}: thumb travels down with the offset"
+            );
+        }
+    }
+
+    /// `scroll_list` is a no-op outside the Main list and on a null window;
+    /// hover clears when the viewport moves (needs a live window, so only the
+    /// no-op halves are pinned here -- movement is proved by the captures).
+    #[test]
+    fn scroll_list_noops() {
+        let mut st = UiState::default();
+        st.cur_view = View::Settings;
+        assert!(!st.scroll_list(NULL, 3));
+        st.cur_view = View::Main;
+        assert!(!st.scroll_list(NULL, 3));
+        assert_eq!(st.scroll_top, 0);
     }
 
     #[test]

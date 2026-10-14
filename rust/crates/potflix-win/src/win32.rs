@@ -100,11 +100,200 @@ pub use windows_sys::Win32::System::Ole::OleInitialize;
 pub use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleBitmap, CreatePen, FillRect, GetStockObject, InvalidateRect,
 };
+pub use windows_sys::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetThreadDpiAwarenessContext,
+};
 pub use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 pub use windows_sys::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent;
 pub use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, DrawIconEx, GetSystemMetrics, GetWindowRect, MoveWindow, SetCursor,
+    SetWindowPos,
 };
+
+/// `SetWindowPos` flags: keep position/size/Z-order/activation and only announce
+/// a frame change; and the `WM_DPICHANGED` move (`SWP_NOZORDER | SWP_NOACTIVATE`).
+pub const SWP_NOSIZE: u32 = 0x0001;
+pub const SWP_NOMOVE: u32 = 0x0002;
+pub const SWP_NOZORDER: u32 = 0x0004;
+pub const SWP_NOACTIVATE: u32 = 0x0010;
+pub const SWP_FRAMECHANGED: u32 = 0x0020;
+
+/// `DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2` (`(HANDLE)-4`), the context this
+/// app declares in its manifest.
+pub const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+
+/// `GetAwarenessFromDpiAwarenessContext` result for Per-Monitor-V2.
+pub const DPI_AWARENESS_PER_MONITOR_AWARE: i32 = 2;
+
+/// The process's DPI awareness for the calling thread, as
+/// `GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext())`.
+/// `-1` when the API answers nothing (pre-1607 Windows).
+#[must_use]
+pub fn dpi_awareness() -> i32 {
+    // SAFETY: both procs read process/thread state only.
+    unsafe {
+        let ctx = GetThreadDpiAwarenessContext();
+        if ctx.is_null() {
+            return -1;
+        }
+        GetAwarenessFromDpiAwarenessContext(ctx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Native dark window chrome (Rust-only; `go\win32.go` has no counterpart -- the
+// Go build keeps the stock light caption).
+//
+// `dwmapi.dll` ships with the OS and is reached through the same `windows-sys`
+// FFI path as every proc above, so there is no new dependency: only the additive
+// `Win32_Graphics_Dwm` feature, exactly like the settings-window features.
+//
+// Attribute numbers and OS floors (learn.microsoft.com/windows/win32/api/dwmapi/
+// ne-dwmapi-dwmwindowattribute, verified 2026-10-14): `DWMWA_USE_IMMERSIVE_DARK_MODE`
+// is 20 (Windows 11 22000+; the pre-22000 Windows 10 attribute was 19, which this
+// app does not target), `DWMWA_WINDOW_CORNER_PREFERENCE` 33, `DWMWA_BORDER_COLOR`
+// 34, `DWMWA_CAPTION_COLOR` 35, `DWMWA_TEXT_COLOR` 36.
+// ---------------------------------------------------------------------------
+
+pub use windows_sys::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+    DWMWA_USE_IMMERSIVE_DARK_MODE,
+};
+
+/// `DwmSetWindowAttribute` for one 4-byte value, best-effort.
+///
+/// On a Windows build that predates an attribute the call returns a failing
+/// HRESULT; it is discarded so an unknown attribute degrades to the stock
+/// chrome instead of aborting window creation.
+fn dwm_set(hwnd: HWND, attr: i32, value: u32) {
+    // SAFETY: `value` is a 4-byte `COLORREF`/`BOOL` that outlives the call; DWM
+    // copies it, and the returned HRESULT needs no cleanup.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            attr as u32,
+            std::ptr::from_ref(&value).cast(),
+            size_of::<u32>() as u32,
+        );
+    }
+}
+
+/// Paint the OS caption dark so the title bar continues the dark client area
+/// instead of the stock white bar (Rust-only chrome; no layout or behavior).
+///
+/// `dwma_use_immersive_dark_mode` darkens the caption and its buttons;
+/// `dwma_caption_color` pins the bar to `caption` (a `COLORREF`, i.e. an
+/// [`crate::window::rgb`] value) so it matches the client background exactly
+/// rather than the system grey; `dwma_text_color` keeps the title readable on
+/// it; and `dwma_border_color` blends the 1px DWM frame dot. Also passed to the
+/// settings view's window, which shares this class' caption.
+///
+/// This is the WHOLE chrome change: `WS_CAPTION` stays. A custom-drawn caption
+/// (`WS_POPUP` + `WM_NCCALCSIZE` + `WM_NCHITTEST`, per
+/// learn.microsoft.com/windows/win32/dwm/customframe, verified 2026-10-14) would
+/// mean re-implementing drag/resize hit testing, `DwmDefWindowProc` caption
+/// buttons, and Windows 11 snap layouts -- and would put this app's eight
+/// hard-won UI-reentrancy fixes (commit 3503ddb) back in play, since every one
+/// of those messages synchronously re-enters `main_wnd_proc`.
+pub fn apply_dark_caption(hwnd: HWND, caption: u32, text: u32) {
+    dwm_set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+    dwm_set(hwnd, DWMWA_CAPTION_COLOR, caption);
+    dwm_set(hwnd, DWMWA_TEXT_COLOR, text);
+    dwm_set(hwnd, DWMWA_BORDER_COLOR, caption);
+}
+
+// ---------------------------------------------------------------------------
+// Dark owner-drawn tray menu (Rust-only: the Go build leaves the stock white
+// popup). `SetMenuInfo`/`MIM_BACKGROUND` paints the popup's interior dark
+// (learn.microsoft.com/windows/win32/api/winuser/nf-winuser-setmenuinfo, verified
+// 2026-10-14); `MF_OWNERDRAW` + `WM_MEASUREITEM`/`WM_DRAWITEM` gives each item
+// palette-correct text and hover. The menu's own item ids, labels and dispatch
+// are untouched, so the tray's behavior is unchanged.
+// ---------------------------------------------------------------------------
+
+pub use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{SetMenuInfo, MENUINFO};
+
+/// `InsertMenuItemW` + `MENUITEMINFOW`: the documented owner-draw recipe is an
+/// `MFT_OWNERDRAW` item carrying `dwItemData`, measured in `WM_MEASUREITEM`
+/// and painted in `WM_DRAWITEM` (learn.microsoft.com/windows/win32/menurc/
+/// using-menus "Creating Owner-Drawn Menu Items", accessed 2026-10-14).
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{InsertMenuItemW, MENUITEMINFOW};
+
+/// `MIIM_*` mask bits and `MFT_*/MFS_*` type/state bits for `MENUITEMINFOW`.
+pub const MIIM_STATE: u32 = 0x0001;
+pub const MIIM_ID: u32 = 0x0002;
+pub const MIIM_STRING: u32 = 0x0040;
+pub const MIIM_FTYPE: u32 = 0x0100;
+pub const MIIM_DATA: u32 = 0x0020;
+pub const MFT_STRING: u32 = 0x0000;
+pub const MFT_OWNERDRAW: u32 = 0x0100;
+pub const MFS_ENABLED: u32 = 0x0000;
+
+/// `WM_MEASUREITEM` / `WM_DRAWITEM`: sent to the menu-owner window for each
+/// owner-drawn item before display and on every paint.
+pub const WM_MEASUREITEM: u32 = 0x002C;
+pub const WM_DRAWITEM: u32 = 0x002B;
+
+/// `MIM_BACKGROUND | MIM_APPLYTOSUBMENUS`: paint the popup background with
+/// `hbrBack`, and apply the same to submenus.
+pub const MENU_INFO_BACKGROUND: u32 = 2 | 0x8000_0000;
+pub const MF_OWNERDRAW: u32 = 0x0000_0100;
+pub const MF_SEPARATOR: u32 = 0x0000_0800;
+/// `ODS_SELECTED` / `ODS_HOTLIGHT` / `ODS_DISABLED` (`itemState` in
+/// `DRAWITEMSTRUCT`).
+pub const ODS_SELECTED: u32 = 0x0001;
+pub const ODS_DISABLED: u32 = 0x0004;
+pub const ODS_HOTLIGHT: u32 = 0x0040;
+/// `ODT_MENU`: the owner-draw request is a menu item.
+pub const ODT_MENU: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// GDI+ (`gdiplus.dll`) -- antialiased rounded geometry.
+//
+// GDI's own `RoundRect` rasterises with the selected 1px pen and aliased
+// brushes: its arcs are hard-stepped, which at 96 DPI reads as a chunky corner.
+// GDI+ fills a `GraphicsPath` with `SmoothingModeAntiAlias`, which is the
+// documented smoothed path for arbitrary geometry (learn.microsoft.com/windows/
+// win32/gdiplus/-gdiplus-antialiasing-with-lines-and-curves-about, verified
+// 2026-10-14). Same DLL family as gdi32, same windows-sys FFI path: no new
+// dependency, no C toolchain.
+// ---------------------------------------------------------------------------
+
+pub use windows_sys::Win32::Graphics::GdiPlus::{
+    FillModeAlternate, GdipAddPathArcI, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath,
+    GdipCreatePath2I, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics,
+    GdipDeletePath, GdipDeletePen, GdipDrawPath, GdipFillPath, GdipSetSmoothingMode,
+    GdiplusShutdown, GdiplusStartup, SmoothingModeAntiAlias, UnitPixel,
+};
+
+/// `GdiplusStartupInput` (version 1, no debug callback, background thread kept).
+/// Built by hand so the crate does not have to name the bindings' struct.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct GdiplusStartupInput {
+    pub gdiplus_version: u32,
+    pub debug_event_callback: usize,
+    pub suppress_background_thread: i32,
+    pub suppress_external_codecs: i32,
+}
+
+impl Default for GdiplusStartupInput {
+    fn default() -> Self {
+        Self {
+            gdiplus_version: 1,
+            debug_event_callback: 0,
+            suppress_background_thread: 0,
+            suppress_external_codecs: 0,
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+const _: () = assert!(size_of::<GdiplusStartupInput>() == 24);
+#[cfg(target_arch = "x86_64")]
+const _: () =
+    assert!(size_of::<windows_sys::Win32::Graphics::GdiPlus::GdiplusStartupInput>() == 24);
 
 // ---------------------------------------------------------------------------
 // Window messages (`go\win32.go:38-49`).
@@ -224,6 +413,25 @@ pub const WM_ERASE_BKGND: u32 = 0x0014;
 pub const WM_SIZE: u32 = 0x0005;
 pub const WM_DPI_CHANGED: u32 = 0x02E0;
 pub const WM_MOUSE_LEAVE: u32 = 0x02A3;
+/// `WM_CANCELMODE`: ends menu tracking (used by the capture harness to dismiss
+/// the tray popup after its pixels are read; the app itself never posts it).
+pub const WM_CANCELMODE: u32 = 0x001F;
+/// `PW_RENDERFULLCONTENT` (`PrintWindow` flag 2): capture the full composed
+/// content, required on themed/owner-drawn surfaces (flag 0 can return a blank
+/// bitmap while reporting success).
+pub const PW_RENDERFULLCONTENT: u32 = 2;
+/// `WM_MOUSEWHEEL`. A wheel notch is `WHEEL_DELTA` (120) in `HIWORD(wParam)`;
+/// the wheel message carries SCREEN coordinates in `lParam`, not client.
+pub const WM_MOUSEWHEEL: u32 = 0x020A;
+pub const WHEEL_DELTA: i32 = 120;
+
+/// The signed wheel delta of a `WM_MOUSEWHEEL` message: `HIWORD(wParam)` as an
+/// `i16` (negative = wheel toward the user).
+#[must_use]
+pub fn wheel_delta(wparam: usize) -> i32 {
+    let hi = ((wparam >> 16) & 0xFFFF) as u16;
+    i32::from(hi as i16)
+}
 
 // `DrawTextW` alignment/ellipsis flags for the owner-drawn UI
 // (`go\win32.go:301-306`).
@@ -248,6 +456,17 @@ pub const SM_CY_SCREEN: i32 = 1;
 pub const TME_LEAVE: u32 = 0x00000002;
 
 pub const FW_SEMI_BOLD: i32 = 600;
+
+// Font output quality and precision (`CreateFontW` `iQuality`/`iOutPrecision`;
+// learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-createfontw, verified
+// 2026-10-14). This app passed `0` (= `DEFAULT_QUALITY`, "appearance does not
+// matter") for both, leaving text at the mercy of the system smoothing default;
+// `CLEARTYPE_QUALITY` asks for subpixel AA explicitly, and `OUT_TT_PRECIS`
+// prefers a TrueType outline face, which is the only kind ClearType can smooth
+// (the docs list bitmap/vector/device fonts as unsupported).
+pub const CLEARTYPE_QUALITY: u32 = 5;
+pub const OUT_TT_PRECIS: u32 = 4;
+pub const CLIP_DEFAULT_PRECIS: u32 = 0;
 
 pub const NULL_BRUSH_STOCK: i32 = 5;
 
