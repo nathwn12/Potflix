@@ -42,6 +42,36 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
+## Metadata sources
+
+The Rust app's Rich Presence card resolves titles through these keyless
+third-party sources (no credentials, no scraping — public APIs only). The
+frozen Go reference used TVmaze, AniList, Jikan, iTunes and Wikipedia; the
+Rust app uses TVmaze, AniList, Cinemeta and Wikipedia.
+
+- **TVmaze** (`https://api.tvmaze.com`) — TV series names, episode tables,
+  posters and summaries. TVmaze's API docs license the data
+  *"licensed by CC BY-SA"*; attribute TVmaze wherever the card data is
+  republished.
+- **AniList** (`https://graphql.anilist.co`) — anime names, episode lists and
+  artwork. AniList's Terms restrict use to non-commercial purposes and forbid
+  using the API *"as a backup or data storage service"*. Stated plainly: the
+  app's permanent on-disk metadata cache
+  (`%LOCALAPPDATA%\Potflix\meta`) keeps AniList-derived answers indefinitely,
+  which is in tension with that term. The cache exists so the card works
+  offline and the provider is not re-queried for the same title; nothing
+  cached is republished or redistributed.
+- **Cinemeta** (`https://v3-cinemeta.strem.io`) — Stremio's default catalog
+  addon (`com.linvo.cinemeta`): movie and series lookup by IMDb id, with
+  TMDB-derived descriptions, ratings, genres and runtimes. Artwork is served
+  from `m.media-amazon.com` and `images.metahub.space`. Replaces the iTunes
+  movie leg (which returned the first `feature-movie` row with no title
+  check) and the Jikan anime leg (discontinued 2026-10-01;
+  `api.jikan.moe` no longer answers).
+- **Wikipedia** (`https://en.wikipedia.org`, Action API) — movie fallback
+  (summary, poster). Article text and images are CC BY-SA; attribute
+  Wikipedia when republishing card data.
+
 ## Bundled logo fonts
 
 The font files in `design\fonts\` are used solely to render the Potflix

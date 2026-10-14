@@ -3,8 +3,8 @@
 //! The provider chain. The poll loop uses the NON-BLOCKING [`Resolver::resolve`]
 //! (a cache miss fires one background fetch per cache key, single-flight, and the
 //! card falls back to the clean title until it lands); the CLIs use the BLOCKING
-//! [`Resolver::lookup_now`]. Order: TVmaze for TV, AniList + Jikan for anime,
-//! iTunes then Wikipedia for movies. Offline safe: with no cache entry and no
+//! [`Resolver::lookup_now`]. Order: TVmaze for TV, AniList plus Cinemeta for
+//! anime, Cinemeta then Wikipedia for movies. Offline safe: with no cache entry and no
 //! network the card is exactly the clean card, and [`Options::offline`] serves
 //! cache-only. `force` bypasses and re-attempts.
 //!
@@ -43,7 +43,7 @@ use crate::cache::{
 };
 use crate::tvmaze::TvmazeSource;
 use crate::wikipedia::{WikiClient, WikipediaSource};
-use crate::{Error, anilist::AnilistSource, itunes::ItunesSource, jikan::JikanSource};
+use crate::{Error, anilist::AnilistSource, cinemeta::CinemetaSource};
 
 /// `negativeBackoff` keeps a failed key from being hammered. In-memory only; the
 /// on-disk cache stays additive forever.
@@ -109,9 +109,8 @@ fn make_default_sources(timeout: Duration) -> Vec<Arc<dyn Source>> {
             "https://graphql.anilist.co",
             client.clone(),
         )),
-        Arc::new(JikanSource::new("https://api.jikan.moe/v4", client.clone())),
-        Arc::new(ItunesSource::new(
-            "https://itunes.apple.com",
+        Arc::new(CinemetaSource::new(
+            "https://v3-cinemeta.strem.io",
             client.clone(),
         )),
         // Wikipedia sends its own User-Agent, so it carries its own agent with
@@ -123,8 +122,8 @@ fn make_default_sources(timeout: Duration) -> Vec<Arc<dyn Source>> {
     ]
 }
 
-/// `DefaultSources`: the built-in keyless providers (TVmaze, AniList, Jikan,
-/// iTunes, Wikipedia) in their historical order.
+/// `DefaultSources`: the built-in keyless providers (TVmaze, AniList, Cinemeta,
+/// Wikipedia) in their historical order.
 pub fn default_sources() -> Vec<Arc<dyn Source>> {
     make_default_sources(Duration::ZERO)
 }
@@ -252,9 +251,9 @@ impl Resolver {
     /// relative order at the end so injected test sources are still tried.
     pub fn ordered_sources(&self, q: &Query) -> Vec<Arc<dyn Source>> {
         let pref: &[(&str, i32)] = if q.kind == Kind::MOVIE {
-            &[("itunes", 0), ("wikipedia", 1)]
+            &[("cinemeta", 0), ("wikipedia", 1)]
         } else {
-            &[("tvmaze", 0), ("anilist", 1), ("jikan", 2)]
+            &[("tvmaze", 0), ("anilist", 1), ("cinemeta", 2)]
         };
         let mut out = self.inner.sources.clone();
         out.sort_by_key(|source| {
@@ -854,7 +853,7 @@ fn button_ok(label: &str, raw_url: &str) -> Option<Button> {
 /// `resolutionButtons`: the max-2 card buttons.
 ///
 /// * movie: `[View Movie, MovieURL]` + `[View Trailer, TrailerURL]`
-/// * anime (anilist/jikan): `[View Episode, streaming URL]` + `[View Anime, ShowURL]`
+/// * anime (anilist): `[View Episode, streaming URL]` + `[View Anime, ShowURL]`
 /// * series (tvmaze + others): `[View Episode, episode URL]` + `[View Show, ShowURL]`
 fn resolution_buttons(
     media: &Media,
@@ -867,7 +866,7 @@ fn resolution_buttons(
             ("View Movie", media.movie_url.clone()),
             ("View Trailer", media.trailer_url.clone()),
         ]
-    } else if media.source == "anilist" || media.source == "jikan" {
+    } else if media.source == "anilist" {
         let episode_url = if has_ep {
             ep.map(|ep| ep.url.clone()).unwrap_or_default()
         } else {
