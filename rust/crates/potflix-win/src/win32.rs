@@ -42,6 +42,7 @@
 use core::mem::size_of;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+pub use windows_sys::Win32::Graphics::Gdi as Gdi;
 
 // ---------------------------------------------------------------------------
 // Binding table (`go\win32.go:8-36`).
@@ -352,6 +353,11 @@ pub const WM_PAINT: u32 = 0x000F;
 pub const WM_COMMAND: u32 = 0x0111;
 pub const WM_SET_ICON: u32 = 0x0080;
 
+/// `WM_GETICON` (0x007F): the message that READS the window's own icon slots --
+/// what the titlebar, alt-tab and the taskbar actually consume. Distinct from
+/// the class slots `GetClassLongPtrW` reads, which is why the proof checks both.
+pub const WM_GET_ICON: u32 = 0x007F;
+
 pub const ICON_SMALL: u32 = 0;
 pub const ICON_BIG: u32 = 1;
 
@@ -620,6 +626,70 @@ pub struct TrackMouseEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Brand-surface bindings (Rust-only; `go\win32.go` has no counterpart).
+//
+// The identity pass in `design\make_logo.py` ships the app's own typefaces and
+// its own 256x256 Ribbon-P `.ico`. Applying them needs three procs the port
+// never declared:
+//
+//   * `AddFontMemResourceEx` (gdi32) -- install a face from a memory image for
+//     the process lifetime, so `design\fonts\*.ttf` can ship inside the binary
+//     with no install step and no system-font dependency. The image must stay
+//     valid while the font is in use, which the `'static` byte slices from
+//     `include_bytes!` guarantee.
+//     (learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-addfontmemresourceex,
+//     verified 2026-10-14.)
+//   * `GetClassLongPtrW`/`SetClassLongPtrW` (user32) -- read and write the
+//     window CLASS's icon slots. `GCLP_HICON` is the proof handle the redesign
+//     asserts non-zero; `WM_SETICON` alone would leave the class slot empty.
+//     (learn.microsoft.com/windows/win32/api/winuser/nf-winuser-getclasslongptrw,
+//     verified 2026-10-14.)
+//   * `DestroyIcon` (user32) -- release an `HICON` this process created.
+//
+// `CreateIconFromResourceEx` (already exported above) is the loader: the
+// embedded `.ico` holds one BMP/DIB frame, which is exactly the "resource bits"
+// shape it consumes, so no temp file and no `LoadImageW` are needed.
+// ---------------------------------------------------------------------------
+
+pub use windows_sys::Win32::Graphics::Gdi::AddFontMemResourceEx;
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DestroyIcon, GetClassLongPtrW, SetClassLongPtrW,
+};
+
+/// `GetTextFaceW` (gdi32): the face name a DC actually selected. The brand
+/// loader reads it back so a missing embedded face is a reported failure, never
+/// a silent system fallback -- the same refusal `design\make_logo.py`'s
+/// `load_font` makes with its `getname()[0]` assert.
+pub use windows_sys::Win32::Graphics::Gdi::GetTextFaceW;
+
+/// `GCLP_HICON` / `GCLP_HICONSM` (`winuser.h`): the class's large and small icon
+/// slots, as negative `GetClassLongPtrW` indices.
+pub const GCLP_HICON: i32 = -14;
+pub const GCLP_HICONSM: i32 = -34;
+
+/// `SM_CXSMICON` / `SM_CYSMICON` (`winuser.h`): the small-icon slot's size.
+pub const SM_CXSMICON: i32 = 49;
+pub const SM_CYSMICON: i32 = 50;
+
+/// `FW_BLACK` (900) and `FW_MEDIUM` (500): the weights the brand faces ask for.
+/// Archivo Black is a single-master 900 display face; Inter Variable exposes
+/// named instances, and GDI reaches the default instance through weight alone.
+pub const FW_BLACK: i32 = 900;
+pub const FW_MEDIUM: i32 = 500;
+
+/// `LR_DEFAULTCOLOR` (0): `CreateIconFromResourceEx`'s only supported flag.
+pub const LR_DEFAULTCOLOR: u32 = 0;
+
+/// `SetTextCharacterExtra` (gdi32): GDI's own inter-character spacing, in
+/// logical units. The wordmark and the micro-labels are letter-spaced
+/// (`design\make_logo.py` tracks `POTFLIX` at 0.08em and manual kerning pairs on
+/// top); GDI has no other letter-spacing control, and this one applies to the
+/// whole `DrawTextW` call, which is exactly the uniform tracking the brand uses.
+/// (learn.microsoft.com/windows/win32/api/wingdi/nf-wingdi-settextcharacterextra,
+/// verified 2026-10-14.)
+pub use windows_sys::Win32::Graphics::Gdi::SetTextCharacterExtra;
+
+// ---------------------------------------------------------------------------
 // Compile-time size assertions: a field added or reordered here fails the
 // build, not `Shell_NotifyIconW`/`RegisterClassExW`/`BeginPaint` at runtime.
 // ---------------------------------------------------------------------------
@@ -883,6 +953,15 @@ mod tests {
         assert_eq!(WM_L_BUTTON_DOWN, wam::WM_LBUTTONDOWN);
         assert_eq!(WM_L_BUTTON_UP, wam::WM_LBUTTONUP);
         assert_eq!(WM_SET_CURSOR, wam::WM_SETCURSOR);
+        // Brand-surface bindings: the class-icon slots, the small-icon metric,
+        // and the two brand font weights, each against windows-sys.
+        assert_eq!(GCLP_HICON, wam::GCLP_HICON);
+        assert_eq!(GCLP_HICONSM, wam::GCLP_HICONSM);
+        assert_eq!(SM_CXSMICON, wam::SM_CXSMICON);
+        assert_eq!(SM_CYSMICON, wam::SM_CYSMICON);
+        assert_eq!(FW_BLACK, gdi::FW_BLACK as i32);
+        assert_eq!(FW_MEDIUM, gdi::FW_MEDIUM as i32);
+        assert_eq!(LR_DEFAULTCOLOR, 0);
         assert_eq!(WM_ERASE_BKGND, wam::WM_ERASEBKGND);
         assert_eq!(WM_SIZE, wam::WM_SIZE);
         assert_eq!(WM_DPI_CHANGED, wam::WM_DPICHANGED);
