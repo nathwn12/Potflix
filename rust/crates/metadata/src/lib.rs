@@ -1,12 +1,12 @@
 //! `metadata` -- mirrors the Go package `go\internal\metadata`.
 //!
 //! Canonical series/episode titles from free, keyless sources (TVmaze for TV,
-//! AniList + Jikan for anime, iTunes then Wikipedia for movies) behind a
+//! AniList plus Cinemeta for anime, Cinemeta then Wikipedia for movies) behind a
 //! permanent on-disk cache. The poll loop uses the non-blocking
 //! [`Resolver::resolve`]; the CLIs use the blocking [`Resolver::lookup_now`];
 //! [`Options::offline`] serves cache-only.
 //!
-//! Workspace seam: this crate carries the provider chain, the five providers and
+//! Workspace seam: this crate carries the provider chain, the four providers and
 //! the cache; the shared record types, the filename parser, candidate matching,
 //! alternate titles and the path context live in `metadata-core`, and the
 //! transport in `metadata-http`.
@@ -29,8 +29,7 @@
 pub mod anilist;
 pub mod artwork;
 pub mod cache;
-pub mod itunes;
-pub mod jikan;
+pub mod cinemeta;
 pub mod resolver;
 mod serdeutil;
 pub mod timefmt;
@@ -47,13 +46,11 @@ mod cache_test;
 #[cfg(test)]
 mod chaincount_test;
 #[cfg(test)]
+mod cinemeta_test;
+#[cfg(test)]
 mod connreuse_test;
 #[cfg(test)]
 mod force_test;
-#[cfg(test)]
-mod itunes_test;
-#[cfg(test)]
-mod jikan_test;
 #[cfg(test)]
 mod resolver_test;
 #[cfg(test)]

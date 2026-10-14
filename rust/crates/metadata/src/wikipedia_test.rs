@@ -497,8 +497,8 @@ fn wiki_year_extraction() {
     }
 }
 
-/// `TestWikipediaMovieOrder`: for a movie query the default chain ranks iTunes
-/// first with Wikipedia immediately after.
+/// `TestWikipediaMovieOrder`: for a movie query the default chain ranks
+/// Cinemeta first with Wikipedia immediately after.
 #[test]
 fn wikipedia_movie_order() {
     let dir = TempDir::new();
@@ -513,8 +513,8 @@ fn wikipedia_movie_order() {
         .map(|source| source.name().to_string())
         .collect();
     assert!(
-        names.len() >= 2 && names[0] == "itunes" && names[1] == "wikipedia",
-        "movie order = {names:?}, want [itunes wikipedia ...]"
+        names.len() >= 2 && names[0] == "cinemeta" && names[1] == "wikipedia",
+        "movie order = {names:?}, want [cinemeta wikipedia ...]"
     );
     // Series order is untouched: wikipedia self-gates there anyway.
     let series_names: Vec<String> = resolver

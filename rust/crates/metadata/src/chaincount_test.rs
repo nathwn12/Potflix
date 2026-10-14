@@ -11,7 +11,7 @@ use metadata_http::cancel::Cancel;
 use crate::resolver::{Options, Resolver, Source};
 use crate::testsupport::{dead_url, http_client, wiki_client, TempDir};
 use crate::Error;
-use crate::{anilist::AnilistSource, itunes::ItunesSource, jikan::JikanSource};
+use crate::{anilist::AnilistSource, cinemeta::CinemetaSource};
 use crate::{tvmaze::TvmazeSource, wikipedia::WikipediaSource};
 
 /// The answering callback shared by every fake provider in this module.
@@ -58,8 +58,7 @@ fn counting_resolver(
         sources: Some(vec![
             make("tvmaze"),
             make("anilist"),
-            make("jikan"),
-            make("itunes"),
+            make("cinemeta"),
         ]),
         ..Options::default()
     })
@@ -99,7 +98,7 @@ fn count(counts: &HashMap<String, i32>, name: &str) -> i32 {
 /// `TestChainCallCounts`: how many provider `Find` calls one lookup costs per
 /// query kind. These are Find invocations, not network calls: each source
 /// self-gates a ruled-out kind before touching the wire, so a series miss still
-/// INVOKES itunes.Find but pays no rate-limiter wait.
+/// INVOKES cinemeta.Find but a movie miss still INVOKES the series-only fakes.
 #[test]
 fn chain_call_counts() {
     let tv_q = resolve_query("Breaking Bad S01E01.mkv", "");
@@ -133,10 +132,16 @@ fn chain_call_counts() {
             want: vec![("tvmaze", 1)],
         },
         Case {
-            name: "movie hit at itunes",
+            name: "movie hit at cinemeta",
             q: movie_q.clone(),
-            answer_at: "itunes",
-            want: vec![("itunes", 1)],
+            answer_at: "cinemeta",
+            want: vec![("cinemeta", 1)],
+        },
+        Case {
+            name: "movie definitive miss walks cinemeta then the unranked tail",
+            q: movie_q.clone(),
+            answer_at: "",
+            want: vec![("cinemeta", 1), ("tvmaze", 1), ("anilist", 1)],
         },
         Case {
             name: "anime hit at anilist",
@@ -145,16 +150,16 @@ fn chain_call_counts() {
             want: vec![("tvmaze", 1), ("anilist", 1)],
         },
         Case {
-            name: "tv definitive miss invokes itunes pre-wire only",
+            name: "tv definitive miss walks the series chain",
             q: miss_q.clone(),
             answer_at: "",
-            want: vec![("tvmaze", 1), ("anilist", 1), ("jikan", 1), ("itunes", 1)],
+            want: vec![("tvmaze", 1), ("anilist", 1), ("cinemeta", 1)],
         },
         Case {
             name: "unknown definitive miss keeps full chain",
             q: bare_q.clone(),
             answer_at: "",
-            want: vec![("tvmaze", 1), ("anilist", 1), ("jikan", 1), ("itunes", 1)],
+            want: vec![("tvmaze", 1), ("anilist", 1), ("cinemeta", 1)],
         },
     ];
 
@@ -205,12 +210,17 @@ fn kind_gate_no_network() {
         title: "Inception".to_string(),
         ..Query::default()
     };
+    // Cinemeta serves both kinds, so its pre-wire gate is the empty title.
+    let empty_q = Query {
+        kind: Kind::MOVIE,
+        ..Query::default()
+    };
 
     let cases: Vec<(&str, Box<dyn Source>, &Query, &Query)> = vec![
         (
-            "itunes",
-            Box::new(ItunesSource::new(dead.clone(), http_client())),
-            &series_q,
+            "cinemeta",
+            Box::new(CinemetaSource::new(dead.clone(), http_client())),
+            &empty_q,
             &movie_q,
         ),
         (
@@ -228,12 +238,6 @@ fn kind_gate_no_network() {
         (
             "anilist",
             Box::new(AnilistSource::new(dead.clone(), http_client())),
-            &movie_q,
-            &series_q,
-        ),
-        (
-            "jikan",
-            Box::new(JikanSource::new(dead.clone(), http_client())),
             &movie_q,
             &series_q,
         ),
