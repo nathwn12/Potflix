@@ -11,8 +11,8 @@ use metadata_http::cancel::Cancel;
 use crate::resolver::{Options, Resolver, Source};
 use crate::testsupport::{FakeServer, Request, Response, TempDir, dead_url, wiki_client};
 use crate::wikipedia::{
-    WIKIPEDIA_USER_AGENT, WikipediaSource, wiki_pick_poster, wiki_sanitize_cause, wiki_transient,
-    wiki_year,
+    WIKIPEDIA_USER_AGENT, WikipediaSource, strip_disambiguation, wiki_pick_poster,
+    wiki_sanitize_cause, wiki_transient, wiki_year,
 };
 
 const WIKI_HIT_SEARCH: &str =
@@ -148,7 +148,9 @@ fn movie_query(title: &str, year: i32) -> Query {
 }
 
 /// `TestWikipediaHit`: the two-call path yields title, year from "(2021 film)",
-/// the thumbnail poster and the extract synopsis.
+/// the thumbnail poster and the extract synopsis. The page title's
+/// disambiguation suffix is stripped (`Dune`, not `Dune (2021 film)`): the live
+/// card showed the raw suffix and doubled the year in the movie line.
 #[test]
 fn wikipedia_hit() {
     let fake = WikiFake::with(WIKI_HIT_SEARCH, WIKI_HIT_DETAIL);
@@ -158,7 +160,7 @@ fn wikipedia_hit() {
         .find(&Cancel::background(), &q)
         .expect("Find")
         .expect("expected media, got nil");
-    assert_eq!(media.title, "Dune (2021 film)");
+    assert_eq!(media.title, "Dune");
     assert_eq!(media.year, 2021);
     assert_eq!(media.kind, Kind::MOVIE);
     assert!(
@@ -300,7 +302,8 @@ fn wikipedia_kind_gate() {
 }
 
 /// `TestWikipediaNoPosterStillFound`: a poster-less page still yields a FOUND
-/// movie with title, year and synopsis, Artwork honestly empty.
+/// movie with title, year and synopsis, Artwork honestly empty. The title is
+/// the stripped page title (`Dune`): the suffix never reaches the card.
 #[test]
 fn wikipedia_no_poster_still_found() {
     let fake = WikiFake::with(WIKI_HIT_SEARCH, WIKI_NO_POSTER_DETAIL);
@@ -310,7 +313,7 @@ fn wikipedia_no_poster_still_found() {
         .expect("Find")
         .expect("expected media, got nil");
     assert_eq!(media.artwork, "", "artwork must stay empty (no thumbnail)");
-    assert_eq!(media.title, "Dune (2021 film)");
+    assert_eq!(media.title, "Dune");
     assert_eq!(media.year, 2021);
     assert!(!media.synopsis.is_empty());
     assert!(
@@ -323,7 +326,8 @@ fn wikipedia_no_poster_still_found() {
 /// `TestWikipediaPosterFromImageList`: a resolved page with no PageImages
 /// thumbnail lists the article files, picks the poster-like file, and resolves
 /// it via `prop=imageinfo` -- exactly 4 calls. The fixture mixes in a logo and
-/// an svg "poster" to prove the pick rule rejects them.
+/// an svg "poster" to prove the pick rule rejects them. The title assertion
+/// pins the stripped page title alongside the artwork pick.
 #[test]
 fn wikipedia_poster_from_image_list() {
     let fake = WikiFake {
@@ -342,14 +346,15 @@ fn wikipedia_poster_from_image_list() {
         media.artwork,
         "https://upload.wikimedia.org/wikipedia/en/8/8e/Dune_theatrical_poster.jpg"
     );
-    assert_eq!(media.title, "Dune (2021 film)");
+    assert_eq!(media.title, "Dune");
     assert_eq!(media.year, 2021);
     assert!(!media.synopsis.is_empty());
     assert_eq!(fake.hits(), 4, "search+detail+images+imageinfo");
 }
 
 /// `TestWikipediaPosterAbsentStillFound`: a poster-less image list keeps
-/// today's behavior -- found, with Artwork honestly empty.
+/// today's behavior -- found, with Artwork honestly empty -- and the stripped
+/// title (`Dune`).
 #[test]
 fn wikipedia_poster_absent_still_found() {
     let fake = WikiFake {
@@ -364,14 +369,14 @@ fn wikipedia_poster_absent_still_found() {
         .expect("Find")
         .expect("expected media, got nil");
     assert_eq!(media.artwork, "", "no poster-like file means empty artwork");
-    assert_eq!(media.title, "Dune (2021 film)");
+    assert_eq!(media.title, "Dune");
     assert_eq!(media.year, 2021);
     assert!(!media.synopsis.is_empty());
     assert_eq!(fake.hits(), 3, "search+detail+images, no imageinfo call");
 }
 
 /// `TestWikipediaNonPosterImageIgnored`: a non-poster image (a logo, a cast
-/// photo) is never substituted.
+/// photo) is never substituted, and the title is still the stripped page title.
 #[test]
 fn wikipedia_non_poster_image_ignored() {
     let fake = WikiFake {
@@ -387,7 +392,7 @@ fn wikipedia_non_poster_image_ignored() {
         .expect("Find")
         .expect("expected media, got nil");
     assert_eq!(media.artwork, "", "a logo/cast photo must never substitute");
-    assert_eq!(media.title, "Dune (2021 film)");
+    assert_eq!(media.title, "Dune");
     assert!(!media.synopsis.is_empty());
     assert_eq!(fake.hits(), 3, "no imageinfo call for a non-poster list");
 }
@@ -452,7 +457,7 @@ fn wiki_pick_poster_ranks_extensions() {
         ("empty list", Vec::new(), ""),
     ];
     for (name, list, want) in cases {
-        assert_eq!(wiki_pick_poster(&list), want, "{name}");
+        assert_eq!(wiki_pick_poster(&list, "Dune (2021 film)"), want, "{name}");
     }
 }
 
@@ -640,10 +645,10 @@ fn wikipedia_missing_string_is_definitive_miss() {
 fn wiki_pick_poster_guidelines_rejected() {
     let one = |name: &str| vec![name.to_string()];
     assert_eq!(
-        wiki_pick_poster(&one("File:Dune poster guidelines.jpg")),
+        wiki_pick_poster(&one("File:Dune poster guidelines.jpg"), "Dune (2021 film)"),
         ""
     );
-    assert!(!wiki_pick_poster(&one("File:Dune theatrical poster.jpg")).is_empty());
+    assert!(!wiki_pick_poster(&one("File:Dune theatrical poster.jpg"), "Dune (2021 film)").is_empty());
     for name in [
         "File:Dune poster logo.jpg",
         "File:Dune poster list.jpg",
@@ -651,7 +656,7 @@ fn wiki_pick_poster_guidelines_rejected() {
         "File:Dune film poster style guide.jpg",
         "File:Posterize.jpg",
     ] {
-        assert_eq!(wiki_pick_poster(&one(name)), "", "blocked pick {name}");
+        assert_eq!(wiki_pick_poster(&one(name), "Dune (2021 film)"), "", "blocked pick {name}");
     }
     // A genuine poster still wins over blocked docs (jpg preferred).
     let mixed = vec![
@@ -659,7 +664,7 @@ fn wiki_pick_poster_guidelines_rejected() {
         "File:Dune theatrical poster.jpg".to_string(),
     ];
     assert_eq!(
-        wiki_pick_poster(&mixed),
+        wiki_pick_poster(&mixed, "Dune (2021 film)"),
         "File:Dune theatrical poster.jpg",
         "the genuine poster must win"
     );
@@ -735,4 +740,123 @@ fn wikipedia_image_list_asks_for_every_file() {
         media.artwork,
         "https://upload.wikimedia.org/wikipedia/en/9/9a/Spider-Man_Brand_New_Day_poster.jpg"
     );
+}
+
+/// `TestWikiStripDisambiguation`: only a trailing parenthetical that IS a media
+/// disambiguation (`film`, `2021 film`, `TV series`, case-insensitive) is
+/// dropped; a real parenthesized title (`Director's Cut`) and a bare year
+/// (`Heat (1995)`, which carries no kind word) survive, because the strip must
+/// never eat a legitimate title.
+#[test]
+fn wiki_strip_disambiguation_kinds_only() {
+    let cases: Vec<(&str, &str)> = vec![
+        ("Ready Player One (film)", "Ready Player One"),
+        ("Dune (2021 film)", "Dune"),
+        ("Backrooms (film)", "Backrooms"),
+        ("Dune (Film)", "Dune"),
+        ("Show (TV series)", "Show"),
+        ("Show (2021 TV series)", "Show"),
+        ("Show (limited series)", "Show"),
+        ("Game (video game)", "Game"),
+        ("Song (song)", "Song"),
+        ("Nymphomaniac (Director's Cut)", "Nymphomaniac (Director's Cut)"),
+        ("Heat (1995)", "Heat (1995)"),
+        ("No Parens", "No Parens"),
+        ("(film)", "(film)"),
+    ];
+    for (input, want) in cases {
+        assert_eq!(strip_disambiguation(input), want, "input = {input:?}");
+    }
+}
+
+/// `TestWikipediaDisambiguationStripped`: the live `Ready Player One (film)`
+/// shape yields a clean `Media.title` with the year still derived from the raw
+/// page title (2018).
+#[test]
+fn wikipedia_disambiguation_stripped() {
+    for (page_title, want_title, want_year, extract) in [
+        (
+            "Ready Player One (film)",
+            "Ready Player One",
+            2018,
+            "Ready Player One is a 2018 American science fiction action film directed by Steven Spielberg.",
+        ),
+        (
+            "Backrooms (film)",
+            "Backrooms",
+            2026,
+            "Backrooms is a 2026 American psychological horror film directed by Kane Parsons.",
+        ),
+    ] {
+        let detail = format!(
+            r#"{{"query":{{"pages":{{"12345":{{"pageid":12345,"title":"{page_title}","extract":"{extract}"}}}}}}}}"#
+        );
+        let search =
+            format!(r#"{{"query":{{"search":[{{"title":"{page_title}"}}]}}}}"#);
+        let fake = WikiFake::with(&search, &detail);
+        let (_server, source) = fake.source();
+        let media = source
+            .find(&Cancel::background(), &movie_query(want_title, 0))
+            .expect("Find")
+            .expect("expected media, got nil");
+        assert_eq!(media.title, want_title, "page = {page_title:?}");
+        assert_eq!(media.year, want_year, "page = {page_title:?}");
+        assert_eq!(media.source_id, want_title, "page = {page_title:?}");
+    }
+}
+
+/// `TestWikipediaNondisambiguationParenSurvives`: a parenthetical that is part
+/// of the real title reaches `Media` untouched.
+#[test]
+fn wikipedia_nondisambiguation_paren_survives() {
+    const PAGE: &str = "Nymphomaniac (Director's Cut)";
+    let search = r#"{"query":{"search":[{"title":"Nymphomaniac (Director's Cut)"}]}}"#;
+    let detail = r#"{"query":{"pages":{"12345":{"pageid":12345,"title":"Nymphomaniac (Director's Cut)","extract":"Nymphomaniac Director's Cut is a 2013 drama film in two volumes."}}}}"#;
+    let fake = WikiFake::with(search, detail);
+    let (_server, source) = fake.source();
+    let media = source
+        .find(&Cancel::background(), &movie_query("Nymphomaniac", 0))
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.title, PAGE);
+    assert_eq!(media.year, 2013);
+}
+
+/// `TestWikipediaExactTitlePoster`: the Ready Player One live shape -- no page
+/// image, and an image list whose only poster file is named exactly like the
+/// article (`File:Ready Player One (film).png`, no "poster" word) -- resolves
+/// that file via `prop=imageinfo` instead of falling back to `logo`.
+#[test]
+fn wikipedia_exact_title_poster() {
+    let fake = WikiFake {
+        search: r#"{"query":{"search":[{"title":"Ready Player One (film)"}]}}"#.to_string(),
+        detail: r#"{"query":{"pages":{"12345":{"pageid":12345,"title":"Ready Player One (film)","extract":"Ready Player One is a 2018 American science fiction action film directed by Steven Spielberg."}}}}"#.to_string(),
+        images: r#"{"query":{"pages":{"12345":{"pageid":12345,"images":[{"title":"File:Commons-logo.svg"},{"title":"File:Ready Player One (film).png"},{"title":"File:Steven Spielberg by Gage Skidmore.jpg"}]}}}}"#.to_string(),
+        imageinfo: r#"{"query":{"pages":{"999":{"pageid":999,"title":"File:Ready Player One (film).png","imageinfo":[{"url":"https://upload.wikimedia.org/wikipedia/en/7/74/Ready_Player_One_%28film%29.png"}]}}}}"#.to_string(),
+        ..WikiFake::new()
+    };
+    let (_server, source) = fake.source();
+    let media = source
+        .find(&Cancel::background(), &movie_query("Ready Player One", 0))
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.title, "Ready Player One");
+    assert_eq!(
+        media.artwork,
+        "https://upload.wikimedia.org/wikipedia/en/7/74/Ready_Player_One_%28film%29.png"
+    );
+    // A same-named non-photo (an svg diagram of the article subject) is still
+    // rejected: the extension guard survives the fallback.
+    let fake = WikiFake {
+        search: r#"{"query":{"search":[{"title":"Dune (2021 film)"}]}}"#.to_string(),
+        detail: WIKI_NO_POSTER_DETAIL.to_string(),
+        images: r#"{"query":{"pages":{"12345":{"pageid":12345,"images":[{"title":"File:Dune (2021 film).svg"}]}}}}"#.to_string(),
+        ..WikiFake::new()
+    };
+    let (_server, source) = fake.source();
+    let media = source
+        .find(&Cancel::background(), &movie_query("Dune", 0))
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.artwork, "", "an svg same-named file is not a poster");
 }
