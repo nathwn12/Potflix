@@ -33,6 +33,7 @@
 use core::ptr::{null, null_mut};
 use std::fmt;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use app_support::debuglog::Logger;
 use windows_sys::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -79,6 +80,50 @@ static APP_LOG: OnceLock<&'static Logger> = OnceLock::new();
 /// logger if one is already installed.
 pub fn set_logger(logger: &'static Logger) -> Result<(), &'static Logger> {
     APP_LOG.set(logger)
+}
+
+/// `RegisterWindowMessageW("TaskbarCreated")` id, stored at
+/// [`create_tray_window`]. Explorer broadcasts this message to all top-level
+/// windows when the shell (re)starts -- a crash, an update, a logon cycle --
+/// and every notify icon is gone until its owner re-adds it. Without this the
+/// app keeps running with no icon and no way back in (the tray menu is the
+/// only UI route and the only Exit path).
+static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+
+/// The tray `HICON` installed by [`create_tray_window`], so the
+/// `TaskbarCreated` handler re-adds the SAME icon through the SAME add path
+/// instead of growing a second one.
+static TRAY_ICON: AtomicUsize = AtomicUsize::new(0);
+
+/// The registered `TaskbarCreated` message id, or 0 when the tray window has
+/// not been created yet (or registration failed, in which case the handler
+/// below never fires).
+pub fn taskbar_created_message() -> u32 {
+    TASKBAR_CREATED_MSG.load(Ordering::SeqCst)
+}
+
+/// Pure predicate for the `TaskbarCreated` branch of [`wnd_proc`]: a real
+/// registered id that the incoming message equals. Split out so tests pin the
+/// dispatch without a window.
+#[must_use]
+pub fn is_taskbar_created_msg(msg: u32, registered: u32) -> bool {
+    registered != 0 && msg == registered
+}
+
+/// Re-add the notify icon after an explorer restart, reusing the existing add
+/// path ([`make_notify_icon_data`] + [`shell_notify_icon`]). Logs the same
+/// `notify-icon add result=` line as startup so the re-add is observable in
+/// the debug log.
+pub fn readd_notify_icon(hwnd: HWND) -> bool {
+    let stored = TRAY_ICON.load(Ordering::SeqCst) as HICON;
+    let icon = if stored.is_null() {
+        load_embedded_icon()
+    } else {
+        stored
+    };
+    let ok = shell_notify_icon(NIM_ADD, &make_notify_icon_data(hwnd, icon));
+    log_line(&format!("notify-icon add result={ok} (TaskbarCreated re-add)"));
+    ok
 }
 
 /// Go `showMainWindow()` (`go\window.go`) -- the main window is ported by the
@@ -249,6 +294,14 @@ pub fn create_tray_window() -> Result<TrayWindow, TrayError> {
 
     let icon = load_embedded_icon();
     let added = shell_notify_icon(NIM_ADD, &make_notify_icon_data(hwnd, icon));
+    TRAY_ICON.store(icon as usize, Ordering::SeqCst);
+    // The shell restart broadcast: a nonzero id after this call; 0 means the
+    // handler below stays inert (no icon to re-add into anyway).
+    let name = utf16_z("TaskbarCreated");
+    let taskbar_created = unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(name.as_ptr())
+    };
+    TASKBAR_CREATED_MSG.store(taskbar_created, Ordering::SeqCst);
     Ok(TrayWindow { hwnd, icon, added })
 }
 
@@ -405,6 +458,11 @@ unsafe extern "system" fn wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if is_taskbar_created_msg(msg, taskbar_created_message()) {
+        // Explorer restarted: the icon is gone, re-add it on the same path.
+        readd_notify_icon(hwnd);
+        return 0;
+    }
     match msg {
         WM_APP_TRAY => {
             if opens_tray_menu(tray_mouse_message(wparam, lparam)) {
@@ -738,6 +796,29 @@ mod tests {
                 "{name}: tray_mouse_message({wparam:#x}, {lparam:#x}) = {got:#06x} opens a menu, want none"
             );
         }
+    }
+
+    /// The `TaskbarCreated` dispatch is a pure predicate on the registered id:
+    /// the registered message re-adds, anything else (including 0 = never
+    /// registered) does not.
+    #[test]
+    fn taskbar_created_dispatch_is_the_registered_id() {
+        assert!(is_taskbar_created_msg(0xC000, 0xC000));
+        assert!(!is_taskbar_created_msg(0xC001, 0xC000));
+        assert!(!is_taskbar_created_msg(0xC000, 0));
+        assert!(!is_taskbar_created_msg(0x8001, 0xC000));
+    }
+
+    /// `RegisterWindowMessageW("TaskbarCreated")` resolves to a real broadcast
+    /// id on this machine (0xC000+ range), proving the name the handler waits
+    /// on is the name the shell broadcasts.
+    #[test]
+    fn taskbar_created_registers() {
+        let name: Vec<u16> = "TaskbarCreated".encode_utf16().chain(core::iter::once(0)).collect();
+        let id = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(name.as_ptr())
+        };
+        assert!(id >= 0xC000, "TaskbarCreated id = {id:#x}");
     }
 
     /// The `cbSize`-from-`Sizeof` rule (`go\tray.go:103`): the value the struct

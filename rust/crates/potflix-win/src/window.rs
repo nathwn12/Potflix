@@ -1610,6 +1610,12 @@ pub fn scan_progress_text(p: &Progress) -> String {
 }
 
 /// `scanDoneText` (`go\window.go:1942`).
+///
+/// Reads the per-KEY counters (`keys_fetched` / `keys_not_found` / `keys_failed`),
+/// not the per-FILE `stats.not_found` the completion log line carries below: the
+/// two agree only when a file yields exactly one key. (`scan.rs:180`/`183` carries
+/// a third meaning under the same name — `not_found` = `files_pending`, the
+/// index-only pending count.) Done-text wording is unchanged.
 #[must_use]
 pub fn scan_done_text(kind: &str, s: &Stats) -> String {
     if s.keys_fetched == 0 && s.keys_not_found == 0 && s.keys_failed == 0 && s.folders_skipped > 0 {
@@ -3397,9 +3403,17 @@ impl UiState {
         } else if let Some(e) = &err {
             app_logf(&format!("{lname}: failed: {}", e.message));
         } else {
-            // `onScanDone` (`go\window.go:2749`).
+            // `onScanDone` (`go\window.go:2749`). The `unresolved-at-scan-time` field
+            // is the per-FILE `stats.not_found`, not the per-KEY `keys_not_found`
+            // the done-text gate above reads — the two agree only when a file
+            // yields exactly one key (`scan.rs:180`/`183` carries a third meaning
+            // under the same name: `not_found` = `files_pending`). The summary is
+            // sampled before the async catch-up pass runs, so an honest nonzero
+            // here can coexist with a later successful fetch. Deliberate
+            // departure from Go's `not-found` field name, which reads as a
+            // verdict; this one states the sampling instant.
             app_logf(&format!(
-                "{lname}: complete files={} skipped={} unique={} resolved={} cached={} fetched={} not-found={} errors={} denied={} foldersScanned={} foldersSkipped={} filesSkipped={}",
+                "{lname}: complete files={} skipped={} unique={} resolved={} cached={} fetched={} unresolved-at-scan-time={} errors={} denied={} foldersScanned={} foldersSkipped={} filesSkipped={}",
                 stats.files, stats.skipped, stats.unique, stats.resolved, stats.cached, stats.fetched, stats.not_found, stats.errors, stats.denied, stats.folders_scanned, stats.folders_skipped, stats.files_skipped
             ));
         }
