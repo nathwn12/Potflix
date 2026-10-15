@@ -39,7 +39,15 @@ use crate::Error;
 use crate::timefmt::{now_rfc3339, parse_rfc3339};
 
 /// `cacheSchema`: the on-disk envelope version.
-pub const CACHE_SCHEMA: i32 = 3;
+///
+/// Bump this whenever the matching or display-title logic changes what a key
+/// SHOULD resolve to (schema 4: alias-aware anime matching, English-first
+/// display titles -- pre-fix positives like `Shingeki no Kyojin: Picture
+/// Drama` for a romaji AoT query must not keep serving as live hits).
+/// A record whose `schema` differs is a whole-record MISS, and the scan-index
+/// skip (`library::scanindex`, gated on `cache_schema()` + `cache_live`)
+/// follows the same version, so one bump re-resolves and re-scans together.
+pub const CACHE_SCHEMA: i32 = 4;
 
 /// `negativeTTL` bounds how long a persisted not-found entry counts as a cached
 /// miss: long enough that rescans stay fast, short enough that a provider

@@ -20,12 +20,17 @@ use titleclean::javacompat::jdk_is_mn;
 
 /// `ShowCand` is one candidate show for title matching. Weight carries the
 /// TVmaze show weight (higher ranks more popular/authoritative); EpisodeCount
-/// breaks remaining ties toward the fuller catalog entry.
+/// breaks remaining ties toward the fuller catalog entry. `aliases` carries
+/// the entry's other titles (an anime entry's romaji name beside its English
+/// one): every alias scores exactly like `name`, so a query in one script
+/// still finds the entry whose display title is in another. A provider with a
+/// single title leaves it empty, which is exactly the old behaviour.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ShowCand {
     pub name: String,
     pub weight: i32,
     pub episode_count: i32,
+    pub aliases: Vec<String>,
 }
 
 /// Tuning for [`pick_best_show`]: candidates need at least this similarity to
@@ -130,13 +135,15 @@ pub(crate) fn title_similarity(query: &str, candidate: &str) -> f64 {
     sim.clamp(0.0, 1.0)
 }
 
-/// `pickBestShow` picks the candidate best matching query. The top-similarity
-/// candidate wins outright unless others fall within [`MATCH_TIE_MARGIN`] of it
-/// (an INCLUSIVE `>= top - margin` window), in which case the tie group breaks
-/// by higher Weight then higher EpisodeCount then higher similarity, with a full
-/// tie keeping the earliest index. Exact normalized matches always outrank near
-/// matches: ONE `sim == 1` candidate excludes every non-exact candidate.
-/// `None` when the list is empty or the best similarity is below
+/// `pickBestShow` picks the candidate best matching query. Each candidate
+/// scores its BEST similarity over `name` plus `aliases`, and the rest is
+/// unchanged: the top-similarity candidate wins outright unless others fall
+/// within [`MATCH_TIE_MARGIN`] of it (an INCLUSIVE `>= top - margin` window),
+/// in which case the tie group breaks by higher Weight then higher
+/// EpisodeCount then higher similarity, with a full tie keeping the earliest
+/// index. Exact normalized matches always outrank near matches: ONE `sim == 1`
+/// title (name or alias) anywhere excludes every candidate whose best is not
+/// exact. `None` when the list is empty or the best similarity is below
 /// [`MATCH_MIN_SIMILARITY`], so the resolver falls through.
 pub fn pick_best_show(query: &str, cands: &[ShowCand]) -> Option<ShowCand> {
     if cands.is_empty() {
@@ -144,7 +151,13 @@ pub fn pick_best_show(query: &str, cands: &[ShowCand]) -> Option<ShowCand> {
     }
     let sims: Vec<f64> = cands
         .iter()
-        .map(|c| title_similarity(query, &c.name))
+        .map(|c| {
+            let mut best = title_similarity(query, &c.name);
+            for alias in &c.aliases {
+                best = best.max(title_similarity(query, alias));
+            }
+            best
+        })
         .collect();
     let top = sims.iter().copied().fold(-1.0f64, f64::max);
     if top < MATCH_MIN_SIMILARITY {

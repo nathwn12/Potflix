@@ -226,10 +226,20 @@ impl TenraiSource {
             if name.is_empty() {
                 continue;
             }
+            // Both spellings score: a romaji query must find the
+            // English-titled main series, not a romaji-named special.
+            let mut aliases = Vec::new();
+            for title in [&entry.title_english, &entry.title] {
+                let title = title.trim();
+                if !title.is_empty() {
+                    aliases.push(title.to_string());
+                }
+            }
             cands.push(ShowCand {
                 name,
                 weight: entry.members.unwrap_or(0),
                 episode_count: entry.episodes.unwrap_or(0),
+                aliases,
             });
             years.push(entry.year.unwrap_or(0));
             entries.push(entry);

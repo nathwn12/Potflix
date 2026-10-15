@@ -7378,7 +7378,11 @@ mod tests {
         metadata::cache::cache_put_raw(
             &meta_s,
             key,
-            br#"{"key":"movie|alpha|2001","schema":3,"media":{"title":"Alpha"}}"#,
+            format!(
+                "{{\"key\":\"movie|alpha|2001\",\"schema\":{},\"media\":{{\"title\":\"Alpha\"}}}}",
+                metadata::cache::CACHE_SCHEMA
+            )
+            .as_bytes(),
         )
         .unwrap();
         let idx = base.join("scanindex.json");
@@ -7730,11 +7734,15 @@ mod tests {
         assert_eq!(metadata::cache::count_negatives(&dir), 0);
         for i in 0..2 {
             let body = format!(
-                r#"{{"key":"k{i}","schema":3,"not_found":true,"checked_at":"2026-01-01T00:00:00Z"}}"#
+                r#"{{"key":"k{i}","schema":{},"not_found":true,"checked_at":"2026-01-01T00:00:00Z"}}"#,
+                metadata::cache::cache_schema()
             );
             metadata::cache::cache_put_raw(&dir, &format!("k{i}"), body.as_bytes()).unwrap();
         }
-        let pos = r#"{"key":"p","schema":3,"media":{"source":"tvmaze","sourceId":"1","kind":"series","title":"S","fetchedAt":"2026-01-01T00:00:00Z"}}"#;
+        let pos = format!(
+            r#"{{"key":"p","schema":{},"media":{{"source":"tvmaze","sourceId":"1","kind":"series","title":"S","fetchedAt":"2026-01-01T00:00:00Z"}}}}"#,
+            metadata::cache::cache_schema()
+        );
         metadata::cache::cache_put_raw(&dir, "p", pos.as_bytes()).unwrap();
         assert_eq!(metadata::cache::count_negatives(&dir), 2);
         assert_eq!(
