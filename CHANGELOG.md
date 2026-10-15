@@ -142,6 +142,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stale cached resolutions no longer survive a matching change: the metadata
+  cache schema bumped to 4 (the alias-aware anime matching / English-first
+  display fix changed what keys should resolve to but kept serving pre-fix
+  positives, e.g. `Shingeki no Kyojin: Picture Drama` for the romaji AoT
+  query). Records written under an older schema are now a whole-record miss
+  and re-resolve on their own -- no cache deletion -- and the library scan
+  index (already gated on the same version) re-scans instead of skipping.
 - Wikipedia disambiguation suffixes no longer reach the card: a page title
   like `Ready Player One (film)` / `Dune (2021 film)` / `Backrooms (film)` is
   stored and shown as the bare title (`Ready Player One`), so the movie line
