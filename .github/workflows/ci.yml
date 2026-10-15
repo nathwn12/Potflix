@@ -1,24 +1,18 @@
-# nathwn12 house CI — stack: go (copy to .github/workflows/ci.yml)
+# nathwn12 house CI — stack: rust (copy to .github/workflows/ci.yml)
+# NOTE: `on:` is held at `workflow_dispatch` only per the owner's standing
+# directive stopping GitHub Actions estate-wide (2026-10-12); jobs and steps
+# are byte-identical to the house rust template except `working-directory: rust`
+# on the cargo steps (the workspace manifest lives in `rust/`).
 name: ci
 on:
   workflow_dispatch:
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.27"
-      - name: Vet
-        working-directory: go
-        run: go vet ./...
-      - name: Test
-        working-directory: go
-        run: go test ./... -count=1
-      - name: Build
-        working-directory: go
-        run: go build ./...
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --locked
+        working-directory: rust
+      - run: cargo test --locked
+        working-directory: rust
