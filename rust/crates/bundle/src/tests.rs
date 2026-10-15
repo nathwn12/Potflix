@@ -78,12 +78,14 @@ fn raw_value(media: &str) -> Option<Box<RawValue>> {
     Some(RawValue::from_string(media.to_string()).expect("valid raw media"))
 }
 
-/// Stores one live cache entry the way the resolver does.
+/// Stores one live cache entry the way the resolver does: stamped fresh, so it
+/// holds a full positive-TTL window.
 fn seed_live_entry(dir: &str, key: &str, schema: i32, media: &str) {
     let rec = CacheRecord {
         key: key.to_string(),
         schema,
         media: raw_value(media),
+        checked_at: metadata::timefmt::now_rfc3339(),
     };
     let payload = serde_json::to_vec(&rec).expect("marshal live seed");
     cache::cache_put_raw(dir, key, &payload).expect("seed live entry");
@@ -96,6 +98,7 @@ fn seed_cache_file(dir: &str, key: &str, schema: i32, media: &str) -> String {
         key: key.to_string(),
         schema,
         media: raw_value(media),
+        checked_at: metadata::timefmt::now_rfc3339(),
     };
     let data = serde_json::to_vec(&rec).expect("marshal seed");
     std::fs::write(Path::new(dir).join(&name), data).expect("write seed");
@@ -343,6 +346,8 @@ fn TestBundleLegacyBundleFileStillImports() {
             key: key.to_string(),
             schema: TEST_SCHEMA,
             media: raw_value(media),
+            // Deliberately undated: proves a pre-TTL bundle still imports.
+            checked_at: String::new(),
         }],
     };
     let mut raw = serde_json::to_vec_pretty(&legacy).unwrap();
@@ -365,7 +370,10 @@ fn TestBundleLegacyBundleFileStillImports() {
         (1, 1, 0, 0, 0),
         "Import stats = {st:?}"
     );
-    assert!(cache::cache_live(&dst.s(), key));
+    // A pre-TTL bundle carries no freshness stamp, so the imported record is
+    // stored byte-identical but STALE: the next lookup re-fetches it rather
+    // than serving undated data indefinitely.
+    assert!(!cache::cache_live(&dst.s(), key));
     let got = live_value(&dst.s(), key).expect("legacy-bundle entry missing");
     let rec: CacheRecord = serde_json::from_slice(&got).unwrap();
     assert_eq!(rec.key, key);
@@ -422,6 +430,7 @@ fn TestBundleSchemaMismatch() {
         key: "movie|stale|2001".to_string(),
         schema: TEST_SCHEMA + 1,
         media: raw_value(r#"{"title":"Stale"}"#),
+        checked_at: String::new(),
     }]);
     let mut reader = Cursor::new(data);
     let st = import(&dir.s(), &mut reader, TEST_SCHEMA).unwrap();
@@ -452,18 +461,21 @@ fn TestBundleInvalidEntries() {
             key: "evil".to_string(),
             schema: TEST_SCHEMA,
             media: raw_value(raw),
+            checked_at: String::new(),
         },
         Entry {
             file: "not-a-cache-name.json".to_string(),
             key: "k2".to_string(),
             schema: TEST_SCHEMA,
             media: raw_value(raw),
+            checked_at: String::new(),
         },
         Entry {
             file: cache_name_for("k3"),
             key: String::new(),
             schema: TEST_SCHEMA,
             media: raw_value(raw),
+            checked_at: String::new(),
         },
     ]);
     let mut reader = Cursor::new(data);
@@ -632,6 +644,7 @@ fn TestBundleImportNoReplace() {
         key: key.to_string(),
         schema: TEST_SCHEMA,
         media: raw_value(r#"{"source":"tvmaze","title":"BUNDLE"}"#),
+        checked_at: String::new(),
     }]);
     let mut reader = Cursor::new(data);
     let st = import(&dir.s(), &mut reader, TEST_SCHEMA).unwrap();
@@ -725,6 +738,7 @@ fn TestBundleReparsePointDirRefused() {
         key: "movie|new|2002".to_string(),
         schema: TEST_SCHEMA,
         media: raw_value(r#"{"title":"New"}"#),
+        checked_at: String::new(),
     }]);
     let mut reader = Cursor::new(data);
     let err = import(&s(&link), &mut reader, TEST_SCHEMA).unwrap_err();
@@ -786,6 +800,7 @@ fn TestBundleEmptyDirRefused() {
         key: "k".to_string(),
         schema: TEST_SCHEMA,
         media: raw_value("{}"),
+        checked_at: String::new(),
     }]);
     let mut reader = Cursor::new(data);
     assert!(import("", &mut reader, TEST_SCHEMA).is_err());

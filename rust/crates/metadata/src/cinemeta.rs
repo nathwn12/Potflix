@@ -12,8 +12,11 @@
 //!   low-confidence best returns a definitive MISS rather than a wrong movie
 //!   (the iTunes leg it replaces returned the first `feature-movie` row with
 //!   no title check at all);
-//! * a known query year that disagrees with the pick's `releaseInfo` year is
-//!   also a definitive miss -- no meta fetch, no wrong-movie cache entry.
+//! * year NEVER rejects: a known query year only PREFERS, at equal title
+//!   strength, the candidate carrying it (any challenger fully covering the
+//!   query title, not just a duplicate exact one) and otherwise rides along
+//!   as a display field. A missing year, or a year that disagrees with the
+//!   filename, never skips a provider holding the essentials.
 //!
 //! An `Absolute` series query renumbers the episode table positionally in
 //! `(season, number)` air order, exactly as TVmaze does, so the resolver's
@@ -186,8 +189,10 @@ fn build_episode(video: &CinemetaVideo, season: i32, number: i32) -> Episode {
 
 impl CinemetaSource {
     /// One validated catalog pick for `catalog` (`"movie"` or `"series"`):
-    /// the title-ranked best whose `releaseInfo` year agrees with a known
-    /// query year. `Ok(None)` is a definitive miss.
+    /// the title-ranked best, with a known query year preferring any
+    /// challenger that both carries it and fully covers the query title.
+    /// `Ok(None)` is a definitive miss. Year never gates beyond that soft
+    /// preference.
     fn pick(
         &self,
         cancel: &Cancel,
@@ -225,40 +230,26 @@ impl CinemetaSource {
             // Low-confidence best: a wrong title is worse than no title.
             return Ok(None);
         };
-        let mut picked = None;
-        // A known query year disambiguates duplicate exact titles first (the
-        // live catalog carries two string-exact "Inception" rows): an exact
-        // title with the right year outranks an earlier exact without one.
-        if q.year > 0 {
-            for entry in &entries {
-                if entry.name.trim().eq_ignore_ascii_case(q.title.trim())
-                    && release_year(&entry.release_info) == q.year
-                {
-                    picked = Some(entry.clone());
-                    break;
-                }
+        let mut winner_idx = None;
+        for (i, cand) in cands.iter().enumerate() {
+            if *cand == winner {
+                winner_idx = Some(i);
+                break;
             }
         }
-        if picked.is_none() {
-            for (i, cand) in cands.iter().enumerate() {
-                if *cand == winner {
-                    picked = Some(entries[i].clone());
-                    break;
-                }
-            }
-        }
-        let Some(picked) = picked else {
+        let Some(winner_idx) = winner_idx else {
             return Ok(None);
         };
-        // A known query year that disagrees with the pick is a definitive
-        // miss: never fetch (and never cache) the wrong movie.
-        if q.year > 0 {
-            let year = release_year(&picked.release_info);
-            if year > 0 && year != q.year {
-                return Ok(None);
-            }
-        }
-        Ok(Some(picked))
+        // A known query year prefers any challenger that both carries it and
+        // fully covers the query title (the live catalog ranks the 2015
+        // "Dragon Ball Super" above the 2026 "Dragon Ball Super: Beerus" on
+        // title alone). Soft only: no year match keeps the title winner.
+        let years: Vec<i32> = entries
+            .iter()
+            .map(|entry| release_year(&entry.release_info))
+            .collect();
+        let take = crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+        Ok(Some(entries[take].clone()))
     }
 
     /// The `/meta` details for a validated catalog pick.
@@ -297,11 +288,6 @@ impl CinemetaSource {
         if year == 0 {
             year = release_year(&picked.release_info);
         }
-        // The meta year gets the same veto as the catalog year: an id-keyed
-        // fetch that disagrees with a known query year is a miss, not a card.
-        if q.year > 0 && year > 0 && year != q.year {
-            return Ok(None);
-        }
         Ok(Some(Media {
             source: "cinemeta".to_string(),
             source_id: picked.id.trim().to_string(),
@@ -335,11 +321,6 @@ impl CinemetaSource {
         let mut year = release_year(&details.year);
         if year == 0 {
             year = release_year(&picked.release_info);
-        }
-        // The meta year gets the same veto as the catalog year: an id-keyed
-        // fetch that disagrees with a known query year is a miss, not a card.
-        if q.year > 0 && year > 0 && year != q.year {
-            return Ok(None);
         }
         let mut episodes: Vec<Episode> = Vec::with_capacity(details.videos.len());
         for video in &details.videos {

@@ -30,8 +30,11 @@ use crate::serdeutil::null_default;
 pub const ANILIST_DEFAULT_BASE: &str = "https://graphql.anilist.co";
 
 /// `anilistQuery`, verbatim: `type: ANIME` is inline, so no `media` filter is
-/// needed and the server-side default ranking is the only ranking.
-pub const ANILIST_QUERY: &str = "query ($search:String){Media(search:$search,type:ANIME){id idMal title{romaji english} season seasonYear episodes genres duration siteUrl description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}";
+/// needed. A `Page` of candidates is ranked locally (`pick_best_show` plus a
+/// soft year preference): a singular `Media(search:)` hands back only the
+/// server's top pick, which for `dragon ball super` is the 2015 series while
+/// the 2026 `Dragon Ball Super: Beerus` release never surfaces.
+pub const ANILIST_QUERY: &str = "query ($search:String){Page(perPage:10){media(search:$search,type:ANIME){id idMal title{romaji english} season seasonYear episodes genres duration siteUrl description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}}";
 
 /// `anilistSource`.
 pub struct AnilistSource {
@@ -120,9 +123,15 @@ struct AnilistMedia {
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
+struct AnilistPage {
+    #[serde(default, deserialize_with = "null_default")]
+    media: Vec<AnilistMedia>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
 struct AnilistData {
-    #[serde(rename = "Media", default)]
-    media: Option<AnilistMedia>,
+    #[serde(rename = "Page", default)]
+    page: Option<AnilistPage>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -250,8 +259,11 @@ impl crate::resolver::Source for AnilistSource {
         "anilist"
     }
 
-    /// `Find`: the keyless GraphQL endpoint, absolute episodes built from
-    /// `streamingEpisodes`, sorted by Number for deterministic ordering.
+    /// `Find`: the keyless GraphQL endpoint, candidates ranked locally by
+    /// title with a soft year preference, absolute episodes built from
+    /// `streamingEpisodes`, sorted by Number for deterministic ordering. A
+    /// low-confidence best is a definitive MISS, never a wrong show; year
+    /// never gates, it only swaps one complete answer for another.
     fn find(&self, cancel: &Cancel, q: &Query) -> Result<Option<Media>, Error> {
         if q.kind == Kind::MOVIE || q.title.is_empty() {
             return Ok(None);
@@ -262,12 +274,51 @@ impl crate::resolver::Source for AnilistSource {
         });
         let response = self.client.post_json(cancel, self.base_url(), &payload)?;
         let parsed: AnilistResp = decode_capped(response)?;
-        let Some(media) = parsed.data.and_then(|data| data.media) else {
-            return Ok(None);
-        };
-        if media.id == 0 {
+        let items = parsed.data.and_then(|data| data.page).map(|page| page.media).unwrap_or_default();
+        // Title identity check: no candidates is a definitive miss (a film
+        // query such as `inception` must return `Ok(None)`, not a wrong anime).
+        let mut cands: Vec<metadata_core::match_::ShowCand> = Vec::with_capacity(items.len());
+        let mut entries: Vec<AnilistMedia> = Vec::with_capacity(items.len());
+        let mut years: Vec<i32> = Vec::with_capacity(items.len());
+        for media in items {
+            if media.id == 0 {
+                continue;
+            }
+            let mut name = media.title.english.trim().to_string();
+            if name.is_empty() {
+                name = media.title.romaji.trim().to_string();
+            }
+            if name.is_empty() {
+                continue;
+            }
+            cands.push(metadata_core::match_::ShowCand {
+                name,
+                weight: 0,
+                episode_count: 0,
+            });
+            years.push(media.season_year.unwrap_or(0));
+            entries.push(media);
+        }
+        if cands.is_empty() {
             return Ok(None);
         }
+        let Some(winner) = metadata_core::match_::pick_best_show(&q.title, &cands) else {
+            return Ok(None);
+        };
+        let mut winner_idx = None;
+        for (i, cand) in cands.iter().enumerate() {
+            if *cand == winner {
+                winner_idx = Some(i);
+                break;
+            }
+        }
+        let Some(winner_idx) = winner_idx else {
+            return Ok(None);
+        };
+        // Soft year preference only: no year match keeps the title winner.
+        let take =
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+        let media = &entries[take];
         let mut title = media.title.english.trim().to_string();
         if title.is_empty() {
             title = media.title.romaji.trim().to_string();

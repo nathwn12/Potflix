@@ -286,3 +286,61 @@ fn tvmaze_enrichment_carries_genres_length_and_urls() {
         );
     }
 }
+
+/// DBS 2026 regression (measured 2026-10-15): TVmaze ranks id2368 (2015)
+/// first for `dragon ball super`, but a 2026 query must land on id93969.
+#[test]
+fn tvmaze_year_prefers_beerus_over_2015_series() {
+    let server = FakeServer::start(|req: &Request| match req.path.as_str() {
+        "/search/shows" => Response::json(
+            r#"[{"score":0.9,"show":{"id":2368,"name":"Dragon Ball Super","premiered":"2015-07-05","weight":99}},{"score":0.85,"show":{"id":93969,"name":"Dragon Ball Super: Beerus","premiered":"2026-10-11","weight":50}}]"#,
+        ),
+        "/shows/93969/episodes" => {
+            Response::json(r#"[{"id":1,"name":"Beerus Appears","season":1,"number":1}]"#)
+        }
+        _ => Response::error(404, "not found"),
+    });
+    let source = TvmazeSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "dragon ball super".to_string(),
+                year: 2026,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("the 2026 query must answer, got nil");
+    assert_eq!(media.source_id, "93969", "media = {media:?}");
+    assert_eq!(media.title, "Dragon Ball Super: Beerus");
+    assert_eq!(media.year, 2026);
+}
+
+/// TVmaze rejection (measured 2026-10-15): a shows-only search returns fuzzy
+/// rows and zero exact matches for films -- `inception` must miss, not become
+/// `Deception`. The query year even matches Deception's, proving no year can
+/// rescue a title miss; only the title check can.
+#[test]
+fn tvmaze_rejects_fuzzy_film_match_despite_year() {
+    let server = FakeServer::start(|req: &Request| match req.path.as_str() {
+        "/search/shows" => Response::json(
+            r#"[{"score":0.9,"show":{"id":1,"name":"Deception","premiered":"2012-01-01","weight":99}},{"score":0.8,"show":{"id":2,"name":"Martin Garrix Show","premiered":"2017-01-01","weight":80}},{"score":0.7,"show":{"id":3,"name":"Perception","premiered":"2012-07-09","weight":70}}]"#,
+        ),
+        _ => Response::error(404, "not found"),
+    });
+    let source = TvmazeSource::new(server.url(), http_client());
+    let found = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Inception".to_string(),
+                year: 2012,
+                ..Query::default()
+            },
+        )
+        .expect("Find");
+    assert!(found.is_none(), "fuzzy inception must miss, got {found:?}");
+}

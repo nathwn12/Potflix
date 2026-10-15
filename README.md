@@ -192,6 +192,87 @@ re-verified live against PotPlayer or Discord on the Rust app, and no CI runs th
   running.` and exits 0), capped rotating debug log beside the exe,
   `--selftest` proves the headless wiring with no live PotPlayer or Discord.
 
+## Intent and limitations
+
+Potflix is a local Windows tray app: whatever is currently playing in
+PotPlayer shows as a Discord Rich Presence card. That is the whole job, and
+the stance is deliberate:
+
+- **Keyless.** No API keys, no accounts, no tokens, no telemetry, no server
+  component — nothing that can leak and nothing to rotate.
+- **Personal scale.** One title at a time, cached under
+  `%LOCALAPPDATA%\Potflix\meta`, tolerant of being offline (a title with no
+  cached answer shows its clean filename).
+
+The limits below follow from that stance. Each carries its reason inline: a
+limit with no reason reads like an unfixed bug; with its reason it reads as
+the choice it is.
+
+| Limitation | Why |
+|---|---|
+| Metadata comes from free public sources; some titles are incomplete or missing | Keyless is the constraint. Keyed providers (TMDB, TheTVDB, Trakt) would answer better, but each needs a credential to ship — and a hardcoded credential in a public repo is a leak. |
+| Requests are spaced conservatively per host, so a first lookup can be slower than a keyed client | Each service publishes a rate limit; the app stays under it and accepts the latency rather than getting throttled or timed out. Correctness over tightness. Intervals below. |
+| A genuine miss is bounded in time rather than walking every source at full timeout | An unknown file — a personal video — should settle quickly instead of hanging the card. |
+| Metadata is cached for 30 days — misses too (`rust\crates\metadata\src\cache.rs:47,53`) | It is a cache, not a store: a stale answer is re-fetched rather than kept forever. |
+| Anime per-episode season is not available | No keyless source carries it: AniList episodes are numbered continuously and the port fixes their season to 0 (`rust\crates\metadata\src\anilist.rs:289-290`). |
+| The card shows series artwork, never an episode still | One card, one recognisable poster — stills never override (`rust\crates\metadata\src\resolver.rs:817-819`). |
+| A file with no episode or season tag is treated as a movie | Title-only classification is all a filename gives; an anime movie or a TV special therefore takes the movie chain, which still resolves it. |
+| Artwork falls back to the app logo when no source has a poster | A deliberate mark beats a broken image. |
+| Bangumi answers only what a romaji query can title-validate: entries whose validated pick is the native-script `name` still match, but a native-only name no romaji query resembles is a miss, not a wrong card (`rust\crates\metadata\src\bangumi.rs:116-122,174-177`) | A wrong title is worse than no title — the pick returns a definitive miss rather than a wrong show. |
+| Year is a preference, never a veto: a query whose year matches nothing still returns the best title match (`rust\crates\metadata\src\bangumi.rs:188-191`, `rust\crates\metadata\src\yearpref.rs`) | A year mismatch is a filename quirk, not a wrong title — rejecting on it would drop a complete answer for a nice-to-have. |
+| Some providers are unofficial or undocumented (JustWatch's GraphQL, Episodate, LiveChart.me, ANN) and may change without notice (`rust\crates\metadata-http\src\ratelimit.rs:52-71`) | Keyless is the constraint: no keys, no registration — so the chain leans on whatever free endpoint answers, and an endpoint that moves breaks its leg until the code follows. |
+
+The source chain, per media kind (`rust\crates\metadata\src\resolver.rs:287-302`):
+
+- **Movie (3 legs):** Cinemeta (general catalog), then Wikipedia (encyclopedic fallback), then JustWatch (title search, `MOVIE` filter only — `rust\crates\metadata\src\justwatch.rs:151-154`).
+- **Series (9 legs):** TVmaze (TV), AniList (anime), Tenrai (anime), Kitsu (anime), Cinemeta (general fallback), Episodate (TV), Bangumi (anime/live action), LiveChart.me (anime), ANN (anime).
+
+Episodate, Bangumi, LiveChart.me and ANN answer series only and self-gate movies before touching the wire (`episodate.rs:202`, `bangumi.rs:205`, `livechart.rs:187`, `ann.rs:340`); JustWatch answers both kinds but only the movie leg is walked for movies.
+
+Every one is keyless and none requires an account.
+
+What wins when sources disagree — completeness first, year last:
+
+| Preference | Why |
+|---|---|
+| A complete answer beats a title-only one: the card renders cover, title, episode, synopsis (and length) (`rust\crates\presence\src\lib.rs:558-572`), and a movie answer only settles the lookup once it carries a synopsis (`rust\crates\metadata\src\resolver.rs:773-787`) | A Breaking Bad with a legit title + episode + length + synopsis is the whole card; a bare title leaves its lines empty. |
+| Year only breaks ties, never rejects: a known year disambiguates duplicate exact titles and otherwise rides along as display (`rust\crates\metadata\src\cinemeta.rs:15-19`); year never gates the chain (`rust\crates\metadata\src\resolver.rs:20-26`) | A year mismatch is a filename quirk, not a wrong title — rejecting on it would drop a complete answer for a nice-to-have. |
+| Completeness beats order: an episode match with no synopsis is kept as the fallback while the walk continues, so a later source carrying the episode *and* the synopsis wins (`rust\crates\metadata\src\resolver.rs:744-753,789-805`) | First answer is not best answer; the card is only as good as the synopsis line it prints. |
+
+Per-host request spacing at the default Turbo profile
+(`rust\crates\metadata-http\src\ratelimit.rs:30-51`; Balanced doubles and
+Gentle quadruples these, `ratelimit.rs:110-124`):
+
+| Host | Spacing |
+|---|---|
+| `api.tvmaze.com` | 500 ms (`ratelimit.rs:31`) |
+| `graphql.anilist.co` | 2000 ms (`ratelimit.rs:32`) — the documented degraded 30/min figure, held until the docs say otherwise; if this number looks mid-flight, the posture at `ratelimit.rs:23-29` is the authority, not the figure |
+| `api.tenrai.org` | 500 ms (`ratelimit.rs:46`) |
+| `kitsu.io` | 1000 ms (`ratelimit.rs:50`) |
+| `v3-cinemeta.strem.io` | 1000 ms (`ratelimit.rs:44`) |
+| `en.wikipedia.org` | 1000 ms (`ratelimit.rs:41`) |
+| `apis.justwatch.com` | 2000 ms (`ratelimit.rs:55`) |
+| `www.episodate.com` | 2000 ms (`ratelimit.rs:59`) |
+| `api.bgm.tv` | 2000 ms (`ratelimit.rs:63`) |
+| `www.livechart.me` | 2000 ms (`ratelimit.rs:67`) |
+| `cdn.animenewsnetwork.com` | 2000 ms (`ratelimit.rs:71`) |
+| `api.jikan.moe` | 350 ms (`ratelimit.rs:34`) |
+| `itunes.apple.com` | 3000 ms (`ratelimit.rs:35`) |
+
+The five new hosts sit at one request per 2 s deliberately: these are small
+or unofficial endpoints that publish no limit, so the app reads
+conservatively (`ratelimit.rs:52-71` — "conservative chosen reading, not a
+measured or published figure") and accepts the latency. A slow-but-working
+card beats a fast one that gets throttled: spacing is the price of staying
+unblocked on someone else's free service. The `jikan` and `itunes` rows are
+port fidelity to `ratelimit.go:17-30`, retained deliberately even though both
+providers are dead (Jikan discontinued 2026-10-01, iTunes leg replaced by
+Cinemeta) — an unknown host is ungated (`ratelimit.rs:14-16`), so dead rows
+cost nothing and the table stays a faithful port.
+
+For each source's licence, see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) —
+one authority, one place; the terms are not restated here.
+
 ## Install
 
 1. Needs: **PotPlayer** open and playing, **Discord** desktop open.

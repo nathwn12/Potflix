@@ -222,8 +222,8 @@ fn card_spec_default_golden_independent() {
         d == "Pilot" && s == "S1 E2",
         "series render = ({d:?}, {s:?}), want (\"Pilot\", \"S1 E2\")"
     );
-    // Movie with canonical override: details is "Title (Year)", state joins
-    // genres/length/synopsis with " . ".
+    // Movie with canonical override: details is "Title (Year)", state is
+    // genres/length joined (the synopsis lives in the tooltip now).
     let (d, s) = def.render(
         "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
         run_action(12345, 1000).as_ref(),
@@ -238,7 +238,7 @@ fn card_spec_default_golden_independent() {
         },
     );
     assert!(
-        d == "Dune: Part Two (2024)" && s == "Sci-Fi \u{b7} 2h 46m \u{b7} Paul unites the Fremen",
+        d == "Dune: Part Two (2024)" && s == "Sci-Fi \u{b7} 2h 46m",
         "movie render = ({d:?}, {s:?}), want goldens"
     );
     // Idle card keeps its shipped lines.
@@ -431,7 +431,7 @@ fn card_spec_kind_adapt() {
             res: movie.clone(),
             spec: default_card_spec(),
             want_d: "Dune: Part Two (2024)",
-            want_s: mid("Sci-Fi", "2h 46m") + MID + "Paul unites the Fremen",
+            want_s: mid("Sci-Fi", "2h 46m"),
         },
         Case {
             name: "movie episode keeps base",
@@ -442,7 +442,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_DEFAULT.to_string(),
             },
             want_d: "Dune: Part Two (2024)",
-            want_s: mid("Sci-Fi", "2h 46m") + MID + "Paul unites the Fremen",
+            want_s: mid("Sci-Fi", "2h 46m"),
         },
         Case {
             name: "movie series appends year",
@@ -453,7 +453,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_DEFAULT.to_string(),
             },
             want_d: "Dune: Part Two (2024)",
-            want_s: mid("Sci-Fi", "2h 46m") + MID + "Paul unites the Fremen",
+            want_s: mid("Sci-Fi", "2h 46m"),
         },
         Case {
             name: "movie title drops year",
@@ -483,7 +483,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_SYNOPSIS.to_string(),
             },
             want_d: "Dune: Part Two (2024)",
-            want_s: "Paul unites the Fremen".to_string(),
+            want_s: mid("Sci-Fi", "2h 46m") + MID + "Paul unites the Fremen",
         },
         Case {
             name: "series default",
@@ -491,7 +491,7 @@ fn card_spec_kind_adapt() {
             res: series.clone(),
             spec: default_card_spec(),
             want_d: "Canonical Episode",
-            want_s: mid("S1 E2", "A brave synopsis"),
+            want_s: "S1 E2".to_string(),
         },
         Case {
             name: "series episode",
@@ -513,7 +513,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_SYNOPSIS.to_string(),
             },
             want_d: "Canonical Series",
-            want_s: "A brave synopsis".to_string(),
+            want_s: mid("S1 E2", "A brave synopsis"),
         },
         Case {
             name: "anime default is series branch",
@@ -521,7 +521,7 @@ fn card_spec_kind_adapt() {
             res: anime.clone(),
             spec: default_card_spec(),
             want_d: "The Hero's Rest",
-            want_s: mid("S1 E1", "An elf mourns"),
+            want_s: "S1 E1".to_string(),
         },
         Case {
             name: "anime series ignores year",
@@ -543,7 +543,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_SYNOPSIS.to_string(),
             },
             want_d: "Frieren",
-            want_s: "An elf mourns".to_string(),
+            want_s: mid("S1 E1", "An elf mourns"),
         },
     ];
     for c in &cases {
@@ -787,4 +787,162 @@ fn card_spec_serde_matches_go_omitempty() {
     let parsed: CardSpec = serde_json::from_str("{}").unwrap();
     assert_eq!(parsed, CardSpec::default(), "an empty object loads zero");
     assert!(parsed.is_default(), "and normalizes to the default");
+}
+
+/// S3: the default state never duplicates the tooltip synopsis. Drives the
+/// real builder for a movie and a series: the state line carries no synopsis
+/// text while large_text does, and the default spec agrees byte-for-byte.
+#[test]
+fn default_state_carries_no_synopsis() {
+    let run = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let movie = Resolved {
+        series: "Dune: Part Two".to_string(),
+        year: 2024,
+        is_movie: true,
+        genres: "Sci-Fi".to_string(),
+        length: "2h 46m".to_string(),
+        synopsis: "Paul unites the Fremen".to_string(),
+        ..Resolved::default()
+    };
+    let got = build_activity_resolved(
+        "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
+        Some(&run),
+        &movie,
+    );
+    assert_eq!(got.state, "Sci-Fi \u{b7} 2h 46m", "movie state");
+    assert!(
+        !got.state.contains("Paul unites the Fremen"),
+        "movie state duplicates the synopsis: {:?}",
+        got.state
+    );
+    assert_eq!(
+        got.large_text, "Paul unites the Fremen",
+        "movie tooltip must still carry the synopsis"
+    );
+    let (d, s) = default_card_spec().render(
+        "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
+        Some(&run),
+        &movie,
+    );
+    assert_eq!(
+        (d.as_str(), s.as_str()),
+        (got.details.as_str(), got.state.as_str()),
+        "default spec must agree with the builder"
+    );
+    let series = Resolved {
+        series: "Canonical Series".to_string(),
+        episode_name: "Canonical Episode".to_string(),
+        synopsis: "A brave synopsis".to_string(),
+        ..Resolved::default()
+    };
+    let got = build_activity_resolved(
+        "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+        Some(&run),
+        &series,
+    );
+    assert_eq!(got.state, "S1 E2", "series state");
+    assert!(
+        !got.state.contains("A brave synopsis"),
+        "series state duplicates the synopsis: {:?}",
+        got.state
+    );
+    assert_eq!(
+        got.large_text, "A brave synopsis",
+        "series tooltip must still carry the synopsis"
+    );
+    let (d, s) = default_card_spec().render(
+        "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+        Some(&run),
+        &series,
+    );
+    assert_eq!(
+        (d.as_str(), s.as_str()),
+        (got.details.as_str(), got.state.as_str()),
+        "default spec must agree with the builder"
+    );
+}
+
+/// S3: the opt-in SYNOPSIS preset keeps the old synopsis-bearing line shapes --
+/// clause cuts end on the word with the ellipsis terminator, long lines end at
+/// a word boundary, all within the 128-unit ceiling.
+#[test]
+fn synopsis_preset_keeps_old_line_shapes() {
+    let run = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let syn_spec = CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
+    // Comma cut (the live `...Majin Buu,` shape).
+    let syn = "Years after the battle with Earth's greatest enemy, Majin Buu, the world faces a new threat from beyond the stars and more";
+    let (_, s) = syn_spec.render(
+        "Dragon.Ball.Movie.1990.1080p.mkv - PotPlayer",
+        Some(&run),
+        &Resolved {
+            series: "Dragon Ball".to_string(),
+            year: 1990,
+            is_movie: true,
+            synopsis: syn.to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(
+        s,
+        "Years after the battle with Earth's greatest enemy, Majin Buu\u{2026}",
+        "comma-cut preset state"
+    );
+    // Semicolon cut (the live `...meet Elliot;` shape).
+    let syn = "Allsafe is controlled; the Dark Army is ready to meet Elliot; the fsociety plan falls apart at midnight somehow";
+    let (_, s) = syn_spec.render(
+        "Show.S02E04.Episode.1080p.mkv - PotPlayer",
+        Some(&run),
+        &Resolved {
+            series: "Show".to_string(),
+            synopsis: syn.to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(
+        s,
+        "S2 E4 \u{b7} Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}",
+        "semicolon-cut preset state"
+    );
+    // Long movie line ends on a whole word with the terminator.
+    let (_, s) = syn_spec.render(
+        "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
+        Some(&run),
+        &Resolved {
+            series: "Dune".to_string(),
+            is_movie: true,
+            genres: "Adventure".to_string(),
+            length: "2h 46m".to_string(),
+            synopsis: format!("{}finale", "epic ".repeat(40)),
+            ..Resolved::default()
+        },
+    );
+    assert!(
+        s.ends_with('\u{2026}'),
+        "long preset state = {s:?}, want trailing ellipsis"
+    );
+    let n = s.encode_utf16().count();
+    assert!(
+        n <= 128,
+        "long preset state length {n} exceeds 128: {s:?}"
+    );
+    let body = s.trim_end_matches('\u{2026}');
+    assert!(
+        body.ends_with("epic") || body.ends_with("finale"),
+        "long preset state ends mid-word: {s:?}"
+    );
 }
