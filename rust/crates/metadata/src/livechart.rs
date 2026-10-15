@@ -127,6 +127,7 @@ impl LivechartSource {
         let mut cands: Vec<ShowCand> = Vec::with_capacity(parsed.items.len());
         let mut entries: Vec<LivechartItem> = Vec::with_capacity(parsed.items.len());
         let mut years: Vec<i32> = Vec::with_capacity(parsed.items.len());
+        let mut complete: Vec<bool> = Vec::with_capacity(parsed.items.len());
         for item in parsed.items {
             if item.id == 0 {
                 continue;
@@ -150,6 +151,7 @@ impl LivechartSource {
                 aliases: Vec::new(),
             });
             years.push(date_year(&item.premiere_date));
+            complete.push(!item.synopsis.trim().is_empty());
             entries.push(item);
         }
         if cands.is_empty() {
@@ -171,7 +173,7 @@ impl LivechartSource {
         };
         // Soft year preference only: no year match keeps the title winner.
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_idx);
         Ok(Some(entries[take].clone()))
     }
 }
@@ -218,6 +220,8 @@ impl crate::resolver::Source for LivechartSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            // Single-title provider: identity is the display title alone.
+            aliases: Vec::new(),
         }))
     }
 }

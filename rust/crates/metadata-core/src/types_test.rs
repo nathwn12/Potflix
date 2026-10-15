@@ -145,6 +145,9 @@ fn every_optional_tag_verbatim() {
             length: "45 min".into(),
         }],
         fetched_at: "2026-01-01T00:00:00Z".into(),
+        // Empty aliases serialize to nothing (skip_serializing_if), so the
+        // byte-exact expectation below is unchanged by the field.
+        aliases: Vec::new(),
     };
     let encoded = serde_json::to_string(&media).expect("encode");
     // U+00B7 is written raw (UTF-8), not escaped, by both serde_json and Go.

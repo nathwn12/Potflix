@@ -302,3 +302,51 @@ fn kitsu_romaji_query_selects_main_series_with_english_title() {
     assert_eq!(ep.title, "To You, in 2000 Years", "episode = {ep:?}");
     assert_ne!(ep.title, "Day 5/Day 6/Day 7", "the special tell: {ep:?}");
 }
+
+/// DBZ Kai recall gap (live shape measured 2026-10-15: `filter[text]=DBZ Kai`
+/// returns `Dragon Ball Kai` (`4394`, 2009, 27567 users) before `Dragon Ball
+/// Kai (2014)` (`8351`, 2014), both carrying the `DBZ Kai` abbreviated title;
+/// AniList answers the same query with zero `streamingEpisodes`, so the chain
+/// can only survive through this leg). The short form must match through the
+/// provider's own abbreviations, and the 2014 year must select `8351`.
+#[test]
+fn kitsu_abbreviated_titles_match_short_form_queries() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path == "/anime" {
+            return Response::json(
+                r#"{"data":[
+                    {"id":"4394","attributes":{"slug":"dragon-ball-kai","canonicalTitle":"Dragon Ball Kai","titles":{"en":"Dragon Ball Z Kai","en_jp":"Dragon Ball Kai"},"abbreviatedTitles":["Dragonball Kai",null,"DBK","DB Kai","DBZ Kai"],"startDate":"2009-04-05","synopsis":"Goku defends the galaxy.","episodeLength":23,"episodeCount":97,"userCount":27567}},
+                    {"id":"8351","attributes":{"slug":"dragon-ball-kai-2014","canonicalTitle":"Dragon Ball Kai (2014)","titles":{"en":"Dragon Ball Z Kai: The Final Chapters","en_jp":"Dragon Ball Kai (2014)"},"abbreviatedTitles":["Dragonball Kai","DBK","DB Kai","DBZ Kai"],"startDate":"2014-04-06","synopsis":"The Majin Buu saga remastered.","episodeLength":23,"episodeCount":69,"userCount":13487}}
+                ]}"#,
+            );
+        }
+        if req.path == "/episodes" {
+            return Response::json(
+                r#"{"data":[{"attributes":{"canonicalTitle":"7 Years Since That Event!","seasonNumber":1,"number":1,"synopsis":"Gohan goes to high school.","length":24}}]}"#,
+            );
+        }
+        Response::error(404, "not found")
+    });
+    let source = KitsuSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "DBZ Kai".to_string(),
+                season: 1,
+                episode: 1,
+                year: 2014,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("the short form must answer through abbreviations, got nil");
+    assert_eq!(media.source_id, "8351", "the 2014 year must select the Final Chapters: {media:?}");
+    assert_eq!(media.year, 2014, "media = {media:?}");
+    assert_eq!(media.title, "Dragon Ball Z Kai: The Final Chapters", "abbreviations must never leak into display: {media:?}");
+    assert!(
+        media.episodes.iter().any(|episode| episode.season == 1 && episode.number == 1),
+        "S1E1 must be present: {media:?}"
+    );
+}

@@ -400,6 +400,7 @@ impl crate::resolver::Source for AnilistSource {
         let mut cands: Vec<metadata_core::match_::ShowCand> = Vec::with_capacity(items.len());
         let mut entries: Vec<AnilistMedia> = Vec::with_capacity(items.len());
         let mut years: Vec<i32> = Vec::with_capacity(items.len());
+        let mut complete: Vec<bool> = Vec::with_capacity(items.len());
         for media in items {
             if media.id == 0 {
                 continue;
@@ -415,6 +416,7 @@ impl crate::resolver::Source for AnilistSource {
                 aliases: match_aliases(&media.title.english, &media.synonyms, &media.title.romaji),
             });
             years.push(media.season_year.unwrap_or(0));
+            complete.push(!media.description.trim().is_empty());
             entries.push(media);
         }
         if cands.is_empty() {
@@ -458,7 +460,7 @@ impl crate::resolver::Source for AnilistSource {
             cand.aliases = titles;
         }
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &year_cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &year_cands, &years, &complete, winner_idx);
         let media = &entries[take];
         let title = canonical_title(&media.title.english, &media.title.romaji);
         if title.is_empty() {
@@ -507,6 +509,12 @@ impl crate::resolver::Source for AnilistSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            // Verified identity only: the canonical english + romaji titles.
+            // Synonyms stay out even when corroborated -- an arbitrary
+            // synonym must never establish chain-level identity (live
+            // `124756` carries a `"Monster"` synonym for the 2004 series
+            // `19`'s exact-titled query).
+            aliases: canonical_aliases(&media.title.english, &media.title.romaji),
         }))
     }
 }

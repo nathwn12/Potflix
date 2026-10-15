@@ -31,6 +31,7 @@ struct WikiFake {
     detail: String,
     images: String,
     imageinfo: String,
+    resolve: String,
     fail_mode: String,
 }
 
@@ -45,6 +46,7 @@ impl WikiFake {
             detail: String::new(),
             images: String::new(),
             imageinfo: String::new(),
+            resolve: String::new(),
             fail_mode: String::new(),
         }
     }
@@ -82,6 +84,7 @@ impl WikiFake {
         let detail = self.detail.clone();
         let images = self.images.clone();
         let imageinfo = self.imageinfo.clone();
+        let resolve = self.resolve.clone();
         let fail_mode = self.fail_mode.clone();
         FakeServer::start(move |req: &Request| {
             hits.fetch_add(1, Ordering::SeqCst);
@@ -125,6 +128,16 @@ impl WikiFake {
             }
             if fail_mode == "detail500" {
                 return Response::error(500, "boom");
+            }
+            // The redirect-resolution check runs after a page is picked and
+            // must never pollute the detail capture above.
+            if req.query("redirects").as_deref() == Some("1") {
+                let body: &str = if resolve.is_empty() {
+                    r#"{"query":{}}"#
+                } else {
+                    &resolve
+                };
+                return Response::json(body);
             }
             *detail_query.lock().unwrap() = req.raw_query.clone();
             Response::json(&detail)
@@ -177,7 +190,7 @@ fn wikipedia_hit() {
     );
     assert_eq!(media.source, "wikipedia");
     assert!(media.episodes.is_empty());
-    assert_eq!(fake.hits(), 2, "hits must be exactly search+detail");
+    assert_eq!(fake.hits(), 3, "hits must be exactly search+detail+redirect");
     assert!(
         fake.saw_ua().contains("Potflix"),
         "User-Agent = {:?}, want the Wikimedia policy identifier",
@@ -349,7 +362,7 @@ fn wikipedia_poster_from_image_list() {
     assert_eq!(media.title, "Dune");
     assert_eq!(media.year, 2021);
     assert!(!media.synopsis.is_empty());
-    assert_eq!(fake.hits(), 4, "search+detail+images+imageinfo");
+    assert_eq!(fake.hits(), 5, "search+detail+images+imageinfo+redirect");
 }
 
 /// `TestWikipediaPosterAbsentStillFound`: a poster-less image list keeps
@@ -372,7 +385,7 @@ fn wikipedia_poster_absent_still_found() {
     assert_eq!(media.title, "Dune");
     assert_eq!(media.year, 2021);
     assert!(!media.synopsis.is_empty());
-    assert_eq!(fake.hits(), 3, "search+detail+images, no imageinfo call");
+    assert_eq!(fake.hits(), 4, "search+detail+images+redirect, no imageinfo call");
 }
 
 /// `TestWikipediaNonPosterImageIgnored`: a non-poster image (a logo, a cast
@@ -394,7 +407,7 @@ fn wikipedia_non_poster_image_ignored() {
     assert_eq!(media.artwork, "", "a logo/cast photo must never substitute");
     assert_eq!(media.title, "Dune");
     assert!(!media.synopsis.is_empty());
-    assert_eq!(fake.hits(), 3, "no imageinfo call for a non-poster list");
+    assert_eq!(fake.hits(), 4, "search+detail+images+redirect, no imageinfo call for a non-poster list");
 }
 
 /// `TestWikipediaPosterFailureStillFound`: the fallback is best-effort -- a 500
@@ -689,8 +702,8 @@ fn wikipedia_page_image_original() {
     assert_eq!(media.artwork, want, "artwork must come from the page image");
     assert_eq!(
         fake.hits(),
-        2,
-        "search+detail: a page image needs no fallback"
+        3,
+        "search+detail+redirect: a page image needs no fallback"
     );
     let detail_query = fake.detail_query();
     assert!(
@@ -710,6 +723,69 @@ fn wikipedia_page_image_original() {
         .lookup_now(&Cancel::background(), &q)
         .expect("LookupNow");
     assert_eq!(res.artwork, want, "the record artwork must reach the card");
+}
+
+/// `TestWikipediaRedirectAlias`: a query Wikipedia itself redirects to the
+/// picked article is recorded as a verified alias (live `Kimi no Na wa` ->
+/// `Your Name`), so the chain's year gate reads it as identity and a wrong
+/// file year no longer destroys the match. A redirect landing anywhere else
+/// authorizes nothing.
+#[test]
+fn wikipedia_redirect_alias() {
+    const SEARCH: &str = r#"{"query":{"search":[{"title":"Your Name"}]}}"#;
+    const DETAIL: &str = r#"{"query":{"pages":{"49375437":{"pageid":49375437,"title":"Your Name","extract":"Your Name is a 2016 Japanese animated romantic fantasy film.","thumbnail":{"source":"https://upload.wikimedia.org/wikipedia/en/0/0b/Your_Name_poster.png"}}}}}"#;
+    const RESOLVE_MATCH: &str = r#"{"query":{"redirects":[{"from":"Kimi no Na wa","to":"Your Name"}],"pages":{"49375437":{"pageid":49375437,"title":"Your Name"}}}}"#;
+    const RESOLVE_ELSEWHERE: &str = r#"{"query":{"redirects":[{"from":"Kimi no Na wa","to":"Something Else"}],"pages":{"1":{"pageid":1,"title":"Something Else"}}}}"#;
+    let q = movie_query("Kimi no Na wa", 2015);
+
+    let fake = WikiFake {
+        search: SEARCH.to_string(),
+        detail: DETAIL.to_string(),
+        resolve: RESOLVE_MATCH.to_string(),
+        ..WikiFake::new()
+    };
+    let (server, source) = fake.source();
+    let media = source
+        .find(&Cancel::background(), &q)
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.title, "Your Name");
+    assert_eq!(media.year, 2016);
+    assert_eq!(
+        media.aliases,
+        vec!["Kimi no Na wa".to_string()],
+        "the redirect is a verified alias: {media:?}"
+    );
+
+    // The alias carries through the chain: a contradicted file year no
+    // longer destroys the correct title match.
+    let dir = TempDir::new();
+    let resolver = resolver_with_wiki(&dir.path(), server.url());
+    let res = resolver
+        .lookup_now(&Cancel::background(), &q)
+        .expect("LookupNow");
+    assert!(
+        res.found && res.series == "Your Name" && res.year == 2016,
+        "alias identity must survive the year gate, got {res:?}"
+    );
+
+    // A redirect to any other page authorizes nothing.
+    let fake = WikiFake {
+        search: SEARCH.to_string(),
+        detail: DETAIL.to_string(),
+        resolve: RESOLVE_ELSEWHERE.to_string(),
+        ..WikiFake::new()
+    };
+    let (_server, source) = fake.source();
+    let media = source
+        .find(&Cancel::background(), &q)
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.title, "Your Name");
+    assert!(
+        media.aliases.is_empty(),
+        "a redirect elsewhere is not identity: {media:?}"
+    );
 }
 
 /// `TestWikipediaImageListAsksForEveryFile`: `prop=images` asks for the whole

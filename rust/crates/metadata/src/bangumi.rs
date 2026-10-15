@@ -152,6 +152,7 @@ impl BangumiSource {
         let mut cands: Vec<ShowCand> = Vec::with_capacity(parsed.list.len());
         let mut entries: Vec<BangumiEntry> = Vec::with_capacity(parsed.list.len());
         let mut years: Vec<i32> = Vec::with_capacity(parsed.list.len());
+        let mut complete: Vec<bool> = Vec::with_capacity(parsed.list.len());
         for entry in parsed.list {
             if entry.id == 0 {
                 continue;
@@ -167,6 +168,7 @@ impl BangumiSource {
                 aliases: Vec::new(),
             });
             years.push(date_year(&entry.air_date));
+            complete.push(!entry.summary.trim().is_empty());
             entries.push(entry);
         }
         if cands.is_empty() {
@@ -188,7 +190,7 @@ impl BangumiSource {
         };
         // Soft year preference only: no year match keeps the title winner.
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_idx);
         Ok(Some(entries[take].clone()))
     }
 }
@@ -253,6 +255,8 @@ impl crate::resolver::Source for BangumiSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            // Single-title provider: identity is the display title alone.
+            aliases: Vec::new(),
         }))
     }
 }

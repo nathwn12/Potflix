@@ -366,6 +366,18 @@ fn date_year_reads_the_leading_four_bytes() {
     assert_eq!(date_year(""), 0);
 }
 
+/// Episodate serves `Apr/06/2012` (measured live 2026-10-15): no leading
+/// year, so the trailing bare four-digit token carries it. Clocks and counts
+/// stay yearless.
+#[test]
+fn date_year_reads_a_trailing_year_when_no_leading_year() {
+    assert_eq!(date_year("Apr/06/2012"), 2012);
+    assert_eq!(date_year("2016-04-04 13:30:00"), 2016);
+    assert_eq!(date_year("Season 2"), 0);
+    assert_eq!(date_year("13:30:00"), 0);
+    assert_eq!(date_year("Aug/24/2013"), 2013);
+}
+
 /// Addition: a direct negative control for the `\b` emulation. Go's `extraRe`
 /// is `\b(...)\b`, so an extras phrase embedded in a longer word is NOT an
 /// extra, while the same phrase standing alone is.

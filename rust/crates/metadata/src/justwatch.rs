@@ -173,6 +173,7 @@ impl JustWatchSource {
         let mut cands: Vec<ShowCand> = Vec::new();
         let mut entries: Vec<(JwNode, JwContent)> = Vec::new();
         let mut years: Vec<i32> = Vec::new();
+        let mut complete: Vec<bool> = Vec::new();
         let edges = parsed
             .data
             .and_then(|data| data.popular_titles)
@@ -197,6 +198,7 @@ impl JustWatchSource {
                 aliases: Vec::new(),
             });
             years.push(content.original_release_year.unwrap_or(0));
+            complete.push(!content.short_description.trim().is_empty());
             entries.push((node, content));
         }
         if cands.is_empty() {
@@ -218,7 +220,7 @@ impl JustWatchSource {
         };
         // Soft year preference only: no year match keeps the title winner.
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_idx);
         Ok(Some(entries[take].clone()))
     }
 }
@@ -267,6 +269,8 @@ impl crate::resolver::Source for JustWatchSource {
                 trailer_url: String::new(),
                 episodes: Vec::new(),
                 fetched_at: crate::timefmt::now_rfc3339(),
+                // Single-title provider: identity is the display title alone.
+                aliases: Vec::new(),
             }));
         }
         if object_type == "SHOW" {
@@ -286,6 +290,8 @@ impl crate::resolver::Source for JustWatchSource {
                 trailer_url: String::new(),
                 episodes: Vec::new(),
                 fetched_at: crate::timefmt::now_rfc3339(),
+                // Single-title provider: identity is the display title alone.
+                aliases: Vec::new(),
             }));
         }
         Ok(None)
