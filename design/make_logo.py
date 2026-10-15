@@ -753,7 +753,6 @@ PROTECTED = [
     "assets/appicon.png",
     "assets/appicon-square.png",
     "assets/icon.ico",
-    "go/assets/icon.ico",
 ]
 
 
@@ -972,7 +971,7 @@ def main():
     badges.update({("V3", k): v3[k] for k in v3})
     badges_variants_sheet(badges).save(P("design", "preview", "badges-variants.png"))
     print(
-        "protected-skip logo.png appicon.png appicon-square.png icon.ico go/assets/icon.ico"
+        "protected-skip logo.png appicon.png appicon-square.png icon.ico"
     )
 
     W, H = 1100, 340

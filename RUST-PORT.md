@@ -1,30 +1,28 @@
 # Potflix — Rust port notes
 
-Deep technical material for the Rust rewrite: crate layout, the parity
+Deep technical material for the Rust implementation: crate layout, the parity
 contract, verification, Windows-specific notes, dependencies, intent and
-limitations, and the deliberate deviations from the Java and Go references.
+limitations, and the deliberate deviations from the original Java flow carried
+over from the retired Go era.
 The user-facing manual is [README.md](./README.md).
 
 The behaviour in [README.md](./README.md) `## Features` is the app's
-**intended contract**, carried over from the Go reference and targeted by the
-Rust port. The Rust app builds and its headless self-test passes (see
+**intended contract**, carried over from the retired Go reference into the
+Rust implementation. The Rust app builds and its headless self-test passes (see
 **Verification**, below), but those gates prove wiring and the title cleaner
 only — they do not prove feature-level behaviour. The features were implemented
-for the frozen Go reference and are carried into the Rust port unchanged, so
+for the Go reference and are carried in the Rust port unchanged, so
 they are expected to behave as described, but they are not re-verified live
 against PotPlayer or Discord on the Rust app, and no CI runs them.
 
 ## Layout
 
 - `rust\` — the implementation: a Cargo workspace (`rust\Cargo.toml`) with one
-  member crate per Go package under `rust\crates\*`, plus `app`, which owns the
-  workspace's `potflix` tray binary. Cargo workspace, edition 2024.
-- `go\` — the frozen Go reference implementation (module `potflix`). Retired at
-  merge; not built by the Rust gate. See `go\README.md`.
-- `src\main\java\me\potflix\rpc\Main.java` — the frozen Java reference the title
-  cleaner was proven against.
+  member crate per package of the retired Go module under `rust\crates\*`,
+  plus `app`, which owns the workspace's `potflix` tray binary. Cargo
+  workspace, edition 2024.
 - `tools\check.ps1` — the single exit command (gate). `tools\rust-build.ps1` —
-  the Rust build. `tools\build.ps1` — the frozen Go build.
+  the Rust build.
 
 ## Crates
 
@@ -54,7 +52,6 @@ All of the following were run on 2026-10-13 on this machine and passed:
 - `pwsh -ExecutionPolicy Bypass -File tools\check.ps1` → PASS (clippy `-D warnings`, `cargo test --workspace --release --locked`, titleclean parity).
 - `pwsh -ExecutionPolicy Bypass -File tools\check.ps1 -Build -Selftest` → PASS; `dist\potflix.exe` produced, `--selftest` emitted `M1 SELFTEST PASS` (exit 0).
 - Build artifact: `dist\potflix.exe`, 3,593,216 bytes, SHA-256 `C73257FD92A7E9E7D1AFA347C9C25CAE221E7F6B7B6FEBE57A58159A5616C2F6` (rebuild 2026-10-13).
-- Go frozen reference: `go vet ./...` and `go test ./... -count=1` PASS (10 packages).
 - Hygiene: `gitleaks detect --no-git` reports 2 findings, both false positives in ignored build artifacts under `rust\target\`; tracked source is clean. The two content hits (a client id in `tools\epname-fix-report.md`, and a real first name in a test doc-example path in `rust\crates\store\src\sys\windows.rs`) were redacted before publication.
 - Rust `target\` and `dist\` remain untracked (gitignored).
 
@@ -64,19 +61,22 @@ in-process fake Discord pipe, with no live PotPlayer or Discord.
 
 ## The parity contract
 
-This rewrite's core claim: the Rust title cleaner reproduces the frozen Go
-implementation's output **byte-for-byte**. On each corpus the two binaries are
-run with the same arguments from the repo root and their TSV outputs must hash
-identically. The committed contract is [`rust\parity-golden.sha256`](./rust/parity-golden.sha256)
+This implementation's core claim: the Rust title cleaner reproduces the retired Go
+implementation's output **byte-for-byte**. On each corpus the Rust binary is
+run from the repo root and its TSV output must hash identically to the
+committed contract, [`rust\parity-golden.sha256`](./rust/parity-golden.sha256)
 — a 64-hex SHA-256 per corpus, nothing else.
+
+The oracle is now FROZEN: its Go reproducer is gone, so the hashes can never
+be regenerated — only matched.
 
 The corpora themselves (`tools\titles-sample4.txt`, `tools\titles-sample.txt`)
 are deliberately **not committed**: they carry real media filenames from a real
 library, which must not be published. The oracle therefore holds hashes only,
 so a missing corpus fails the gate rather than being treated as "nothing to
-compare" (`tools\check.ps1` § `Invoke-TitlecleanParity`). Regenerate the oracle
-from the frozen Go reference with the commands in the oracle's own header
-comment.
+compare" (`tools\check.ps1` § `Invoke-TitlecleanParity`). The oracle header's
+regeneration commands named the retired Go reproducer; they are history now —
+the oracle holds hashes only, and a hash mismatch fails the gate.
 
 ## Windows-specific notes
 
@@ -102,8 +102,9 @@ exclusions, recorded in `rust\Cargo.toml`:
 
 - **No third-party Unicode / word-segmentation crate.** `titleclean` must
   reproduce the JDK-11 tables exactly, so it carries that data ported verbatim
-  from `go\internal\titleclean`; a third-party Unicode table may not enter the
-  graph. The regex matcher is part of the port for the same reason.
+  from the retired Go tree (`go\internal\titleclean`); a third-party Unicode
+  table may not enter the graph. The regex matcher is part of the port for the
+  same reason.
 - `ureq` with `native-tls` (SChannel on Windows), so HTTPS needs no C toolchain
   and no OpenSSL; rustls/ring is deliberately not in the graph.
 - CRC32 for the store is hand-rolled (table-driven IEEE), not a crate.
@@ -189,11 +190,12 @@ cost nothing and the table stays a faithful port.
 For each source's licence, see [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) —
 one authority, one place; the terms are not restated here.
 
-## Deviations from the Java reference
+## Deviations from the original Java flow
 
-These are the frozen Go reference's deliberate deviations from the original
-Java flow; the Rust port targets the Go reference, so they are the behaviour it
-carries. Mostly proven live for the Go reference:
+These are the retired Go reference's deliberate deviations from the original
+Java flow; the Rust implementation targets the Go behaviour, so they are the
+behaviour it carries. Mostly proven live for the Go reference (whose tree is
+retired; its history remains in git):
 
 1. Empty asset text is omitted, not sent empty. `go\internal\discord\activity.go:86-109`
    tags every text field `omitempty` (rationale at `activity.go:42-46`): Java
@@ -237,9 +239,10 @@ carries. Mostly proven live for the Go reference:
     renders `ED 3`; Java fell through to `buildDisplay` (`Main.java:372-377`,
     `:479-483`) and duplicated it as `ED 3 — ED 3`.
 
-## Departures from the frozen Go reference (Rust era)
+## Departures from the retired Go reference (Rust era)
 
-The Go module above is frozen; the Rust port under `rust\` deliberately goes
+The Go module above is retired (tree removed; history in git); the Rust
+implementation under `rust\` deliberately goes
 further where the owner's live card proved the Go behaviour wrong:
 
 11. Wikipedia disambiguation suffixes are stripped. `rust\crates\metadata\src\wikipedia.rs`
@@ -268,7 +271,7 @@ further where the owner's live card proved the Go behaviour wrong:
     (`Inception` answered as `Ring of Fire`) — and the Jikan leg (dead since
     2026-10-01). A Cinemeta pick must match the query title (house-ranked)
     and any known query year, or it is a miss rather than a wrong card. The
-    frozen Go keeps the old TVmaze/AniList/Jikan/iTunes chain.
+    retired Go kept the old TVmaze/AniList/Jikan/iTunes chain.
 15. The tray icon survives an explorer restart (additive, not a departure).
     `rust\crates\potflix-win\src\tray.rs` registers `TaskbarCreated` with
     `RegisterWindowMessageW` and its wndproc re-adds the icon through the
@@ -281,10 +284,10 @@ further where the owner's live card proved the Go behaviour wrong:
     `notify-icon add result=false` and continues — Discord transport, poll
     loop, and settings window all start — and leaves the main window shown
     instead of hidden, so the app is reachable and quittable (X). Java
-    (`Main.java:550-551`) and the frozen Go exited the process; silently
+    (`Main.java:550-551`) and the retired Go exited the process; silently
     dying serves no card, and the card does not depend on the tray.
 17. The scan completion log names the instant, not the verdict. `rust\crates\potflix-win\src\window.rs`
-    (`on_scan_done`) logs `unresolved-at-scan-time=` where the frozen Go logs
+    (`on_scan_done`) logs `unresolved-at-scan-time=` where the retired Go logged
     `not-found=` (`go\window.go:2749`): the per-file counter is honest but sampled
     before the async catch-up pass, so a nonzero value can coexist with a later
     successful fetch — Go's name reads as final at a moment that is not final.

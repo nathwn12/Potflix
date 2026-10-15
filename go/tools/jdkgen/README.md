@@ -1,1 +1,0 @@
-`jdkgen.java` emits `../../internal/titleclean/jdk11tables.go` (JDK-11 / Unicode-10 exact `isLetterOrDigit`, `NON_SPACING_MARK`, simple-upper, and full-upper tables) from the installed JDK 11 `Character` tables; run it with that JDK, never regenerate it from a newer runtime.
