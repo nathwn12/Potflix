@@ -43,11 +43,25 @@ use crate::timefmt::{now_rfc3339, parse_rfc3339};
 /// Bump this whenever the matching or display-title logic changes what a key
 /// SHOULD resolve to (schema 4: alias-aware anime matching, English-first
 /// display titles -- pre-fix positives like `Shingeki no Kyojin: Picture
-/// Drama` for a romaji AoT query must not keep serving as live hits).
+/// Drama` for a romaji AoT query must not keep serving as live hits;
+/// schema 5: year-preference coverage judged across aliases, synonyms never
+/// displayed as English -- pre-fix positives like `Sailor Moon` for a 2014
+/// Crystal query or a synonym arc-name card for `Gintama` must re-resolve;
+/// schema 6: year-override coverage judged across canonical titles only --
+/// pre-fix positives like the `Golden Kamuy` OVA for a `Monster`/2019 query
+/// (admitted by a `"Monster"` synonym) must re-resolve;
+/// schema 7: an alias may extend year-override identity only with canonical
+/// corroboration -- pre-fix misses like the 1977 Yamato movie for a `Space
+/// Battleship Yamato`/1974 query (the corroborated `1650` alias was refused)
+/// must re-resolve;
+/// schema 8: that corroboration is judged by content token, not token length
+/// -- pre-fix misses like the 2009 `Dragon Ball Kai` for a `DBZ Kai`/2014
+/// query (the `kai` corroboration of `20635` was rejected by the length
+/// floor) must re-resolve).
 /// A record whose `schema` differs is a whole-record MISS, and the scan-index
 /// skip (`library::scanindex`, gated on `cache_schema()` + `cache_live`)
 /// follows the same version, so one bump re-resolves and re-scans together.
-pub const CACHE_SCHEMA: i32 = 4;
+pub const CACHE_SCHEMA: i32 = 8;
 
 /// `negativeTTL` bounds how long a persisted not-found entry counts as a cached
 /// miss: long enough that rescans stay fast, short enough that a provider
