@@ -194,6 +194,7 @@ impl JustWatchSource {
                 name,
                 weight: 0,
                 episode_count: 0,
+                aliases: Vec::new(),
             });
             years.push(content.original_release_year.unwrap_or(0));
             entries.push((node, content));

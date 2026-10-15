@@ -213,3 +213,55 @@ fn kitsu_year_prefers_beerus_over_2015_series() {
     assert_eq!(media.title, "Dragon Ball Super: Beerus");
     assert_eq!(media.year, 2026);
 }
+
+/// AoT regression (measured 2026-10-15): a romaji S01E03 query must land on
+/// the main TV series with its ENGLISH title, never on a romaji-named
+/// special. The live chain resolved `Shingeki no Kyojin S01E03` to the
+/// "Picture Drama" entry with `Day 5/Day 6/Day 7` leaking into details.
+#[test]
+fn kitsu_romaji_query_selects_main_series_with_english_title() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path == "/anime" {
+            return Response::json(
+                r#"{"data":[
+                    {"id":"1","attributes":{"slug":"attack-on-titan","canonicalTitle":"Attack on Titan","titles":{"en":"Attack on Titan","en_jp":"Shingeki no Kyojin"},"startDate":"2013-04-07","synopsis":"Humanity fights for survival.","episodeLength":24,"episodeCount":25,"userCount":500000}},
+                    {"id":"2","attributes":{"slug":"shingeki-no-kyojin-picture-drama","canonicalTitle":"Shingeki no Kyojin: Picture Drama","titles":{"en":"","en_jp":"Shingeki no Kyojin: Picture Drama"},"startDate":"2013-08-06","synopsis":"Chibi comedy shorts.","episodeLength":2,"episodeCount":32,"userCount":100}}
+                ]}"#,
+            );
+        }
+        if req.path == "/episodes" {
+            if req.query("filter[mediaId]").as_deref() == Some("1") {
+                return Response::json(
+                    r#"{"data":[{"attributes":{"canonicalTitle":"To You, in 2000 Years","seasonNumber":1,"number":3,"synopsis":"The fall of Shiganshina.","length":24,"thumbnail":{"original":"https://example.com/s1e3.jpg"}}}]}"#,
+                );
+            }
+            return Response::json(
+                r#"{"data":[{"attributes":{"canonicalTitle":"Day 5/Day 6/Day 7","seasonNumber":1,"number":3,"synopsis":"Chibi shorts.","length":2,"thumbnail":{"original":"https://example.com/pd3.jpg"}}}]}"#,
+            );
+        }
+        Response::error(404, "not found")
+    });
+    let source = KitsuSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Shingeki no Kyojin".to_string(),
+                season: 1,
+                episode: 3,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("the romaji query must answer, got nil");
+    assert_eq!(media.source_id, "1", "a special must not win: {media:?}");
+    assert_eq!(media.title, "Attack on Titan", "media = {media:?}");
+    let ep = media
+        .episodes
+        .iter()
+        .find(|episode| episode.season == 1 && episode.number == 3)
+        .expect("S1E3 must be present");
+    assert_eq!(ep.title, "To You, in 2000 Years", "episode = {ep:?}");
+    assert_ne!(ep.title, "Day 5/Day 6/Day 7", "the special tell: {ep:?}");
+}

@@ -176,3 +176,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an episode, so it no longer resolves as the series `Dragon Ball Super Movie`
   episode 1. A strong `SxxEyy` tag still wins, and a title that merely ends in
   the word (e.g. `The Lego Movie`) is left exactly as parsed.
+- Romaji anime filenames no longer resolve to a romaji-named spin-off.
+  `Shingeki no Kyojin S01E03` came back as the `Shingeki no Kyojin: Picture
+  Drama` entry (`Day 5/Day 6/Day 7`) with a romanized card title instead of
+  the main TV series. Every anime candidate now scores all of its known
+  titles (AniList romaji + English + synonyms, Tenrai `title` +
+  `title_english`, Kitsu canonical + `en` + `en_jp`), so the main series'
+  exact romaji alias outranks the special's near match, and the display
+  title prefers English in every leg (AniList falls back to the first
+  synonym, measured live English for entries whose `english` is null,
+  before romaji). The live chain now returns `Attack on Titan` S1E3 from
+  Kitsu. Measured live 2026-10-15.

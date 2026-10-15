@@ -220,6 +220,7 @@ impl CinemetaSource {
                 name: meta.name.clone(),
                 weight: 0,
                 episode_count: 0,
+                aliases: Vec::new(),
             });
             entries.push(meta);
         }

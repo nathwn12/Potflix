@@ -164,6 +164,7 @@ impl BangumiSource {
                 name,
                 weight: 0,
                 episode_count: bangumi_count(&entry),
+                aliases: Vec::new(),
             });
             years.push(date_year(&entry.air_date));
             entries.push(entry);
