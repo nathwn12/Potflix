@@ -3,8 +3,11 @@
 //! The provider chain. The poll loop uses the NON-BLOCKING [`Resolver::resolve`]
 //! (a cache miss fires one background fetch per cache key, single-flight, and the
 //! card falls back to the clean title until it lands); the CLIs use the BLOCKING
-//! [`Resolver::lookup_now`]. Order: TVmaze for TV, AniList plus Cinemeta for
-//! anime, Cinemeta then Wikipedia for movies. Offline safe: with no cache entry and no
+//! [`Resolver::lookup_now`]. Order: TVmaze for TV, AniList, Tenrai and Kitsu
+//! for anime with Cinemeta as the general fallback, Episodate, Bangumi,
+//! LiveChart.me and ANN as the further anime coverage legs, Cinemeta then
+//! Wikipedia then JustWatch
+//! for movies. Offline safe: with no cache entry and no
 //! network the card is exactly the clean card, and [`Options::offline`] serves
 //! cache-only. `force` bypasses and re-attempts.
 //!
@@ -16,10 +19,13 @@
 //!   absolute numbering -- Re:ZERO media 21355 serves 51-66 for an episode-1
 //!   query, and a wrong title is worse than no title). Unranked names keep their
 //!   relative order at rank 100, so an injected test source is still tried.
-//! * `fetchChain` keeps going past an error (`sawError`, first error kept) and
-//!   past a source that answered but lacks the requested episode. A movie
-//!   answer returns immediately; a series answer needs a number-exact episode
-//!   match ([`match_episode`], NEVER a positional index).
+//! * `fetchChain` keeps going past an error (`sawError`, first error kept),
+//!   past a source that answered but lacks the requested episode, and past a
+//!   match with no synopsis (kept as the fallback while the walk continues).
+//!   A movie answer with a synopsis returns immediately, as does a series
+//!   answer with a number-exact episode match ([`match_episode`], NEVER a
+//!   positional index) plus a synopsis; year never gates, cover and length
+//!   never gate.
 //! * `fetchMedia` retries the SAME chain once with the separator-normalized
 //!   alternate title, and ONLY after a definitive primary miss: a transient
 //!   primary is unknown, and substituting an alternate match would overwrite a
@@ -44,6 +50,9 @@ use crate::cache::{
 use crate::tvmaze::TvmazeSource;
 use crate::wikipedia::{WikiClient, WikipediaSource};
 use crate::{Error, anilist::AnilistSource, cinemeta::CinemetaSource};
+use crate::{ann::AnnSource, bangumi::BangumiSource, episodate::EpisodateSource};
+use crate::{justwatch::JustWatchSource, livechart::LivechartSource};
+use crate::{kitsu::KitsuSource, tenrai::TenraiSource};
 
 /// `negativeBackoff` keeps a failed key from being hammered. In-memory only; the
 /// on-disk cache stays additive forever.
@@ -78,7 +87,7 @@ pub struct Options {
     pub dir: String,
     /// Per-request HTTP budget; zero means [`DEFAULT_HTTP_TIMEOUT`].
     pub timeout: Duration,
-    /// The provider set; `None` selects the built-in five. `Some(vec![])` is a
+    /// The provider set; `None` selects the built-in eleven. `Some(vec![])` is a
     /// deliberately empty chain (every lookup is a definitive miss).
     pub sources: Option<Vec<Arc<dyn Source>>>,
     /// A sink for the resolver's diagnostics (`metadata: source ... error: ...`).
@@ -109,6 +118,14 @@ fn make_default_sources(timeout: Duration) -> Vec<Arc<dyn Source>> {
             "https://graphql.anilist.co",
             client.clone(),
         )),
+        Arc::new(TenraiSource::new(
+            "https://api.tenrai.org",
+            client.clone(),
+        )),
+        Arc::new(KitsuSource::new(
+            "https://kitsu.io/api/edge",
+            client.clone(),
+        )),
         Arc::new(CinemetaSource::new(
             "https://v3-cinemeta.strem.io",
             client.clone(),
@@ -119,11 +136,29 @@ fn make_default_sources(timeout: Duration) -> Vec<Arc<dyn Source>> {
             "https://en.wikipedia.org",
             WikiClient::new(timeout),
         )),
+        Arc::new(JustWatchSource::new(
+            "https://apis.justwatch.com",
+            client.clone(),
+        )),
+        Arc::new(EpisodateSource::new(
+            "https://www.episodate.com",
+            client.clone(),
+        )),
+        Arc::new(BangumiSource::new("https://api.bgm.tv", client.clone())),
+        Arc::new(LivechartSource::new(
+            "https://www.livechart.me",
+            client.clone(),
+        )),
+        Arc::new(AnnSource::new(
+            "https://cdn.animenewsnetwork.com",
+            client.clone(),
+        )),
     ]
 }
 
-/// `DefaultSources`: the built-in keyless providers (TVmaze, AniList, Cinemeta,
-/// Wikipedia) in their historical order.
+/// `DefaultSources`: the built-in keyless providers (TVmaze, AniList, Tenrai,
+/// Kitsu, Cinemeta, Wikipedia, JustWatch, Episodate, Bangumi, LiveChart.me and
+/// ANN) in their historical order.
 pub fn default_sources() -> Vec<Arc<dyn Source>> {
     make_default_sources(Duration::ZERO)
 }
@@ -251,9 +286,19 @@ impl Resolver {
     /// relative order at the end so injected test sources are still tried.
     pub fn ordered_sources(&self, q: &Query) -> Vec<Arc<dyn Source>> {
         let pref: &[(&str, i32)] = if q.kind == Kind::MOVIE {
-            &[("cinemeta", 0), ("wikipedia", 1)]
+            &[("cinemeta", 0), ("wikipedia", 1), ("justwatch", 2)]
         } else {
-            &[("tvmaze", 0), ("anilist", 1), ("cinemeta", 2)]
+            &[
+                ("tvmaze", 0),
+                ("anilist", 1),
+                ("tenrai", 2),
+                ("kitsu", 3),
+                ("cinemeta", 4),
+                ("episodate", 5),
+                ("bangumi", 6),
+                ("livechart", 7),
+                ("ann", 8),
+            ]
         };
         let mut out = self.inner.sources.clone();
         out.sort_by_key(|source| {
@@ -492,16 +537,27 @@ impl Resolver {
         state.inflight.insert(key.clone(), Arc::clone(&done));
         drop(state);
 
-        let chain = self.fetch_media(cancel, q);
+        // The blocking lookup's total budget, the same order as the poll path's
+        // `timeout * 4` cap: a genuinely-unknown file must resolve in bounded
+        // time instead of walking every provider at the full per-request
+        // timeout. Reuses `child_scope` (the `Cancel::with_deadline`
+        // machinery); no new subsystem. The child carries the parent's
+        // cancellation, so its reason covers both.
+        let budget = child_scope(cancel, self.inner.timeout * 4);
+        let chain = self.fetch_media(&budget, q);
+        let reason = budget.err();
+        // Release the propagation watcher: this scope is finished.
+        budget.cancel();
 
         let mut state = self.lock();
         state.inflight.remove(&key);
         let _guard = DoneGuard(done);
         let Some(media) = chain.media else {
-            if let Some(reason) = cancel.err() {
+            if let Some(reason) = reason {
                 // A cancelled fetch persists nothing; restore the negative
                 // cleared above so a failed forced refresh leaves prior
-                // suppression intact.
+                // suppression intact. A total-budget expiry lands here as
+                // `DeadlineExceeded`: bounded and transient, never a miss.
                 if force && let Some(prev) = prev_neg {
                     state.neg.insert(key.clone(), prev);
                 }
@@ -713,11 +769,18 @@ impl Resolver {
 
     /// `fetchChain`: iterate the ordered sources; an error is recorded and the
     /// walk continues (the FIRST error is kept), a `None` answer continues, a
-    /// movie answer returns immediately, and a series answer returns only on a
-    /// number-exact episode match.
+    /// movie answer returns immediately when it is complete, and a series
+    /// answer returns immediately on a number-exact episode match with a
+    /// synopsis. Completeness beats order: an answer that matches but carries
+    /// no synopsis is kept as the fallback while the walk continues, so a
+    /// later provider carrying the episode AND a synopsis wins; only when no
+    /// later source answers complete does the bare match settle. Cover and
+    /// length are preferred, never gating (a missing cover degrades to the
+    /// app logo downstream); year never gates at all.
     fn fetch_chain(&self, cancel: &Cancel, q: &Query) -> Chain {
         let mut saw_error = false;
         let mut first_err: Option<Error> = None;
+        let mut bare: Option<Media> = None;
         for source in self.ordered_sources(q) {
             match source.find(cancel, q) {
                 Err(err) => {
@@ -734,10 +797,38 @@ impl Resolver {
                         media.source = source.name().to_string();
                     }
                     if media.kind == Kind::MOVIE || q.kind == Kind::MOVIE {
-                        return Chain::found(media);
+                        if !media.synopsis.trim().is_empty() {
+                            return Chain::found(media);
+                        }
+                        // A bare title must not settle the lookup when a later
+                        // source may hold the synopsis: keep it and walk on.
+                        self.log(&format!(
+                            "metadata: source {} answers {:?} without a synopsis, trying next",
+                            source.name(),
+                            q.title
+                        ));
+                        if bare.is_none() {
+                            bare = Some(media);
+                        }
+                        continue;
                     }
                     if match_episode(&media.episodes, q).is_some() {
-                        return Chain::found(media);
+                        if episode_complete(&media, q) {
+                            return Chain::found(media);
+                        }
+                        // The episode matches but neither it nor the show
+                        // carries a synopsis: a later provider with the
+                        // complete record wins; this stays the fallback.
+                        self.log(&format!(
+                            "metadata: source {} answers episode {} for {:?} without a synopsis, trying next",
+                            source.name(),
+                            q.episode,
+                            q.title
+                        ));
+                        if bare.is_none() {
+                            bare = Some(media);
+                        }
+                        continue;
                     }
                     // The show matched but its Numbers lack the requested
                     // episode: fall through to the next source rather than
@@ -750,6 +841,9 @@ impl Resolver {
                     ));
                 }
             }
+        }
+        if let Some(media) = bare {
+            return Chain::found(media);
         }
         if saw_error {
             return Chain::transient(first_err);
@@ -768,6 +862,17 @@ pub(crate) fn media_answers(media: &Media, q: &Query) -> bool {
         return true;
     }
     match_episode(&media.episodes, q).is_some()
+}
+
+/// `episodeComplete`: the matched episode -- or, failing that, the show --
+/// carries a synopsis. Mirrors [`resolve_from_media`]'s synopsis preference
+/// (episode first, then show): a bare match keeps the walk going so a later
+/// provider with the complete record wins.
+pub(crate) fn episode_complete(media: &Media, q: &Query) -> bool {
+    let Some(ep) = match_episode(&media.episodes, q) else {
+        return false;
+    };
+    !ep.synopsis.trim().is_empty() || !media.synopsis.trim().is_empty()
 }
 
 /// `matchEpisode` is number-exact: only `Number == q.Episode` (plus

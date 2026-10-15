@@ -4,7 +4,9 @@
 //! `%LOCALAPPDATA%\Potflix\meta.idx` for the default `meta` dir) behind one
 //! handle held for the process lifetime, so a read is a map lookup. One entry
 //! per key (`series|<show>|<year>|<season>` or `movie|<title>|<year>`);
-//! not-found titles are cached as NEGATIVE entries for 30 days.
+//! not-found titles are cached as NEGATIVE entries for 30 days, and media
+//! answers as positive entries for 30 days ([`POSITIVE_TTL`]): a bounded
+//! read-through cache, never indefinite storage.
 //! `migrateLegacyCache` imports the retired per-key `meta\*.json` directory
 //! once, when the store is empty, and keeps it as the recovery copy;
 //! `ClearCache` is the only code that removes it.
@@ -43,6 +45,12 @@ pub const CACHE_SCHEMA: i32 = 3;
 /// miss: long enough that rescans stay fast, short enough that a provider
 /// improvement is picked up within a month. `force` always re-attempts.
 pub const NEGATIVE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// `positiveTTL` bounds how long a persisted media answer counts as a live
+/// hit: the same shape and order as [`NEGATIVE_TTL`], so the store is a
+/// bounded read-through cache and never indefinite storage. An expired
+/// positive is re-fetched, never re-served.
+pub const POSITIVE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// `cacheClockSkew` tolerates a small future drift in a stored `checkedAt`
 /// (NTP step, dual-boot clock jump). Further than this in the future is
@@ -466,9 +474,9 @@ pub fn cache_has(dir: &str, key: &str) -> bool {
 
 /// `CacheLive`: whether `key` has a VALID LIVE answer in the cache under `dir`.
 /// Unlike the presence-only [`cache_has`], this decodes and validates the stored
-/// record: a positive entry (any age) is live; a negative entry is live only
-/// while its TTL has not expired; corrupt / wrong-schema / wrong-key /
-/// truncated records are not.
+/// record: a positive entry is live only while its TTL has not expired; a
+/// negative entry is live only while its TTL has not expired; corrupt /
+/// wrong-schema / wrong-key / truncated records are not.
 pub fn cache_live(dir: &str, key: &str) -> bool {
     cache_load_entry(dir, key).is_some()
 }
@@ -482,10 +490,10 @@ pub(crate) fn cache_load_entry(dir: &str, key: &str) -> Option<CacheEntry> {
 
 /// `decodeCacheEntry`: applies the cache's validity gates to one stored record:
 /// the schema and key must match, a negative must still be fresh, and a positive
-/// must carry a `source`. A positive Wikipedia record additionally heals its
+/// must still be fresh and carry a `source`. A positive Wikipedia record additionally heals its
 /// title on decode: records written before the disambiguation strip carry
 /// `Ready Player One (film)`, and normalizing here (no schema bump, no rewrite,
-/// no refetch) lets the owner's permanent cache heal in place. The normalizer
+/// no refetch) lets the owner's existing cache heal in place. The normalizer
 /// is deliberately narrow -- a real parenthesized title survives -- so healing
 /// cannot corrupt a legitimate record.
 pub(crate) fn decode_cache_entry(data: &[u8], key: &str) -> Option<CacheEntry> {
@@ -504,6 +512,9 @@ pub(crate) fn decode_cache_entry(data: &[u8], key: &str) -> Option<CacheEntry> {
         });
     }
     if record.media.source.is_empty() {
+        return None;
+    }
+    if !positive_fresh(&record.checked_at, SystemTime::now()) {
         return None;
     }
     let mut media = record.media;
@@ -552,7 +563,8 @@ pub(crate) fn cache_store_negative(dir: &str, key: &str) -> Result<(), Error> {
 }
 
 /// `cacheStore`: writes one record for `key` into the store. Entries are
-/// additive; nothing here ever deletes.
+/// additive; nothing here ever deletes. The record is stamped with now, which
+/// starts its [`POSITIVE_TTL`] window.
 pub(crate) fn cache_store(dir: &str, key: &str, media: &Media) -> Result<(), Error> {
     if key.is_empty() {
         return Err(Error::other("metadata: cacheStore empty key"));
@@ -562,7 +574,7 @@ pub(crate) fn cache_store(dir: &str, key: &str, media: &Media) -> Result<(), Err
         schema: CACHE_SCHEMA,
         media: media.clone(),
         not_found: false,
-        checked_at: String::new(),
+        checked_at: now_rfc3339(),
     };
     let data = serde_json::to_vec(&record)?;
     cache_put(dir, key, &data)
@@ -606,6 +618,26 @@ pub fn count_negatives(dir: &str) -> i32 {
     match result {
         Ok(()) => count,
         Err(_) => 0,
+    }
+}
+
+/// `positiveFresh`: whether a stored positive `checkedAt` still counts as a
+/// live hit at `now`. Zero, TTL-expired, and far-future (beyond
+/// [`CACHE_CLOCK_SKEW`]) timestamps are all expired; a near-future timestamp
+/// within the skew window is fresh (clock wobble, not a jump).
+pub(crate) fn positive_fresh(checked_at: &str, now: SystemTime) -> bool {
+    let Some(at) = parse_rfc3339(checked_at) else {
+        return false;
+    };
+    if at > now + CACHE_CLOCK_SKEW {
+        return false;
+    }
+    if at > now {
+        return true;
+    }
+    match now.duration_since(at) {
+        Ok(age) => age <= POSITIVE_TTL,
+        Err(_) => true,
     }
 }
 
@@ -797,7 +829,7 @@ mod tests {
                 ..Media::default()
             },
             not_found: false,
-            checked_at: String::new(),
+            checked_at: format_rfc3339(SystemTime::now()),
         };
         let data = serde_json::to_vec(&record).expect("encode record");
         let entry = decode_cache_entry(&data, key).expect("entry");

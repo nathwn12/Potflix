@@ -7,8 +7,8 @@ use metadata_http::{
     set_rate_profile,
 };
 
-/// Proves the three named profiles map onto the five known hosts with the
-/// published intervals as the floor: turbo is exactly the published values,
+/// Proves the three named profiles map onto the known hosts with the
+/// published intervals as the floor (asserted on the five published ones): turbo is exactly the published values,
 /// balanced is 2x, gentle is 4x. Turbo is the default: unknown or empty
 /// profiles yield turbo, and an unknown host stays ungated in every profile.
 #[test]
@@ -18,7 +18,7 @@ fn rate_profile_mapping() {
             "turbo",
             [
                 ("api.tvmaze.com", Duration::from_millis(500)),
-                ("graphql.anilist.co", Duration::from_millis(700)),
+                ("graphql.anilist.co", Duration::from_millis(2000)),
                 ("api.jikan.moe", Duration::from_millis(350)),
                 ("itunes.apple.com", Duration::from_millis(3000)),
                 ("en.wikipedia.org", Duration::from_millis(1000)),
@@ -28,7 +28,7 @@ fn rate_profile_mapping() {
             "balanced",
             [
                 ("api.tvmaze.com", Duration::from_millis(1000)),
-                ("graphql.anilist.co", Duration::from_millis(1400)),
+                ("graphql.anilist.co", Duration::from_millis(4000)),
                 ("api.jikan.moe", Duration::from_millis(700)),
                 ("itunes.apple.com", Duration::from_millis(6000)),
                 ("en.wikipedia.org", Duration::from_millis(2000)),
@@ -38,7 +38,7 @@ fn rate_profile_mapping() {
             "gentle",
             [
                 ("api.tvmaze.com", Duration::from_millis(2000)),
-                ("graphql.anilist.co", Duration::from_millis(2800)),
+                ("graphql.anilist.co", Duration::from_millis(8000)),
                 ("api.jikan.moe", Duration::from_millis(1400)),
                 ("itunes.apple.com", Duration::from_millis(12000)),
                 ("en.wikipedia.org", Duration::from_millis(4000)),
@@ -89,7 +89,7 @@ fn rate_profile_mapping() {
         "profile GENTLE"
     );
 
-    // A profile switch rewrites only the five published hosts, so an injected
+    // A profile switch rewrites only the thirteen listed hosts, so an injected
     // test host keeps working (ratelimit.go:69-71).
     set_host_interval("test-ratelimit-profile.example", Duration::from_millis(120));
     set_rate_profile("gentle");

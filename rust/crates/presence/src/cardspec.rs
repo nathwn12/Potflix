@@ -10,16 +10,18 @@
 //!
 //! [`default_card_spec`] reproduces today's shipped output BYTE-FOR-BYTE: its
 //! [`CardSpec::render`] returns exactly [`build_activity_resolved`]'s
-//! details/state for the same inputs. Non-default presets only reselect among the
-//! same already-capped strings; the paused " - Paused" marker path is preserved
-//! on every line.
+//! details/state for the same inputs. The default state carries no synopsis
+//! (genres/length for a movie, the episode tag for a series); the synopsis
+//! lives in the tooltip and stays one click away behind [`CARD_STATE_SYNOPSIS`].
+//! Non-default presets only reselect among the same already-capped strings;
+//! the paused " - Paused" marker path is preserved on every line.
 
 use player::window::{APP_NAME, SUFFIX};
 use serde::{Deserialize, Serialize};
 use titleclean::{clean, trunc};
 
 use crate::{
-    Action, HUGE, PAUSED_MARKER, Resolved, build_activity_resolved, rp_text, trim_word,
+    Action, PAUSED_MARKER, Resolved, build_activity_resolved, rp_text, synopsis_state,
     with_state_time,
 };
 
@@ -106,7 +108,9 @@ impl CardSpec {
 
     /// Returns the (details, state) body lines for the given inputs under this
     /// spec (`cardspec.go:147`). The default spec returns
-    /// [`build_activity_resolved`]'s lines exactly; every other preset reselects
+    /// [`build_activity_resolved`]'s lines exactly (no synopsis in the state);
+    /// [`CARD_STATE_SYNOPSIS`] renders the synopsis-bearing line instead and
+    /// hides the slot when there is no synopsis; every other preset reselects
     /// among the same capped strings. The idle card keeps its shipped lines under
     /// any spec.
     pub fn render(&self, raw_title: &str, a: Option<&Action>, r: &Resolved) -> (String, String) {
@@ -143,7 +147,7 @@ impl CardSpec {
         }
         match spec.state.as_str() {
             CARD_STATE_TAG => state = episode_tag_only(raw_title, a),
-            CARD_STATE_SYNOPSIS => state = synopsis_only(&r.synopsis, a),
+            CARD_STATE_SYNOPSIS => state = synopsis_state(raw_title, a, r),
             CARD_STATE_NONE => state = String::new(),
             _ => {}
         }
@@ -216,21 +220,4 @@ fn episode_tag_only(raw_title: &str, a: Option<&Action>) -> String {
         return with_state_time(&tag_t, PAUSED_MARKER);
     }
     tag_t
-}
-
-/// Renders the resolved synopsis with the paused marker path preserved
-/// (`cardspec.go:127`): paused with no synopsis still reads "Paused".
-fn synopsis_only(syn: &str, a: Option<&Action>) -> String {
-    let full = rp_text(syn, HUGE);
-    let paused = a.is_some_and(|x| x.paused);
-    if full.is_empty() {
-        if paused {
-            return with_state_time("", PAUSED_MARKER);
-        }
-        return String::new();
-    }
-    if paused {
-        return with_state_time(&trim_word(&full, 128 - PAUSED_MARKER.len()), PAUSED_MARKER);
-    }
-    trim_word(&full, 128)
 }

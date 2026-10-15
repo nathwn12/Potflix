@@ -1,12 +1,14 @@
 //! `metadata` -- mirrors the Go package `go\internal\metadata`.
 //!
 //! Canonical series/episode titles from free, keyless sources (TVmaze for TV,
-//! AniList plus Cinemeta for anime, Cinemeta then Wikipedia for movies) behind a
+//! AniList, Tenrai and Kitsu plus Cinemeta, Episodate, Bangumi, LiveChart.me
+//! and ANN for anime, Cinemeta then Wikipedia then JustWatch
+//! for movies) behind a
 //! permanent on-disk cache. The poll loop uses the non-blocking
 //! [`Resolver::resolve`]; the CLIs use the blocking [`Resolver::lookup_now`];
 //! [`Options::offline`] serves cache-only.
 //!
-//! Workspace seam: this crate carries the provider chain, the four providers and
+//! Workspace seam: this crate carries the provider chain, the six providers and
 //! the cache; the shared record types, the filename parser, candidate matching,
 //! alternate titles and the path context live in `metadata-core`, and the
 //! transport in `metadata-http`.
@@ -27,20 +29,32 @@
 //! persists nothing. Callers must never bin the sentinel as not-found.
 
 pub mod anilist;
+pub mod ann;
 pub mod artwork;
+pub mod bangumi;
 pub mod cache;
 pub mod cinemeta;
+pub mod episodate;
+pub mod kitsu;
+pub mod justwatch;
+pub mod livechart;
 pub mod resolver;
 mod serdeutil;
+pub mod tenrai;
 pub mod timefmt;
 pub mod tvmaze;
 pub mod urlutil;
 pub mod wikipedia;
+mod yearpref;
 
 #[cfg(test)]
 mod anilist_test;
 #[cfg(test)]
+mod ann_test;
+#[cfg(test)]
 mod artwork_test;
+#[cfg(test)]
+mod bangumi_test;
 #[cfg(test)]
 mod cache_test;
 #[cfg(test)]
@@ -50,11 +64,21 @@ mod cinemeta_test;
 #[cfg(test)]
 mod connreuse_test;
 #[cfg(test)]
+mod episodate_test;
+#[cfg(test)]
 mod force_test;
+#[cfg(test)]
+mod justwatch_test;
+#[cfg(test)]
+mod kitsu_test;
+#[cfg(test)]
+mod livechart_test;
 #[cfg(test)]
 mod resolver_test;
 #[cfg(test)]
 mod testsupport;
+#[cfg(test)]
+mod tenrai_test;
 #[cfg(test)]
 mod tvmaze_test;
 #[cfg(test)]
