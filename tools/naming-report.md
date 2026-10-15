@@ -3,10 +3,10 @@
 Measurement of `clean()` / `stripTags()` in
 `src/main/java/me/potflix/rpc/Main.java` against a media library.
 
-Method: enumerating the configured library roots only (e.g. `D:\Movies`,
-`D:\Shows`, `E:\Films`, `E:\Anime`), sampling every 3rd video file,
+Method: enumerating the configured library roots only (e.g. `<library-root-1>`,
+`<library-root-2>`), sampling every 3rd video file,
 dumping `{title, episodeTag, episodeName, display}` via reflection
-(`BatchDump`), then classifying. **No file under `E:\` or `D:\` was modified.**
+(`BatchDump`), then classifying. **No file under the library roots was modified.**
 `Main.java` was not edited; the running app was not touched.
 
 ## 1. Files scanned
