@@ -314,16 +314,19 @@ fn run_ui(log: &'static Logger) {
             return;
         }
     };
-    if !tray_window.added {
-        // Parity with Java :550-551.
+    let tray_failed = !tray_window.added;
+    if tray_failed {
+        // Deliberate departure from Java :550-551 (see README deviation 16):
+        // a tray-less process keeps serving the card with the window visible
+        // instead of exiting silently.
         eprintln!("TrayIcon could not be added.");
         log.log("notify-icon add result=false");
-        return;
+    } else {
+        log.log(&format!(
+            "notify-icon add result=true tooltip=Potflix hwnd=0x{:x} icon=0x{:x}",
+            tray_window.hwnd as usize, tray_window.icon as usize
+        ));
     }
-    log.log(&format!(
-        "notify-icon add result=true tooltip=Potflix hwnd=0x{:x} icon=0x{:x}",
-        tray_window.hwnd as usize, tray_window.icon as usize
-    ));
 
     // Tray is up: start the Discord transport and the poll loop on their own
     // threads; the message loop below owns this OS thread.
@@ -400,7 +403,12 @@ fn run_ui(log: &'static Logger) {
         Err(err) => log.log(&format!("main window init failed: {err}")),
         Ok(()) => {
             let args: Vec<String> = std::env::args().collect();
-            if potflix_win::settings::should_show_main_window(&args) {
+            if tray_failed {
+                // No tray icon, no tray menu, no other way back in: leave the
+                // window visible so the app is reachable and quittable (X).
+                log.log("tray icon missing: window left visible");
+                window::show_main_window();
+            } else if potflix_win::settings::should_show_main_window(&args) {
                 window::show_main_window();
             } else {
                 log.log("autostart launch: window kept hidden (tray only)");
