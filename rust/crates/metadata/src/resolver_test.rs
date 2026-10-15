@@ -11,7 +11,7 @@ use crate::cache::{
     cache_exists, cache_key, cache_live, cache_load, cache_load_entry, cache_record, cache_store,
     cache_store_negative, with_cache, CacheFile, CACHE_SCHEMA, NEGATIVE_TTL,
 };
-use crate::resolver::{match_episode, Resolver, Source, NEGATIVE_BACKOFF};
+use crate::resolver::{match_episode, Options, Resolver, Source, NEGATIVE_BACKOFF};
 use crate::testsupport::{
     correct_media, mislabeled_media, resolver_with, series_media, FakeSource, TempDir,
 };
@@ -850,4 +850,159 @@ fn probed_entry_deleted_not_served() {
 fn source_trait_is_object_safe() {
     let sources: Vec<Arc<dyn Source>> = vec![FakeSource::new("x").shared()];
     assert_eq!(sources[0].name(), "x");
+}
+
+/// Completeness beats order and year never gates: the first source answers
+/// the requested episode with NO synopsis (and a year disagreeing with the
+/// query), the second answers the same episode WITH a synopsis (also
+/// year-disagreeing). The lookup must settle on the second source's complete
+/// record -- the bare match must not settle it, and neither year mismatch may
+/// skip its provider.
+#[test]
+fn chain_prefers_complete_record_over_bare_match() {
+    fn answer(name: &str, year: i32, ep_synopsis: &str) -> Media {
+        Media {
+            source: name.to_string(),
+            source_id: "1".to_string(),
+            kind: Kind::SERIES,
+            title: "Breaking Bad".to_string(),
+            year,
+            episodes: vec![Episode {
+                season: 1,
+                number: 1,
+                title: "Pilot".to_string(),
+                synopsis: ep_synopsis.to_string(),
+                ..Episode::default()
+            }],
+            fetched_at: now_rfc3339(),
+            ..Media::default()
+        }
+    }
+    let bare = FakeSource::with_media("fake-first", answer("fake-first", 2000, ""));
+    let bare_calls = bare.counter();
+    let full = FakeSource::with_media(
+        "fake-second",
+        answer("fake-second", 1999, "Walter White learns he has cancer."),
+    );
+    let full_calls = full.counter();
+    let dir = TempDir::new();
+    let resolver = resolver_with(&dir.path(), vec![bare.shared(), full.shared()]);
+    let q = Query {
+        kind: Kind::SERIES,
+        title: "Breaking Bad".to_string(),
+        year: 2020,
+        season: 1,
+        episode: 1,
+        ..Query::default()
+    };
+    let res = resolver
+        .lookup_now(&Cancel::background(), &q)
+        .expect("LookupNow");
+    assert!(
+        res.found && res.episode == "Pilot",
+        "resolution = {res:?}, want the Pilot found"
+    );
+    assert!(
+        !res.synopsis.is_empty(),
+        "the complete record must win: resolution = {res:?}"
+    );
+    assert_eq!(
+        bare_calls.load(Ordering::SeqCst),
+        1,
+        "the bare match must still be tried first"
+    );
+    assert_eq!(
+        full_calls.load(Ordering::SeqCst),
+        1,
+        "the walk must continue past a synopsis-less match"
+    );
+}
+
+/// The same completeness preference for movies: a bare title must not settle
+/// the lookup when a later source has the title AND a synopsis, whatever the
+/// years say.
+#[test]
+fn chain_prefers_complete_movie_over_bare_title() {
+    fn answer(name: &str, year: i32, synopsis: &str) -> Media {
+        Media {
+            source: name.to_string(),
+            source_id: "tt1375666".to_string(),
+            kind: Kind::MOVIE,
+            title: "Inception".to_string(),
+            year,
+            synopsis: synopsis.to_string(),
+            fetched_at: now_rfc3339(),
+            ..Media::default()
+        }
+    }
+    let bare = FakeSource::with_media("fake-first", answer("fake-first", 2000, ""));
+    let bare_calls = bare.counter();
+    let full = FakeSource::with_media(
+        "fake-second",
+        answer("fake-second", 1999, "A skilled thief steals secrets."),
+    );
+    let full_calls = full.counter();
+    let dir = TempDir::new();
+    let resolver = resolver_with(&dir.path(), vec![bare.shared(), full.shared()]);
+    let q = Query {
+        kind: Kind::MOVIE,
+        title: "Inception".to_string(),
+        year: 2020,
+        ..Query::default()
+    };
+    let res = resolver
+        .lookup_now(&Cancel::background(), &q)
+        .expect("LookupNow");
+    assert!(
+        res.found && res.is_movie && res.series == "Inception",
+        "resolution = {res:?}, want Inception found"
+    );
+    assert!(
+        !res.synopsis.is_empty(),
+        "the complete movie record must win: resolution = {res:?}"
+    );
+    assert_eq!(bare_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        full_calls.load(Ordering::SeqCst),
+        1,
+        "the walk must continue past a synopsis-less movie"
+    );
+}
+
+/// `LookupNow` carries a total budget (`timeout * 4`, the same order as the
+/// poll path's cap): two providers that each hang past the budget still
+/// resolve in bounded time with a transient outcome, never a 60 s walk and
+/// never a definitive miss.
+#[test]
+fn lookup_now_total_budget_bounds_a_total_miss() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        timeout: Duration::from_millis(200),
+        sources: Some(vec![
+            FakeSource {
+                delay: Duration::from_secs(30),
+                ..FakeSource::new("slow-first")
+            }
+            .shared(),
+            FakeSource {
+                delay: Duration::from_secs(30),
+                ..FakeSource::new("slow-second")
+            }
+            .shared(),
+        ]),
+        ..Options::default()
+    });
+    let q = show_query(1, 2);
+    let start = Instant::now();
+    let result = resolver.lookup_now(&Cancel::background(), &q);
+    let elapsed = start.elapsed();
+    assert!(
+        result.is_err(),
+        "a budget-expired lookup is transient, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "a total miss must be bounded, took {elapsed:?}"
+    );
 }

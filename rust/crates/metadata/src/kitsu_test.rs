@@ -1,0 +1,215 @@
+//! Kitsu provider tests: the anime-then-episodes round trip against a fake
+//! server (including the title validation the iTunes leg lacked -- year never
+//! gates), plus one live round trip against the real endpoint.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use metadata_core::types::{Kind, Query};
+use metadata_http::cancel::Cancel;
+
+use crate::kitsu::KitsuSource;
+use crate::resolver::Source;
+use crate::testsupport::{FakeServer, Request, Response, TempDir, http_client, resolver_with};
+
+const SEARCH: &str = r#"{"data":[{"id":"11","attributes":{"slug":"naruto","canonicalTitle":"Naruto","titles":{"en":"Naruto","en_jp":"Naruto"},"startDate":"2002-10-03","synopsis":"A young ninja chases his dream.","posterImage":{"large":"https://media.kitsu.io/anime/poster_images/11/large.jpg","original":"https://media.kitsu.io/anime/poster_images/11/original.jpg"},"episodeLength":23,"episodeCount":220,"userCount":300000}}]}"#;
+const EPISODES: &str = r#"{"data":[{"attributes":{"canonicalTitle":"Enter: Naruto Uzumaki!","seasonNumber":1,"number":1,"synopsis":"The pilot.","length":23,"thumbnail":{"original":"https://media.kitsu.io/anime/11/episodes/1/thumbnail.jpg"}}},{"attributes":{"canonicalTitle":"My Name is Konohamaru!","seasonNumber":1,"number":2,"synopsis":"The second.","length":23,"thumbnail":{"original":"https://media.kitsu.io/anime/11/episodes/2/thumbnail.jpg"}}}]}"#;
+
+/// A fake Kitsu API serving the canned anime/episodes pair, recording every
+/// request path so a test can prove the episode leg was never touched.
+fn fake_api(paths: Arc<Mutex<Vec<String>>>) -> FakeServer {
+    FakeServer::start(move |req: &Request| {
+        paths.lock().unwrap().push(req.path.clone());
+        if req.path == "/anime" {
+            return Response::json(SEARCH);
+        }
+        match req.path.as_str() {
+            "/episodes" => Response::json(EPISODES),
+            _ => Response::error(404, "not found"),
+        }
+    })
+}
+
+fn anime_query(title: &str, year: i32, episode: i32) -> Query {
+    Query {
+        kind: Kind::SERIES,
+        title: title.to_string(),
+        year,
+        episode,
+        absolute: true,
+        ..Query::default()
+    }
+}
+
+/// The anime-then-episodes round trip maps title/year/poster, and the
+/// resolver carries the number-exact episode title.
+#[test]
+fn kitsu_finds_anime_by_validated_title() {
+    let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let server = fake_api(Arc::clone(&paths));
+    let source = KitsuSource::new(server.url(), http_client());
+    let q = anime_query("Naruto", 2002, 1);
+    let media = source
+        .find(&Cancel::background(), &q)
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.title, "Naruto");
+    assert_eq!(media.year, 2002);
+    assert_eq!(media.kind, Kind::SERIES);
+    assert_eq!(media.source, "kitsu");
+    assert_eq!(media.source_id, "11");
+    assert_eq!(media.length, "23 min");
+    assert!(
+        !media.synopsis.is_empty(),
+        "synopsis must survive the cap/strip helpers"
+    );
+    assert!(
+        media.artwork.starts_with("https://"),
+        "artwork = {:?}",
+        media.artwork
+    );
+    assert_eq!(media.episodes.len(), 2);
+    assert_eq!(media.episodes[0].number, 1);
+    assert_eq!(media.episodes[0].title, "Enter: Naruto Uzumaki!");
+    assert_eq!(media.episodes[0].length, "23 min");
+
+    let dir = TempDir::new();
+    let resolver = resolver_with(
+        &dir.path(),
+        vec![Arc::new(KitsuSource::new(server.url(), http_client()))],
+    );
+    let res = resolver
+        .lookup_now(&Cancel::background(), &q)
+        .expect("LookupNow");
+    assert!(
+        res.found && res.series == "Naruto" && res.episode == "Enter: Naruto Uzumaki!",
+        "resolution = {res:?}"
+    );
+}
+
+/// The iTunes failure, inverted: a search whose best title does not match the
+/// query is a definitive miss, and the episode leg is never fetched.
+#[test]
+fn kitsu_rejects_wrong_title_without_episode_fetch() {
+    let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&paths);
+    let server = FakeServer::start(move |req: &Request| {
+        recorded.lock().unwrap().push(req.path.clone());
+        if req.path == "/anime" {
+            return Response::json(
+                r#"{"data":[{"id":"999","attributes":{"slug":"ring-of-fire","canonicalTitle":"Ring of Fire","startDate":"2012-01-01","userCount":10,"episodeCount":12}}]}"#,
+            );
+        }
+        Response::error(404, "not found")
+    });
+    let source = KitsuSource::new(server.url(), http_client());
+    let found = source
+        .find(&Cancel::background(), &anime_query("Naruto", 0, 1))
+        .expect("Find");
+    assert!(found.is_none(), "a wrong title must miss, got {found:?}");
+    assert!(
+        !paths.lock().unwrap().iter().any(|p| p == "/episodes"),
+        "no episode fetch for a rejected title: {paths:?}"
+    );
+}
+
+/// Year NEVER rejects: a known query year that disagrees with the pick still
+/// answers with the essentials -- the episode leg IS fetched and the pick's
+/// year rides along as a display field.
+#[test]
+fn kitsu_year_mismatch_still_answers() {
+    let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let server = fake_api(Arc::clone(&paths));
+    let source = KitsuSource::new(server.url(), http_client());
+    let media = source
+        .find(&Cancel::background(), &anime_query("Naruto", 2000, 1))
+        .expect("Find")
+        .expect("a year mismatch must still answer, got nil");
+    assert_eq!(media.title, "Naruto");
+    assert_eq!(media.year, 2002, "the pick's year rides along: {media:?}");
+    assert!(
+        paths.lock().unwrap().iter().any(|p| p == "/episodes"),
+        "the episode leg must be fetched despite the mismatch: {paths:?}"
+    );
+}
+
+/// A movie query is self-gated before the wire: no request, definitive miss.
+#[test]
+fn kitsu_gates_movies_without_network() {
+    let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let server = fake_api(Arc::clone(&paths));
+    let source = KitsuSource::new(server.url(), http_client());
+    let found = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::MOVIE,
+                title: "Naruto".to_string(),
+                ..Query::default()
+            },
+        )
+        .expect("Find");
+    assert!(found.is_none(), "a movie query must miss, got {found:?}");
+    assert!(
+        paths.lock().unwrap().is_empty(),
+        "no request for a gated kind: {paths:?}"
+    );
+}
+
+/// LIVE: the real Kitsu endpoint answers `Naruto` with year, poster and the
+/// absolute episode-1 entry. Real network, real input; a mock proves nothing
+/// here.
+#[test]
+fn kitsu_live_naruto_round_trip() {
+    let source = KitsuSource::new("", http_client());
+    let cancel = Cancel::with_deadline(Duration::from_secs(25));
+    let media = source
+        .find(&cancel, &anime_query("Naruto", 2002, 1))
+        .expect("live Find")
+        .expect("the live search must answer Naruto");
+    assert_eq!(media.title, "Naruto", "media = {media:?}");
+    assert_eq!(media.year, 2002, "media = {media:?}");
+    assert!(
+        !media.synopsis.is_empty(),
+        "the live synopsis must be non-empty"
+    );
+    assert!(
+        media.artwork.starts_with("https://"),
+        "artwork = {:?}",
+        media.artwork
+    );
+    let first = media
+        .episodes
+        .iter()
+        .find(|episode| episode.number == 1)
+        .expect("the live page must carry absolute episode 1");
+    assert!(
+        !first.title.is_empty(),
+        "the live episode 1 must be titled: {first:?}"
+    );
+}
+
+/// DBS 2026 regression (measured 2026-10-15): same treatment as the other
+/// picks -- a 2026 query must land on the Beerus entry, not the 2015 series.
+#[test]
+fn kitsu_year_prefers_beerus_over_2015_series() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path == "/anime" {
+            return Response::json(
+                r#"{"data":[{"id":"101","attributes":{"slug":"dragon-ball-super","canonicalTitle":"Dragon Ball Super","startDate":"2015-07-05","synopsis":"The 2015 series.","episodeLength":24,"episodeCount":131,"userCount":500000}},{"id":"202","attributes":{"slug":"dragon-ball-super-beerus","canonicalTitle":"Dragon Ball Super: Beerus","startDate":"2026-10-11","synopsis":"The Beerus arc.","episodeLength":24,"episodeCount":1,"userCount":100}}]}"#,
+            );
+        }
+        match req.path.as_str() {
+            "/episodes" => Response::json(EPISODES),
+            _ => Response::error(404, "not found"),
+        }
+    });
+    let source = KitsuSource::new(server.url(), http_client());
+    let media = source
+        .find(&Cancel::background(), &anime_query("dragon ball super", 2026, 1))
+        .expect("Find")
+        .expect("the 2026 query must answer, got nil");
+    assert_eq!(media.source_id, "202", "media = {media:?}");
+    assert_eq!(media.title, "Dragon Ball Super: Beerus");
+    assert_eq!(media.year, 2026);
+}

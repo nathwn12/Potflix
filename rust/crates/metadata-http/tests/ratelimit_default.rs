@@ -23,7 +23,7 @@ fn rate_limiter_initial_profile_is_turbo() {
 
     for (host, want) in [
         ("api.tvmaze.com", Duration::from_millis(500)),
-        ("graphql.anilist.co", Duration::from_millis(700)),
+        ("graphql.anilist.co", Duration::from_millis(2000)),
         ("api.jikan.moe", Duration::from_millis(350)),
         ("itunes.apple.com", Duration::from_millis(3000)),
         ("en.wikipedia.org", Duration::from_millis(1000)),

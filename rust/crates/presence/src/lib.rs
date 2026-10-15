@@ -831,11 +831,13 @@ pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
 /// (`presence.go:662`).
 ///
 /// Movie (`r.is_movie`): details is the canonical title with " (YYYY)" when
-/// `year > 0`; state joins genres, length and the synopsis with " \u{b7} ",
-/// skipping empties, capped word-aware at 128. Series: details is the episode
-/// override when present (else [`build_activity`]'s filename-derived line); state
-/// joins the episode tag and the synopsis the same way, with the synopsis
-/// word-capped. The paused " - Paused" marker path is preserved for both.
+/// `year > 0`; state joins genres and length with " \u{b7} " (never the synopsis:
+/// the hover tooltip already carries it), capped word-aware at 128. Series:
+/// details is the episode override when present (else
+/// [`build_activity`]'s filename-derived line); state is the episode tag alone
+/// for the same reason. The synopsis-bearing line the default used to render
+/// moved to [`synopsis_state`] (the `CARD_STATE_SYNOPSIS` opt-in). The paused
+/// " - Paused" marker path is preserved for both.
 pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved) -> Activity {
     let mut act = build_activity(raw_title, a);
     let paused = a.is_some_and(|x| x.paused);
@@ -862,9 +864,11 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
                 act.details = trunc(&r.series, 128);
             }
         }
+        // Default state: genres and length only -- never the synopsis, which
+        // already fills the hover tooltip. The synopsis-bearing line lives on
+        // as the CARD_STATE_SYNOPSIS opt-in (see `synopsis_state`).
         let g = rp_text(&r.genres, HUGE);
         let l = rp_text(&r.length, HUGE);
-        let s_full = rp_text(&r.synopsis, HUGE);
         let mut prefix_parts: Vec<&str> = Vec::new();
         if !g.is_empty() {
             prefix_parts.push(&g);
@@ -873,44 +877,17 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
             prefix_parts.push(&l);
         }
         let prefix = prefix_parts.join(" \u{b7} ");
-        if prefix.is_empty() && s_full.is_empty() {
+        if prefix.is_empty() {
             // Empty join: keep build_activity's state (including any Paused
             // marker).
-        } else if s_full.is_empty() {
-            // No synopsis: keep the 128 ceiling (non-synopsis states untouched).
-            act.state = if paused {
-                with_state_time(
-                    &trim_word(&prefix, 128 - PAUSED_MARKER.len()),
-                    PAUSED_MARKER,
-                )
-            } else {
-                trim_word(&prefix, 128)
-            };
+        } else if paused {
+            // Paused: keep the 128 ceiling (non-synopsis states untouched).
+            act.state = with_state_time(
+                &trim_word(&prefix, 128 - PAUSED_MARKER.len()),
+                PAUSED_MARKER,
+            );
         } else {
-            let join_budget = if paused {
-                STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len()
-            } else {
-                STATE_SYNOPSIS_BUDGET
-            };
-            let sep = if prefix.is_empty() { "" } else { " \u{b7} " };
-            let prefix_units = utf16_units(&prefix);
-            let sep_units = utf16_units(sep);
-            if prefix_units + sep_units >= join_budget {
-                let full_joined = format!("{prefix}{sep}{s_full}");
-                act.state = if paused {
-                    with_state_time(&trim_word(&full_joined, join_budget), PAUSED_MARKER)
-                } else {
-                    trim_word(&full_joined, join_budget)
-                };
-            } else {
-                let trimmed = smart_trim_synopsis(&s_full, join_budget - prefix_units - sep_units);
-                let joined = format!("{prefix}{sep}{trimmed}");
-                act.state = if paused {
-                    with_state_time(&joined, PAUSED_MARKER)
-                } else {
-                    joined
-                };
-            }
+            act.state = trim_word(&prefix, 128);
         }
         // Empty join: keep build_activity's state (including any Paused marker).
     } else {
@@ -918,52 +895,23 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
             act.details = trunc(&r.episode_name, 128);
         }
         // Episode tag for the state line, derived from the title the same way
-        // build_activity derives it.
+        // build_activity derives it. Default state: the tag alone -- never the
+        // synopsis, which already fills the hover tooltip (the synopsis-bearing
+        // line lives on as the CARD_STATE_SYNOPSIS opt-in: `synopsis_state`).
         let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
         let mut tag_raw = String::new();
         if !(raw.trim().is_empty() || raw == APP_NAME) {
             tag_raw = clean(raw).episode_tag;
         }
         let tag_t = rp_text(&tag_raw, 128);
-        let syn_full = rp_text(&r.synopsis, HUGE);
-        if tag_t.is_empty() && syn_full.is_empty() {
-            // Neither: keep build_activity's state (including any Paused marker).
+        if tag_t.is_empty() {
+            // No tag: keep build_activity's state (including any Paused marker).
         } else if paused {
-            if syn_full.is_empty() {
-                // Tag-only paused: no synopsis, keep the 128 ceiling.
-                act.state =
-                    with_state_time(&trim_word(&tag_t, 128 - PAUSED_MARKER.len()), PAUSED_MARKER);
-            } else {
-                let join_budget = STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len();
-                let sep = if tag_t.is_empty() { "" } else { " \u{b7} " };
-                let prefix_units = utf16_units(&tag_t);
-                let sep_units = utf16_units(sep);
-                if prefix_units + sep_units >= join_budget {
-                    act.state = with_state_time(
-                        &trim_word(&format!("{tag_t}{sep}{syn_full}"), join_budget),
-                        PAUSED_MARKER,
-                    );
-                } else {
-                    let trimmed =
-                        smart_trim_synopsis(&syn_full, join_budget - prefix_units - sep_units);
-                    act.state = with_state_time(&format!("{tag_t}{sep}{trimmed}"), PAUSED_MARKER);
-                }
-            }
-        } else if !tag_t.is_empty() && !syn_full.is_empty() {
-            let join_budget = STATE_SYNOPSIS_BUDGET;
-            let prefix_units = utf16_units(&tag_t);
-            let sep_units = utf16_units(" \u{b7} ");
-            if prefix_units + sep_units >= join_budget {
-                act.state = trim_word(&format!("{tag_t} \u{b7} {syn_full}"), join_budget);
-            } else {
-                let trimmed =
-                    smart_trim_synopsis(&syn_full, join_budget - prefix_units - sep_units);
-                act.state = format!("{tag_t} \u{b7} {trimmed}");
-            }
-        } else if !tag_t.is_empty() {
-            act.state = tag_t;
+            // Tag-only paused: keep the 128 ceiling.
+            act.state =
+                with_state_time(&trim_word(&tag_t, 128 - PAUSED_MARKER.len()), PAUSED_MARKER);
         } else {
-            act.state = smart_trim_synopsis(&syn_full, STATE_SYNOPSIS_BUDGET);
+            act.state = tag_t;
         }
     }
     if r.artwork.starts_with("http://") || r.artwork.starts_with("https://") {
@@ -974,6 +922,92 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
     // No buttons: the pristine card carries no click-through links, so
     // Resolved::buttons is always ignored.
     act
+}
+
+/// The synopsis-bearing state line the default rendered before the S3
+/// de-duplication: a movie joins genres, length and the synopsis with " \u{b7} ",
+/// a series joins the episode tag and the synopsis the same way, both capped
+/// word-aware at [`STATE_SYNOPSIS_BUDGET`]. Now opt-in behind
+/// [`cardspec::CARD_STATE_SYNOPSIS`]; the default state carries no synopsis.
+/// With no synopsis the slot hides (`""`, `"Paused"` when paused), so the
+/// preset honors the empty-hides contract (`cardspec_test::card_spec_empty_hide`).
+pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) -> String {
+    let paused = a.is_some_and(|x| x.paused);
+    let s_full = rp_text(&r.synopsis, HUGE);
+    if s_full.is_empty() {
+        if paused {
+            return with_state_time("", PAUSED_MARKER);
+        }
+        return String::new();
+    }
+    if r.is_movie {
+        let g = rp_text(&r.genres, HUGE);
+        let l = rp_text(&r.length, HUGE);
+        let mut prefix_parts: Vec<&str> = Vec::new();
+        if !g.is_empty() {
+            prefix_parts.push(&g);
+        }
+        if !l.is_empty() {
+            prefix_parts.push(&l);
+        }
+        let prefix = prefix_parts.join(" \u{b7} ");
+        let join_budget = if paused {
+            STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len()
+        } else {
+            STATE_SYNOPSIS_BUDGET
+        };
+        let sep = if prefix.is_empty() { "" } else { " \u{b7} " };
+        let prefix_units = utf16_units(&prefix);
+        let sep_units = utf16_units(sep);
+        if prefix_units + sep_units >= join_budget {
+            let full_joined = format!("{prefix}{sep}{s_full}");
+            return if paused {
+                with_state_time(&trim_word(&full_joined, join_budget), PAUSED_MARKER)
+            } else {
+                trim_word(&full_joined, join_budget)
+            };
+        }
+        let trimmed = smart_trim_synopsis(&s_full, join_budget - prefix_units - sep_units);
+        let joined = format!("{prefix}{sep}{trimmed}");
+        if paused {
+            with_state_time(&joined, PAUSED_MARKER)
+        } else {
+            joined
+        }
+    } else {
+        let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+        let mut tag_raw = String::new();
+        if !(raw.trim().is_empty() || raw == APP_NAME) {
+            tag_raw = clean(raw).episode_tag;
+        }
+        let tag_t = rp_text(&tag_raw, 128);
+        if tag_t.is_empty() {
+            return smart_trim_synopsis(&s_full, STATE_SYNOPSIS_BUDGET);
+        }
+        if paused {
+            let join_budget = STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len();
+            let sep = " \u{b7} ";
+            let prefix_units = utf16_units(&tag_t);
+            let sep_units = utf16_units(sep);
+            if prefix_units + sep_units >= join_budget {
+                return with_state_time(
+                    &trim_word(&format!("{tag_t}{sep}{s_full}"), join_budget),
+                    PAUSED_MARKER,
+                );
+            }
+            let trimmed = smart_trim_synopsis(&s_full, join_budget - prefix_units - sep_units);
+            return with_state_time(&format!("{tag_t}{sep}{trimmed}"), PAUSED_MARKER);
+        }
+        let join_budget = STATE_SYNOPSIS_BUDGET;
+        let prefix_units = utf16_units(&tag_t);
+        let sep_units = utf16_units(" \u{b7} ");
+        if prefix_units + sep_units >= join_budget {
+            trim_word(&format!("{tag_t} \u{b7} {s_full}"), join_budget)
+        } else {
+            let trimmed = smart_trim_synopsis(&s_full, join_budget - prefix_units - sep_units);
+            format!("{tag_t} \u{b7} {trimmed}")
+        }
+    }
 }
 
 // Go callers write `presence.CardSpec`; the module path `cardspec::CardSpec` is

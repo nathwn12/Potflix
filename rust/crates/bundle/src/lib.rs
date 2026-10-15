@@ -94,6 +94,13 @@ pub struct Entry {
     /// Opaque passthrough (Go's `json.RawMessage`).
     #[serde(default)]
     pub media: Option<Box<RawValue>>,
+    /// Carried verbatim: the record's freshness stamp rides the bundle so an
+    /// export/import round-trip preserves the entry's remaining TTL instead of
+    /// resetting it. Absent in bundles written before the positive TTL, which
+    /// still parse (`default`) and import as undated — and therefore stale —
+    /// records.
+    #[serde(default)]
+    pub checked_at: String,
 }
 
 /// The export/import envelope (`bundle.go:77`).
@@ -165,8 +172,8 @@ impl From<serde_json::Error> for Error {
 }
 
 /// `cacheRecord` mirrors the cache envelope the store carries: the record's own
-/// key, schema and media. Media stays raw so its bytes survive an
-/// export/import round-trip unchanged (`bundle.go:102`).
+/// key, schema, media and freshness stamp. Media stays raw so its bytes survive
+/// an export/import round-trip unchanged (`bundle.go:102`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CacheRecord {
     #[serde(default)]
@@ -175,6 +182,8 @@ struct CacheRecord {
     schema: i32,
     #[serde(default)]
     media: Option<Box<RawValue>>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    checked_at: String,
 }
 
 /// `requireDir` refuses an empty cache directory (`bundle.go:112`): every
@@ -253,6 +262,7 @@ pub fn export<W: Write>(
                     key: rec.key,
                     schema: rec.schema,
                     media: rec.media,
+                    checked_at: rec.checked_at,
                 }),
                 _ => st.skipped += 1,
             }
@@ -331,6 +341,7 @@ pub fn import<R: Read>(dir: &str, r: &mut R, schema: i32) -> Result<ImportStats,
             key: e.key.clone(),
             schema: e.schema,
             media: e.media.clone(),
+            checked_at: e.checked_at.clone(),
         };
         let payload = match serde_json::to_vec(&rec) {
             Ok(payload) => payload,

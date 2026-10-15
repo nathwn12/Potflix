@@ -47,20 +47,27 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 The Rust app's Rich Presence card resolves titles through these keyless
 third-party sources (no credentials, no scraping — public APIs only). The
 frozen Go reference used TVmaze, AniList, Jikan, iTunes and Wikipedia; the
-Rust app uses TVmaze, AniList, Cinemeta and Wikipedia.
+Rust app uses TVmaze, AniList, Tenrai, Kitsu, Cinemeta, Wikipedia, JustWatch,
+Episodate, Bangumi, LiveChart.me and ANN.
 
 - **TVmaze** (`https://api.tvmaze.com`) — TV series names, episode tables,
   posters and summaries. TVmaze's API docs license the data
   *"licensed by CC BY-SA"*; attribute TVmaze wherever the card data is
   republished.
 - **AniList** (`https://graphql.anilist.co`) — anime names, episode lists and
-  artwork. AniList's Terms restrict use to non-commercial purposes and forbid
-  using the API *"as a backup or data storage service"*. Stated plainly: the
-  app's permanent on-disk metadata cache
-  (`%LOCALAPPDATA%\Potflix\meta`) keeps AniList-derived answers indefinitely,
-  which is in tension with that term. The cache exists so the card works
-  offline and the provider is not re-queried for the same title; nothing
-  cached is republished or redistributed.
+  artwork. AniList's Terms (fetched 2026-10-15) allow free non-commercial use
+  (commercial use under $150/month revenue needs no express permission) and
+  state: using the API *"as a backup or data storage service is strictly
+  prohibited. Hoarding or mass collection of data from the AniList API is
+  strictly prohibited."* Read with its neighbours — *backup … service*,
+  *hoarding*, *mass collection* — that clause targets re-hosting AniList's
+  database and bulk scraping, not a client's offline copy of what the user is
+  being shown; no fetched page mentions caching. The app stays on that side of
+  the line: a bounded 30-day read-through cache
+  (`%LOCALAPPDATA%\Potflix\meta`), keyed to the user's own titles so the card
+  works offline and the provider is not re-queried for the same title. Nothing
+  cached is republished, redistributed, or bulk-collected. Fetch spacing is
+  2000 ms (30/min), matching the documented current degraded limit.
 - **Cinemeta** (`https://v3-cinemeta.strem.io`) — Stremio's default catalog
   addon (`com.linvo.cinemeta`): movie and series lookup by IMDb id, with
   TMDB-derived descriptions, ratings, genres and runtimes. Artwork is served
@@ -71,6 +78,20 @@ Rust app uses TVmaze, AniList, Cinemeta and Wikipedia.
 - **Wikipedia** (`https://en.wikipedia.org`, Action API) — movie fallback
   (summary, poster). Article text and images are CC BY-SA; attribute
   Wikipedia when republishing card data.
+- **JustWatch** (`https://apis.justwatch.com`, unofficial GraphQL) — movie
+  title search (third movie leg). Unofficial and undocumented; may change
+  without notice.
+- **Episodate** (`https://www.episodate.com`) — TV series names and episode
+  tables. A small community database; unofficial, may change without notice.
+- **Bangumi** (`https://api.bgm.tv`, keyless subject search) — anime and
+  live-TV subjects (cover, titles, episode count, air date, synopsis in one
+  call). Display title is the native `name`, falling back to the Chinese
+  title.
+- **LiveChart.me** (`https://www.livechart.me`) — anime names and episode
+  tables. Unofficial; may change without notice.
+- **ANN** (`https://cdn.animenewsnetwork.com`, encyclopedia API) — anime
+  names, episode counts and summaries. Unofficial; may change without
+  notice.
 
 ## Bundled logo fonts
 

@@ -205,7 +205,11 @@ impl crate::resolver::Source for TvmazeSource {
         // Ranked search: `/search/shows` returns score order, which misranks
         // (singlesearch picked the "Re:Zero ... Break Time" spinoff over the
         // main show), so pick_best_show re-ranks by title similarity with
-        // TVmaze-weight tie-breaks. A low-confidence best returns not-found so
+        // TVmaze-weight tie-breaks. Two guards keep a fuzzy score from ever
+        // becoming a card: only candidates that clear the matcher's own floor
+        // on their own rank at all (a shows-only search returns ten fuzzy
+        // rows and zero exact matches for films -- `inception` must miss, not
+        // become `Deception`), and a low-confidence best returns not-found so
         // the resolver falls through to AniList/Jikan.
         let search_url = format!(
             "{base}/search/shows?q={}",
@@ -236,19 +240,42 @@ impl crate::resolver::Source for TvmazeSource {
         if cands.is_empty() {
             return Ok(None);
         }
-        let Some(winner) = pick_best_show(&q.title, &cands) else {
+        // Title identity: rank only candidates that match the query on their
+        // own. No year can rescue a title miss, so this runs before any year
+        // preference; an empty confident set is a definitive miss.
+        let mut conf_cands: Vec<ShowCand> = Vec::with_capacity(cands.len());
+        let mut conf_idx: Vec<usize> = Vec::with_capacity(cands.len());
+        for (i, cand) in cands.iter().enumerate() {
+            if pick_best_show(&q.title, std::slice::from_ref(cand)).is_some() {
+                conf_cands.push(cand.clone());
+                conf_idx.push(i);
+            }
+        }
+        if conf_cands.is_empty() {
+            return Ok(None);
+        }
+        let Some(winner) = pick_best_show(&q.title, &conf_cands) else {
             return Ok(None);
         };
-        let mut show = None;
-        for (i, cand) in cands.iter().enumerate() {
+        let mut winner_at = None;
+        for (at, cand) in conf_cands.iter().enumerate() {
             if *cand == winner {
-                show = Some(shows[i].clone());
+                winner_at = Some(conf_idx[at]);
                 break;
             }
         }
-        let Some(show) = show else {
+        let Some(winner_at) = winner_at else {
             return Ok(None);
         };
+        // Soft year preference only: a known query year prefers a challenger
+        // carrying it at equal title strength, never a miss.
+        let years: Vec<i32> = shows
+            .iter()
+            .map(|show| date_year(&show.premiered))
+            .collect();
+        let take =
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_at);
+        let show = shows[take].clone();
 
         let year = date_year(&show.premiered);
         let genres = join_genres(&show.genres);

@@ -12,6 +12,9 @@ use crate::resolver::{Options, Resolver, Source};
 use crate::testsupport::{dead_url, http_client, wiki_client, TempDir};
 use crate::Error;
 use crate::{anilist::AnilistSource, cinemeta::CinemetaSource};
+use crate::{ann::AnnSource, bangumi::BangumiSource, episodate::EpisodateSource};
+use crate::{justwatch::JustWatchSource, livechart::LivechartSource};
+use crate::{kitsu::KitsuSource, tenrai::TenraiSource};
 use crate::{tvmaze::TvmazeSource, wikipedia::WikipediaSource};
 
 /// The answering callback shared by every fake provider in this module.
@@ -58,7 +61,15 @@ fn counting_resolver(
         sources: Some(vec![
             make("tvmaze"),
             make("anilist"),
+            make("tenrai"),
+            make("kitsu"),
             make("cinemeta"),
+            make("wikipedia"),
+            make("justwatch"),
+            make("episodate"),
+            make("bangumi"),
+            make("livechart"),
+            make("ann"),
         ]),
         ..Options::default()
     })
@@ -77,14 +88,19 @@ fn lookup_counts(
     counts.lock().unwrap().clone()
 }
 
-/// `seriesAnswer`: an answering series media for the query's own episode.
+/// `seriesAnswer`: an answering series media for the query's own episode. It
+/// carries a synopsis (episode and show) so the hit is complete and settles
+/// the chain at the answering provider; the walk-on for a bare match is
+/// covered by the completeness test in `resolver_test`.
 fn series_answer(q: &Query) -> Media {
     Media {
         title: q.title.clone(),
+        synopsis: "A complete record with a synopsis.".to_string(),
         episodes: vec![Episode {
             season: i32::try_from(q.season).expect("test query season fits i32"),
             number: q.episode,
             title: "Pilot".to_string(),
+            synopsis: "The pilot episode.".to_string(),
             ..Episode::default()
         }],
         ..Media::default()
@@ -138,10 +154,28 @@ fn chain_call_counts() {
             want: vec![("cinemeta", 1)],
         },
         Case {
-            name: "movie definitive miss walks cinemeta then the unranked tail",
+            name: "movie hit at justwatch walks past cinemeta and wikipedia",
+            q: movie_q.clone(),
+            answer_at: "justwatch",
+            want: vec![("cinemeta", 1), ("wikipedia", 1), ("justwatch", 1)],
+        },
+        Case {
+            name: "movie definitive miss walks cinemeta, wikipedia, justwatch then the unranked tail",
             q: movie_q.clone(),
             answer_at: "",
-            want: vec![("cinemeta", 1), ("tvmaze", 1), ("anilist", 1)],
+            want: vec![
+                ("cinemeta", 1),
+                ("wikipedia", 1),
+                ("justwatch", 1),
+                ("tvmaze", 1),
+                ("anilist", 1),
+                ("tenrai", 1),
+                ("kitsu", 1),
+                ("episodate", 1),
+                ("bangumi", 1),
+                ("livechart", 1),
+                ("ann", 1),
+            ],
         },
         Case {
             name: "anime hit at anilist",
@@ -150,16 +184,77 @@ fn chain_call_counts() {
             want: vec![("tvmaze", 1), ("anilist", 1)],
         },
         Case {
+            name: "anime hit at tenrai walks past tvmaze and anilist",
+            q: anime_q.clone(),
+            answer_at: "tenrai",
+            want: vec![("tvmaze", 1), ("anilist", 1), ("tenrai", 1)],
+        },
+        Case {
+            name: "anime hit at kitsu walks past tvmaze, anilist and tenrai",
+            q: anime_q.clone(),
+            answer_at: "kitsu",
+            want: vec![("tvmaze", 1), ("anilist", 1), ("tenrai", 1), ("kitsu", 1)],
+        },
+        Case {
+            name: "series hit at episodate walks past the first five legs",
+            q: anime_q.clone(),
+            answer_at: "episodate",
+            want: vec![
+                ("tvmaze", 1),
+                ("anilist", 1),
+                ("tenrai", 1),
+                ("kitsu", 1),
+                ("cinemeta", 1),
+                ("episodate", 1),
+            ],
+        },
+        Case {
+            name: "series hit at ann walks the whole series chain",
+            q: anime_q.clone(),
+            answer_at: "ann",
+            want: vec![
+                ("tvmaze", 1),
+                ("anilist", 1),
+                ("tenrai", 1),
+                ("kitsu", 1),
+                ("cinemeta", 1),
+                ("episodate", 1),
+                ("bangumi", 1),
+                ("livechart", 1),
+                ("ann", 1),
+            ],
+        },
+        Case {
             name: "tv definitive miss walks the series chain",
             q: miss_q.clone(),
             answer_at: "",
-            want: vec![("tvmaze", 1), ("anilist", 1), ("cinemeta", 1)],
+            want: vec![
+                ("tvmaze", 1),
+                ("anilist", 1),
+                ("tenrai", 1),
+                ("kitsu", 1),
+                ("cinemeta", 1),
+                ("episodate", 1),
+                ("bangumi", 1),
+                ("livechart", 1),
+                ("ann", 1),
+            ],
         },
         Case {
             name: "unknown definitive miss keeps full chain",
             q: bare_q.clone(),
             answer_at: "",
-            want: vec![("tvmaze", 1), ("anilist", 1), ("cinemeta", 1)],
+            want: vec![
+                ("tvmaze", 1),
+                ("anilist", 1),
+                ("tenrai", 1),
+                ("kitsu", 1),
+                ("cinemeta", 1),
+                ("episodate", 1),
+                ("bangumi", 1),
+                ("livechart", 1),
+                ("ann", 1),
+            ],
         },
     ];
 
@@ -174,6 +269,7 @@ fn chain_call_counts() {
             if q.kind == Kind::MOVIE {
                 return Some(Media {
                     title: q.title.clone(),
+                    synopsis: "A complete record with a synopsis.".to_string(),
                     ..Media::default()
                 });
             }
@@ -238,6 +334,48 @@ fn kind_gate_no_network() {
         (
             "anilist",
             Box::new(AnilistSource::new(dead.clone(), http_client())),
+            &movie_q,
+            &series_q,
+        ),
+        (
+            "tenrai",
+            Box::new(TenraiSource::new(dead.clone(), http_client())),
+            &movie_q,
+            &series_q,
+        ),
+        (
+            "kitsu",
+            Box::new(KitsuSource::new(dead.clone(), http_client())),
+            &movie_q,
+            &series_q,
+        ),
+        (
+            "justwatch",
+            Box::new(JustWatchSource::new(dead.clone(), http_client())),
+            &series_q,
+            &movie_q,
+        ),
+        (
+            "episodate",
+            Box::new(EpisodateSource::new(dead.clone(), http_client())),
+            &movie_q,
+            &series_q,
+        ),
+        (
+            "bangumi",
+            Box::new(BangumiSource::new(dead.clone(), http_client())),
+            &movie_q,
+            &series_q,
+        ),
+        (
+            "livechart",
+            Box::new(LivechartSource::new(dead.clone(), http_client())),
+            &movie_q,
+            &series_q,
+        ),
+        (
+            "ann",
+            Box::new(AnnSource::new(dead.clone(), http_client())),
             &movie_q,
             &series_q,
         ),

@@ -1,5 +1,5 @@
 //! Cinemeta provider tests: the catalog-then-meta round trip against a fake
-//! server (including the title/year validation that the iTunes leg lacked),
+//! server (including the title validation that the iTunes leg lacked),
 //! plus one live round trip against the real endpoint.
 
 use std::sync::{Arc, Mutex};
@@ -133,23 +133,23 @@ fn cinemeta_rejects_wrong_title_without_meta_fetch() {
     );
 }
 
-/// A known query year that disagrees with the pick's release year is a
-/// definitive miss with no meta fetch.
+/// Year NEVER rejects: a known query year that disagrees with the pick's
+/// release year still answers with the essentials -- the meta leg IS fetched
+/// and the pick's year rides along as a display field.
 #[test]
-fn cinemeta_rejects_year_mismatch_without_meta_fetch() {
+fn cinemeta_year_mismatch_still_answers() {
     let paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let server = fake_addon(Arc::clone(&paths));
     let source = CinemetaSource::new(server.url(), http_client());
-    let found = source
+    let media = source
         .find(&Cancel::background(), &movie_query("Inception", 2000))
-        .expect("Find");
+        .expect("Find")
+        .expect("a year mismatch must still answer, got nil");
+    assert_eq!(media.title, "Inception");
+    assert_eq!(media.year, 2010, "the pick's year rides along: {media:?}");
     assert!(
-        found.is_none(),
-        "a year mismatch must miss, got {found:?}"
-    );
-    assert!(
-        !paths.lock().unwrap().iter().any(|p| p.starts_with("/meta/")),
-        "no meta fetch for a year mismatch: {paths:?}"
+        paths.lock().unwrap().iter().any(|p| p.starts_with("/meta/")),
+        "the meta leg must be fetched despite the mismatch: {paths:?}"
     );
 }
 
@@ -223,10 +223,10 @@ fn cinemeta_year_disambiguates_duplicate_exact_titles() {
     assert_eq!(media.year, 2010);
 }
 
-/// The meta year veto: a catalog pick whose details disagree with a known
-/// query year is a miss, never a card.
+/// No meta year veto: details that disagree with a known query year are still
+/// a card, never a miss -- the essentials win over the nice-to-have year.
 #[test]
-fn cinemeta_meta_year_veto_is_a_miss() {
+fn cinemeta_meta_year_disagreement_still_answers() {
     let server = FakeServer::start(|req: &Request| {
         if req.path.starts_with("/catalog/") {
             return Response::json(
@@ -238,10 +238,11 @@ fn cinemeta_meta_year_veto_is_a_miss() {
         )
     });
     let source = CinemetaSource::new(server.url(), http_client());
-    let found = source
+    let media = source
         .find(&Cancel::background(), &movie_query("Inception", 2010))
-        .expect("Find");
-    assert!(found.is_none(), "a meta year veto must miss, got {found:?}");
+        .expect("Find")
+        .expect("a meta year disagreement must still answer, got nil");
+    assert_eq!(media.title, "Inception");
 }
 
 /// LIVE: the real Cinemeta endpoint answers `Inception` -- the title the old
@@ -272,4 +273,75 @@ fn cinemeta_live_inception_round_trip() {
         "artwork = {:?}",
         media.artwork
     );
+}
+
+/// DBS 2026 regression (measured 2026-10-15): the catalog ranks the perfect-
+/// title 2015 series first, but a 2026 query must land on Beerus.
+#[test]
+fn cinemeta_year_prefers_beerus_over_2015_series() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path.starts_with("/catalog/") {
+            return Response::json(
+                r#"{"metas":[{"id":"tt4644488","name":"Dragon Ball Super","releaseInfo":"2015-2018"},{"id":"tt39395275","name":"Dragon Ball Super: Beerus","releaseInfo":"2026-"}]}"#,
+            );
+        }
+        match req.path.as_str() {
+            "/meta/series/tt39395275.json" => Response::json(
+                r#"{"meta":{"name":"Dragon Ball Super: Beerus","year":"2026","genre":["Animation"],"description":"The Beerus arc.","poster":"https://example.com/beerus.jpg","videos":[]}}"#,
+            ),
+            "/meta/series/tt4644488.json" => Response::json(
+                r#"{"meta":{"name":"Dragon Ball Super","year":"2015","genre":["Animation"],"description":"The 2015 series.","poster":"https://example.com/dbs.jpg","videos":[]}}"#,
+            ),
+            _ => Response::error(404, "not found"),
+        }
+    });
+    let source = CinemetaSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "dragon ball super".to_string(),
+                year: 2026,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("the 2026 query must answer, got nil");
+    assert_eq!(media.source_id, "tt39395275", "media = {media:?}");
+    assert_eq!(media.title, "Dragon Ball Super: Beerus");
+    assert_eq!(media.year, 2026);
+}
+
+/// Never-a-veto: a query year matching NOTHING still returns the best title
+/// match (the 2015 series) rather than `Ok(None)`.
+#[test]
+fn cinemeta_year_matching_nothing_keeps_best_title() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path.starts_with("/catalog/") {
+            return Response::json(
+                r#"{"metas":[{"id":"tt4644488","name":"Dragon Ball Super","releaseInfo":"2015-2018"},{"id":"tt39395275","name":"Dragon Ball Super: Beerus","releaseInfo":"2026-"}]}"#,
+            );
+        }
+        match req.path.as_str() {
+            "/meta/series/tt4644488.json" => Response::json(
+                r#"{"meta":{"name":"Dragon Ball Super","year":"2015","genre":["Animation"],"description":"The 2015 series.","poster":"https://example.com/dbs.jpg","videos":[]}}"#,
+            ),
+            _ => Response::error(404, "not found"),
+        }
+    });
+    let source = CinemetaSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "dragon ball super".to_string(),
+                year: 1999,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("an unmatched year must still answer, got nil");
+    assert_eq!(media.source_id, "tt4644488", "media = {media:?}");
 }
