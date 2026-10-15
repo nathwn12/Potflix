@@ -143,7 +143,7 @@ fn parse_args(args: &[String], err: &mut dyn Write) -> Result<Config, String> {
 }
 
 fn session_id() -> String {
-    let id = std::env::var("OPENCODE_SESSION_ID").unwrap_or_default();
+    let id = std::env::var("POTFLIX_SESSION_ID").unwrap_or_default();
     let id = id.trim();
     if id.is_empty() {
         return "manual".to_string();
