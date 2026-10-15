@@ -301,6 +301,7 @@ impl AnnSource {
                 name: entry.main.clone(),
                 weight: 0,
                 episode_count: entry.episodes.unwrap_or(0),
+                aliases: Vec::new(),
             });
             years.push(date_year(&entry.vintage));
         }

@@ -316,3 +316,59 @@ fn anilist_empty_page_is_a_miss_not_a_wrong_anime() {
         .expect("Find");
     assert!(found.is_none(), "film query must miss, got {found:?}");
 }
+
+/// AoT regression (measured 2026-10-15): ranking by the english-then-romaji
+/// display name alone scores the main series ("Attack on Titan") 0 against a
+/// romaji query, so the romaji-named special wins. The romaji alias must
+/// count, and the display title stays English.
+#[test]
+fn anilist_romaji_query_selects_main_series_with_english_title() {
+    let body = r#"{"data":{"Page":{"media":[
+        {"id":16498,"title":{"romaji":"Shingeki no Kyojin","english":"Attack on Titan"},"seasonYear":2013,"streamingEpisodes":[{"title":"Episode 3 - To You, in 2000 Years","url":"http://x","site":"C"}]},
+        {"id":99999,"title":{"romaji":"Shingeki no Kyojin: Picture Drama","english":""},"synonyms":["Attack on Titan Picture Drama"],"seasonYear":2013,"streamingEpisodes":[{"title":"Episode 3 - Day 5/Day 6/Day 7","url":"http://y","site":"C"}]}
+    ]}}}"#;
+    let server = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source = AnilistSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Shingeki no Kyojin".to_string(),
+                episode: 3,
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("the romaji query must answer, got nil");
+    assert_eq!(media.source_id, "16498", "a special must not win: {media:?}");
+    assert_eq!(media.title, "Attack on Titan", "media = {media:?}");
+}
+
+/// An entry with an empty `english` must surface its other titles (here the
+/// first synonym, measured live English) rather than the romaji string.
+#[test]
+fn anilist_empty_english_falls_back_to_synonym_not_romaji() {
+    let body = r#"{"data":{"Page":{"media":[
+        {"id":108942,"title":{"romaji":"Shingeki no Kyojin: Chimi Kyara Gekijou - Rivai-han","english":""},"synonyms":["Attack on Titan Season 3 Picture Drama","Shingeki no Kyojin Season 3 Specials"],"seasonYear":2018,"streamingEpisodes":[]}
+    ]}}}"#;
+    let server = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source = AnilistSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Shingeki no Kyojin: Chimi Kyara Gekijou - Rivai-han".to_string(),
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(
+        media.title, "Attack on Titan Season 3 Picture Drama",
+        "media = {media:?}"
+    );
+}

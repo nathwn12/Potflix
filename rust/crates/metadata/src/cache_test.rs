@@ -119,7 +119,7 @@ fn cache_corrupt_ignored() {
 }
 
 /// `TestCacheSchema2IsMiss`: schema-2 entries (pre-enrichment) are a miss under
-/// schema 3 while fresh stores hit.
+/// the current schema while fresh stores hit.
 #[test]
 fn cache_schema2_is_miss() {
     let dir = TempDir::new();
@@ -131,7 +131,7 @@ fn cache_schema2_is_miss() {
     std::fs::write(format!("{d}/{}", cache_file_name(&key)), legacy2).unwrap();
     assert!(
         cache_load(&d, &key).is_none(),
-        "Schema:2 entry should be a miss under schema 3"
+        "Schema:2 entry should be a miss under the current schema"
     );
 
     let media = Media {
@@ -150,6 +150,60 @@ fn cache_schema2_is_miss() {
     };
     cache_store(&d, &key, &media).expect("cacheStore");
     assert!(cache_load(&d, &key).is_some());
+}
+
+/// `TestCachePreviousSchemaIsMiss`: a positive written under the PREVIOUS
+/// schema (a matching/display change like the alias-aware anime fix must bump
+/// `CACHE_SCHEMA`) is never served after the bump -- not via load, live probe
+/// or entry decode -- and a fresh store under the current schema replaces it.
+#[test]
+fn cache_previous_schema_is_miss() {
+    let dir = TempDir::new();
+    let d = dir.path();
+    let key = cache_key(&series_query("Show", 1));
+    let stale = CacheFile {
+        key: key.clone(),
+        // Pinned to 3, the schema that wrote the pre-fix positives on disk
+        // (e.g. `Shingeki no Kyojin: Picture Drama` for the romaji AoT query):
+        // under schema 3 this record serves, under 4+ it must miss.
+        schema: 3,
+        media: Media {
+            source: "tvmaze".to_string(),
+            source_id: "1".to_string(),
+            kind: Kind::SERIES,
+            title: "Stale Show".to_string(),
+            episodes: vec![Episode {
+                season: 1,
+                number: 1,
+                title: "Pilot".to_string(),
+                ..Episode::default()
+            }],
+            fetched_at: crate::timefmt::now_rfc3339(),
+            ..Media::default()
+        },
+        not_found: false,
+        checked_at: format_rfc3339(SystemTime::now()),
+    };
+    let data = serde_json::to_vec(&stale).expect("encode stale record");
+    // Written straight into the live store (not the legacy dir), exactly where
+    // a pre-fix positive already sits on the owner's machine.
+    store_raw_record(&d, &key, &data);
+    assert!(
+        cache_load(&d, &key).is_none(),
+        "previous-schema positive must be a miss after the bump"
+    );
+    assert!(!cache_live(&d, &key));
+    assert!(decode_cache_entry(&data, &key).is_none());
+
+    let fresh = Media {
+        source: "kitsu".to_string(),
+        title: "Show".to_string(),
+        ..stale.media.clone()
+    };
+    cache_store(&d, &key, &fresh).expect("cacheStore replaces the stale record");
+    let got = cache_load(&d, &key).expect("fresh store must hit");
+    assert_eq!(got.title, "Show");
+    assert_eq!(got.source, "kitsu");
 }
 
 /// `TestCacheHasIsPresenceOnly`: a presence check that never parses a stored
@@ -383,7 +437,8 @@ fn cache_legacy_positive_no_new_fields() {
     };
     let key = cache_key(&q);
     let legacy = format!(
-        "{{\"key\":{key:?},\"schema\":3,\"media\":{{\"source\":\"tvmaze\",\"sourceId\":\"9\",\"kind\":1,\"title\":\"Legacy Show\",\"episodes\":[{{\"season\":2,\"number\":1,\"title\":\"Pilot\"}}],\"fetchedAt\":\"2026-01-01T00:00:00Z\"}}}}"
+        "{{\"key\":{key:?},\"schema\":{},\"media\":{{\"source\":\"tvmaze\",\"sourceId\":\"9\",\"kind\":1,\"title\":\"Legacy Show\",\"episodes\":[{{\"season\":2,\"number\":1,\"title\":\"Pilot\"}}],\"fetchedAt\":\"2026-01-01T00:00:00Z\"}}}}",
+        CACHE_SCHEMA
     );
     std::fs::write(format!("{d}/{}", cache_file_name(&key)), legacy).unwrap();
     assert!(
@@ -395,7 +450,8 @@ fn cache_legacy_positive_no_new_fields() {
     // imports legacy files only while the store is empty).
     let dir2 = TempDir::new();
     let d2 = dir2.path();    let fresh = format!(
-        "{{\"key\":{key:?},\"schema\":3,\"checked_at\":{:?},\"media\":{{\"source\":\"tvmaze\",\"sourceId\":\"9\",\"kind\":1,\"title\":\"Legacy Show\",\"episodes\":[{{\"season\":2,\"number\":1,\"title\":\"Pilot\"}}],\"fetchedAt\":\"2026-01-01T00:00:00Z\"}}}}",
+        "{{\"key\":{key:?},\"schema\":{},\"checked_at\":{:?},\"media\":{{\"source\":\"tvmaze\",\"sourceId\":\"9\",\"kind\":1,\"title\":\"Legacy Show\",\"episodes\":[{{\"season\":2,\"number\":1,\"title\":\"Pilot\"}}],\"fetchedAt\":\"2026-01-01T00:00:00Z\"}}}}",
+        CACHE_SCHEMA,
         format_rfc3339(SystemTime::now())
     );
     std::fs::write(format!("{d2}/{}", cache_file_name(&key)), fresh).unwrap();

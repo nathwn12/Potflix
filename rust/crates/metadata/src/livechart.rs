@@ -147,6 +147,7 @@ impl LivechartSource {
                 name,
                 weight: 0,
                 episode_count: item.episode_count.unwrap_or(0),
+                aliases: Vec::new(),
             });
             years.push(date_year(&item.premiere_date));
             entries.push(item);
