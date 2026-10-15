@@ -1006,3 +1006,94 @@ fn lookup_now_total_budget_bounds_a_total_miss() {
         "a total miss must be bounded, took {elapsed:?}"
     );
 }
+
+/// LIVE chain (DoD 3): the REAL provider chain over the REAL network for
+/// `Dragon Ball Super` (year 2026, S1E1) must settle on the 2026 Beerus
+/// entity, never the 2015 series. The series walk (`ordered_sources`:
+/// tvmaze, anilist, tenrai, kitsu, cinemeta, episodate, bangumi, livechart,
+/// ann) stops at the first COMPLETE answer -- a number-exact episode match
+/// carrying a synopsis -- so whichever leg answers Beerus-2026-complete
+/// first wins; this asserts the settled record, not the leg, and prints the
+/// winner. Real network, real input; a mock proves nothing here. No
+/// `#[ignore]`: an unreachable network errors the lookup and fails loudly,
+/// never passes silently.
+#[test]
+fn chain_live_dbs_selects_beerus_2026_not_the_2015_series() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = Query {
+        kind: Kind::SERIES,
+        title: "Dragon Ball Super".to_string(),
+        year: 2026,
+        season: 1,
+        episode: 1,
+        ..Query::default()
+    };
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for Dragon Ball Super 2026 S1E1");
+    assert!(
+        res.found,
+        "the live chain must find Dragon Ball Super 2026 S1E1, got {res:?}"
+    );
+    assert_eq!(
+        res.year, 2026,
+        "the chain must select the 2026 Beerus entity, not the 2015 series (cinemeta tt4644488 / tvmaze 2368 / tenrai mal30694 / anilist 21175): {res:?}"
+    );
+    assert!(
+        res.series.contains("Beerus"),
+        "the 2026 entity is Beerus-titled, not the bare 2015 series: {res:?}"
+    );
+    let key = cache_key(&q);
+    let entry = cache_load_entry(&dir.path(), &key).expect("the live chain must persist its winning record");
+    assert!(
+        !entry.not_found,
+        "the live chain must persist a positive for Dragon Ball Super 2026 S1E1"
+    );
+    let media = entry
+        .media
+        .expect("the live chain must persist the winning Beerus record");
+    eprintln!(
+        "LIVE-CHAIN winner: source={} id={} title={:?} year={}",
+        media.source, media.source_id, media.title, media.year
+    );
+    assert_eq!(
+        media.year, 2026,
+        "the persisted winner must be the 2026 entity: {media:?}"
+    );
+    assert!(
+        media.title.contains("Beerus"),
+        "the persisted winner must be Beerus-titled: {media:?}"
+    );
+    for wrong in [
+        "tt4644488", "2368", "30694", "mal30694", "21175", "101",
+    ] {
+        assert_ne!(
+            media.source_id, wrong,
+            "the winner must not be the 2015 series id {wrong}: {media:?}"
+        );
+    }
+    match media.source.as_str() {
+        "cinemeta" => assert_eq!(
+            media.source_id, "tt39395275",
+            "cinemeta's 2026 entity is tt39395275: {media:?}"
+        ),
+        "tvmaze" => assert_eq!(
+            media.source_id, "93969",
+            "tvmaze's 2026 entity is 93969: {media:?}"
+        ),
+        "tenrai" => assert!(
+            media.source_id == "63367" || media.source_id == "mal63367",
+            "tenrai's 2026 entity is mal63367: {media:?}"
+        ),
+        "anilist" => assert_eq!(
+            media.source_id, "206814",
+            "anilist's 2026 entity is 206814: {media:?}"
+        ),
+        _ => {}
+    }
+}
