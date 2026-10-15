@@ -2,7 +2,7 @@
 
 ## Rewrite: the app moves to Rust
 
-The app is being rewritten in Rust. The Go module in `go\` was the incumbent
+The app has been rewritten in Rust. The Go module in `go\` was the incumbent
 that shipped; `rust\` is now the implementation — a Cargo workspace whose member
 crates under `rust\crates\*` mirror the Go packages one-for-one — and `go\` is
 retired at merge.
