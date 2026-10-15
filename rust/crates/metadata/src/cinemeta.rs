@@ -249,7 +249,12 @@ impl CinemetaSource {
             .iter()
             .map(|entry| release_year(&entry.release_info))
             .collect();
-        let take = crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+        // The catalog carries no synopses (descriptions arrive with the taken
+        // entry's details only), so every candidate reads as undescribed: a
+        // contradicting title winner carries no record evidence to protect.
+        let complete = vec![false; cands.len()];
+        let take =
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_idx);
         Ok(Some(entries[take].clone()))
     }
 
@@ -305,6 +310,8 @@ impl CinemetaSource {
             trailer_url: String::new(),
             episodes: Vec::new(),
             fetched_at: crate::timefmt::now_rfc3339(),
+            // Single-title provider: identity is the display title alone.
+            aliases: Vec::new(),
         }))
     }
 
@@ -355,6 +362,8 @@ impl CinemetaSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            // Single-title provider: identity is the display title alone.
+            aliases: Vec::new(),
         }))
     }
 }

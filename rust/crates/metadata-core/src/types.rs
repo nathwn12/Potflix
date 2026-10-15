@@ -165,6 +165,13 @@ pub struct Media {
     /// RFC3339 UTC, as Go's `time.Time` writes it.
     #[serde(rename = "fetchedAt", default)]
     pub fetched_at: String,
+    /// Verified alias titles for the answer: the canonical, translated and
+    /// abbreviation spellings the provider matched on (never unverified
+    /// synonyms). The chain reads exact query identity off these as well as
+    /// off the display title, so identity proved through an alias survives
+    /// the year gate. Empty for providers with a single title.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// `Resolution` is the user-facing answer for a [`Query`]. No JSON tags in Go.

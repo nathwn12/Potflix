@@ -57,11 +57,28 @@ use crate::timefmt::{now_rfc3339, parse_rfc3339};
 /// schema 8: that corroboration is judged by content token, not token length
 /// -- pre-fix misses like the 2009 `Dragon Ball Kai` for a `DBZ Kai`/2014
 /// query (the `kai` corroboration of `20635` was rejected by the length
-/// floor) must re-resolve).
+/// floor) must re-resolve;
+/// schema 9: year-contradicted picks no longer settle (round 1) -- stale
+/// wrong-work positives must re-resolve;
+/// schema 10: identity is read off the display title and verified aliases --
+/// an exact winner keeps a covering spin-off out of the year override (the
+/// 2014 `Kuinaki Sentaku` spin-off no longer takes a `Shingeki no
+/// Kyojin`/2014 query from the 2013 main series) and alias-proved identity
+/// survives the year gate (a `Kimi no Na wa`/2015 miss becomes `Your Name`
+/// 2016); the chain itself still settles the first gate-passing complete
+/// answer in provider order -- pre-fix spin-off positives and alias misses
+/// must re-resolve;
+/// schema 11: year decides before title strength among identity-grade picks
+/// -- a remake recorded AS the shared title in the query year takes a
+/// foreign-alias winner's place (`Hagane no Renkinjutsushi`/2009 takes the
+/// 2009 `Brotherhood` over the 2003 series), and a title winner the chain
+/// would skip outright concedes to the query-year carriers (`Kimi no Na
+/// wa`/1953 takes the 1953 work instead of the 2016 `Your Name`) -- pre-fix
+/// remake misses and alias-exempt wrong-work positives must re-resolve).
 /// A record whose `schema` differs is a whole-record MISS, and the scan-index
 /// skip (`library::scanindex`, gated on `cache_schema()` + `cache_live`)
 /// follows the same version, so one bump re-resolves and re-scans together.
-pub const CACHE_SCHEMA: i32 = 8;
+pub const CACHE_SCHEMA: i32 = 11;
 
 /// `negativeTTL` bounds how long a persisted not-found entry counts as a cached
 /// miss: long enough that rescans stay fast, short enough that a provider

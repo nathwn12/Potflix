@@ -34,7 +34,7 @@ use ureq::http::StatusCode;
 
 use crate::Error;
 use crate::artwork::{cap_synopsis, strip_html};
-use crate::serdeutil::null_default;
+use crate::serdeutil::{null_default, null_string_vec};
 use crate::urlutil::query_escape;
 
 /// The provider's default host.
@@ -122,6 +122,11 @@ struct KitsuAnimeAttrs {
     episode_count: Option<i32>,
     #[serde(rename = "userCount", default)]
     user_count: Option<i32>,
+    /// Kitsu's own short-form synonyms (`DBZ Kai`, `DBK`): scored as match
+    /// aliases exactly like AniList's `synonyms`, so a short-form query finds
+    /// the work instead of missing the leg. Never display text.
+    #[serde(rename = "abbreviatedTitles", default, deserialize_with = "null_string_vec")]
+    abbreviated_titles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -170,7 +175,9 @@ struct KitsuEpisodesResp {
 /// second, romaji (`en_jp`) is the last resort. Returns the display title
 /// plus every non-empty spelling for alias-aware matching, so a romaji query
 /// still finds the English-titled main series instead of a romaji-named
-/// special.
+/// special. Kitsu's `abbreviatedTitles` ride along as match-only aliases (a
+/// short-form query must find the work, never become a wrong title); they are
+/// never display text.
 fn display_and_aliases(attrs: &KitsuAnimeAttrs) -> (String, Vec<String>) {
     let canonical = attrs.canonical_title.trim();
     let en = attrs
@@ -194,6 +201,12 @@ fn display_and_aliases(attrs: &KitsuAnimeAttrs) -> (String, Vec<String>) {
     for title in [canonical, en, en_jp] {
         if !title.is_empty() {
             aliases.push(title.to_string());
+        }
+    }
+    for short in &attrs.abbreviated_titles {
+        let short = short.trim();
+        if !short.is_empty() {
+            aliases.push(short.to_string());
         }
     }
     (display, aliases)
@@ -251,6 +264,7 @@ impl KitsuSource {
         let mut cands: Vec<ShowCand> = Vec::with_capacity(parsed.data.len());
         let mut entries: Vec<(KitsuAnime, KitsuAnimeAttrs)> = Vec::with_capacity(parsed.data.len());
         let mut years: Vec<i32> = Vec::with_capacity(parsed.data.len());
+        let mut complete: Vec<bool> = Vec::with_capacity(parsed.data.len());
         for anime in parsed.data {
             let Some(attrs) = anime.attributes.clone() else {
                 continue;
@@ -269,6 +283,7 @@ impl KitsuSource {
                 aliases,
             });
             years.push(date_year(&attrs.start_date));
+            complete.push(!attrs.synopsis.trim().is_empty());
             entries.push((anime, attrs));
         }
         if cands.is_empty() {
@@ -290,7 +305,7 @@ impl KitsuSource {
         };
         // Soft year preference only: no year match keeps the title winner.
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_idx);
         Ok(Some(entries[take].clone()))
     }
 
@@ -346,7 +361,7 @@ impl crate::resolver::Source for KitsuSource {
         let Some((anime, attrs)) = self.pick(cancel, q)? else {
             return Ok(None);
         };
-        let (title, _) = display_and_aliases(&attrs);
+        let (title, aliases) = display_and_aliases(&attrs);
         if title.is_empty() {
             return Ok(None);
         }
@@ -373,6 +388,9 @@ impl crate::resolver::Source for KitsuSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            // The canonical, translated and abbreviated spellings already
+            // scored as match aliases above: all verified, all identity.
+            aliases,
         }))
     }
 }

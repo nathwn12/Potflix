@@ -271,6 +271,28 @@ struct WikiSearchResp {
     query: WikiSearchQuery,
 }
 
+/// `wikiRedirect` is one `from` -> `to` hop in a `redirects=1` resolution.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WikiRedirect {
+    #[serde(default, deserialize_with = "null_default")]
+    from: String,
+    #[serde(default, deserialize_with = "null_default")]
+    to: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WikiResolveQuery {
+    #[serde(default, deserialize_with = "null_default")]
+    redirects: Vec<WikiRedirect>,
+}
+
+/// `wikiResolveResp` is `GET w/api.php?action=query&titles=<q>&redirects=1`.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct WikiResolveResp {
+    #[serde(default, deserialize_with = "null_default")]
+    query: WikiResolveQuery,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 struct WikiImageSource {
     #[serde(default, deserialize_with = "null_default")]
@@ -709,6 +731,51 @@ impl WikipediaSource {
             path_escape(&page_title.replace(' ', "_"))
         ))
     }
+
+    /// `wikiVerifiedAlias`: the query's own title when Wikipedia itself
+    /// redirects it to the picked article (`Kimi no Na wa` -> `Your Name`).
+    /// A redirect is a curated alias -- the romanized, translated and
+    /// abbreviated spellings all surface as redirects -- so it establishes
+    /// chain-level identity exactly like a provider match alias, and a wrong
+    /// file year can no longer destroy the correct title match. `[]` when
+    /// the query resolves elsewhere (a redirect to another page authorizes
+    /// nothing) or when the check itself fails: the lookup then degrades to
+    /// the display-only gate rather than failing.
+    fn verified_alias(&self, cancel: &Cancel, q: &Query, page: &str) -> Result<Vec<String>, Error> {
+        let resolve_url = format!(
+            "{}/w/api.php?action=query&titles={}&redirects=1&format=json",
+            self.base_url(),
+            query_escape(q.title.trim())
+        );
+        let response = match self.wiki_get(cancel, &resolve_url) {
+            Ok(response) => response,
+            Err(err) => return Err(wiki_transient(err)),
+        };
+        let resolved = match decode_capped::<WikiResolveResp>(response) {
+            Ok(resolved) => resolved,
+            Err(err) => return Err(wiki_transient(err)),
+        };
+        let mut aliases = Vec::new();
+        for hop in &resolved.query.redirects {
+            let from = hop.from.trim();
+            let to = hop.to.trim();
+            if from.is_empty() || to.is_empty() {
+                continue;
+            }
+            // Both ends must agree: the redirect starts at the query and
+            // lands on the picked article. A redirect to any other page
+            // authorizes nothing (`Fate` redirects to `Destiny`, never to a
+            // film pick).
+            if metadata_core::match_::normalize_title(from)
+                == metadata_core::match_::normalize_title(&q.title)
+                && metadata_core::match_::normalize_title(to)
+                    == metadata_core::match_::normalize_title(page)
+            {
+                aliases.push(from.to_string());
+            }
+        }
+        Ok(aliases)
+    }
 }
 
 impl crate::resolver::Source for WikipediaSource {
@@ -719,7 +786,10 @@ impl crate::resolver::Source for WikipediaSource {
     /// `Find` is movie-only (a series key never reaches the wire): `(nil, nil)`
     /// for series or blank titles BEFORE any fetch, an
     /// [`Error::Unavailable`] on transient failure, and `(nil, nil)` on a
-    /// definitive "no such page".
+    /// definitive "no such page". A resolved page additionally records the
+    /// query as a verified alias when Wikipedia redirects the query to that
+    /// page, so chain-level identity survives translation (see
+    /// [`WikipediaSource::verified_alias`]).
     fn find(&self, cancel: &Cancel, q: &Query) -> Result<Option<Media>, Error> {
         if q.kind == Kind::SERIES || q.title.is_empty() {
             return Ok(None);
@@ -822,6 +892,9 @@ impl crate::resolver::Source for WikipediaSource {
         if artwork.is_empty() {
             artwork = self.wiki_poster_url(cancel, &page);
         }
+        // The redirect check is one more same-host call, and it fails open:
+        // without a verified alias the answer keeps the display-only gate.
+        let aliases = self.verified_alias(cancel, q, &page).unwrap_or_default();
         Ok(Some(Media {
             source: "wikipedia".to_string(),
             source_id: title.clone(),
@@ -838,6 +911,7 @@ impl crate::resolver::Source for WikipediaSource {
             trailer_url: String::new(),
             episodes: Vec::new(),
             fetched_at: crate::timefmt::now_rfc3339(),
+            aliases,
         }))
     }
 }

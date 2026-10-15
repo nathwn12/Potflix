@@ -90,7 +90,12 @@ fn folded_accent(r: char) -> Option<&'static str> {
 /// the Mn strip immediately below; and Go's `IsLetter || IsNumber` is read as
 /// Rust's `is_alphabetic() || is_numeric()`, which differs only for the
 /// Other_Alphabetic spacing marks (Mc) no real title carries.
-pub(crate) fn normalize_title(s: &str) -> String {
+///
+/// Public because exact title identity -- the same normalized equality
+/// [`title_similarity`] scores as 1.0 -- is also the chain's notion of
+/// identity (the year gate and the year preference in the `metadata` crate),
+/// and all three must agree on what "exact" means.
+pub fn normalize_title(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for r in s.to_lowercase().chars() {
         if jdk_is_mn(r) {
