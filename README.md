@@ -321,6 +321,25 @@ further where the owner's live card proved the Go behaviour wrong:
     2026-10-01). A Cinemeta pick must match the query title (house-ranked)
     and any known query year, or it is a miss rather than a wrong card. The
     frozen Go keeps the old TVmaze/AniList/Jikan/iTunes chain.
+15. The tray icon survives an explorer restart (additive, not a departure).
+    `rust\crates\potflix-win\src\tray.rs` registers `TaskbarCreated` with
+    `RegisterWindowMessageW` and its wndproc re-adds the icon through the
+    existing add path when that broadcast arrives. Neither Java nor Go
+    handled it: after a shell crash, update, or logon cycle the app kept
+    running with no icon and no way back in (the tray menu is the only UI
+    route and the only Exit path).
+16. A failed tray add keeps the app alive with the window visible (a real
+    departure). `rust\crates\app\src\main.rs` (`run_ui`) logs
+    `notify-icon add result=false` and continues — Discord transport, poll
+    loop, and settings window all start — and leaves the main window shown
+    instead of hidden, so the app is reachable and quittable (X). Java
+    (`Main.java:550-551`) and the frozen Go exited the process; silently
+    dying serves no card, and the card does not depend on the tray.
+17. The scan completion log names the instant, not the verdict. `rust\crates\potflix-win\src\window.rs`
+    (`on_scan_done`) logs `unresolved-at-scan-time=` where the frozen Go logs
+    `not-found=` (`go\window.go:2749`): the per-file counter is honest but sampled
+    before the async catch-up pass, so a nonzero value can coexist with a later
+    successful fetch — Go's name reads as final at a moment that is not final.
 
 ## Docs
 
