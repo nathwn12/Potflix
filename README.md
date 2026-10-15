@@ -18,10 +18,11 @@ and release groups stripped, years parenthesized, `SxxEyy` parsed), series and
 episode names resolve from free keyless sources, and a settings window holds
 the library folders, scan controls, and card preview.
 
-The implementation is the Rust workspace under `rust/`. The Go module in `go/`
-is the frozen reference implementation, retained until the Rust port merges
-and takes over the shipped binary; the original Java sources under
-`src/main/java/me/potflix/rpc/` (`Main.java`) are retained in the same way.
+The implementation is the Rust workspace under `rust/`, which also produces
+the shipped binary (`dist\potflix.exe` via `tools\rust-build.ps1`). The Go
+module (`go/`) and the original Java sources (`src/main/java/`) were the
+reference implementations the port was proven against; both are retired —
+their history remains in git, but nothing in this tree builds on them.
 
 ## Why
 
@@ -145,13 +146,9 @@ with the `metacheck` CLI.
 
 - [RUST-PORT.md](./RUST-PORT.md) — the Rust port notes: crate layout, the parity
   contract, verification, Windows-specific notes, dependencies, limitations, and
-  the deviations from the Java and Go references.
-- [`go/README.md`](./go/README.md) — the frozen Go reference: package layout,
-  metadata design, scan-index tiers, rate limiter, M1–M4 status.
-- [`go/internal/titleclean/README.md`](./go/internal/titleclean/README.md) — the
-  title-cleaner port and its parity method.
+  the deviations from the original Java flow carried over from the retired Go era.
 - [`DECISION.md`](./DECISION.md) — why the cleaner port chose Go, and why the app
-  is being rewritten in Rust on a parity oracle.
+  was rewritten in Rust on a parity oracle.
 - [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md) — upstream BSD-3-Clause text
   and the bundled logo-font notices.
 
