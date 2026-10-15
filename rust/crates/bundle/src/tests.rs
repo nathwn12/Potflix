@@ -16,7 +16,10 @@ use serde_json::value::RawValue;
 
 use super::*;
 
-const TEST_SCHEMA: i32 = 3;
+/// The schema the tests seed and round-trip: the live cache schema, so a
+/// `CACHE_SCHEMA` bump keeps seeding live entries (a pinned old value would
+/// go stale by design and fail liveness asserts).
+const TEST_SCHEMA: i32 = metadata::cache::CACHE_SCHEMA;
 
 // --- helpers ----------------------------------------------------------------
 

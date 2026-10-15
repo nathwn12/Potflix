@@ -142,6 +142,7 @@ impl EpisodateSource {
                 name: hit.name.clone(),
                 weight: 0,
                 episode_count: 0,
+                aliases: Vec::new(),
             });
             years.push(date_year(&hit.start_date));
             entries.push(hit);

@@ -234,6 +234,7 @@ impl crate::resolver::Source for TvmazeSource {
                 name: result.show.name.clone(),
                 weight: result.show.weight,
                 episode_count: 0,
+                aliases: Vec::new(),
             });
             shows.push(result.show);
         }

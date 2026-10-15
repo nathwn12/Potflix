@@ -34,7 +34,7 @@ pub const ANILIST_DEFAULT_BASE: &str = "https://graphql.anilist.co";
 /// soft year preference): a singular `Media(search:)` hands back only the
 /// server's top pick, which for `dragon ball super` is the 2015 series while
 /// the 2026 `Dragon Ball Super: Beerus` release never surfaces.
-pub const ANILIST_QUERY: &str = "query ($search:String){Page(perPage:10){media(search:$search,type:ANIME){id idMal title{romaji english} season seasonYear episodes genres duration siteUrl description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}}";
+pub const ANILIST_QUERY: &str = "query ($search:String){Page(perPage:10){media(search:$search,type:ANIME){id idMal title{romaji english} synonyms season seasonYear episodes genres duration siteUrl description coverImage{extraLarge large} bannerImage streamingEpisodes{title url site thumbnail}}}}";
 
 /// `anilistSource`.
 pub struct AnilistSource {
@@ -100,6 +100,8 @@ struct AnilistMedia {
     id_mal: i32,
     #[serde(default, deserialize_with = "null_default")]
     title: AnilistTitle,
+    #[serde(default, deserialize_with = "null_default")]
+    synonyms: Vec<String>,
     #[serde(rename = "seasonYear", default)]
     season_year: Option<i32>,
     #[serde(default, deserialize_with = "null_default")]
@@ -254,6 +256,42 @@ pub(crate) fn parse_anilist_episode(s: &str, fallback: i32) -> (i32, String) {
     (0, trimmed.to_string())
 }
 
+/// `canonicalTitle`: English wins; the entry's other titles (the first
+/// non-empty synonym, measured live English for entries whose `english` is
+/// null) come next; romaji is the last resort, never the default while an
+/// English title exists anywhere on the entry.
+fn canonical_title(english: &str, synonyms: &[String], romaji: &str) -> String {
+    let english = english.trim();
+    if !english.is_empty() {
+        return english.to_string();
+    }
+    if let Some(synonym) = synonyms
+        .iter()
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty())
+    {
+        return synonym.to_string();
+    }
+    romaji.trim().to_string()
+}
+
+/// The entry's match titles: every non-empty one of english, romaji and the
+/// synonyms, so a romaji query still finds the English-titled main series
+/// instead of a romaji-named special.
+fn match_aliases(english: &str, synonyms: &[String], romaji: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for title in std::iter::once(english)
+        .chain(std::iter::once(romaji))
+        .chain(synonyms.iter().map(String::as_str))
+    {
+        let title = title.trim();
+        if !title.is_empty() {
+            out.push(title.to_string());
+        }
+    }
+    out
+}
+
 impl crate::resolver::Source for AnilistSource {
     fn name(&self) -> &str {
         "anilist"
@@ -284,10 +322,7 @@ impl crate::resolver::Source for AnilistSource {
             if media.id == 0 {
                 continue;
             }
-            let mut name = media.title.english.trim().to_string();
-            if name.is_empty() {
-                name = media.title.romaji.trim().to_string();
-            }
+            let name = canonical_title(&media.title.english, &media.synonyms, &media.title.romaji);
             if name.is_empty() {
                 continue;
             }
@@ -295,6 +330,7 @@ impl crate::resolver::Source for AnilistSource {
                 name,
                 weight: 0,
                 episode_count: 0,
+                aliases: match_aliases(&media.title.english, &media.synonyms, &media.title.romaji),
             });
             years.push(media.season_year.unwrap_or(0));
             entries.push(media);
@@ -319,10 +355,7 @@ impl crate::resolver::Source for AnilistSource {
         let take =
             crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
         let media = &entries[take];
-        let mut title = media.title.english.trim().to_string();
-        if title.is_empty() {
-            title = media.title.romaji.trim().to_string();
-        }
+        let title = canonical_title(&media.title.english, &media.synonyms, &media.title.romaji);
         if title.is_empty() {
             return Ok(None);
         }

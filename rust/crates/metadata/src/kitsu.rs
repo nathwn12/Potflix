@@ -166,6 +166,39 @@ struct KitsuEpisodesResp {
     data: Vec<KitsuEpisodeEntry>,
 }
 
+/// The entry's display title: English wins (`en`), the canonical title rides
+/// second, romaji (`en_jp`) is the last resort. Returns the display title
+/// plus every non-empty spelling for alias-aware matching, so a romaji query
+/// still finds the English-titled main series instead of a romaji-named
+/// special.
+fn display_and_aliases(attrs: &KitsuAnimeAttrs) -> (String, Vec<String>) {
+    let canonical = attrs.canonical_title.trim();
+    let en = attrs
+        .titles
+        .as_ref()
+        .map(|titles| titles.en.trim())
+        .unwrap_or_default();
+    let en_jp = attrs
+        .titles
+        .as_ref()
+        .map(|titles| titles.en_jp.trim())
+        .unwrap_or_default();
+    let display = if !en.is_empty() {
+        en.to_string()
+    } else if !canonical.is_empty() {
+        canonical.to_string()
+    } else {
+        en_jp.to_string()
+    };
+    let mut aliases = Vec::new();
+    for title in [canonical, en, en_jp] {
+        if !title.is_empty() {
+            aliases.push(title.to_string());
+        }
+    }
+    (display, aliases)
+}
+
 /// `kitsuPoster` prefers the large poster, falling back to the original.
 fn kitsu_poster(poster: Option<&KitsuPoster>) -> String {
     let Some(poster) = poster else {
@@ -225,20 +258,7 @@ impl KitsuSource {
             if anime.id.trim().is_empty() {
                 continue;
             }
-            let mut name = attrs.canonical_title.trim().to_string();
-            if name.is_empty() {
-                name = attrs
-                    .titles
-                    .as_ref()
-                    .map(|titles| {
-                        if !titles.en.trim().is_empty() {
-                            titles.en.trim().to_string()
-                        } else {
-                            titles.en_jp.trim().to_string()
-                        }
-                    })
-                    .unwrap_or_default();
-            }
+            let (name, aliases) = display_and_aliases(&attrs);
             if name.is_empty() {
                 continue;
             }
@@ -246,6 +266,7 @@ impl KitsuSource {
                 name,
                 weight: attrs.user_count.unwrap_or(0),
                 episode_count: attrs.episode_count.unwrap_or(0),
+                aliases,
             });
             years.push(date_year(&attrs.start_date));
             entries.push((anime, attrs));
@@ -325,20 +346,7 @@ impl crate::resolver::Source for KitsuSource {
         let Some((anime, attrs)) = self.pick(cancel, q)? else {
             return Ok(None);
         };
-        let mut title = attrs.canonical_title.trim().to_string();
-        if title.is_empty() {
-            title = attrs
-                .titles
-                .as_ref()
-                .map(|titles| {
-                    if !titles.en.trim().is_empty() {
-                        titles.en.trim().to_string()
-                    } else {
-                        titles.en_jp.trim().to_string()
-                    }
-                })
-                .unwrap_or_default();
-        }
+        let (title, _) = display_and_aliases(&attrs);
         if title.is_empty() {
             return Ok(None);
         }

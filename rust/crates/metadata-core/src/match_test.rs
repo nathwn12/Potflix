@@ -9,6 +9,7 @@ fn cand(name: &str, weight: i32) -> ShowCand {
         name: name.to_string(),
         weight,
         episode_count: 0,
+        aliases: Vec::new(),
     }
 }
 
@@ -133,11 +134,13 @@ fn pick_best_show_tie_breaks() {
             name: "Show Alpha".into(),
             weight: 10,
             episode_count: 100,
+            aliases: Vec::new(),
         },
         ShowCand {
             name: "Show Beta".into(),
             weight: 90,
             episode_count: 1,
+            aliases: Vec::new(),
         },
     ];
     let best = pick_best_show("Show", &by_weight).expect("weight tie-break");
@@ -147,13 +150,38 @@ fn pick_best_show_tie_breaks() {
             name: "Show Alpha".into(),
             weight: 10,
             episode_count: 5,
+            aliases: Vec::new(),
         },
         ShowCand {
             name: "Show Beta".into(),
             weight: 10,
             episode_count: 40,
+            aliases: Vec::new(),
         },
     ];
     let best = pick_best_show("Show", &by_eps).expect("episode-count tie-break");
     assert_eq!(best.name, "Show Beta");
+}
+
+/// An entry's romaji alias scores like its display name: a romaji query
+/// finds the English-titled main series instead of a romaji-named special,
+/// and the exact-alias rule excludes the near-matching special.
+#[test]
+fn pick_best_show_scores_aliases() {
+    let cands = vec![
+        ShowCand {
+            name: "Attack on Titan".into(),
+            weight: 0,
+            episode_count: 0,
+            aliases: vec!["Shingeki no Kyojin".into()],
+        },
+        ShowCand {
+            name: "Shingeki no Kyojin: Picture Drama".into(),
+            weight: 0,
+            episode_count: 0,
+            aliases: Vec::new(),
+        },
+    ];
+    let best = pick_best_show("Shingeki no Kyojin", &cands).expect("romaji alias must win");
+    assert_eq!(best.name, "Attack on Titan");
 }

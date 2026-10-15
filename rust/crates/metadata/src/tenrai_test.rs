@@ -213,3 +213,33 @@ fn tenrai_live_naruto_round_trip() {
         "episode 1 = {first:?}"
     );
 }
+
+/// AoT regression (measured 2026-10-15): ranking by the english-first display
+/// name alone scores the main series ("Attack on Titan") 0 against a romaji
+/// query, so a romaji-named special wins. The `title` alias must count.
+#[test]
+fn tenrai_romaji_query_selects_main_series() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path == "/v1/anime" {
+            return Response::json(
+                r#"{"pagination":{"last_visible_page":1,"has_next_page":false},"data":[{"mal_id":16498,"url":"https://myanimelist.net/anime/16498/Shingeki_no_Kyojin","title":"Shingeki no Kyojin","title_english":"Attack on Titan","year":2013,"synopsis":"Humanity fights for survival.","duration":"24 min per ep","members":900000,"episodes":25},{"mal_id":99999,"url":"https://myanimelist.net/anime/99999/Picture_Drama","title":"Shingeki no Kyojin: Picture Drama","title_english":"","year":2013,"synopsis":"Chibi comedy shorts.","duration":"2 min per ep","members":100,"episodes":32}]}"#,
+            );
+        }
+        Response::error(404, "not found")
+    });
+    let source = TenraiSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Shingeki no Kyojin".to_string(),
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("the romaji query must answer, got nil");
+    assert_eq!(media.source_id, "16498", "a special must not win: {media:?}");
+    assert_eq!(media.title, "Attack on Titan", "media = {media:?}");
+}
