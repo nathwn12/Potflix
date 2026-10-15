@@ -142,6 +142,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Stale cached resolutions no longer survive this matching fix either: the
+  metadata cache schema bumped to 8 (the year-override corroboration is now
+  judged by content token, not token length -- a token corroborates when it
+  carries a letter and is neither a generic function word, a romanised
+  particle, a release-form word, nor a numeral form. Pre-fix misses like the
+  2009 `Dragon Ball Kai` (`6033`) for a `DBZ Kai`/2014 query must re-resolve
+  to `20635`, whose canonical titles overlap the query on the content token
+  `kai`; the Yamato corroboration and the `Monster`/2019 refusal are
+  unchanged). Records written under an older schema are a whole-record miss
+  and re-resolve on their own, as before.
+- Stale cached resolutions no longer survive this matching fix either: the
+  metadata cache schema bumped to 7 (an AniList alias may now extend the
+  year-override identity only with canonical corroboration -- the query
+  shares a distinctive token with the entry's canonical titles. Pre-fix
+  misses like the 1977 Yamato movie for a `Space Battleship Yamato`/1974
+  query must re-resolve to the 1974 series (`1650`), while the
+  corroboration-free `Monster`/2019 refusal (the 2004 series `19` over the
+  `Golden Kamuy` OVA `124756`) is unchanged). Records written under an
+  older schema are a whole-record miss and re-resolve on their own, as
+  before.
+- Stale cached resolutions no longer survive this matching fix either: the
+  metadata cache schema bumped to 6 (the year-override coverage is now judged
+  across canonical titles only -- an AniList synonym like `"Monster"` on the
+  `Golden Kamuy` OVA (`124756`, 2019) no longer authorizes a year override
+  that steals a `Monster`/2019 query from the 2004 series (`19`); pre-fix
+  positives of that shape must re-resolve rather than keep serving). Records
+  written under an older schema are a whole-record miss and re-resolve on
+  their own, as before.
+- Stale cached resolutions no longer survive these matching fixes either: the
+  metadata cache schema bumped to 5 (the year-preference coverage is now
+  judged across entry aliases instead of the display name alone, and synonyms
+  are never displayed as the English title -- pre-fix positives like `Sailor
+  Moon` for a 2014 Crystal query, or a synonym arc-name card for `Gintama`,
+  must re-resolve rather than keep serving). Records written under an older
+  schema are a whole-record miss and re-resolve on their own, as before.
+- Year disambiguation no longer goes blind on English display titles: the
+  year-preference coverage test is judged across the entry's aliases, not the
+  one display string. `Bishoujo Senshi Sailor Moon` with year 2014 picked the
+  1992 series (`Sailor Moon`) because Crystal's English display name (`Pretty
+  Guardian Sailor Moon Crystal`) fails coverage its romaji alias covers; it
+  now selects Crystal (`7163`). Measured live 2026-10-15.
+- Synonyms are matching material only, never display text: an AniList entry
+  with null `english` now displays romaji instead of the first synonym. Live
+  `Media(id:20760)` (`Gintama: Yorinuki Gintama-san on Theater 2D`) showed
+  the romaji arc-name first synonym (`Shinsengumi Douran-hen, Kabuki Chou
+  Shitennou-hen`) and dropped `Gintama` from the card; synonym queries still
+  match the entry. Measured live 2026-10-15.
 - Stale cached resolutions no longer survive a matching change: the metadata
   cache schema bumped to 4 (the alias-aware anime matching / English-first
   display fix changed what keys should resolve to but kept serving pre-fix

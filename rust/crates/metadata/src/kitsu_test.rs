@@ -214,6 +214,43 @@ fn kitsu_year_prefers_beerus_over_2015_series() {
     assert_eq!(media.year, 2026);
 }
 
+/// Sailor Moon 2014 regression (review of the alias-aware change): query
+/// `Bishoujo Senshi Sailor Moon` with year 2014 must land on Crystal (`7163`,
+/// 2014), not the 1992 series (`489`). The 1992 entry wins the title pick via
+/// its exact romaji alias, so only the year preference can swap to Crystal --
+/// and Crystal's English display name (`Pretty Guardian Sailor Moon Crystal`)
+/// does NOT cover the romaji query, while its aliases do. Coverage judged on
+/// the display name alone keeps the 1992 series; judged across aliases it
+/// selects Crystal. Live shape measured 2026-10-15 (trimmed to the fields the
+/// pick reads).
+#[test]
+fn kitsu_year_prefers_crystal_over_1992_series_for_romaji_query() {
+    let server = FakeServer::start(|req: &Request| {
+        if req.path == "/anime" {
+            return Response::json(
+                r#"{"data":[
+                    {"id":"489","attributes":{"slug":"bishoujo-senshi-sailor-moon","canonicalTitle":"Bishoujo Senshi Sailor Moon","titles":{"en":"Sailor Moon","en_jp":"Bishoujo Senshi Sailor Moon"},"startDate":"1992-03-07","synopsis":"The 1992 series.","episodeLength":24,"episodeCount":46,"userCount":300000}},
+                    {"id":"7163","attributes":{"slug":"bishoujo-senshi-sailor-moon-crystal","canonicalTitle":"Bishoujo Senshi Sailor Moon Crystal","titles":{"en":"Pretty Guardian Sailor Moon Crystal","en_jp":"Bishoujo Senshi Sailor Moon Crystal"},"startDate":"2014-07-05","synopsis":"The 2014 remake.","episodeLength":24,"episodeCount":26,"userCount":14167}}
+                ]}"#,
+            );
+        }
+        match req.path.as_str() {
+            "/episodes" => Response::json(EPISODES),
+            _ => Response::error(404, "not found"),
+        }
+    });
+    let source = KitsuSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &anime_query("Bishoujo Senshi Sailor Moon", 2014, 1),
+        )
+        .expect("Find")
+        .expect("the 2014 query must answer, got nil");
+    assert_eq!(media.source_id, "7163", "media = {media:?}");
+    assert_eq!(media.title, "Pretty Guardian Sailor Moon Crystal");
+    assert_eq!(media.year, 2014);
+}
 /// AoT regression (measured 2026-10-15): a romaji S01E03 query must land on
 /// the main TV series with its ENGLISH title, never on a romaji-named
 /// special. The live chain resolved `Shingeki no Kyojin S01E03` to the

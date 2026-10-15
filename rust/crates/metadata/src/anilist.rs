@@ -256,21 +256,16 @@ pub(crate) fn parse_anilist_episode(s: &str, fallback: i32) -> (i32, String) {
     (0, trimmed.to_string())
 }
 
-/// `canonicalTitle`: English wins; the entry's other titles (the first
-/// non-empty synonym, measured live English for entries whose `english` is
-/// null) come next; romaji is the last resort, never the default while an
-/// English title exists anywhere on the entry.
-fn canonical_title(english: &str, synonyms: &[String], romaji: &str) -> String {
+/// `canonicalTitle`: verified English wins; otherwise romaji. Synonyms are
+/// NEVER display text -- they stay in `match_aliases` for matching only, but
+/// an unverified synonym must not stand in as the English card title (live
+/// `Media(id:20760)` carries `english` null with a FIRST synonym of romaji
+/// arc names while the English title sits third, so the synonym fallback
+/// displayed arc names and dropped `Gintama` from the card).
+fn canonical_title(english: &str, romaji: &str) -> String {
     let english = english.trim();
     if !english.is_empty() {
         return english.to_string();
-    }
-    if let Some(synonym) = synonyms
-        .iter()
-        .map(|s| s.trim())
-        .find(|s| !s.is_empty())
-    {
-        return synonym.to_string();
     }
     romaji.trim().to_string()
 }
@@ -284,6 +279,93 @@ fn match_aliases(english: &str, synonyms: &[String], romaji: &str) -> Vec<String
         .chain(std::iter::once(romaji))
         .chain(synonyms.iter().map(String::as_str))
     {
+        let title = title.trim();
+        if !title.is_empty() {
+            out.push(title.to_string());
+        }
+    }
+    out
+}
+
+/// Generic tokens carry no identity: function words (articles, prepositions,
+/// conjunctions), romanised particles, and release-form vocabulary recur
+/// across unrelated entries, so sharing one proves nothing about which work
+/// the query names. This is a closed vocabulary list, not a length rule: a
+/// short content token (`kai`) corroborates while a long generic one
+/// (`season`) never does.
+fn is_generic_token(token: &str) -> bool {
+    matches!(
+        token,
+        // English function words.
+        "the" | "a" | "an" | "of" | "and" | "or" | "nor" | "in" | "on" | "at" | "to"
+        | "for" | "from" | "with" | "by" | "as" | "vs" | "per" | "via"
+        // Articles and prepositions common in French, German, Spanish,
+        // Portuguese and Italian titles.
+        | "de" | "la" | "le" | "les" | "des" | "du" | "el" | "il" | "der" | "die"
+        | "das" | "und" | "et" | "y"
+        // Romanised Japanese particles.
+        | "no" | "na" | "ni" | "wo" | "o" | "wa" | "ga" | "he" | "e" | "mo" | "ka"
+        | "yo" | "ne" | "ya" | "sa" | "zo" | "ze"
+        // Release-form vocabulary: the kind of release, never which work.
+        | "ova" | "ona" | "oad" | "tv" | "movie" | "film" | "special" | "season"
+        | "series" | "part" | "cour" | "episode" | "edition" | "version"
+        | "collection" | "volume" | "vol"
+    )
+}
+
+/// Numbered labels (`2nd`, `3rd`, ...) are numeral forms, not names: like a
+/// bare numeral they mark an installment and can never establish identity.
+fn is_ordinal_numeral(token: &str) -> bool {
+    for suffix in ["st", "nd", "rd", "th"] {
+        if let Some(stem) = token.strip_suffix(suffix)
+            && !stem.is_empty()
+            && stem.chars().all(|c| c.is_ascii_digit())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// A corroborating token is a content token: it carries a letter (so bare
+/// numerals never corroborate) and is not generic (see
+/// [`is_generic_token`]). What matters is whether the token can establish
+/// identity, never how long it is -- `kai` corroborates while `ova` does
+/// not.
+fn is_content_token(token: &str) -> bool {
+    token.chars().any(|c| c.is_alphabetic())
+        && !is_generic_token(token)
+        && !is_ordinal_numeral(token)
+}
+
+/// Canonical corroboration for the year override. Canonical titles decide
+/// identity; an alias may extend identity ONLY with canonical
+/// corroboration: the query shares a content token (see
+/// [`is_content_token`]) with the candidate's canonical (`english` +
+/// `romaji`) titles. An alias-only cover with no such token must not
+/// authorize a year override -- `Space Battleship Yamato`/1974 reaches `1650`
+/// (`yamato` is in `Uchuu Senkan Yamato`) and `DBZ Kai`/2014 reaches `20635`
+/// (`kai` is in `Dragon Ball Kai`), while `Monster`/2019 keeps `19` (nothing
+/// in `Golden Kamuy 2nd Season OVA` overlaps `monster`).
+fn query_corroborated_by_canonical(query: &str, english: &str, romaji: &str) -> bool {
+    let canonical = [english, romaji]
+        .into_iter()
+        .flat_map(crate::yearpref::tokens)
+        .collect::<Vec<_>>();
+    crate::yearpref::tokens(query)
+        .into_iter()
+        .any(|token| is_content_token(&token) && canonical.contains(&token))
+}
+
+/// The entry's canonical titles for year-override coverage: verified
+/// `english` + `romaji` only. Synonyms stay in [`match_aliases`] for
+/// ordinary matching/scoring, but an unverified synonym must never authorize
+/// a year override (live `124756` carries a `"Monster"` synonym with year
+/// 2019 that would otherwise steal a `Monster`/2019 query from the 2004
+/// series `19`, whose canonical titles do cover it).
+fn canonical_aliases(english: &str, romaji: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for title in [english, romaji] {
         let title = title.trim();
         if !title.is_empty() {
             out.push(title.to_string());
@@ -322,7 +404,7 @@ impl crate::resolver::Source for AnilistSource {
             if media.id == 0 {
                 continue;
             }
-            let name = canonical_title(&media.title.english, &media.synonyms, &media.title.romaji);
+            let name = canonical_title(&media.title.english, &media.title.romaji);
             if name.is_empty() {
                 continue;
             }
@@ -352,10 +434,33 @@ impl crate::resolver::Source for AnilistSource {
             return Ok(None);
         };
         // Soft year preference only: no year match keeps the title winner.
+        // The override judges canonical titles (english + romaji); synonyms
+        // stay in `cands` for matching/scoring and may extend identity only
+        // with canonical corroboration ([`query_corroborated_by_canonical`]):
+        // an uncorroborated synonym must never authorize the swap (live
+        // `124756` carries a `"Monster"` synonym with year 2019 that would
+        // otherwise steal a `Monster`/2019 query from the 2004 series `19`),
+        // while a corroborated alias still may (live `1650` carries the
+        // `Space Battleship Yamato` synonym sharing `yamato` with `Uchuu
+        // Senkan Yamato`).
+        let mut year_cands = cands.clone();
+        for (cand, media) in year_cands.iter_mut().zip(entries.iter()) {
+            let mut titles = canonical_aliases(&media.title.english, &media.title.romaji);
+            if query_corroborated_by_canonical(&q.title, &media.title.english, &media.title.romaji) {
+                titles.extend(
+                    media
+                        .synonyms
+                        .iter()
+                        .map(|synonym| synonym.trim().to_string())
+                        .filter(|synonym| !synonym.is_empty()),
+                );
+            }
+            cand.aliases = titles;
+        }
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &year_cands, &years, winner_idx);
         let media = &entries[take];
-        let title = canonical_title(&media.title.english, &media.synonyms, &media.title.romaji);
+        let title = canonical_title(&media.title.english, &media.title.romaji);
         if title.is_empty() {
             return Ok(None);
         }
@@ -403,5 +508,44 @@ impl crate::resolver::Source for AnilistSource {
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
         }))
+    }
+}
+
+/// The token test is vocabulary, not length: the three corroborating tokens
+/// the year override depends on (`kai`, `yamato`, `monster`) count, while
+/// function words, particles, release-form words, ordinals and bare numbers
+/// never do -- however long or short either side runs.
+#[cfg(test)]
+mod content_token_tests {
+    use super::{is_content_token, query_corroborated_by_canonical};
+
+    #[test]
+    fn content_token_is_vocabulary_not_length() {
+        for token in ["kai", "yamato", "monster", "ball", "dragon"] {
+            assert!(is_content_token(token), "{token:?} can establish identity");
+        }
+        for token in [
+            "the", "of", "a", "and", "ova", "season", "movie", "special", "2nd", "3rd", "2014",
+            "19", "no", "ni",
+        ] {
+            assert!(
+                !is_content_token(token),
+                "{token:?} is generic and corroborates nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn kai_corroborates_but_the_alone_does_not() {
+        assert!(query_corroborated_by_canonical(
+            "DBZ Kai",
+            "Dragon Ball Z Kai: The Final Chapters",
+            "Dragon Ball Kai (2014)"
+        ));
+        assert!(!query_corroborated_by_canonical(
+            "The DBZ",
+            "Dragon Ball Z Kai: The Final Chapters",
+            "Dragon Ball Kai (2014)"
+        ));
     }
 }

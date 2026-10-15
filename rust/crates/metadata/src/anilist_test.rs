@@ -346,10 +346,14 @@ fn anilist_romaji_query_selects_main_series_with_english_title() {
     assert_eq!(media.title, "Attack on Titan", "media = {media:?}");
 }
 
-/// An entry with an empty `english` must surface its other titles (here the
-/// first synonym, measured live English) rather than the romaji string.
+/// An entry with an empty `english` displays romaji: synonyms are matching
+/// material only, never display text (the Gintama 20760 review: an unverified
+/// first synonym stood in as English). This test pinned the old
+/// first-synonym fallback; the new behaviour is the intended one per that
+/// review, so it now asserts romaji display plus a synonym query still
+/// matching the same entry.
 #[test]
-fn anilist_empty_english_falls_back_to_synonym_not_romaji() {
+fn anilist_empty_english_falls_back_to_romaji_synonyms_stay_for_matching() {
     let body = r#"{"data":{"Page":{"media":[
         {"id":108942,"title":{"romaji":"Shingeki no Kyojin: Chimi Kyara Gekijou - Rivai-han","english":""},"synonyms":["Attack on Titan Season 3 Picture Drama","Shingeki no Kyojin Season 3 Specials"],"seasonYear":2018,"streamingEpisodes":[]}
     ]}}}"#;
@@ -368,7 +372,176 @@ fn anilist_empty_english_falls_back_to_synonym_not_romaji() {
         .expect("Find")
         .expect("expected media, got nil");
     assert_eq!(
-        media.title, "Attack on Titan Season 3 Picture Drama",
-        "media = {media:?}"
+        media.title, "Shingeki no Kyojin: Chimi Kyara Gekijou - Rivai-han",
+        "display is verified English, otherwise romaji -- never a synonym: {media:?}"
     );
+    let server2 = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source2 = AnilistSource::new(server2.url(), http_client());
+    let media2 = source2
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Attack on Titan Season 3 Picture Drama".to_string(),
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("a synonym query must still match, got nil");
+    assert_eq!(media2.source_id, "108942", "media = {media2:?}");
+    assert_eq!(
+        media2.title, "Shingeki no Kyojin: Chimi Kyara Gekijou - Rivai-han",
+        "media = {media2:?}"
+    );
+}
+
+/// Gintama 20760 regression (review of the alias-aware change, live shape
+/// measured 2026-10-15): `Media(id:20760)` carries `english` null, a FIRST
+/// synonym of `Shinsengumi Douran-hen, Kabuki Chou Shitennou-hen`, and the
+/// English title third (`Gintama: The Best of Gintama on Theater 2D`). The
+/// first-synonym fallback displays romaji arc names and drops `Gintama` from
+/// the card. Synonyms stay for MATCHING, but the display title must be
+/// verified English, otherwise romaji.
+#[test]
+fn anilist_null_english_displays_romaji_not_first_synonym() {
+    let body = r#"{"data":{"Page":{"media":[
+        {"id":20760,"title":{"romaji":"Gintama: Yorinuki Gintama-san on Theater 2D","english":null},"synonyms":["Shinsengumi Douran-hen, Kabuki Chou Shitennou-hen","Kabuki-chou Devas-hen","Gintama: The Best of Gintama on Theater 2D"],"seasonYear":2012,"streamingEpisodes":[]}
+    ]}}}"#;
+    let server = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source = AnilistSource::new(server.url(), http_client());
+    // By romaji: the card must show the romaji title, never the first synonym.
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Gintama: Yorinuki Gintama-san on Theater 2D".to_string(),
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.source_id, "20760", "media = {media:?}");
+    assert_eq!(
+        media.title, "Gintama: Yorinuki Gintama-san on Theater 2D",
+        "the first synonym must never stand in as English: {media:?}"
+    );
+    // By the English (third) synonym: synonyms still match, display unchanged.
+    let server2 = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source2 = AnilistSource::new(server2.url(), http_client());
+    let media2 = source2
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Gintama: The Best of Gintama on Theater 2D".to_string(),
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("a synonym query must still match, got nil");
+    assert_eq!(media2.source_id, "20760", "media = {media2:?}");
+    assert_eq!(
+        media2.title, "Gintama: Yorinuki Gintama-san on Theater 2D",
+        "media = {media2:?}"
+    );
+}
+
+/// Monster/2019 over-correction (live shape measured 2026-10-15, re-verified
+/// live 2026-10-15: `search:"Monster"` returns `Monster` (`19`, 2004) AND
+/// `Golden Kamuy 2nd Season OVA` (`124756`, 2019) whose synonyms include
+/// `"Monster"`). Query `Monster` + year 2019 must keep `19`: the OVA's
+/// canonical titles (`Golden Kamuy 2nd Season OVA`) never cover `Monster`,
+/// so only an arbitrary synonym authorizes the override.
+#[test]
+fn anilist_year_override_ignores_synonym_only_coverage() {
+    let body = r#"{"data":{"Page":{"media":[
+        {"id":19,"title":{"romaji":"MONSTER","english":"Monster"},"synonyms":["Monster"],"seasonYear":2004,"streamingEpisodes":[]},
+        {"id":124756,"title":{"romaji":"Golden Kamuy 2nd Season OVA","english":null},"synonyms":["Monster","Golden Kamui 2nd Season OVA"],"seasonYear":2019,"streamingEpisodes":[]}
+    ]}}}"#;
+    let server = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source = AnilistSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Monster".to_string(),
+                year: 2019,
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.source_id, "19", "a synonym must not authorize a year override: {media:?}");
+    assert_eq!(media.title, "Monster", "media = {media:?}");
+}
+
+/// Yamato under-correction (live shape measured 2026-10-15:
+/// `search:"Space Battleship Yamato"` returns the 1977 movie (`711`,
+/// english `Space Battleship Yamato`) before the 1974 TV series (`1650`,
+/// english `Star Blazers: The Quest for Iscandar`, romaji `Uchuu Senkan
+/// Yamato`, synonym `Space Battleship Yamato`). Query + year 1974 must
+/// select `1650`: the alias-only cover is corroborated by the distinctive
+/// token `yamato`, which the canonical romaji title carries.
+#[test]
+fn anilist_year_override_allows_corroborated_alias_coverage() {
+    let body = r#"{"data":{"Page":{"media":[
+        {"id":711,"title":{"romaji":"Uchuu Senkan Yamato (Movie)","english":"Space Battleship Yamato"},"synonyms":[],"seasonYear":1977,"streamingEpisodes":[]},
+        {"id":1650,"title":{"romaji":"Uchuu Senkan Yamato","english":"Star Blazers: The Quest for Iscandar"},"synonyms":["Space Battleship Yamato","Space Cruiser Yamato"],"seasonYear":1974,"streamingEpisodes":[]}
+    ]}}}"#;
+    let server = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source = AnilistSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "Space Battleship Yamato".to_string(),
+                year: 1974,
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.source_id, "1650", "a corroborated alias must authorize the year override: {media:?}");
+    assert_eq!(media.title, "Star Blazers: The Quest for Iscandar", "media = {media:?}");
+}
+
+/// DBZ Kai over-narrowing (live shape measured 2026-10-15:
+/// `search:"DBZ Kai"` returns `Dragon Ball Kai` (`6033`, english `Dragon
+/// Ball Z Kai`, 2009) before `Dragon Ball Kai (2014)` (`20635`, english
+/// `Dragon Ball Z Kai: The Final Chapters`, 2014); both carry the `DBZ Kai`
+/// synonym, and the correct entry's canonical titles overlap the query only
+/// on `kai`). Query + year 2014 must select `20635`: `kai` is a content
+/// token, so the alias-only cover is corroborated. The length floor rejected
+/// `kai` and stranded the query on the 2009 series.
+#[test]
+fn anilist_year_override_allows_short_content_token_corroboration() {
+    let body = r#"{"data":{"Page":{"media":[
+        {"id":6033,"title":{"romaji":"Dragon Ball Kai","english":"Dragon Ball Z Kai"},"synonyms":["Dragonball Kai","DBK","DB Kai","DBZ Kai"],"seasonYear":2009,"streamingEpisodes":[]},
+        {"id":20635,"title":{"romaji":"Dragon Ball Kai (2014)","english":"Dragon Ball Z Kai: The Final Chapters"},"synonyms":["Dragon Ball Kai","DBK","DB Kai","DBZ Kai"],"seasonYear":2014,"streamingEpisodes":[]}
+    ]}}}"#;
+    let server = FakeServer::start(move |_req: &Request| Response::json(body));
+    let source = AnilistSource::new(server.url(), http_client());
+    let media = source
+        .find(
+            &Cancel::background(),
+            &Query {
+                kind: Kind::SERIES,
+                title: "DBZ Kai".to_string(),
+                year: 2014,
+                absolute: true,
+                ..Query::default()
+            },
+        )
+        .expect("Find")
+        .expect("expected media, got nil");
+    assert_eq!(media.source_id, "20635", "a content-token corroboration must authorize the year override: {media:?}");
+    assert_eq!(media.title, "Dragon Ball Z Kai: The Final Chapters", "media = {media:?}");
 }
