@@ -1035,9 +1035,9 @@ fn build_activity_resolved_rich() {
     assert_eq!(got.name, want, "name");
     let want = trunc("Canonical Episode", 128);
     assert_eq!(got.details, want, "details");
-    let want = rp_text("S1 E2 \u{b7} A brave synopsis", 128);
+    let want = rp_text("S1 E2", 128);
     assert_eq!(got.state, want, "state");
-    assert_eq!(got.state, "S1 E2 \u{b7} A brave synopsis", "state exact");
+    assert_eq!(got.state, "S1 E2", "state exact");
     // Hover slot: large_text carries the complete short synopsis, not a
     // duplicate of name (the card header already shows the series).
     assert_eq!(
@@ -1046,7 +1046,7 @@ fn build_activity_resolved_rich() {
         "large_text"
     );
 
-    // synopsis only becomes state
+    // synopsis stays in the tooltip, never the state (S3 de-duplication)
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -1055,13 +1055,14 @@ fn build_activity_resolved_rich() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "Just a synopsis", "state");
+    assert_eq!(got.state, "", "state");
+    assert_eq!(got.large_text, "Just a synopsis", "large_text");
 
     // tag only becomes state
     let got = build_activity_resolved(TV_TAG_ONLY_RAW, Some(&run_act), &Resolved::default());
     assert_eq!(got.state, "S1 E2", "state");
 
-    // long synopsis truncated to synopsis budget
+    // long synopsis reaches the tooltip (hard-cut at 128); the state stays empty
     let long = "s".repeat(200);
     let got = build_activity_resolved(
         MOVIE_RAW,
@@ -1071,7 +1072,8 @@ fn build_activity_resolved_rich() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, rp_text(&long, STATE_SYNOPSIS_BUDGET), "state");
+    assert_eq!(got.state, "", "state");
+    assert_eq!(got.large_text, rp_text(&long, 128), "large_text");
     let n = java_units(&got.state);
     assert!(
         n <= STATE_SYNOPSIS_BUDGET,
@@ -1171,10 +1173,11 @@ fn trim_word_strips_cut_punctuation() {
     assert_eq!(got, want, "trim_word cut");
 }
 
-/// The live comma-cut shape (`…Majin Buu,` on the wire): a movie card whose
-/// synopsis cuts at a clause comma ends on the word with U+2026.
+/// The default movie state carries no synopsis (the live `…Majin Buu,` cut now
+/// lives on the SYNOPSIS preset, pinned in cardspec_test): with no genres or
+/// length the state stays empty and the tooltip carries the synopsis.
 #[test]
-fn movie_state_comma_cut_ends_clean() {
+fn movie_default_state_has_no_synopsis() {
     const MOVIE_RAW: &str = "Dragon.Ball.Movie.1990.1080p.mkv - PotPlayer";
     let run_act = Action {
         running: true,
@@ -1195,15 +1198,14 @@ fn movie_state_comma_cut_ends_clean() {
             ..Resolved::default()
         },
     );
-    let want = "Years after the battle with Earth's greatest enemy, Majin Buu\u{2026}";
-    assert_eq!(got.state, want, "state");
-    assert_clean_cut(syn, &got.state);
+    assert_eq!(got.state, "", "state");
+    assert_eq!(got.large_text, trim_word(syn, 128), "large_text");
 }
 
-/// The live semicolon-cut shape (`…meet Elliot;` on the wire): a series card
-/// whose synopsis cuts at a clause semicolon ends on the word with U+2026.
+/// The default series state is the episode tag alone (the live `…meet Elliot;`
+/// cut now lives on the SYNOPSIS preset, pinned in cardspec_test).
 #[test]
-fn series_state_semicolon_cut_ends_clean() {
+fn series_default_state_is_tag_only() {
     const TV_RAW: &str = "Show.S02E04.Episode.1080p.mkv - PotPlayer";
     let run_act = Action {
         running: true,
@@ -1222,10 +1224,8 @@ fn series_state_semicolon_cut_ends_clean() {
             ..Resolved::default()
         },
     );
-    let want =
-        "S2 E4 \u{b7} Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}";
-    assert_eq!(got.state, want, "state");
-    assert_clean_cut(&format!("S2 E4 \u{b7} {syn}"), &got.state);
+    assert_eq!(got.state, "S2 E4", "state");
+    assert_eq!(got.large_text, trim_word(syn, 128), "large_text");
 }
 
 /// The live tooltip shape (`…Zak Penn and Ernest` on the wire): a cut hover
@@ -1305,7 +1305,7 @@ fn build_activity_resolved_movie() {
     );
     assert_eq!(got.details, trunc("Dune: Part Two", 128), "details");
 
-    // state joins Genre Length synopsis
+    // state joins Genre Length (no synopsis)
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -1319,10 +1319,7 @@ fn build_activity_resolved_movie() {
             ..Resolved::default()
         },
     );
-    assert_eq!(
-        got.state, "Sci-Fi \u{b7} 2h 46m \u{b7} Paul unites the Fremen",
-        "state"
-    );
+    assert_eq!(got.state, "Sci-Fi \u{b7} 2h 46m", "state");
 
     // state skips empties
     let got = build_activity_resolved(
@@ -1336,9 +1333,9 @@ fn build_activity_resolved_movie() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "2h 19m \u{b7} A quest", "state");
+    assert_eq!(got.state, "2h 19m", "state");
 
-    // long movie state ends on ellipsis at a word boundary
+    // long movie state carries genres/length only; the synopsis stays in the tooltip
     let syn = format!("{}finale", "epic ".repeat(40));
     let got = build_activity_resolved(
         MOVIE_RAW,
@@ -1352,27 +1349,9 @@ fn build_activity_resolved_movie() {
             ..Resolved::default()
         },
     );
-    assert!(
-        got.state.ends_with('\u{2026}'),
-        "state = {:?}, want trailing ellipsis",
-        got.state
-    );
+    assert_eq!(got.state, "Adventure \u{b7} 2h 46m", "state");
     let n = java_units(&got.state);
     assert!(n <= 128, "state length {n} exceeds 128: {:?}", got.state);
-    let body = got.state.trim_end_matches('\u{2026}');
-    if let Some(idx) = body.rfind("\u{b7} ") {
-        let tail = &body[idx + "\u{b7} ".len()..];
-        if tail.contains(' ') {
-            // The synopsis tail after the last separator still ends mid-list;
-            // the key invariant is no partial word: last char before ellipsis
-            // must not be a word prefix fragment. "epic" words are whole.
-            assert!(
-                body.ends_with("epic") || body.ends_with("finale"),
-                "state ends mid-word: {:?}",
-                got.state
-            );
-        }
-    }
 
     // paused movie keeps the Paused marker
     let got = build_activity_resolved(
@@ -1437,7 +1416,7 @@ fn build_activity_resolved_series_state() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "S1 E2 \u{b7} A brave new world unfolds", "state");
+    assert_eq!(got.state, "S1 E2", "state");
 }
 
 #[test]

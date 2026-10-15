@@ -13,7 +13,7 @@ use crate::cache::{
     cache_store_negative, checked_at_instant, clear_cache, clear_cache_entries, count_negatives,
     decode_cache_entry, default_cache_dir, legacy_cache_files, migrate_legacy_cache,
     resolve_cache_dir, with_cache, with_cache_write, CacheEntry, CacheFile, CACHE_MAX_VALUE_SIZE,
-    CACHE_SCHEMA, NEGATIVE_TTL,
+    CACHE_SCHEMA, NEGATIVE_TTL, POSITIVE_TTL, positive_fresh,
 };
 use crate::resolver::NEGATIVE_BACKOFF;
 use crate::testsupport::{resolver_with, FakeSource, TempDir};
@@ -367,7 +367,9 @@ fn cache_live_future_checked_at() {
 }
 
 /// `TestCacheLegacyPositiveNoNewFields`: a pre-existing positive file with no
-/// `notFound`/`checkedAt` fields still loads as a positive hit.
+/// `notFound`/`checkedAt` fields is now STALE under the positive TTL (a record
+/// with no timestamp cannot prove freshness), while the same record carrying a
+/// fresh `checkedAt` still loads as a positive hit.
 #[test]
 fn cache_legacy_positive_no_new_fields() {
     let dir = TempDir::new();
@@ -384,10 +386,116 @@ fn cache_legacy_positive_no_new_fields() {
         "{{\"key\":{key:?},\"schema\":3,\"media\":{{\"source\":\"tvmaze\",\"sourceId\":\"9\",\"kind\":1,\"title\":\"Legacy Show\",\"episodes\":[{{\"season\":2,\"number\":1,\"title\":\"Pilot\"}}],\"fetchedAt\":\"2026-01-01T00:00:00Z\"}}}}"
     );
     std::fs::write(format!("{d}/{}", cache_file_name(&key)), legacy).unwrap();
-    let media = cache_load(&d, &key).expect("legacy positive cacheLoad");
+    assert!(
+        cache_load(&d, &key).is_none(),
+        "a positive record with no checkedAt must be stale under POSITIVE_TTL"
+    );
+    assert!(!positive_fresh("", SystemTime::now()));
+    // The same record with a fresh stamp loads (separate directory: migration
+    // imports legacy files only while the store is empty).
+    let dir2 = TempDir::new();
+    let d2 = dir2.path();    let fresh = format!(
+        "{{\"key\":{key:?},\"schema\":3,\"checked_at\":{:?},\"media\":{{\"source\":\"tvmaze\",\"sourceId\":\"9\",\"kind\":1,\"title\":\"Legacy Show\",\"episodes\":[{{\"season\":2,\"number\":1,\"title\":\"Pilot\"}}],\"fetchedAt\":\"2026-01-01T00:00:00Z\"}}}}",
+        format_rfc3339(SystemTime::now())
+    );
+    std::fs::write(format!("{d2}/{}", cache_file_name(&key)), fresh).unwrap();
+    let media = cache_load(&d2, &key).expect("fresh positive cacheLoad");
     assert_eq!(media.source, "tvmaze");
-    let entry = cache_load_entry(&d, &key).expect("legacy positive cacheLoadEntry");
+    let entry = cache_load_entry(&d2, &key).expect("fresh positive cacheLoadEntry");
     assert!(!entry.not_found && entry.media.is_some());
+}
+
+/// `TestPositiveTTLGovernsRefetch`: a positive entry inside its TTL serves the
+/// hit with zero provider calls from a cold resolver; a positive backdated
+/// past the TTL is stale and is re-fetched.
+#[test]
+fn positive_ttl_governs_refetch() {
+    let dir = TempDir::new();
+    let d = dir.path();
+    let q = Query {
+        kind: Kind::SERIES,
+        title: "Aired Somewhere".to_string(),
+        season: 1,
+        episode: 1,
+        ..Query::default()
+    };
+    let key = cache_key(&q);
+    let media = Media {
+        source: "fake".to_string(),
+        source_id: "1".to_string(),
+        kind: Kind::SERIES,
+        title: "Aired Somewhere".to_string(),
+        episodes: vec![Episode {
+            season: 1,
+            number: 1,
+            title: "Pilot".to_string(),
+            ..Episode::default()
+        }],
+        fetched_at: crate::timefmt::now_rfc3339(),
+        ..Media::default()
+    };
+
+    let first = FakeSource::with_media("fake", media.clone());
+    let first_calls = first.counter();
+    let r1 = resolver_with(&d, vec![first.shared()]);
+    let res = r1
+        .lookup_now(&Cancel::background(), &q)
+        .expect("run 1 LookupNow");
+    assert!(res.found, "run 1 = {res:?}, want a hit");
+    assert_eq!(first_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(cache_live(&d, &key), "fresh positive must be live");
+
+    let second = FakeSource::with_media("fake", media.clone());
+    let second_calls = second.counter();
+    let r2 = resolver_with(&d, vec![second.shared()]);
+    let res = r2
+        .lookup_now(&Cancel::background(), &q)
+        .expect("run 2 LookupNow");
+    assert!(res.found, "run 2 = {res:?}, want the cached hit");
+    assert_eq!(
+        second_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "positive inside its TTL must not touch the provider"
+    );
+
+    let backdated = serde_json::to_vec(&CacheFile {
+        key: key.clone(),
+        schema: CACHE_SCHEMA,
+        media: media.clone(),
+        checked_at: format_rfc3339(SystemTime::now() - POSITIVE_TTL - Duration::from_secs(3600)),
+        ..CacheFile::default()
+    })
+    .unwrap();
+    with_cache(&d, |db| {
+        db.put(&key, &backdated)?;
+        Ok(())
+    })
+    .expect("backdate stored positive");
+    assert!(
+        !cache_live(&d, &key),
+        "a positive older than POSITIVE_TTL must be stale"
+    );
+    assert!(!positive_fresh(
+        &format_rfc3339(SystemTime::now() - POSITIVE_TTL - Duration::from_secs(3600)),
+        SystemTime::now()
+    ));
+    assert!(positive_fresh(
+        &format_rfc3339(SystemTime::now()),
+        SystemTime::now()
+    ));
+
+    let third = FakeSource::with_media("fake", media.clone());
+    let third_calls = third.counter();
+    let r3 = resolver_with(&d, vec![third.shared()]);
+    let res = r3
+        .lookup_now(&Cancel::background(), &q)
+        .expect("run 3 LookupNow");
+    assert!(res.found, "run 3 = {res:?}, want a hit");
+    assert_eq!(
+        third_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an expired positive must be re-fetched"
+    );
 }
 
 /// `TestCacheLargeEntryRoundTrip`: the retired 64 KiB read cap is gone -- a

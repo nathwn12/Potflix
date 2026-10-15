@@ -142,7 +142,21 @@ impl HttpClient {
     /// `fetchGet`: a GET with the shared `User-Agent`/`Accept` and one bounded
     /// 429 retry (http.go:99).
     pub fn get(&self, cancel: &Cancel, url: &str) -> Result<Response<Body>, Error> {
-        self.fetch(cancel, url, None)
+        self.fetch(cancel, url, None, "")
+    }
+
+    /// `fetchGet` with a per-request `Accept` override (empty means the shared
+    /// one). Kitsu's JSON:API answers `406 Not Acceptable` unless the request
+    /// carries `Accept: application/vnd.api+json`, so that one provider opts
+    /// out of the shared `application/json` here; pool, timeout, limiter and
+    /// retry are unchanged.
+    pub fn get_with_accept(
+        &self,
+        cancel: &Cancel,
+        url: &str,
+        accept: &str,
+    ) -> Result<Response<Body>, Error> {
+        self.fetch(cancel, url, None, accept)
     }
 
     /// `fetchPostJSON`: a JSON POST with the shared `User-Agent`/`Accept`, a
@@ -155,7 +169,7 @@ impl HttpClient {
         payload: &T,
     ) -> Result<Response<Body>, Error> {
         let body = serde_json::to_vec(payload).map_err(Error::Encode)?;
-        self.fetch(cancel, url, Some(body))
+        self.fetch(cancel, url, Some(body), "")
     }
 
     /// `fetchWithRetry`: runs the request once, and on HTTP 429 retries
@@ -167,11 +181,12 @@ impl HttpClient {
         cancel: &Cancel,
         url: &str,
         payload: Option<Vec<u8>>,
+        accept: &str,
     ) -> Result<Response<Body>, Error> {
         let uri: Uri = url
             .parse()
             .map_err(|err: ureq::http::uri::InvalidUri| Error::Url(err.to_string()))?;
-        let response = self.attempt(cancel, &uri, payload.as_deref())?;
+        let response = self.attempt(cancel, &uri, payload.as_deref(), accept)?;
         if response.status().as_u16() != StatusCode::TOO_MANY_REQUESTS.as_u16() {
             return Ok(response);
         }
@@ -185,7 +200,7 @@ impl HttpClient {
         // Go bounds the wait, then a zero wait still checks `ctx.Err()` - which
         // is exactly what a zero-length `wait` does here.
         cancel.wait(wait).map_err(Error::Cancelled)?;
-        self.attempt(cancel, &uri, payload.as_deref())
+        self.attempt(cancel, &uri, payload.as_deref(), accept)
     }
 
     fn attempt(
@@ -193,6 +208,7 @@ impl HttpClient {
         cancel: &Cancel,
         uri: &Uri,
         payload: Option<&[u8]>,
+        accept: &str,
     ) -> Result<Response<Body>, Error> {
         wait_for_host(cancel, uri.host().unwrap_or_default()).map_err(Error::Cancelled)?;
         // Go's `client.Do` honors the request context: an already-cancelled or
@@ -201,6 +217,7 @@ impl HttpClient {
         if let Some(reason) = cancel.err() {
             return Err(Error::Cancelled(reason));
         }
+        let accept = if accept.is_empty() { ACCEPT_JSON } else { accept };
         // `ureq` type-states the request body, so the two wire shapes are
         // built separately: same headers, same contract as Go's one closure.
         let result = match payload {
@@ -208,14 +225,14 @@ impl HttpClient {
                 .agent
                 .post(uri.clone())
                 .header("User-Agent", METADATA_USER_AGENT)
-                .header("Accept", ACCEPT_JSON)
+                .header("Accept", accept)
                 .header("Content-Type", CONTENT_TYPE_JSON)
                 .send(body),
             None => self
                 .agent
                 .get(uri.clone())
                 .header("User-Agent", METADATA_USER_AGENT)
-                .header("Accept", ACCEPT_JSON)
+                .header("Accept", accept)
                 .call(),
         };
         result.map_err(Error::Transport)

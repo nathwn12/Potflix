@@ -5,8 +5,13 @@
 //! Unknown hosts are ungated.
 //!
 //! Per-host fetch spacing, chosen from each provider's published limits:
-//! TVmaze ~2/s, AniList ~1.4/s, Jikan ~2.8/s, iTunes Search 20/min,
-//! Wikipedia anonymous Action API 1/s. Any host NOT listed gets NO gate, so
+//! TVmaze ~2/s, AniList at the documented current degraded 30/min (the
+//! published normal is 90/min; the limiter holds the degraded figure),
+//! Jikan ~2.8/s, iTunes Search 20/min, Tenrai at its documented 120/min,
+//! Wikipedia anonymous Action API 1/s. Cinemeta, Kitsu, JustWatch, Episodate,
+//! Bangumi, LiveChart.me and ANN publish no limit, so theirs are conservative
+//! chosen readings in the order of the other hosts, not measured or published
+//! figures. Any host NOT listed gets NO gate, so
 //! tests, the loopback fake provider, and any future source are never silently
 //! throttled by a wrong guess (ratelimit.go:14-16).
 
@@ -16,10 +21,16 @@ use std::time::{Duration, Instant};
 
 use crate::cancel::{Cancel, CancelError};
 
-/// The published intervals (ratelimit.go:17-30).
+/// The published intervals (ratelimit.go:17-30), except AniList: the docs state
+/// a normal 90/min ceiling but the API is currently degraded to 30/min, so the
+/// limiter holds the degraded figure (2000 ms) until the docs say otherwise.
+/// A fixed interval fits this limiter's design (one spacing per host, plus the
+/// bounded `Retry-After` retry in `http.rs`); adopting `X-RateLimit-Limit`
+/// would need response headers plumbed back into the limiter, a new subsystem
+/// for no functional gain in a one-title-at-a-time desktop app.
 const DEFAULT_HOST_INTERVALS: &[(&str, Duration)] = &[
     ("api.tvmaze.com", Duration::from_millis(500)),
-    ("graphql.anilist.co", Duration::from_millis(700)),
+    ("graphql.anilist.co", Duration::from_millis(2000)),
     ("api.jikan.moe", Duration::from_millis(350)),
     ("itunes.apple.com", Duration::from_millis(3000)),
     // MediaWiki API etiquette asks anonymous clients to make requests serially
@@ -28,6 +39,36 @@ const DEFAULT_HOST_INTERVALS: &[(&str, Duration)] = &[
     // case - fine for a miss path behind the 3s iTunes gate. 429s are
     // additionally honored via `Retry-After`.
     ("en.wikipedia.org", Duration::from_millis(1000)),
+    // Cinemeta publishes no rate limit: 1 req/s is a conservative chosen
+    // reading in the order of the other hosts, not a measured or published
+    // figure. A series lookup costs 2 sequential calls (catalog then meta).
+    ("v3-cinemeta.strem.io", Duration::from_millis(1000)),
+    // Tenrai documents 120 requests/minute, so 500 ms holds that ceiling.
+    ("api.tenrai.org", Duration::from_millis(500)),
+    // Kitsu publishes no rate limit: 1 req/s is a conservative chosen reading
+    // in the order of the other hosts, not a measured or published figure.
+    // A series lookup costs 2 sequential calls (anime then one episode page).
+    ("kitsu.io", Duration::from_millis(1000)),
+    // JustWatch's unofficial GraphQL publishes no rate limit: 2 req/s is a
+    // conservative chosen reading, not a measured or published figure. One
+    // lookup is a single POST.
+    ("apis.justwatch.com", Duration::from_millis(2000)),
+    // Episodate is a small community database publishing no rate limit: one
+    // request per 2 s is a conservative chosen reading, not a measured or
+    // published figure. A series lookup costs 2 sequential calls.
+    ("www.episodate.com", Duration::from_millis(2000)),
+    // Bangumi publishes no rate limit for keyless search: one request per
+    // 2 s is a conservative chosen reading, not a measured or published
+    // figure. A series lookup costs up to 2 sequential calls.
+    ("api.bgm.tv", Duration::from_millis(2000)),
+    // LiveChart.me publishes no rate limit: one request per 2 s is a
+    // conservative chosen reading, not a measured or published figure. One
+    // lookup is a single call.
+    ("www.livechart.me", Duration::from_millis(2000)),
+    // ANN's encyclopedia API publishes no rate limit: one request per 2 s is
+    // a conservative chosen reading, not a measured or published figure. A
+    // lookup costs up to 2 sequential calls (the colon retry).
+    ("cdn.animenewsnetwork.com", Duration::from_millis(2000)),
 ];
 
 /// Turbo: the published intervals exactly. The default, and the fastest.
@@ -84,7 +125,7 @@ pub fn normalize_rate_profile(p: &str) -> &'static str {
     }
 }
 
-/// Maps a named profile onto the five published hosts, leaving any other
+/// Maps a named profile onto the thirteen known hosts, leaving any other
 /// (test/fake) host entry untouched so `set_host_interval` keeps working.
 /// Unknown/empty profiles yield turbo (ratelimit.go:72).
 pub fn set_rate_profile(profile: &str) {
