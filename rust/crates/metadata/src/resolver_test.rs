@@ -1097,3 +1097,315 @@ fn chain_live_dbs_selects_beerus_2026_not_the_2015_series() {
         _ => {}
     }
 }
+
+/// A complete S1E1 answer shaped like the measured live records: a
+/// number-exact episode match carrying a synopsis, so the chain would settle
+/// on it today.
+fn year_gate_media(title: &str, year: i32) -> Media {
+    Media {
+        source: "fake".to_string(),
+        source_id: "1".to_string(),
+        kind: Kind::SERIES,
+        title: title.to_string(),
+        year,
+        synopsis: "Show synopsis.".to_string(),
+        episodes: vec![Episode {
+            season: 1,
+            number: 1,
+            title: "Pilot".to_string(),
+            synopsis: "Episode synopsis.".to_string(),
+            ..Episode::default()
+        }],
+        fetched_at: now_rfc3339(),
+        ..Media::default()
+    }
+}
+
+fn year_gate_query(title: &str, year: i32) -> Query {
+    Query {
+        kind: Kind::SERIES,
+        title: title.to_string(),
+        season: 1,
+        episode: 1,
+        year,
+        ..Query::default()
+    }
+}
+
+/// Chain year gate, live shape measured 2026-10-15: `Case Closed` + 1996 must
+/// not settle on the general leg's `D.B. Cooper: Case Closed?` (2016) when a
+/// later leg carries the 1996 work with the episode in hand. A year-known,
+/// title-divergent pick is a different work, never the answer.
+#[test]
+fn chain_skips_year_mismatched_non_exact_pick() {
+    let dir = TempDir::new();
+    let wrong = FakeSource::with_media("general", year_gate_media("D.B. Cooper: Case Closed?", 2016));
+    let right = FakeSource::with_media("anime", year_gate_media("Detective Conan", 1996));
+    let resolver = resolver_with(&dir.path(), vec![wrong.shared(), right.shared()]);
+    let out = resolver
+        .lookup_now(&Cancel::background(), &year_gate_query("Case Closed", 1996))
+        .expect("lookup");
+    assert!(
+        out.found && out.series == "Detective Conan",
+        "the chain must skip the 2016 different-work pick, got {out:?}"
+    );
+}
+
+/// Chain year gate, live shape measured 2026-10-15: `Space Battleship
+/// Yamato` + 1974 must not settle on `Star Blazers: Space Battleship Yamato`
+/// (2012) when a later leg carries the 1974 work.
+#[test]
+fn chain_skips_year_mismatched_non_exact_pick_yamato() {
+    let dir = TempDir::new();
+    let wrong = FakeSource::with_media(
+        "general",
+        year_gate_media("Star Blazers: Space Battleship Yamato", 2012),
+    );
+    let right = FakeSource::with_media(
+        "anime",
+        year_gate_media("Star Blazers: The Quest for Iscandar", 1974),
+    );
+    let resolver = resolver_with(&dir.path(), vec![wrong.shared(), right.shared()]);
+    let out = resolver
+        .lookup_now(
+            &Cancel::background(),
+            &year_gate_query("Space Battleship Yamato", 1974),
+        )
+        .expect("lookup");
+    assert!(
+        out.found && out.series == "Star Blazers: The Quest for Iscandar",
+        "the chain must skip the 2012 different-work pick, got {out:?}"
+    );
+}
+
+/// Chain year gate guard, live shape measured 2026-10-15: `Monster` + 2019
+/// keeps the exact-titled 2004 series. An exact title match is identity even
+/// when the file year disagrees, so the gate must not turn it into a miss.
+#[test]
+fn chain_keeps_year_mismatched_exact_title() {
+    let dir = TempDir::new();
+    let exact = FakeSource::with_media("general", year_gate_media("Monster", 2004));
+    let resolver = resolver_with(&dir.path(), vec![exact.shared()]);
+    let out = resolver
+        .lookup_now(&Cancel::background(), &year_gate_query("Monster", 2019))
+        .expect("lookup");
+    assert!(
+        out.found && out.series == "Monster",
+        "an exact title match must survive a year mismatch, got {out:?}"
+    );
+}
+
+/// Chain year gate, alias shape measured live 2026-10-16: `Kimi no Na wa` +
+/// 2015 (movie) keeps `Your Name` (2016). Identity proved through a verified
+/// alias is exempt from the year gate exactly like a display-title match --
+/// comparing display titles only turned this into a miss.
+#[test]
+fn chain_keeps_year_mismatched_alias_identity() {
+    let dir = TempDir::new();
+    let media = Media {
+        source: "fake".to_string(),
+        source_id: "1".to_string(),
+        kind: Kind::MOVIE,
+        title: "Your Name".to_string(),
+        year: 2016,
+        synopsis: "A 2016 animated romantic fantasy film.".to_string(),
+        aliases: vec!["Kimi no Na wa".to_string()],
+        fetched_at: now_rfc3339(),
+        ..Media::default()
+    };
+    let fake = FakeSource::with_media("general", media);
+    let resolver = resolver_with(&dir.path(), vec![fake.shared()]);
+    let q = Query {
+        kind: Kind::MOVIE,
+        title: "Kimi no Na wa".to_string(),
+        year: 2015,
+        ..Query::default()
+    };
+    let out = resolver.lookup_now(&Cancel::background(), &q).expect("lookup");
+    assert!(
+        out.found && out.series == "Your Name" && out.year == 2016,
+        "alias identity must survive a year mismatch, got {out:?}"
+    );
+}
+
+/// Chain exemption, spin-off shape measured live 2026-10-16:
+/// `Shingeki no Kyojin` + 2014 (S1E1) keeps the earlier leg's 2013 main
+/// series instead of falling through to a later leg's year-agreeing `No
+/// Regrets` spin-off. Alias-proved identity is exempt from the year gate,
+/// so the first complete answer still settles: the spin-off leg is never
+/// even consulted. Order arbitrates; identity only exempts.
+#[test]
+fn chain_keeps_exempt_identity_ahead_of_later_spinoff() {
+    fn complete_series(title: &str, year: i32, aliases: Vec<String>) -> Media {
+        let mut media = year_gate_media(title, year);
+        media.aliases = aliases;
+        media
+    }
+    let dir = TempDir::new();
+    let main = FakeSource::with_media(
+        "earlier",
+        complete_series("Attack on Titan", 2013, vec!["Shingeki no Kyojin".to_string()]),
+    );
+    let spinoff = FakeSource::with_media(
+        "later",
+        complete_series("Attack on Titan: No Regrets", 2014, Vec::new()),
+    );
+    let spinoff_calls = spinoff.counter();
+    let resolver = resolver_with(&dir.path(), vec![main.shared(), spinoff.shared()]);
+    let out = resolver
+        .lookup_now(
+            &Cancel::background(),
+            &year_gate_query("Shingeki no Kyojin", 2014),
+        )
+        .expect("lookup");
+    assert_eq!(
+        spinoff_calls.load(Ordering::SeqCst),
+        0,
+        "the exempt identity settles before the spin-off leg"
+    );
+    assert!(
+        out.found && out.series == "Attack on Titan" && out.year == 2013,
+        "alias identity must survive the year gate, got {out:?}"
+    );
+}
+
+/// LIVE chain: `Fate` + 2006 (S1E1) must never settle on TVmaze's `Fate/Zero`
+/// (2011) -- measured live 2026-10-15. Real network, real input.
+#[test]
+fn chain_live_fate_2006_not_fate_zero() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = year_gate_query("Fate", 2006);
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for Fate 2006 S1E1");
+    eprintln!("LIVE-CHAIN Fate/2006 winner: series={:?} year={} found={}", res.series, res.year, res.found);
+    assert!(
+        res.found && res.series == "Fate/stay night" && res.year == 2006,
+        "the chain must return the 2006 work, never the 2011 different work, got {res:?}"
+    );
+}
+
+/// LIVE chain: `Case Closed` + 1996 (S1E1) must never settle on TVmaze's
+/// `D.B. Cooper: Case Closed?` (2016) -- measured live 2026-10-15.
+#[test]
+fn chain_live_case_closed_1996_not_db_cooper() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = year_gate_query("Case Closed", 1996);
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for Case Closed 1996 S1E1");
+    eprintln!("LIVE-CHAIN Case Closed/1996 winner: series={:?} year={} found={}", res.series, res.year, res.found);
+    assert!(
+        res.found && res.series == "Detective Conan" && res.year == 1996,
+        "the chain must return the 1996 work, never a different work, got {res:?}"
+    );
+}
+
+/// LIVE chain: `Space Battleship Yamato` + 1974 (S1E1) must resolve to the
+/// 1974 work, never the 2012 entity -- measured live 2026-10-15. An honest
+/// miss beats a different work, but the work is resolvable, so the test
+/// requires it: found AND the expected identity, never a total miss.
+#[test]
+fn chain_live_yamato_1974_not_the_2012_entity() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = year_gate_query("Space Battleship Yamato", 1974);
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for Yamato 1974 S1E1");
+    eprintln!("LIVE-CHAIN Yamato/1974 winner: series={:?} year={} found={}", res.series, res.year, res.found);
+    assert!(
+        res.found && res.series == "Star Blazers: The Quest for Iscandar" && res.year == 1974,
+        "the chain must return the 1974 work, never the 2012 entity and never a miss, got {res:?}"
+    );
+}
+
+/// LIVE chain: `DBZ Kai` + 2014 (S1E1) was a full-chain miss (exit 1, every
+/// provider) measured live 2026-10-15 even though AniList answers the show
+/// (id `20635` with zero `streamingEpisodes`, so the episode fallthrough
+/// drops the leg). Kitsu carries the 2014 work with episodes under the
+/// query's own abbreviated title, so the chain must now find it -- found AND
+/// the 2014 work's identity, never any 2014 work and never a miss.
+#[test]
+fn chain_live_dbz_kai_2014_finds_the_final_chapters() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = year_gate_query("DBZ Kai", 2014);
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for DBZ Kai 2014 S1E1");
+    eprintln!("LIVE-CHAIN DBZ Kai/2014 winner: series={:?} year={} found={}", res.series, res.year, res.found);
+    assert!(
+        res.found && res.year == 2014 && res.series.contains("Final Chapters"),
+        "the chain must find the 2014 Final Chapters work, not miss and not another 2014 work, got {res:?}"
+    );
+}
+
+/// LIVE chain: `Kimi no Na wa` + 2015 (movie) must keep `Your Name` (2016) --
+/// measured live 2026-10-16 as an exit-1 miss (the yearless and 2016 controls
+/// resolve). Identity proved through the redirect-verified alias survives
+/// the year gate: a wrong file year never destroys a correct title match.
+#[test]
+fn chain_live_kimi_no_na_wa_2015_keeps_your_name() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = Query {
+        kind: Kind::MOVIE,
+        title: "Kimi no Na wa".to_string(),
+        year: 2015,
+        ..Query::default()
+    };
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for Kimi no Na wa 2015");
+    eprintln!("LIVE-CHAIN Kimi no Na wa/2015 winner: series={:?} year={} found={}", res.series, res.year, res.found);
+    assert!(
+        res.found && res.series == "Your Name" && res.year == 2016,
+        "the chain must keep Your Name (2016) for a wrong file year, got {res:?}"
+    );
+}
+
+/// LIVE chain: `Shingeki no Kyojin` + 2014 (S1E1) must keep the 2013 main
+/// series, never the 2014 `No Regrets` spin-off -- measured live 2026-10-16
+/// (the 2013 control returns the main series). A wrong file year must not
+/// let a different work win merely because its year agrees.
+#[test]
+fn chain_live_kyojin_2014_not_no_regrets() {
+    let dir = TempDir::new();
+    let resolver = Resolver::new(Options {
+        dir: dir.path(),
+        ..Options::default()
+    });
+    let q = year_gate_query("Shingeki no Kyojin", 2014);
+    let cancel = Cancel::with_deadline(Duration::from_secs(90));
+    let res = resolver
+        .lookup_now(&cancel, &q)
+        .expect("live chain lookup needs the real network for Shingeki no Kyojin 2014 S1E1");
+    eprintln!("LIVE-CHAIN Shingeki no Kyojin/2014 winner: series={:?} year={} found={}", res.series, res.year, res.found);
+    assert!(
+        res.found && res.series == "Attack on Titan" && res.year == 2013,
+        "the chain must keep the main series, never the No Regrets spin-off, got {res:?}"
+    );
+}

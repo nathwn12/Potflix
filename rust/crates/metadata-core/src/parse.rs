@@ -366,15 +366,41 @@ pub(crate) fn group<'a>(caps: &[Option<&'a str>], i: usize) -> &'a str {
 pub fn date_year(s: &str) -> i32 {
     let s = s.trim();
     let b = s.as_bytes();
-    if b.len() < 4 {
-        return 0;
-    }
-    let mut y = 0i32;
-    for &c in &b[..4] {
-        if !c.is_ascii_digit() {
+    if b.len() >= 4 {
+        let mut y = 0i32;
+        let mut ok = true;
+        for &c in &b[..4] {
+            if !c.is_ascii_digit() {
+                ok = false;
+                break;
+            }
+            y = y * 10 + i32::from(c - b'0');
+        }
+        if ok && is_year_num(y) {
+            return y;
+        }
+        if ok {
             return 0;
         }
-        y = y * 10 + i32::from(c - b'0');
+    } else if !b.is_empty() {
+        return 0;
     }
-    if is_year_num(y) { y } else { 0 }
+    // No leading year (Episodate serves `Apr/06/2012`): the trailing bare
+    // four-digit token carries it. Only a bare token counts, so clocks and
+    // counts (`13:30:00`, `Season 2`) stay yearless.
+    let tail: String = s
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if tail.len() == 4 && tail.bytes().all(|c| c.is_ascii_digit()) {
+        let y = tail.parse().unwrap_or(0);
+        if is_year_num(y) {
+            return y;
+        }
+    }
+    0
 }

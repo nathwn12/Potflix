@@ -20,3 +20,16 @@ where
 {
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
+
+/// Go's leniency one level down: a JSON string array may carry `null`
+/// elements (live Kitsu `abbreviatedTitles` does), which `serde` rejects for
+/// `Vec<String>`. `null` elements are dropped; a top-level `null` or a
+/// missing field is the empty vec.
+pub(crate) fn null_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let items =
+        Option::<Vec<Option<String>>>::deserialize(deserializer)?.unwrap_or_default();
+    Ok(items.into_iter().flatten().collect())
+}

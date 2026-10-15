@@ -215,6 +215,7 @@ impl TenraiSource {
         let mut cands: Vec<ShowCand> = Vec::with_capacity(parsed.data.len());
         let mut entries: Vec<TenraiEntry> = Vec::with_capacity(parsed.data.len());
         let mut years: Vec<i32> = Vec::with_capacity(parsed.data.len());
+        let mut complete: Vec<bool> = Vec::with_capacity(parsed.data.len());
         for entry in parsed.data {
             if entry.mal_id == 0 {
                 continue;
@@ -242,6 +243,7 @@ impl TenraiSource {
                 aliases,
             });
             years.push(entry.year.unwrap_or(0));
+            complete.push(!entry.synopsis.trim().is_empty());
             entries.push(entry);
         }
         if cands.is_empty() {
@@ -263,7 +265,7 @@ impl TenraiSource {
         };
         // Soft year preference only: no year match keeps the title winner.
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_idx);
         Ok(Some(entries[take].clone()))
     }
 
@@ -330,6 +332,15 @@ impl crate::resolver::Source for TenraiSource {
         if title.is_empty() {
             return Ok(None);
         }
+        // Both spellings already scored as match aliases above: the english
+        // and romaji titles are both verified, both identity.
+        let mut aliases = Vec::new();
+        for spelling in [&picked.title_english, &picked.title] {
+            let spelling = spelling.trim();
+            if !spelling.is_empty() {
+                aliases.push(spelling.to_string());
+            }
+        }
         let year = picked.year.unwrap_or(0);
         let episodes = self.episodes(cancel, &picked, q.episode)?;
         // The wire numbers are already absolute: no positional renumbering, so
@@ -355,6 +366,7 @@ impl crate::resolver::Source for TenraiSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            aliases,
         }))
     }
 }

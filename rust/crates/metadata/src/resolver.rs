@@ -24,8 +24,10 @@
 //!   match with no synopsis (kept as the fallback while the walk continues).
 //!   A movie answer with a synopsis returns immediately, as does a series
 //!   answer with a number-exact episode match ([`match_episode`], NEVER a
-//!   positional index) plus a synopsis; year never gates, cover and length
-//!   never gate.
+//!   positional index) plus a synopsis; a year-carrying, non-identity pick
+//!   that contradicts an explicit query year is skipped as a different work
+//!   (exact identity is the display title or a verified alias, an unknown
+//!   year never gates), cover and length never gate.
 //! * `fetchMedia` retries the SAME chain once with the separator-normalized
 //!   alternate title, and ONLY after a definitive primary miss: a transient
 //!   primary is unknown, and substituting an alternate match would overwrite a
@@ -769,14 +771,24 @@ impl Resolver {
 
     /// `fetchChain`: iterate the ordered sources; an error is recorded and the
     /// walk continues (the FIRST error is kept), a `None` answer continues, a
-    /// movie answer returns immediately when it is complete, and a series
+    /// year-contradicted different-work pick is skipped, a movie answer
+    /// returns immediately when it is complete, and a series
     /// answer returns immediately on a number-exact episode match with a
     /// synopsis. Completeness beats order: an answer that matches but carries
     /// no synopsis is kept as the fallback while the walk continues, so a
     /// later provider carrying the episode AND a synopsis wins; only when no
-    /// later source answers complete does the bare match settle. Cover and
-    /// length are preferred, never gating (a missing cover degrades to the
-    /// app logo downstream); year never gates at all.
+    /// later source answers complete does the bare match settle. The first
+    /// complete answer settles: provider order arbitrates same-named works
+    /// that strings and years alone cannot tell apart (an exact display
+    /// string may name a different work than the query means -- `Case
+    /// Closed`/1996 is the anime, not the 1993 reality series -- while a
+    /// contradicted exact identity elsewhere is the right work with a wrong
+    /// file year -- `Monster`/2019 is `19`). No ranking can satisfy both
+    /// shapes at once, so identity never outranks order here; it only exempts
+    /// the gate. Cover and length are preferred, never gating (a missing
+    /// cover degrades to the app logo downstream); year gates only a
+    /// non-identity pick against an explicit query year, never an exact title
+    /// match (display title or verified alias) and never on an unknown year.
     fn fetch_chain(&self, cancel: &Cancel, q: &Query) -> Chain {
         let mut saw_error = false;
         let mut first_err: Option<Error> = None;
@@ -795,6 +807,25 @@ impl Resolver {
                 Ok(Some(mut media)) => {
                     if media.source.is_empty() {
                         media.source = source.name().to_string();
+                    }
+                    // Year gate: an explicit query year contradicted by a
+                    // year-carrying, non-identity pick names a different
+                    // work, never the answer -- fall through to the next
+                    // source. Exact identity (display title or a verified
+                    // alias: canonical, translated, abbreviation) is exempt:
+                    // a wrong file year must not turn `Monster`/2019 or
+                    // `Kimi no Na wa`/2015 into a miss. An unknown year on
+                    // either side never gates.
+                    if year_contradicted(q, &media) {
+                        self.log(&format!(
+                            "metadata: source {} answers {:?} as {:?} ({}), want year {}, trying next",
+                            source.name(),
+                            q.title,
+                            media.title,
+                            media.year,
+                            q.year
+                        ));
+                        continue;
                     }
                     if media.kind == Kind::MOVIE || q.kind == Kind::MOVIE {
                         if !media.synopsis.trim().is_empty() {
@@ -853,6 +884,26 @@ impl Resolver {
         }
         Chain::missed()
     }
+}
+
+/// `exactIdentity`: the query IS the answer -- the display title or one of
+/// the provider's verified aliases (canonical, translated, abbreviation --
+/// never an unverified synonym) equals the query. Identity exempts the year
+/// gate: a wrong file year must not turn the correct match into a miss
+/// (`Monster`/2019 keeps `19`, `Kimi no Na wa`/2015 keeps `Your Name`,
+/// `Shingeki no Kyojin`/2014 keeps the main series). It never outranks
+/// provider order: an exact display string can name a different work than
+/// the query means (`Case Closed`/1996 is the anime, not the 1993 reality
+/// series answering the same string), so order still arbitrates.
+fn exact_identity(q: &Query, media: &Media) -> bool {
+    crate::yearpref::is_exact_identity(&q.title, &media.title, &media.aliases)
+}
+
+/// `yearContradicted`: an explicit query year contradicted by a
+/// year-carrying, non-identity pick names a different work, never the
+/// answer. An unknown year on either side never contradicts.
+fn year_contradicted(q: &Query, media: &Media) -> bool {
+    q.year > 0 && media.year > 0 && media.year != q.year && !exact_identity(q, media)
 }
 
 /// `mediaAnswers`: movies answer on presence; series require a number-exact

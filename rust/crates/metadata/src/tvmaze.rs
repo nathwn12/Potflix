@@ -226,6 +226,7 @@ impl crate::resolver::Source for TvmazeSource {
         }
         let mut cands: Vec<ShowCand> = Vec::with_capacity(results.len());
         let mut shows: Vec<TvmazeShow> = Vec::with_capacity(results.len());
+        let mut complete: Vec<bool> = Vec::with_capacity(results.len());
         for result in results {
             if result.show.id == 0 || result.show.name.is_empty() {
                 continue;
@@ -236,6 +237,7 @@ impl crate::resolver::Source for TvmazeSource {
                 episode_count: 0,
                 aliases: Vec::new(),
             });
+            complete.push(!result.show.summary.trim().is_empty());
             shows.push(result.show);
         }
         if cands.is_empty() {
@@ -275,7 +277,7 @@ impl crate::resolver::Source for TvmazeSource {
             .map(|show| date_year(&show.premiered))
             .collect();
         let take =
-            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_at);
+            crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, &complete, winner_at);
         let show = shows[take].clone();
 
         let year = date_year(&show.premiered);
@@ -353,6 +355,8 @@ impl crate::resolver::Source for TvmazeSource {
             trailer_url: String::new(),
             episodes,
             fetched_at: crate::timefmt::now_rfc3339(),
+            // Single-title provider: identity is the display title alone.
+            aliases: Vec::new(),
         }))
     }
 }

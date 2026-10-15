@@ -155,6 +155,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Year now decides before title strength among identity-grade picks: a
+  remake the provider records AS the shared title in the query year takes a
+  foreign-alias winner's place, and a title winner the chain would skip
+  outright concedes to the query-year carriers when its own record is bare.
+  `Hagane no Renkinjutsushi`/2009 (S01E01) now returns `Fullmetal Alchemist:
+  Brotherhood` (2009, Kitsu `3936`) instead of the 2003 series -- the
+  `Hagane no Renkinjutsushi (2009)` alias opens the foreign-alias door that
+  stays shut for same-stem spin-offs (`Shingeki no Kyojin`/2014 still keeps
+  the 2013 main series, which carries no such alias). `Kimi no Na wa`/1953
+  (movie) now returns the 1953 `What Is Your Name?` (Cinemeta `tt1954577`)
+  instead of the 2016 `Your Name`: the contradicting title winner is
+  undescribed, so the query-year carriers take the pick. A described winner
+  still stands (`Space Battleship Yamato`/1974 keeps resolving through the
+  corroborated 1974 leg), an exact winner never concedes (`Monster`/2019
+  keeps the 2004 series), and `Kimi no Na wa`/2015 still keeps `Your Name`
+  (2016). Measured live 2026-10-16.
+- Stale cached resolutions no longer survive this matching fix either: the
+  metadata cache schema bumped to 11 (remake and query-year-carrier picks
+  now displace alias-exempt wrong-work positives -- pre-fix positives like
+  `Your Name` for a 1953 query must re-resolve rather than keep serving).
+  Records written under an older schema are a whole-record miss and
+  re-resolve on their own, as before.
+- A wrong filename year no longer destroys a correct title match: provider
+  answers now carry their verified alias titles (canonical, translated and
+  abbreviation spellings -- never unverified synonyms) through to the chain,
+  and the year gate reads identity off the display title or any of those
+  aliases. `Kimi no Na wa`/2015 (movie) now returns `Your Name` (2016) --
+  Wikipedia redirects that query to the article, which verifies the alias --
+  instead of missing outright. Measured live 2026-10-16.
+- A wrong filename year no longer lets a same-stem spin-off win: inside one
+  provider, an alias-exact winner (the query itself through a verified alias,
+  with a differing display title) now yields only to another exact identity
+  carrying the query year, never to a merely covering subtitle-carrier.
+  `Shingeki no Kyojin`/2014 (S01E01) now returns the 2013 main series
+  (`Attack on Titan`) instead of the 2014 `No Regrets` spin-off. A
+  display-exact winner keeps the plain coverage rule, so `Dragon Ball
+  Super`/2026 still takes the 2026 `Beerus` entity over the 2015 series.
+  Measured live 2026-10-16.
+- Stale cached resolutions no longer survive this matching fix either: the
+  metadata cache schema bumped to 10 (alias-proved identity now survives the
+  year gate and an alias-exact winner keeps covering spin-offs out of the
+  year override -- pre-fix spin-off positives and alias misses must
+  re-resolve rather than keep serving). Records written under an older
+  schema are a whole-record miss and re-resolve on their own, as before.
+- The provider chain no longer settles on a different work when the filename
+  year contradicts the pick: a year-carrying, title-divergent provider answer
+  is skipped when the query carries an explicit year that disagrees with it,
+  and the walk continues to the anime legs. `Fate`/2006 now returns
+  `Fate/stay night` (2006) instead of TVmaze's `Fate/Zero` (2011);
+  `Case Closed`/1996 returns `Detective Conan` (1996, Kitsu `210`) instead of
+  `D.B. Cooper: Case Closed?` (2016); `Space Battleship Yamato`/1974 returns
+  the 1974 series instead of the 2012 entity; `DBZ Kai`/2014 resolves to
+  `Dragon Ball Z Kai: The Final Chapters` (2014, Kitsu `8351`) instead of
+  missing the whole chain. An exact normalized title match is identity (so
+  `Monster`/2019 keeps the 2004 series `19`), and an unknown year on either
+  side never gates. Measured live 2026-10-15.
+- Kitsu short-form queries match through the provider's own
+  `abbreviatedTitles` (scored as match-only aliases, never display text):
+  `DBZ Kai` missed the leg outright because neither `Dragon Ball Kai` spelling
+  reaches the 0.5 title floor, while AniList answers the same query with zero
+  `streamingEpisodes` so the episode fallthrough drops that leg. Live Kitsu
+  abbreviation lists also carry `null` elements, which the strict `Vec<String>`
+  decode rejected and failed the whole leg; they now decode leniently. No
+  franchise cases, no lookup tables.
+- Episodate dates no longer read yearless: the service serves `start_date` as
+  `Apr/06/2012`, which the leading-four-bytes year read turns into 0, hiding a
+  2012 record (`Space Battleship Yamato 2199`) from the chain year gate. The
+  shared date-year read now falls back to a trailing bare four-digit token, so
+  only genuinely dateless records stay yearless. Measured live 2026-10-15.
+- Stale cached resolutions no longer survive this matching fix either: the
+  metadata cache schema bumped to 9 (a year-contradicted, title-divergent pick
+  no longer settles the chain -- pre-fix positives like TVmaze's `Fate/Zero`
+  for a `Fate`/2006 query or `D.B. Cooper: Case Closed?` for a
+  `Case Closed`/1996 query must re-resolve rather than keep serving; exact
+  title matches and yearless records are unaffected). Records written under an
+  older schema are a whole-record miss and re-resolve on their own, as before.
 - Stale cached resolutions no longer survive this matching fix either: the
   metadata cache schema bumped to 8 (the year-override corroboration is now
   judged by content token, not token length -- a token corroborates when it
