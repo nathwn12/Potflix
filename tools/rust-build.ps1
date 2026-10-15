@@ -1,12 +1,11 @@
 # Potflix (Rust) -- build the tray app to dist\potflix.exe.
 #
-# The Rust port (this tree) is the target of the rewrite; the Go module in `go\`
-# is the incumbent that still produces the shipped binary, built by
-# `tools\build.ps1`. Each writes its own checkout's `dist\potflix.exe`: the Go
-# build the main checkout's, this one the rewrite worktree's.
+# The Rust workspace is the sole implementation and produces the shipped
+# binary (the Go/Java reference era is retired; its history remains in git).
 #
-# Builds the whole crate workspace (`rust\Cargo.toml`, one member per Go package
-# under `rust\crates\`) and copies the app binary out.
+# Builds the whole crate workspace (`rust\Cargo.toml`, one member crate per
+# package of the retired Go module under `rust\crates\`) and copies the app
+# binary out.
 #
 # Flags:
 #   --release  optimised binary

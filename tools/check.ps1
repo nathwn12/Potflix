@@ -55,7 +55,7 @@ function Assert-SelftestExe([string]$Exe) {
 }
 
 # The title-cleaner parity step: build the binary, run it over both corpora, and
-# require the frozen Go reference's hashes. The oracle holds hashes only (the
+# require the frozen oracle's hashes. The oracle holds hashes only (the
 # corpora are gitignored because they carry real media filenames), so a missing
 # oracle, a missing corpus, or an oracle line without a hash FAILS - none of
 # them is ever treated as "nothing to compare". It is a function so the guards
@@ -113,8 +113,8 @@ function Invoke-TitlecleanParity([string]$Root, [string]$RustDir) {
   }
   $bin = Join-Path $RustDir 'target\release\titleclean.exe'
 
-  # Run from the repo root with repo-root-relative paths, exactly like the Go
-  # reference in the oracle header, so both binaries see the same arguments.
+  # Run from the repo root with repo-root-relative paths, exactly like the
+  # commands in the oracle header, so the binary sees the same arguments.
   Push-Location (Get-Literal $Root)
   try {
     $mismatch = ''

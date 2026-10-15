@@ -17,18 +17,20 @@ package, the same on-disk formats, the same wire shapes.
 **Why a parity oracle.** The cleaner is the one piece whose output is a
 byte-exact contract, and it was already proven byte-identical to the Java
 baseline by the Go port. The Rust rewrite therefore does not re-derive the Java
-golden set: it treats the frozen Go cleaner as the oracle and requires the Rust
+golden set: it treats the Go cleaner as the oracle and requires the Rust
 binary to reproduce its TSV output hash-for-hash on the same corpora. The
 committed contract is `rust\parity-golden.sha256` — a SHA-256 per corpus, with
 the corpora themselves deliberately absent (they carry real media filenames).
-The gate builds the Rust binary, runs it over the same corpora with the same
-arguments the Go reference used, and fails on a hash mismatch against the
-oracle, so parity is checked, not asserted.
+The gate builds the Rust binary, runs it over the same corpora, and fails on a
+hash mismatch against the oracle, so parity is checked, not asserted. The
+oracle is FROZEN: the Go reproducer is retired, so the hashes can never be
+regenerated — only matched.
 
-**Frozen reference.** `go\` and its original `src\main\java\me\potflix\rpc\Main.java`
-are retained as the frozen reference: `go\` is the oracle the cleaner is proven
-against and the behaviour the Rust port must match, and `Main.java` is the source
-of the original Java golden set. Neither is edited.
+**Retired reference.** `go\` and its original `src\main\java\me\potflix\rpc\Main.java`
+were retained as the frozen reference while the Rust port took over the shipped
+binary; both trees are now retired (history in git). `go\` was the oracle the
+cleaner was proven against and the behaviour the Rust implementation had to
+match, and `Main.java` was the source of the original Java golden set.
 
 The record below is the original cleaner-port bake-off, kept because the Rust
 parity oracle is derived from its Go result.
