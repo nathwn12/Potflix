@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/icon.svg" width="120" height="120" alt="Potflix icon" />
+  <img src="assets/icon.ico" width="120" height="120" alt="Potflix icon" />
 </p>
 <h1 align="center">Potflix</h1>
 <p align="center"><strong>Mirror whatever plays in PotPlayer on your Discord card — Rust.</strong></p>
