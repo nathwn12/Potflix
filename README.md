@@ -226,6 +226,10 @@ behaviour is not re-verified here.
 4. Record user-visible changes in [CHANGELOG.md](./CHANGELOG.md) under
    `[Unreleased]`.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
+
 ## Credits
 
 - Derived from [ayunami2000/PotPlayer-DiscordRPC](https://github.com/ayunami2000/PotPlayer-DiscordRPC)
@@ -237,10 +241,6 @@ behaviour is not re-verified here.
   app's typeface and are not redistributed as one.
 - See [THIRD-PARTY-NOTICES.md](./THIRD-PARTY-NOTICES.md) for the full upstream
   and font notices.
-
-## License
-
-MIT — see [LICENSE](LICENSE).
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">
