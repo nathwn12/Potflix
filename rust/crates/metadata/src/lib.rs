@@ -8,7 +8,7 @@
 //! [`Resolver::resolve`]; the CLIs use the blocking [`Resolver::lookup_now`];
 //! [`Options::offline`] serves cache-only.
 //!
-//! Workspace seam: this crate carries the provider chain, the six providers and
+//! Workspace seam: this crate carries the provider chain, the eleven providers and
 //! the cache; the shared record types, the filename parser, candidate matching,
 //! alternate titles and the path context live in `metadata-core`, and the
 //! transport in `metadata-http`.
