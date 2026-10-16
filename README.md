@@ -9,7 +9,7 @@
   <img src="https://img.shields.io/badge/platform-windows--64bit-2b3137?logo=windows&logoColor=white" alt="Platform" />
 </p>
 
-## Description
+## Project name and description
 
 Potflix is a Windows tray app that watches the PotPlayer window and mirrors
 what is playing as a Discord Rich Presence card (`Watching <title>`). It needs
@@ -19,7 +19,7 @@ titles (codecs, tags, and release groups stripped, years parenthesized,
 and cache on disk, and a settings window holds the library folders, scan
 controls, and card preview.
 
-## Technology Stack
+## Technology stack
 
 - **Rust** — Cargo workspace under `rust/` (`rust/Cargo.toml`): edition 2024,
   workspace version `1.0.0`, `rust-version = "1.99"` (measured `rustc 1.99.1`
@@ -67,7 +67,7 @@ owns the workspace's `potflix` tray binary:
 > PotPlayer/Discord is carried over from the retired reference and not
 > re-verified here (see [RUST-PORT.md](./RUST-PORT.md)).
 
-## Getting Started
+## Getting started
 
 Prerequisites: **PotPlayer** open and playing, **Discord** desktop open, and a
 Rust toolchain with `cargo` for the build. Windows-only.
@@ -112,7 +112,7 @@ Prefer an installer to the manual build? `tools\make-installer.ps1` produces
 `dist\Potflix-Setup.exe` — tick `desktopicon` (or pass `/TASKS=desktopicon` to
 a silent install) for a desktop icon.
 
-## Project Structure
+## Project structure
 
 ```text
 rust/                  Cargo workspace (edition 2024, Cargo.lock committed)
@@ -137,7 +137,7 @@ State lives outside the repo under `%LOCALAPPDATA%\Potflix` (settings, the
 index). The debug log `potflix-debug.log` sits beside the exe and rotates at
 5 MB × 3.
 
-## Key Features
+## Key features
 
 - Clean titles always: codecs, tags, and release groups stripped, years
   parenthesized, `SxxEyy` parsed.
@@ -158,7 +158,7 @@ index). The debug log `potflix-debug.log` sits beside the exe and rotates at
   `Potflix is already running.` and exits 0); `--selftest` proves the headless
   wiring with no live PotPlayer or Discord.
 
-## Development Workflow
+## Development workflow
 
 - Behaviour changes go in `rust\` — the Go and Java reference trees are retired
   and removed; their history remains in git. Never recreate them.
@@ -185,7 +185,7 @@ index). The debug log `potflix-debug.log` sits beside the exe and rotates at
   every gate is proven locally.
 - Changes are recorded in [CHANGELOG.md](./CHANGELOG.md) (Keep a Changelog).
 
-## Coding Standards
+## Coding standards
 
 - `cargo clippy --workspace --all-targets -- -D warnings` must pass — warnings
   are errors, enforced by the gate.
