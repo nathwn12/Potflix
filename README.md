@@ -141,19 +141,51 @@ index). The debug log `potflix-debug.log` sits beside the exe and rotates at
 
 - Clean titles always: codecs, tags, and release groups stripped, years
   parenthesized, `SxxEyy` parsed.
-- A card that tells the truth: episode name when known, else episode tag, else
-  title; ` - Paused` appended while paused with a count-up timer;
-  `Browsing` / `Idle` when idle. Quiet while paused: the paused card is sent
-  once and held — not even the 30 s heartbeat re-pushes it until resume.
+- A card that is never blank: every body line is a fill ladder — the first
+  non-empty rung wins and the last rung is identity from the file itself.
+  SERIES (TV + anime) ships the episode name on line 1 and `S1 E1 · <teaser…>`
+  on line 2; MOVIE ships `Title (Year)` on line 1 and `genres · length`
+  (then synopsis, then year, then clean title) on line 2. The card carries
+  the teaser; the hover text of the LARGE image slot — the cover when
+  artwork resolved, the PotFlix `logo` asset otherwise — carries the whole
+  stored note; ` - Paused`
+  appended while paused with a count-up timer; `Browsing` / `Idle` when
+  idle. Quiet while paused: the paused card is sent once and held — not
+  even the 30 s heartbeat re-pushes it until resume: while paused, the card is re-parked when the compared content is unchanged — the header, the two body lines, the large image, the button list and the paused flag — and a change to any of those still goes out with a fresh pause anchor; a change confined to the hover text does not re-park on its own, because the send gate compares name/details/state/paused/images/buttons/has_start against the last-sent card and sends when they differ.
+- Slot budgets in UTF-16 units, held in one place in the code (`NAME_BUDGET`,
+  `DETAILS_BUDGET`, `STATE_BUDGET` / `STATE_SYNOPSIS_BUDGET`,
+  `LARGE_TEXT_BUDGET`): header 128, line 1 128, line 2 128 plain / 72 with
+  a synopsis, hover 128; body lines join with `JOINER` (U+00B7 with single
+  spaces). Every provider mapper caps the note at fetch time (`cap_synopsis`,
+  `MAX_SYNOPSIS_UNITS` = 128 UTF-16 code units), so the stored note always
+  fits the 128-unit hover whole. Truncation is always signalled:
+  never silently truncated; a whole-word end wherever the text has word boundaries
+  and always a terminator otherwise: a cut that lands on a sentence end returns
+  the complete sentence with its own `.`/`!`/`?` and no ellipsis, while every
+  other cut ends with a single `…` — including a note with no spaces at all
+  (a long token, CJK text), cut on a character boundary and still ending
+  with that `…`.
 - Canonical names, keyless, cached on disk; offline it shows the clean
   filename title.
 - Library window: media folders (`Add folder` / `Remove`), incremental `Scan`
   (unchanged folders skipped), `Refresh` (re-walks everything, re-fetches
   every entry), export / import of the metadata cache as one JSON bundle.
 - Settings that stick: scan speed (`Turbo` / `Balanced` / `Gentle`, applied
-  immediately), Start-with-Windows toggle, card line presets.
-- Card preview: the window shows the exact card last handed to Discord
-  (recorded on send, never rebuilt for display).
+  immediately), Start-with-Windows toggle, per-kind card line presets
+  (`"card":{"series":{"details":"…","state":"…"},"movie":{…}}`; a legacy flat
+  pair still loads as the series pair and re-saves nested, and an
+  all-default config still writes `"card":{}`). A preset re-heads
+  a ladder, never empties it — except `Minimal` state (stored `none`), the
+  only one-line card; the Card view labels that segment `Minimal`.
+- Card preview: the Card view's `Card lines for` row (a Series/Movie toggle,
+  `BTN_CARD_KIND_AT`) picks which kind the Details and State preset rows edit
+  — writes go to the SELECTED kind only. The preview renders through the same
+  composer the send path uses, so a preset choice changes the preview
+  immediately; it is exact for the rows it shows (Header / Details / State /
+  Images / Buttons / Tooltip). The progress-bar end timestamp is projected by
+  the send gate from the player clock, not by the composer, so the preview
+  shows no timestamps. A Card-view preset save publishes the new specs to the running sender, in-process, through the store's live mirror (the same live-apply shape as the scan-speed path); the poll loop reads the published specs on every push, so the change reaches the live Discord card at the next poll tick:
+  no restart, and no push from the click itself.
 - Local only: one instance (a second launch prints
   `Potflix is already running.` and exits 0); `--selftest` proves the headless
   wiring with no live PotPlayer or Discord.

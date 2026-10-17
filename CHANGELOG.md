@@ -42,6 +42,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rust\` is the sole implementation. Their history remains in git, and the
   title-cleaner parity oracle (`rust\parity-golden.sha256`) is FROZEN — its
   Go reproducer is gone, so the hashes can never be regenerated, only matched.
+- Presence card is always filled and per-kind: each body line is a fill ladder
+  ending on file identity, so a card is never blank; SERIES (TV + anime) and
+  MOVIE store their own Details/State choices as
+  `"card":{"series":{"details":"…","state":"…"},"movie":{…}}` (a legacy flat
+  pair still loads as the series pair and re-saves nested, and an
+  all-default config still writes `"card":{}`). Shipped SERIES
+  default is the episode name plus `S1 E1 · teaser`, MOVIE default is
+  `Title (Year)` plus `genres · length` (then synopsis, year, clean title);
+  the hover text of the LARGE image slot — the cover when artwork resolved,
+  the PotFlix `logo` asset otherwise — carries the whole stored note.
+  Budgets in UTF-16 units (`NAME_BUDGET`, `DETAILS_BUDGET`, `STATE_BUDGET` /
+  `STATE_SYNOPSIS_BUDGET`, `LARGE_TEXT_BUDGET`): 128 / 128 / 128 plain (72
+  with a synopsis) / 128, body lines joined with `JOINER` (U+00B7 with
+  single spaces). Truncation is always signalled, never silent: a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…`. Guarantee: never silently truncated; a whole-word end wherever the text has word boundaries; always a terminator otherwise — a note with no spaces at all (a long token, CJK text) is cut on a character boundary and still ends with that `…`. Every provider mapper caps the note
+  at fetch time (`cap_synopsis`, `MAX_SYNOPSIS_UNITS` = 128 UTF-16 code
+  units), so the stored note always fits the 128-unit hover whole; `Minimal`
+  state (`none`) is the only one-line card. The Card view's `Card lines for`
+  row (a Series/Movie toggle, `BTN_CARD_KIND_AT`) picks which kind the
+  Details and State preset rows edit — writes go to the SELECTED kind only.
+  The Card-view preview renders through the send-path composer, exact for
+  the rows it shows (Header / Details / State / Images / Buttons / Tooltip);
+  the progress-bar end timestamp is projected by the send gate from the
+  player clock, not by the composer, so the preview shows no timestamps.
+  A Card-view preset save publishes the new specs to the running sender, in-process, through the store's live mirror (the same live-apply shape as the scan-speed path); the poll loop reads the published specs on every push, so the change reaches the live Discord card at the next poll tick: no restart, and no push from the click itself.
+  The send gate compares name/details/state/paused/images/buttons/has_start against the last-sent card and sends when they differ, so the changed lines go out by themselves — while paused too, where the card is re-parked when the compared content is unchanged — the header, the two body lines, the large image, the button list and the paused flag — and a change to any of those still goes out with a fresh pause anchor; a change confined to the hover text does not re-park on its own.
 
 #### Removed
 
@@ -72,7 +97,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Scan-speed profiles (`Turbo` / `Balanced` / `Gentle`) applied live with no
   restart, plus a Start-with-Windows toggle and card line presets.
 - Netflix-style presence card: clean title header, episode name and tag,
-  ` - Paused` count-up card held quietly while paused, `Browsing` / `Idle`
+  ` - Paused` count-up card that re-parks unchanged content while paused — the header, the two body lines, the large image, the button list and the paused flag (a change to any of those still goes out with a fresh pause anchor; a hover-text-only change does not re-park on its own), `Browsing` / `Idle`
   when idle, `READY`-gated sends, and clear-activity-on-exit.
 - Diagnostic CLIs: `metacheck` (resolve one title), `metawarm` (pre-warm the
   cache over a library walk), `titleclean` (corpus parity TSV).
@@ -218,7 +243,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cut)` survives. Cached records written before the strip heal on decode (no
   schema bump, no refetch). Deliberate departure from the frozen Go reference
   (`go\internal\metadata\wikipedia.go:504`), which stored the raw page title.
-- Truncated card lines now end cleanly: every cut lands on a word boundary,
+- Truncated card lines are now always signalled, never silent: a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…`; a whole-word end wherever the text has word boundaries, always a terminator otherwise — even a note with no spaces at all (a long token, CJK text), cut on a character boundary and still ending with that `…`:
   strips trailing `, ; : - – — ·` before the terminator, and ends with U+2026
   when cut (nothing extra when whole). The live card carried `Majin Buu,…` /
   `meet Elliot;…` in `state` and a mid-word `…Zak Penn and Ernest` in

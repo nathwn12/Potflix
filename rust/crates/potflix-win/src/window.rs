@@ -47,7 +47,9 @@ use crate::brand;
 use crate::win32::{Rect, utf16_z};
 
 use library::{Progress, Stats};
-use presence::{Activity, CardPreset, CardSpec};
+use presence::{Action, Activity, CardPreset, CardSpec, Resolved};
+
+use app_support::config::{CardKind, CardLine, CardSpecs};
 
 // ---------------------------------------------------------------------------
 // Button ids (`go\window.go:39-70`): rect-table keys, not child control ids.
@@ -75,6 +77,8 @@ pub const BTN_CARD_BACK: i32 = 9;
 pub const BTN_CARD_DETAILS_AT: i32 = 30;
 /// Card view State presets, `+0..3` in `CardPresets` order.
 pub const BTN_CARD_STATE_AT: i32 = 40;
+/// Card view kind toggle, `+0..1` Series/Movie.
+pub const BTN_CARD_KIND_AT: i32 = 50;
 /// Settings LIBRARY "Clear metadata".
 pub const BTN_CLEAR_CACHE: i32 = 15;
 /// Settings LIBRARY "Export...".
@@ -1181,11 +1185,23 @@ pub fn card_state_button(i: i32) -> i32 {
     BTN_CARD_STATE_AT + i
 }
 
+/// `cardKindButton`: `0` Series, `1` Movie.
+#[must_use]
+pub fn card_kind_button(i: i32) -> i32 {
+    BTN_CARD_KIND_AT + i
+}
+
 /// `cardFocusOrder` (`go\window.go:1256`), in visual order: the strip, the way
-/// back, then the two preset rows.
+/// back, the kind toggle, then the two preset rows.
 #[must_use]
 pub fn card_focus_order() -> Vec<i32> {
-    let mut order = vec![BTN_CARD, BTN_SETTINGS, BTN_CARD_BACK];
+    let mut order = vec![
+        BTN_CARD,
+        BTN_SETTINGS,
+        BTN_CARD_BACK,
+        card_kind_button(0),
+        card_kind_button(1),
+    ];
     for i in 0..4 {
         order.push(card_details_button(i));
     }
@@ -1264,23 +1280,34 @@ pub fn card_preset_style(line: i32, id: &str, spec: &CardSpec) -> i32 {
     BTN_TAB
 }
 
-/// `computeCardLayout` (`go\window.go:1546`). The spec only flips button styles.
+/// `computeCardLayout` (`go\window.go:1546`). The selected kind's spec flips
+/// the preset styles; the kind toggle's own lit segment follows `kind`.
 #[must_use]
-pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardLayout {
+pub fn compute_card_layout(
+    cw: i32,
+    ch: i32,
+    dpi: i32,
+    specs: &CardSpecs,
+    kind: CardKind,
+) -> CardLayout {
     let sc = |v: i32| scale_px(dpi, v);
     let margin = sc(MAIN_MARGIN);
     let content_w = (cw - margin * 2).max(sc(100));
+    let spec = specs.for_kind(kind);
 
     let mut l = CardLayout::default();
 
-    // Same stack, same grid: header band, tab strip, then the preview panel and
-    // the two preset rows, each under its own micro-label.
+    // Same stack, same grid: header band, tab strip, then the preview panel,
+    // the kind toggle under its own micro-label, and the two preset rows, each
+    // under its own micro-label. The preview is 78px shorter than before so the
+    // inserted kind row (label + segments + gap) leaves every row below exactly
+    // where it was.
     let label_top = sc(TAB_TOP_L) + sc(TAB_H_L) + sc(SP_3);
     let label_h = sc(SECTION_H_L);
     let after_label = label_h + sc(SP_2);
 
     let prev_top = label_top + after_label;
-    let prev_h = sc(254);
+    let prev_h = sc(176);
     let prev_pad = sc(SP_3);
     let (row_h, row_pitch) = (sc(20), sc(22));
     l.preview = Rect {
@@ -1299,7 +1326,9 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
         });
     }
 
-    let det_label = prev_top + prev_h + sc(SP_4);
+    let kind_label = prev_top + prev_h + sc(SP_4);
+    let kind_row = kind_label + after_label;
+    let det_label = kind_row + sc(BTN_H) + sc(SP_4);
     let det_row = det_label + after_label;
     let state_label = det_row + sc(BTN_H) + sc(SP_4);
     let state_row = state_label + after_label;
@@ -1312,6 +1341,15 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
                 top: label_top,
                 right: margin + content_w,
                 bottom: label_top + label_h,
+            },
+        },
+        NamedTextRect {
+            id: "card.kind".into(),
+            rc: Rect {
+                left: margin,
+                top: kind_label,
+                right: margin + content_w,
+                bottom: kind_label + label_h,
             },
         },
         NamedTextRect {
@@ -1359,7 +1397,7 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
             out.push(UiButton {
                 id,
                 label: p.label.clone(),
-                style: card_preset_style(line, &p.id, spec),
+                style: card_preset_style(line, &p.id, &spec),
                 rc: Rect {
                     left,
                     top,
@@ -1372,6 +1410,26 @@ pub fn compute_card_layout(cw: i32, ch: i32, dpi: i32, spec: &CardSpec) -> CardL
     };
     let (dets, states) = presence::cardspec::card_presets();
     l.btns = tab_strip_buttons(cw, dpi);
+    // The kind toggle: two equal segments, the selected kind lit.
+    {
+        let n = 2i32;
+        let w = (content_w - seg_gap * (n - 1)) / n;
+        for i in 0..n {
+            let left = margin + i * (w + seg_gap);
+            let this = if i == 0 { CardKind::Series } else { CardKind::Movie };
+            l.btns.push(UiButton {
+                id: card_kind_button(i),
+                label: if i == 0 { "Series".into() } else { "Movie".into() },
+                style: if this == kind { BTN_TAB_SEL } else { BTN_TAB },
+                rc: Rect {
+                    left,
+                    top: kind_row,
+                    right: if i == n - 1 { margin + content_w } else { left + w },
+                    bottom: kind_row + sc(BTN_H),
+                },
+            });
+        }
+    }
     l.btns.extend(seg(det_row, 0, &dets));
     l.btns.extend(seg(state_row, 1, &states));
 
@@ -2321,6 +2379,16 @@ pub fn app_logf(message: &str) {
 // UiState: the UI-thread state (`go\window.go:97-176`, `:1427-1431`).
 // ---------------------------------------------------------------------------
 
+/// One recorded preview input: what a preview needs (the composer inputs), not
+/// the finished payload. The preview composes on demand through the same
+/// composer the send path uses, so picking a line re-renders immediately.
+#[derive(Clone, Debug, Default)]
+struct CardPreviewInput {
+    raw_title: String,
+    action: Option<Action>,
+    resolved: Resolved,
+}
+
 /// The scanner the UI seam owns. Every mutable value the Go root package held as
 /// a process global lives here, so Rust tests construct an isolated instance
 /// instead of racing a global.
@@ -2356,10 +2424,12 @@ pub struct UiState {
 
     pub startup_state: bool,
     pub scan_speed_state: String,
-    pub card_spec_state: CardSpec,
+    pub card_specs_state: CardSpecs,
+    pub card_kind: CardKind,
     pub dead_cache_count: i32,
 
-    pub preview: Option<Activity>,
+    preview_series: Option<CardPreviewInput>,
+    preview_movie: Option<CardPreviewInput>,
     pub ui_icon: usize,
     pub main_hwnd: usize,
     pub ui_centered: bool,
@@ -2418,9 +2488,11 @@ impl Default for UiState {
             scan_shared: Arc::new(Mutex::new(ScanSnapshot::default())),
             startup_state: false,
             scan_speed_state: app_support::config::SCAN_SPEED_TURBO.to_string(),
-            card_spec_state: CardSpec::default(),
+            card_specs_state: CardSpecs::default(),
+            card_kind: CardKind::Series,
             dead_cache_count: 0,
-            preview: None,
+            preview_series: None,
+            preview_movie: None,
             ui_icon: 0,
             main_hwnd: 0,
             ui_centered: false,
@@ -2606,7 +2678,7 @@ impl UiState {
 
     /// `enterCard` (`go\window.go:1670`).
     pub fn enter_card(&mut self) {
-        self.card_spec_state = app_support::config::load_config().effective_card_spec();
+        self.card_specs_state = app_support::config::load_config().effective_card_specs();
         self.open_card();
     }
 
@@ -2702,7 +2774,8 @@ impl UiState {
             cw,
             ch,
             window_dpi(hwnd),
-            &self.card_spec_state,
+            &self.card_specs_state,
+            self.card_kind,
         ))
     }
 
@@ -3050,6 +3123,10 @@ impl UiState {
     pub fn do_card_action(&mut self, _hwnd: HWND, id: i32) {
         if id == BTN_CARD_BACK {
             self.close_card();
+        } else if id == card_kind_button(0) {
+            self.set_card_kind(CardKind::Series);
+        } else if id == card_kind_button(1) {
+            self.set_card_kind(CardKind::Movie);
         } else if let Some((line, preset)) = card_preset_for_button(id) {
             self.on_select_card_preset(line, &preset);
         }
@@ -3195,32 +3272,69 @@ impl UiState {
         app_logf(&format!("config: dir added (count={})", cfg.dirs.len()));
     }
 
-    /// `recordPreview` (`go\main.go:60`).
-    pub fn record_preview(&mut self, out: Activity) {
-        self.preview = Some(out);
+    /// `recordPreview` (`go\main.go:60`): records what a preview needs (the
+    /// composer inputs) under `kind`, not the finished payload. The preview
+    /// re-composes on demand through the same composer the send path uses.
+    pub fn record_preview(
+        &mut self,
+        kind: CardKind,
+        raw_title: String,
+        action: Option<Action>,
+        resolved: Resolved,
+    ) {
+        let input = CardPreviewInput {
+            raw_title,
+            action,
+            resolved,
+        };
+        match kind {
+            CardKind::Series => self.preview_series = Some(input),
+            CardKind::Movie => self.preview_movie = Some(input),
+        }
     }
 
-    /// `previewActivity` (`go\main.go:68`).
+    /// `previewActivity` (`go\main.go:68`): composes on demand for the SELECTED
+    /// kind. Returns `(default, false)` when that kind has no recorded item.
     #[must_use]
     pub fn preview_activity(&self) -> (Activity, bool) {
-        match &self.preview {
-            Some(a) => (a.clone(), true),
-            None => (Activity::default(), false),
+        let kind = self.card_kind;
+        let input = match kind {
+            CardKind::Series => self.preview_series.as_ref(),
+            CardKind::Movie => self.preview_movie.as_ref(),
+        };
+        let Some(input) = input else {
+            return (Activity::default(), false);
+        };
+        let card = presence::compose_card(
+            &input.raw_title,
+            input.action.as_ref(),
+            &input.resolved,
+            kind.is_movie(),
+            &self.card_specs_state.for_kind(kind),
+        );
+        (card, true)
+    }
+
+    /// The kind toggle: view state only, never persisted.
+    pub fn set_card_kind(&mut self, kind: CardKind) {
+        if self.card_kind != kind {
+            self.card_kind = kind;
+            self.invalidate();
         }
     }
 
-    /// `onSelectCardPreset` (`go\window.go:1679`).
+    /// `onSelectCardPreset` (`go\window.go:1679`): writes to the SELECTED KIND
+    /// only — details when `line == 0`, state otherwise.
     pub fn on_select_card_preset(&mut self, line: i32, preset: &str) {
-        let cur = app_support::config::load_config().effective_card_spec();
-        let (mut details, mut state) = (cur.details.clone(), cur.state.clone());
-        if line == 0 {
-            details = preset.to_string();
+        let kind = self.card_kind;
+        let cl = if line == 0 {
+            CardLine::Details
         } else {
-            state = preset.to_string();
-        }
+            CardLine::State
+        };
         let mut cfg = app_support::config::load_config();
-        if !cfg.set_card_spec(&details, &state) {
-            self.card_spec_state = cfg.effective_card_spec();
+        if !cfg.set_card_line(kind, cl, preset) {
+            self.card_specs_state = cfg.effective_card_specs();
             self.invalidate();
             return;
         }
@@ -3229,19 +3343,24 @@ impl UiState {
             self.set_status_text("Save failed.");
             return;
         }
-        self.card_spec_state = cfg.effective_card_spec();
+        self.card_specs_state = cfg.effective_card_specs();
+        // The sender composes with the mirror at its next poll, so the new
+        // preset takes effect with no restart. A failed save publishes
+        // nothing: the mirror keeps the last good specs.
+        app_support::config::set_live_card_specs(self.card_specs_state.clone());
+        let cur = self.card_specs_state.for_kind(kind);
         let (dets, states) = presence::cardspec::card_presets();
         let mut name = preset.to_string();
         if line == 0 {
             for p in &dets {
-                if p.id == self.card_spec_state.details {
+                if p.id == cur.details {
                     name = p.label.clone();
                 }
             }
             self.set_status_text(format!("Line 1: {name}"));
         } else {
             for p in &states {
-                if p.id == self.card_spec_state.state {
+                if p.id == cur.state {
                     name = p.label.clone();
                 }
             }
@@ -4926,9 +5045,9 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         | crate::win32::DT_V_CENTER
         | crate::win32::DT_END_ELLIPSIS;
 
-    let mut l = compute_card_layout(cw, ch, dpi, &st.card_spec_state);
+    let mut l = compute_card_layout(cw, ch, dpi, &st.card_specs_state, st.card_kind);
     for b in l.btns.iter_mut() {
-        if b.style == BTN_TAB || b.style == BTN_TAB_SEL {
+        if b.id == BTN_CARD || b.id == BTN_SETTINGS {
             b.style = if b.id == BTN_CARD { BTN_TAB_SEL } else { BTN_TAB };
         }
     }
@@ -4952,7 +5071,8 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     paint_header(hdc, header, dpi);
     for lab in &l.labels {
         let text = match lab.id.as_str() {
-            "card.preview-label" => "Preview - exact Discord payload",
+            "card.preview-label" => "Preview - the card Discord receives",
+            "card.kind" => "Card lines for",
             "card.line1" => "Line 1 - details",
             _ => "Line 2 - state",
         };
@@ -4961,7 +5081,7 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     paint_preview_rows(hdc, dpi, l.preview, &full, body_font);
     draw_ui_text(
         hdc,
-        "Preview shows the exact values handed to Discord.",
+        "Preview re-renders as you pick lines; the live card follows at the next update.",
         l.hint,
         fmt_left,
         hint_font,
@@ -5478,6 +5598,14 @@ mod tests {
 
     const NULL: HWND = std::ptr::null_mut();
 
+    /// Serializes the tests that drive the process-wide live card-spec mirror
+    /// or the real store behind `on_select_card_preset`: a concurrent publish
+    /// would leak into another test's read, and a concurrent store reader
+    /// would observe mid-flight bytes.
+    static LIVE_MIRROR_SERIAL: Mutex<()> = Mutex::new(());
+
+    // -- window_test.go -----------------------------------------------------
+
     // -- window_test.go -----------------------------------------------------
 
     #[test]
@@ -5957,7 +6085,7 @@ mod tests {
         for (order, want_len) in [
             (main_focus_order(), 8usize),
             (settings_focus_order(), 12),
-            (card_focus_order(), 11),
+            (card_focus_order(), 13),
         ] {
             assert_eq!(order.len(), want_len);
             let mut seen = std::collections::HashSet::new();
@@ -5967,7 +6095,7 @@ mod tests {
         }
         assert_eq!(focus_order_for_view(View::Main).len(), 8);
         assert_eq!(focus_order_for_view(View::Settings).len(), 12);
-        assert_eq!(focus_order_for_view(View::Card).len(), 11);
+        assert_eq!(focus_order_for_view(View::Card).len(), 13);
         for id in [
             BTN_ADD,
             BTN_REMOVE,
@@ -5980,6 +6108,11 @@ mod tests {
         ] {
             assert!(main_focus_order().contains(&id), "missing {id}");
         }
+        // The Card view's kind toggle is two focus stops in visual order.
+        assert_eq!(
+            &card_focus_order()[3..5],
+            &[card_kind_button(0), card_kind_button(1)]
+        );
         // The focus order IS the rect table: every control in every view's table
         // has exactly one focus stop, and every focus stop has a rect.
         for (order, ids) in [
@@ -6001,11 +6134,17 @@ mod tests {
             ),
             (
                 card_focus_order(),
-                compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &CardSpec::default())
-                    .btns
-                    .iter()
-                    .map(|b| b.id)
-                    .collect::<Vec<i32>>(),
+                compute_card_layout(
+                    MAIN_CLIENT_W,
+                    MAIN_CLIENT_H,
+                    96,
+                    &CardSpecs::default(),
+                    CardKind::Series,
+                )
+                .btns
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<i32>>(),
             ),
         ] {
             let mut a = order.clone();
@@ -7475,17 +7614,26 @@ mod tests {
 
     #[test]
     fn card_hit_test() {
-        for spec in [
-            CardSpec::default(),
-            CardSpec {
-                details: "title".into(),
-                state: "synopsis".into(),
-            },
-        ] {
-            let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &spec);
-            assert_eq!(l.btns.len(), 11);
+        let cases: Vec<(CardSpecs, CardKind)> = vec![
+            (CardSpecs::default(), CardKind::Series),
+            (
+                CardSpecs {
+                    series: CardSpec {
+                        details: "title".into(),
+                        state: "synopsis".into(),
+                    },
+                    movie: CardSpec::default(),
+                },
+                CardKind::Movie,
+            ),
+        ];
+        for (specs, kind) in &cases {
+            let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, specs, *kind);
+            assert_eq!(l.btns.len(), 13);
             for id in [
                 BTN_CARD_BACK,
+                card_kind_button(0),
+                card_kind_button(1),
                 card_details_button(0),
                 card_details_button(1),
                 card_details_button(2),
@@ -7521,16 +7669,38 @@ mod tests {
                         && r.bottom <= l.preview.bottom
                 );
             }
+            // The kind row sits directly under the preview, above Line 1.
+            let kind_rc = l.card_btn(card_kind_button(0)).unwrap();
+            let det_rc = l.card_btn(card_details_button(0)).unwrap();
+            assert!(kind_rc.top >= l.preview.bottom, "kind row above the preview");
+            assert!(kind_rc.bottom <= det_rc.top, "kind row below Line 1");
+            let kind_label = l
+                .labels
+                .iter()
+                .find(|x| x.id == "card.kind")
+                .expect("card.kind label missing");
+            assert!(kind_label.rc.bottom <= kind_rc.top);
+            assert!(kind_label.rc.top >= l.preview.bottom);
         }
-        let a = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &CardSpec::default());
+        let a = compute_card_layout(
+            MAIN_CLIENT_W,
+            MAIN_CLIENT_H,
+            96,
+            &CardSpecs::default(),
+            CardKind::Series,
+        );
         let b = compute_card_layout(
             MAIN_CLIENT_W,
             MAIN_CLIENT_H,
             96,
-            &CardSpec {
-                details: "series".into(),
-                state: "none".into(),
+            &CardSpecs {
+                series: CardSpec {
+                    details: "series".into(),
+                    state: "none".into(),
+                },
+                movie: CardSpec::default(),
             },
+            CardKind::Series,
         );
         for (x, y) in a.btns.iter().zip(b.btns.iter()) {
             assert!(r_eq(x.rc, y.rc), "preset {} moved", x.id);
@@ -7542,14 +7712,21 @@ mod tests {
         for dpi in [96, 120, 144, 192] {
             let cw = scale_px(dpi, MAIN_CLIENT_W);
             let ch = scale_px(dpi, MAIN_CLIENT_H);
-            for spec in [
-                CardSpec::default(),
-                CardSpec {
-                    details: "title".into(),
-                    state: "tag".into(),
-                },
-            ] {
-                let l = compute_card_layout(cw, ch, dpi, &spec);
+            let cases: Vec<(CardSpecs, CardKind)> = vec![
+                (CardSpecs::default(), CardKind::Series),
+                (
+                    CardSpecs {
+                        series: CardSpec {
+                            details: "title".into(),
+                            state: "tag".into(),
+                        },
+                        movie: CardSpec::default(),
+                    },
+                    CardKind::Movie,
+                ),
+            ];
+            for (specs, kind) in &cases {
+                let l = compute_card_layout(cw, ch, dpi, specs, *kind);
                 let rects = card_text_rects(cw, ch, dpi, &l);
                 for r in &rects {
                     assert!(
@@ -7696,18 +7873,279 @@ mod tests {
     #[test]
     fn preview_record_round_trip() {
         let mut st = UiState::default();
-        let want = Activity {
-            name: "T".into(),
-            details: "D".into(),
-            state: "S".into(),
-            large_image: "logo".into(),
-            small_image: "play".into(),
-            ..Activity::default()
-        };
-        st.record_preview(want.clone());
+        let raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer".to_string();
+        let action = Some(Action {
+            running: true,
+            has_start: true,
+            start: 999,
+            ct: 1000,
+            ..Action::default()
+        });
+        let resolved = Resolved::default();
+        st.record_preview(CardKind::Series, raw.clone(), action.clone(), resolved.clone());
+        // Default kind is Series: the recorded series item composes.
         let (got, have) = st.preview_activity();
         assert!(have);
+        let want = presence::compose_card(
+            &raw,
+            action.as_ref(),
+            &resolved,
+            false,
+            &st.card_specs_state.for_kind(CardKind::Series),
+        );
         assert_eq!(got, want);
+        // The movie slot is still empty.
+        st.set_card_kind(CardKind::Movie);
+        assert!(!st.preview_activity().1);
+        // Recording the movie slot makes the movie preview appear.
+        st.record_preview(CardKind::Movie, raw.clone(), action.clone(), resolved.clone());
+        let (got_movie, have_movie) = st.preview_activity();
+        assert!(have_movie);
+        let want_movie = presence::compose_card(
+            &raw,
+            action.as_ref(),
+            &resolved,
+            true,
+            &st.card_specs_state.for_kind(CardKind::Movie),
+        );
+        assert_eq!(got_movie, want_movie);
+    }
+
+    /// Picking a line under SERIES changes the composed preview immediately
+    /// while the MOVIE spec is untouched (and the reverse).
+    #[test]
+    fn card_per_kind_line_changes_preview() {
+        let raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer".to_string();
+        let action = Action {
+            running: true,
+            has_start: true,
+            start: 1000,
+            ct: 1000,
+            ..Action::default()
+        };
+        let resolved = Resolved::default();
+        let mut st = UiState::default();
+        st.record_preview(CardKind::Series, raw.clone(), Some(action.clone()), resolved.clone());
+        st.record_preview(CardKind::Movie, raw.clone(), Some(action.clone()), resolved.clone());
+
+        let (before_series, _) = st.preview_activity();
+        assert_eq!(st.card_kind, CardKind::Series);
+        // Pick a details line under SERIES only.
+        assert!(st
+            .card_specs_state
+            .set_line(CardKind::Series, CardLine::Details, "title"));
+        let (after_series, have) = st.preview_activity();
+        assert!(have);
+        assert_ne!(
+            (before_series.details, before_series.state),
+            (after_series.details.clone(), after_series.state.clone()),
+            "series preview must re-render after a series line pick"
+        );
+        // The movie spec is untouched.
+        assert!(st.card_specs_state.for_kind(CardKind::Movie).is_default());
+        st.set_card_kind(CardKind::Movie);
+        let (movie_before, have_movie) = st.preview_activity();
+        assert!(have_movie);
+        // Pick a state line under MOVIE only: series keeps its pick.
+        assert!(st
+            .card_specs_state
+            .set_line(CardKind::Movie, CardLine::State, "none"));
+        let (movie_after, _) = st.preview_activity();
+        assert_eq!(movie_after.state, "");
+        assert_ne!(movie_before.state, movie_after.state);
+        assert_eq!(
+            st.card_specs_state.for_kind(CardKind::Series).details,
+            "title",
+            "series pick must survive a movie pick"
+        );
+    }
+
+    /// Toggling the kind swaps which spec is lit and which recorded item is
+    /// previewed.
+    #[test]
+    fn card_kind_toggle_swaps_preview_and_lit() {
+        let series_raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer".to_string();
+        let movie_raw = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer".to_string();
+        let action = Action {
+            running: true,
+            has_start: true,
+            start: 1000,
+            ct: 1000,
+            ..Action::default()
+        };
+        let mut st = UiState::default();
+        assert!(st.card_specs_state.set_line(
+            CardKind::Series,
+            CardLine::Details,
+            "title"
+        ));
+        assert!(st.card_specs_state.set_line(
+            CardKind::Movie,
+            CardLine::State,
+            "none"
+        ));
+        st.record_preview(
+            CardKind::Series,
+            series_raw.clone(),
+            Some(action.clone()),
+            Resolved::default(),
+        );
+        st.record_preview(
+            CardKind::Movie,
+            movie_raw.clone(),
+            Some(action.clone()),
+            Resolved::default(),
+        );
+
+        st.set_card_kind(CardKind::Series);
+        let (series_act, have_series) = st.preview_activity();
+        assert!(have_series);
+        let want_series = presence::compose_card(
+            &series_raw,
+            Some(&action),
+            &Resolved::default(),
+            false,
+            &st.card_specs_state.for_kind(CardKind::Series),
+        );
+        assert_eq!(series_act, want_series);
+
+        st.set_card_kind(CardKind::Movie);
+        let (movie_act, have_movie) = st.preview_activity();
+        assert!(have_movie);
+        let want_movie = presence::compose_card(
+            &movie_raw,
+            Some(&action),
+            &Resolved::default(),
+            true,
+            &st.card_specs_state.for_kind(CardKind::Movie),
+        );
+        assert_eq!(movie_act, want_movie);
+        assert_ne!(
+            (series_act.details, series_act.state),
+            (movie_act.details, movie_act.state),
+            "the two kinds must preview different recorded items"
+        );
+
+        // The lit segments follow the selected kind's spec.
+        for kind in [CardKind::Series, CardKind::Movie] {
+            let l = compute_card_layout(
+                MAIN_CLIENT_W,
+                MAIN_CLIENT_H,
+                96,
+                &st.card_specs_state,
+                kind,
+            );
+            let lit_kind = l
+                .btns
+                .iter()
+                .find(|b| b.style == BTN_TAB_SEL && (b.id == card_kind_button(0) || b.id == card_kind_button(1)))
+                .expect("one kind segment lit");
+            assert_eq!(
+                lit_kind.id,
+                if kind == CardKind::Series {
+                    card_kind_button(0)
+                } else {
+                    card_kind_button(1)
+                }
+            );
+            let spec = st.card_specs_state.for_kind(kind);
+            let (dets, states) = presence::cardspec::card_presets();
+            for p in &dets {
+                let want = if p.id == spec.details { BTN_TAB_SEL } else { BTN_TAB };
+                assert_eq!(card_preset_style(0, &p.id, &spec), want);
+            }
+            for p in &states {
+                assert_eq!(
+                    card_preset_style(1, &p.id, &spec),
+                    if p.id == spec.state { BTN_TAB_SEL } else { BTN_TAB }
+                );
+            }
+            // The layout's own preset buttons carry the same lit rule.
+            for b in l.btns.iter().filter(|b| {
+                (BTN_CARD_DETAILS_AT..BTN_CARD_DETAILS_AT + 4).contains(&b.id)
+                    || (BTN_CARD_STATE_AT..BTN_CARD_STATE_AT + 4).contains(&b.id)
+            }) {
+                if let Some((line, id)) = card_preset_for_button(b.id) {
+                    assert_eq!(b.style, card_preset_style(line, &id, &spec));
+                }
+            }
+        }
+    }
+
+    /// The kind toggle is view-only: it never touches the stored config.
+    #[test]
+    fn card_kind_toggle_is_view_only() {
+        // Shares the real store with the save tests below; the serial keeps a
+        // mid-flight save from landing between the two reads.
+        let _serial = LIVE_MIRROR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = app_support::config::load_config().effective_card_specs();
+        let mut st = UiState::default();
+        let specs_before = st.card_specs_state.clone();
+        st.set_card_kind(CardKind::Movie);
+        assert_eq!(st.card_kind, CardKind::Movie);
+        assert_eq!(st.card_specs_state, specs_before);
+        st.set_card_kind(CardKind::Series);
+        assert_eq!(st.card_kind, CardKind::Series);
+        assert_eq!(st.card_specs_state, specs_before);
+        assert_eq!(
+            app_support::config::load_config().effective_card_specs(),
+            before,
+            "toggling the kind must not persist anything"
+        );
+    }
+
+    /// A kind with no recorded item yields `have == false`, with the exact
+    /// placeholder rows (never a sample card).
+    #[test]
+    fn card_missing_kind_has_no_preview() {
+        let mut st = UiState::default();
+        assert!(!st.preview_activity().1);
+        assert_eq!(
+            preview_rows(&Activity::default(), false),
+            [
+                "Header: -".to_string(),
+                "Details: -".to_string(),
+                "State: -".to_string(),
+                "Images: -".to_string(),
+                "Buttons: -".to_string(),
+            ]
+        );
+        st.record_preview(
+            CardKind::Series,
+            "Show.S01E02.Pilot.1080p.mkv - PotPlayer".to_string(),
+            None,
+            Resolved::default(),
+        );
+        assert!(st.preview_activity().1);
+        st.set_card_kind(CardKind::Movie);
+        let (act, have) = st.preview_activity();
+        assert!(!have);
+        assert_eq!(act, Activity::default());
+        assert_eq!(
+            preview_rows(&act, have),
+            [
+                "Header: -".to_string(),
+                "Details: -".to_string(),
+                "State: -".to_string(),
+                "Images: -".to_string(),
+                "Buttons: -".to_string(),
+            ]
+        );
+    }
+
+    /// The kind toggle dispatches through the real card action.
+    #[test]
+    fn card_kind_buttons_dispatch() {
+        let mut st = UiState::default();
+        assert_eq!(st.card_kind, CardKind::Series);
+        st.do_card_action(NULL, card_kind_button(1));
+        assert_eq!(st.card_kind, CardKind::Movie);
+        st.do_card_action(NULL, card_kind_button(0));
+        assert_eq!(st.card_kind, CardKind::Series);
+        assert!(card_preset_for_button(card_kind_button(0)).is_none());
+        assert!(card_preset_for_button(card_kind_button(1)).is_none());
     }
 
     #[test]
@@ -8376,5 +8814,88 @@ mod tests {
             st.scan_last_paint = Instant::now();
             st.status_text = "Ready".into();
         }
+    }
+
+    /// Driving `on_select_card_preset` through a real save publishes the new
+    /// effective specs to the live mirror: the regression test for the
+    /// Card-view-preset-needs-restart defect. The real store is snapshotted
+    /// and restored byte-exact (panic-safe via `Drop`), as is the mirror.
+    #[test]
+    fn card_preset_save_publishes_live_specs() {
+        let _serial = LIVE_MIRROR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct Restore {
+            path: std::path::PathBuf,
+            bytes: Option<Vec<u8>>,
+            mirror: CardSpecs,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Some(bytes) = self.bytes.take() {
+                    let _ = std::fs::write(&self.path, bytes);
+                } else {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+                app_support::config::set_live_card_specs(self.mirror.clone());
+            }
+        }
+        let path = app_support::config::config_path();
+        let _restore = Restore {
+            bytes: std::fs::read(&path).ok(),
+            mirror: app_support::config::live_card_specs(),
+            path: path.clone(),
+        };
+        // Two distinct presets in a row: whatever the store held, the second
+        // save always changes it, so the publish path is always exercised.
+        let mut st = UiState::default();
+        st.on_select_card_preset(0, "episode");
+        st.on_select_card_preset(0, "title");
+        let live = app_support::config::live_card_specs();
+        assert_eq!(live.series.details, "title");
+        assert_eq!(
+            live,
+            app_support::config::load_config().effective_card_specs(),
+            "the mirror must carry the saved effective specs"
+        );
+    }
+
+    /// A failed Card-view preset save publishes nothing: the mirror keeps the
+    /// last good specs.
+    #[test]
+    fn card_preset_failed_save_publishes_nothing() {
+        let _serial = LIVE_MIRROR_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mirror_before = app_support::config::live_card_specs();
+        let mut sentinel = CardSpecs::default();
+        assert!(sentinel.set_line(CardKind::Series, CardLine::Details, "title"));
+        app_support::config::set_live_card_specs(sentinel.clone());
+        // Break the store without touching the real file: point the cache root
+        // at a regular file, so the load yields the zero config and the atomic
+        // save's `create_dir_all` fails.
+        let scratch = Scratch::new("card-save-fail");
+        let blocker = scratch.write("blocker", "x");
+        let prev = std::env::var_os(app_support::config::LOCAL_APP_DATA_ENV);
+        // SAFETY: the serial above excludes every other test that reads this
+        // variable or the store; the previous value is restored below.
+        unsafe {
+            std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, &blocker);
+        }
+        let mut st = UiState::default();
+        st.on_select_card_preset(0, "title");
+        let live = app_support::config::live_card_specs();
+        let status = st.status_text.clone();
+        match prev {
+            Some(value) => unsafe {
+                std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(app_support::config::LOCAL_APP_DATA_ENV);
+            },
+        }
+        app_support::config::set_live_card_specs(mirror_before);
+        assert_eq!(live, sentinel, "a failed save must publish nothing");
+        assert_eq!(status, "Save failed.");
     }
 }

@@ -8,22 +8,17 @@
 //! language. The zero value falls back to the default on every line, so no
 //! migration is needed for stored configs.
 //!
-//! [`default_card_spec`] reproduces today's shipped output BYTE-FOR-BYTE: its
-//! [`CardSpec::render`] returns exactly [`build_activity_resolved`]'s
-//! details/state for the same inputs. The default state carries no synopsis
-//! (genres/length for a movie, the episode tag for a series); the synopsis
-//! lives in the tooltip and stays one click away behind [`CARD_STATE_SYNOPSIS`].
-//! Non-default presets only reselect among the same already-capped strings;
-//! the paused " - Paused" marker path is preserved on every line.
+//! [`default_card_spec`] reproduces [`build_activity_resolved`]'s lines
+//! exactly: both delegate to the [`compose_card`](crate::compose_card) fill
+//! ladder, so the default state carries the synopsis teaser after the episode
+//! tag for a series (genres/length for a movie); the whole synopsis stays one
+//! click away in the tooltip. The paused " - Paused" marker path is preserved
+//! on every rung, and only [`CARD_STATE_NONE`] may empty the line.
 
 use player::window::{APP_NAME, SUFFIX};
 use serde::{Deserialize, Serialize};
-use titleclean::{clean, trunc};
 
-use crate::{
-    Action, PAUSED_MARKER, Resolved, build_activity_resolved, rp_text, synopsis_state,
-    with_state_time,
-};
+use crate::{Action, Resolved, compose_details_for, compose_state_for};
 
 /// Details-line preset id: the shipped default.
 pub const CARD_DETAILS_DEFAULT: &str = "default";
@@ -108,49 +103,34 @@ impl CardSpec {
 
     /// Returns the (details, state) body lines for the given inputs under this
     /// spec (`cardspec.go:147`). The default spec returns
-    /// [`build_activity_resolved`]'s lines exactly (no synopsis in the state);
-    /// [`CARD_STATE_SYNOPSIS`] renders the synopsis-bearing line instead and
-    /// hides the slot when there is no synopsis; every other preset reselects
-    /// among the same capped strings. The idle card keeps its shipped lines under
-    /// any spec.
+    /// [`build_activity_resolved`](crate::build_activity_resolved)'s lines
+    /// exactly (both delegate to the same fill ladder); the series default
+    /// state carries the synopsis teaser after the episode tag, and every
+    /// ladder ends on the clean filename title so the line is never blank.
+    /// Only [`CARD_STATE_NONE`] empties the line. The idle card keeps its
+    /// shipped lines under any spec.
     pub fn render(&self, raw_title: &str, a: Option<&Action>, r: &Resolved) -> (String, String) {
-        let base = build_activity_resolved(raw_title, a, r);
+        self.render_kind(raw_title, a, r, r.is_movie)
+    }
+
+    /// [`CardSpec::render`] with an explicit kind: `is_movie` drives the
+    /// per-kind branches instead of the stored `r.is_movie` flag, so anime
+    /// (`is_movie=false`, even with a year set) resolves through the series
+    /// branch. The push path passes the stored flag; the Card-view preview
+    /// passes the live kind.
+    pub fn render_kind(
+        &self,
+        raw_title: &str,
+        a: Option<&Action>,
+        r: &Resolved,
+        is_movie: bool,
+    ) -> (String, String) {
         if is_idle_title(raw_title) {
-            return (base.details, base.state);
+            return ("Browsing".to_string(), "Idle".to_string());
         }
         let spec = self.normalized();
-        let mut details = base.details;
-        let mut state = base.state;
-        match spec.details.as_str() {
-            CARD_DETAILS_TITLE => {
-                // The header title: canonical series when known, else the
-                // filename-derived header (base.name), else today's line.
-                if !r.series.is_empty() {
-                    details = trunc(&r.series, 128);
-                } else if !base.name.is_empty() {
-                    details = base.name;
-                }
-            }
-            CARD_DETAILS_EPISODE => {
-                if !r.episode_name.is_empty() {
-                    details = trunc(&r.episode_name, 128);
-                }
-            }
-            CARD_DETAILS_SERIES => {
-                if !r.series.is_empty() && r.is_movie && r.year > 0 {
-                    details = trunc(&format!("{} ({})", r.series, r.year), 128);
-                } else if !r.series.is_empty() {
-                    details = trunc(&r.series, 128);
-                }
-            }
-            _ => {}
-        }
-        match spec.state.as_str() {
-            CARD_STATE_TAG => state = episode_tag_only(raw_title, a),
-            CARD_STATE_SYNOPSIS => state = synopsis_state(raw_title, a, r),
-            CARD_STATE_NONE => state = String::new(),
-            _ => {}
-        }
+        let details = compose_details_for(raw_title, r, is_movie, &spec.details);
+        let state = compose_state_for(raw_title, a, r, is_movie, &spec.state);
         (details, state)
     }
 }
@@ -192,7 +172,7 @@ pub fn card_presets() -> (Vec<CardPreset>, Vec<CardPreset>) {
         },
         CardPreset {
             id: CARD_STATE_NONE.to_string(),
-            label: "Empty".to_string(),
+            label: "Minimal".to_string(),
         },
     ];
     (details, states)
@@ -204,20 +184,4 @@ pub fn card_presets() -> (Vec<CardPreset>, Vec<CardPreset>) {
 pub(crate) fn is_idle_title(raw_title: &str) -> bool {
     let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
     raw.trim().is_empty() || raw == APP_NAME
-}
-
-/// Renders the filename episode tag with the paused marker path preserved
-/// (`cardspec.go:109`): paused with no tag reads "Paused", as
-/// [`build_activity`](crate::build_activity) does.
-fn episode_tag_only(raw_title: &str, a: Option<&Action>) -> String {
-    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
-    let mut tag_raw = String::new();
-    if !(raw.trim().is_empty() || raw == APP_NAME) {
-        tag_raw = clean(raw).episode_tag;
-    }
-    let tag_t = rp_text(&tag_raw, 128);
-    if a.is_some_and(|x| x.paused) {
-        return with_state_time(&tag_t, PAUSED_MARKER);
-    }
-    tag_t
 }

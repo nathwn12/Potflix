@@ -5,10 +5,13 @@
 //! in the owner's cache went through `capSynopsis`, so the cap and its
 //! boundaries are behaviour, not tuning.
 
-/// `maxSynopsisRunes` caps a synopsis at 128 runes (Discord's asset-text cap, so
-/// the LargeText hover tooltip carries the short synopsis whole); `cap_synopsis`
-/// backs off to a word/sentence boundary so the card never shows a cut-off word.
-pub const MAX_SYNOPSIS_RUNES: usize = 128;
+/// `maxSynopsisUnits` caps a synopsis at 128 UTF-16 code units (Discord's
+/// asset-text cap, so the LargeText hover tooltip carries the short synopsis
+/// whole); `cap_synopsis` backs off to a word/sentence boundary so the card
+/// never shows a cut-off word. The unit is the UTF-16 code unit -- Discord's
+/// asset-text cap and every presence slot budget (`NAME`/`DETAILS`/`STATE`/
+/// `LARGE_TEXT_BUDGET` in the presence crate) use the same unit.
+pub const MAX_SYNOPSIS_UNITS: usize = 128;
 
 /// `firstNonEmpty`: the first string that is non-empty after trimming
 /// whitespace, or `""` when all are blank.
@@ -78,29 +81,53 @@ pub fn strip_html(s: &str) -> String {
     decoded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `capSynopsis` trims `s` to ~[`MAX_SYNOPSIS_RUNES`] runes, preferring to end
-/// at the last sentence boundary (`.` `!` `?` followed by a space or the end) in
-/// the back half, else at the last word boundary past the halfway mark, else
-/// hard at the cap. Input at or under the cap is returned trimmed as-is.
+/// `capSynopsis` trims `s` to ~[`MAX_SYNOPSIS_UNITS`] UTF-16 code units,
+/// preferring to end at the last sentence boundary (`.` `!` `?` followed by a
+/// space or the end) in the back half, else at the last word boundary past the
+/// halfway mark, else hard at the cap. Input at or under the cap is returned
+/// trimmed as-is.
 ///
 /// Named reading: Go's `unicode.IsSpace` is read as Rust's `char::is_whitespace`
 /// (the `White_Space` property); the two differ only for the U+200B-family
 /// zero-width characters no synopsis carries.
 pub fn cap_synopsis(s: &str) -> String {
     let s = s.trim();
-    let runes: Vec<char> = s.chars().collect();
-    if runes.len() <= MAX_SYNOPSIS_RUNES {
+    if s.encode_utf16().count() <= MAX_SYNOPSIS_UNITS {
         return s.to_string();
     }
-    let cut = &runes[..MAX_SYNOPSIS_RUNES];
-    for i in (MAX_SYNOPSIS_RUNES / 2..cut.len()).rev() {
+    let runes: Vec<char> = s.chars().collect();
+    // Leading runes fitting in the UTF-16 budget (never splits a surrogate
+    // pair: astral runes cost 2 units).
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (i, r) in runes.iter().enumerate() {
+        let sz = r.len_utf16();
+        if used + sz > MAX_SYNOPSIS_UNITS {
+            break;
+        }
+        used += sz;
+        end = i + 1;
+    }
+    // Start of the back half: the smallest leading rune count of the cut whose
+    // UTF-16 length reaches half the budget.
+    let mut acc = 0usize;
+    let mut half = 0usize;
+    for (i, r) in runes.iter().enumerate().take(end) {
+        acc += r.len_utf16();
+        if acc >= MAX_SYNOPSIS_UNITS / 2 {
+            half = i + 1;
+            break;
+        }
+    }
+    let cut = &runes[..end];
+    for i in (half..cut.len()).rev() {
         let c = cut[i];
         if (c == '.' || c == '!' || c == '?') && (i + 1 == cut.len() || cut[i + 1].is_whitespace())
         {
             return cut[..=i].iter().collect::<String>().trim().to_string();
         }
     }
-    for i in (MAX_SYNOPSIS_RUNES / 2..cut.len()).rev() {
+    for i in (half..cut.len()).rev() {
         if cut[i].is_whitespace() {
             return cut[..i].iter().collect::<String>().trim().to_string();
         }

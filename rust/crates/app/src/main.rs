@@ -58,10 +58,6 @@ const NO_PLAYER_SLEEP: Duration = Duration::from_millis(1000);
 /// the loop starts (unset in tests, which keep the clean card) (`go\main.go:42`).
 static META_RESOLVER: OnceLock<metadata::Resolver> = OnceLock::new();
 
-/// The current settings store: loaded once at startup, refreshed on every
-/// Settings save (`go\main.go:46`).
-static LIVE_CONFIG: LazyLock<Mutex<Option<config::Config>>> = LazyLock::new(|| Mutex::new(None));
-
 /// The folder-aware query cache keyed by the current raw title
 /// (`go\main.go:81-85`): the poll loop is the only writer.
 static META_CACHE: LazyLock<Mutex<Option<(String, metadata::Query)>>> =
@@ -75,14 +71,12 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// The stored card spec, or the shipped default when no config is loaded
-/// (`go\main.go:353`: `liveConfig.Load()` nil skips the override entirely).
-fn live_card_spec() -> presence::CardSpec {
-    let guard = LIVE_CONFIG.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .as_ref()
-        .map(config::Config::effective_card_spec)
-        .unwrap_or_default()
+/// The stored per-kind card specs: whatever the Card view last published to the
+/// process-wide mirror, or the shipped defaults when nothing was published
+/// yet. The poll loop reads this every poll, so a preset save takes effect on
+/// the next push with no restart.
+fn live_card_specs() -> app_support::config::CardSpecs {
+    config::live_card_specs()
 }
 
 /// The folder-aware query for `raw_title`, querying the playing-file path once
@@ -113,9 +107,10 @@ fn meta_query_for(raw_title: &str) -> metadata::Query {
 /// the gate says so. A failed send is not fatal -- the supervisor reconnects and
 /// a later decision resends -- but it is never silent.
 ///
-/// `spec` is the stored Card view choice (`liveCardSpec`) and `record` is the
-/// preview sink (`recordPreview`), injected so this one implementation is both
-/// the production path the poll loop runs and the path the cardview tests drive.
+/// `specs` is the stored per-kind Card view choice (`liveCardSpecs`) and
+/// `record` is the preview sink (`recordPreview`), injected so this one
+/// implementation is both the production path the poll loop runs and the path
+/// the cardview tests drive.
 ///
 /// The preview is recorded only AFTER a successful send (`main.go:391-392`).
 #[allow(clippy::too_many_arguments)]
@@ -123,8 +118,13 @@ fn push_activity(
     log: &Logger,
     dc: &discord::Client,
     gate: &mut Gate,
-    spec: presence::CardSpec,
-    record: &mut dyn FnMut(presence::Activity),
+    specs: app_support::config::CardSpecs,
+    record: &mut dyn FnMut(
+        app_support::config::CardKind,
+        String,
+        Option<presence::Action>,
+        presence::Resolved,
+    ),
     raw_title: &str,
     action: Option<&presence::Action>,
     ct: i64,
@@ -133,12 +133,12 @@ fn push_activity(
     event: bool,
     debounced: bool,
 ) {
-    let mut card = presence::build_activity(raw_title, action);
+    let query = meta_query_for(raw_title);
     let mut res = presence::Resolved::default();
+    let mut found = false;
     if let Some(resolver) = META_RESOLVER.get() {
         // Non-blocking: a miss fires at most one background fetch per key.
         // Unknown kinds (themes, extras, bare names) never fetch or cache.
-        let query = meta_query_for(raw_title);
         if query.kind != metadata::Kind::UNKNOWN {
             let cancel = metadata_http::Cancel::background();
             if let Ok(answer) = resolver.resolve(&cancel, &query)
@@ -155,17 +155,26 @@ fn push_activity(
                     is_movie: answer.is_movie,
                     buttons: Vec::new(),
                 };
-                card = presence::build_activity_resolved(raw_title, action, &res);
+                found = true;
             }
         }
     }
-    // Card view spec: a non-default preset overrides the two body lines; the
-    // default spec reproduces the builders byte-for-byte, so it is skipped.
-    if !spec.is_default() {
-        let (details, state) = spec.render(raw_title, action, &res);
-        card.details = details;
-        card.state = state;
-    }
+    // The kind follows the answer when one was found, else the query; an
+    // UNKNOWN title takes the series ladder.
+    let is_movie = if found {
+        res.is_movie
+    } else {
+        query.kind == metadata::Kind::MOVIE
+    };
+    let kind = if is_movie {
+        app_support::config::CardKind::Movie
+    } else {
+        app_support::config::CardKind::Series
+    };
+    // Always compose: with the default spec for a kind, `compose_card`
+    // reproduces the builder's output byte-for-byte, so no skip branch is
+    // needed.
+    let card = presence::compose_card(raw_title, action, &res, is_movie, &specs.for_kind(kind));
     let (out, verdict) = gate.decide(card, ct, total, now, event, debounced);
     selftest::event_push_attempt(log, &out, &verdict);
     if !verdict.send {
@@ -194,7 +203,12 @@ fn push_activity(
         buttons: Vec::new(),
     };
     match dc.set_activity(wire) {
-        Ok(()) => record(out),
+        Ok(()) => record(
+            kind,
+            raw_title.to_string(),
+            action.cloned(),
+            res.clone(),
+        ),
         Err(err) => selftest::event_send_error(log, &err),
     }
 }
@@ -275,12 +289,15 @@ fn poll_loop(log: &Logger, dc: &discord::Client) -> ! {
             // re-anchor on divergence, fire the heartbeat, and log the verdict.
             let debounced = tracker.pending_debounce();
             if let Some(cur) = action.clone().or_else(|| tracker.current()) {
-                let mut record = |a: presence::Activity| window::ui().record_preview(a);
+                let mut record =
+                    |kind, raw: String, act: Option<presence::Action>, res: presence::Resolved| {
+                        window::ui().record_preview(kind, raw, act, res);
+                    };
                 push_activity(
                     log,
                     dc,
                     &mut gate,
-                    live_card_spec(),
+                    live_card_specs(),
                     &mut record,
                     &title,
                     Some(&cur),
@@ -358,7 +375,7 @@ fn run_ui(log: &'static Logger) {
     dc.start();
 
     let cfg = config::load_config();
-    *LIVE_CONFIG.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
+    config::set_live_card_specs(cfg.effective_card_specs());
     metadata_http::set_rate_profile(cfg.effective_scan_speed());
     log.log(&format!(
         "scan speed profile: {}",
@@ -471,6 +488,11 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
+    /// Serializes the tests that publish to or read the process-wide live card
+    /// mirror: a concurrent publisher would leak into another test's read, and
+    /// a concurrent reader would observe mid-flight specs.
+    static LIVE_SERIAL: Mutex<()> = Mutex::new(());
+
     use player::control::PlayStatus;
 
     fn unique_dir(tag: &str) -> std::path::PathBuf {
@@ -489,6 +511,9 @@ mod tests {
     /// sequence and asserts the exact SET_ACTIVITY frames.
     #[test]
     fn gate_fake_pipe_sequence() {
+        // Reads the live mirror on every drive; the serial keeps a concurrent
+        // publisher out of this long run.
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         const IT_TITLE: &str = "Breaking Bad (2008) - S04E07 - Problem Dog (1080p BluRay x265 Silence).mkv - PotPlayer";
         const IT_TOTAL: i64 = 2_832_979;
         const IT_N: i64 = 1_000_000_000_000;
@@ -557,12 +582,15 @@ mod tests {
                 let action = tracker.poll(IT_TITLE, status, ct, now);
                 let debounced = tracker.pending_debounce();
                 if let Some(cur) = action.clone().or_else(|| tracker.current()) {
-                    let mut record = |a: presence::Activity| window::ui().record_preview(a);
+                    let mut record =
+                        |kind, raw: String, act: Option<presence::Action>, res: presence::Resolved| {
+                            window::ui().record_preview(kind, raw, act, res);
+                        };
                     push_activity(
                         &log,
                         &dc,
                         &mut gate,
-                        live_card_spec(),
+                        live_card_specs(),
                         &mut record,
                         IT_TITLE,
                         Some(&cur),
@@ -601,12 +629,15 @@ mod tests {
         gate.force_next();
         let cur = tracker.current();
         {
-            let mut record = |a: presence::Activity| window::ui().record_preview(a);
+            let mut record =
+                |kind, raw: String, act: Option<presence::Action>, res: presence::Resolved| {
+                    window::ui().record_preview(kind, raw, act, res);
+                };
             push_activity(
                 &log,
                 &dc,
                 &mut gate,
-                live_card_spec(),
+                live_card_specs(),
                 &mut record,
                 IT_TITLE,
                 cur.as_ref(),
@@ -954,8 +985,9 @@ mod tests {
 
     /// The cardview test, repointed to the APP's `pushActivity`
     /// (`go\main.go:332-394`): drives the ONE production implementation over a
-    /// fake pipe and asserts preview-is-the-payload through the send, under the
-    /// stored Card view spec (`spec` param = `liveCardSpec`).
+    /// fake pipe and asserts the preview composes to the payload the send path
+    /// produced, under the stored per-kind Card view specs (`specs` param =
+    /// `liveCardSpecs`).
     #[test]
     fn preview_is_payload_through_send() {
         let srv = discord::FakeServer::new(0);
@@ -1004,20 +1036,24 @@ mod tests {
 
         let dir = unique_dir("preview");
         let log = Logger::new(dir.join("preview.log"), 0, 1);
-        let raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
         let now = 1_000_000_000_000i64;
-        let drive = |spec: presence::CardSpec,
+        let drive = |specs: config::CardSpecs,
+                     raw: &str,
                      act: &presence::Action,
                      ct: i64|
          -> (presence::Activity, serde_json::Value, Vec<u8>) {
             let mut st = window::UiState::default();
+            st.card_specs_state = specs.clone();
             let mut gate = Gate::new();
-            let mut record = |a: presence::Activity| st.record_preview(a);
+            let mut record =
+                |kind, raw: String, a: Option<presence::Action>, res: presence::Resolved| {
+                    st.record_preview(kind, raw, a, res);
+                };
             push_activity(
                 &log,
                 &dc,
                 &mut gate,
-                spec,
+                specs,
                 &mut record,
                 raw,
                 Some(act),
@@ -1034,8 +1070,21 @@ mod tests {
             let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
             assert_eq!(v["cmd"], "SET_ACTIVITY");
             assert!(!v["args"]["activity"].is_null());
-            let (got, have) = st.preview_activity();
-            assert!(have, "preview not recorded after a successful send");
+            // The push records exactly one kind; the preview for that kind must
+            // compose to the payload. Probe both kinds: exactly one is present.
+            let mut matched: Option<presence::Activity> = None;
+            for kind in [config::CardKind::Series, config::CardKind::Movie] {
+                st.set_card_kind(kind);
+                let (got, have) = st.preview_activity();
+                if have {
+                    assert!(
+                        matched.is_none(),
+                        "both kinds recorded for {raw:?}, want exactly one"
+                    );
+                    matched = Some(got);
+                }
+            }
+            let got = matched.expect("preview not recorded after a successful send");
             (got, v, payload)
         };
         let check = |got: &presence::Activity, v: &serde_json::Value| {
@@ -1053,20 +1102,26 @@ mod tests {
             }
             assert_eq!(assets["large_image"].as_str().unwrap_or(""), want_large);
             assert_eq!(assets["large_text"].as_str().unwrap_or(""), got.large_text);
+            // The preview composes through the same composer (name, lines,
+            // assets, start anchor) but carries no gate projection: `end` is
+            // computed by the send gate from ct/total, not from the recorded
+            // inputs, so the preview's `end` stays 0 while a running wire
+            // frame carries the projection.
             if got.has_start {
                 assert_eq!(a["timestamps"]["start"].as_i64(), Some(got.start));
-                if got.end > 0 {
-                    assert_eq!(a["timestamps"]["end"].as_i64(), Some(got.end));
-                } else {
-                    assert!(a["timestamps"]["end"].is_null());
-                }
             }
+            assert_eq!(got.end, 0, "preview carries no gate-projected end");
+            assert!(
+                a["timestamps"]["end"].as_i64().is_some(),
+                "running wire frame must carry the gate-projected end"
+            );
             assert_eq!(
                 a["buttons"].as_array().map_or(0, Vec::len),
                 got.buttons.len()
             );
         };
 
+        let series_raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
         let act = presence::Action {
             running: true,
             has_start: true,
@@ -1074,7 +1129,7 @@ mod tests {
             ct: 1000,
             ..presence::Action::default()
         };
-        let (got, v, _) = drive(presence::cardspec::default_card_spec(), &act, 1000);
+        let (got, v, _) = drive(config::CardSpecs::default(), series_raw, &act, 1000);
         check(&got, &v);
 
         let act2 = presence::Action {
@@ -1084,14 +1139,14 @@ mod tests {
             ct: 2000,
             ..presence::Action::default()
         };
-        let (got2, v2, _) = drive(
-            presence::CardSpec {
-                details: "title".into(),
-                state: "tag".into(),
-            },
-            &act2,
-            2000,
-        );
+        let mut series_specs = config::CardSpecs::default();
+        assert!(series_specs.set_line(
+            config::CardKind::Series,
+            config::CardLine::Details,
+            "title"
+        ));
+        assert!(series_specs.set_line(config::CardKind::Series, config::CardLine::State, "tag"));
+        let (got2, v2, _) = drive(series_specs, series_raw, &act2, 2000);
         check(&got2, &v2);
         assert!(!got2.details.is_empty() && !got2.state.is_empty());
 
@@ -1102,14 +1157,13 @@ mod tests {
             ct: 3000,
             ..presence::Action::default()
         };
-        let (got3, v3, frame) = drive(
-            presence::CardSpec {
-                details: "default".into(),
-                state: "none".into(),
-            },
-            &act3,
-            3000,
-        );
+        let mut minimal_specs = config::CardSpecs::default();
+        assert!(minimal_specs.set_line(
+            config::CardKind::Series,
+            config::CardLine::State,
+            "none"
+        ));
+        let (got3, v3, frame) = drive(minimal_specs, series_raw, &act3, 3000);
         check(&got3, &v3);
         assert_eq!(got3.state, "");
         let env: serde_json::Value = serde_json::from_slice(&frame).unwrap();
@@ -1118,6 +1172,159 @@ mod tests {
             "empty state reached the wire"
         );
         assert_eq!(env["args"]["activity"]["details"], "Pilot");
+
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The per-kind wire test: a movie title composes with the movie spec and a
+    /// series title with the series spec, through the ONE production push path
+    /// with no resolver (kind from the query).
+    #[test]
+    fn per_kind_specs_reach_the_wire() {
+        let srv = discord::FakeServer::new(0);
+        let base = srv.base.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(srv.accept());
+        });
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: base,
+            retry_delay: Duration::from_millis(30),
+            ..Default::default()
+        });
+        dc.start();
+        let sc = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client connects")
+            .expect("accept");
+        let (op, _) = sc.read_frame().expect("handshake frame");
+        assert_eq!(op, discord::OP_HANDSHAKE);
+        sc.write_frame(
+            discord::OP_FRAME,
+            br#"{"cmd":"DISPATCH","evt":"READY","data":{"v":1}}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dc.generation() < 1 {
+            assert!(Instant::now() < deadline, "never became ready");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (ftx, frx) = mpsc::channel::<Vec<u8>>();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match sc.read_frame() {
+                    Ok((discord::OP_FRAME, payload)) => {
+                        if ftx.send(payload).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let dir = unique_dir("per-kind");
+        let log = Logger::new(dir.join("per-kind.log"), 0, 1);
+        let now = 1_000_000_000_000i64;
+        // Series keeps a visible state; movies go minimal. With no resolver the
+        // inputs are empty, so `none` (empty) is the only state preset that
+        // stays distinct on both ladders.
+        let mut specs = config::CardSpecs::default();
+        assert!(specs.set_line(config::CardKind::Series, config::CardLine::State, "tag"));
+        assert!(specs.set_line(config::CardKind::Movie, config::CardLine::State, "none"));
+
+        let drive_raw = |raw: &str, ct: i64| -> serde_json::Value {
+            let mut st = window::UiState::default();
+            st.card_specs_state = specs.clone();
+            let mut gate = Gate::new();
+            let act = presence::Action {
+                running: true,
+                has_start: true,
+                start: now - ct,
+                ct,
+                ..presence::Action::default()
+            };
+            let mut record =
+                |kind, raw: String, a: Option<presence::Action>, res: presence::Resolved| {
+                    st.record_preview(kind, raw, a, res);
+                };
+            push_activity(
+                &log,
+                &dc,
+                &mut gate,
+                specs.clone(),
+                &mut record,
+                raw,
+                Some(&act),
+                ct,
+                2_832_979,
+                now,
+                true,
+                false,
+            );
+            drop(record);
+            let payload = frx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("SET_ACTIVITY frame");
+            let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(v["cmd"], "SET_ACTIVITY");
+            // The preview for the recorded kind equals the wire payload.
+            let mut matched = false;
+            for kind in [config::CardKind::Series, config::CardKind::Movie] {
+                st.set_card_kind(kind);
+                let (got, have) = st.preview_activity();
+                if have {
+                    assert!(!matched, "both kinds recorded for {raw:?}");
+                    assert_eq!(
+                        got.details,
+                        v["args"]["activity"]["details"].as_str().unwrap_or("")
+                    );
+                    if got.state.is_empty() {
+                        assert!(
+                            v["args"]["activity"].get("state").is_none(),
+                            "empty state reached the wire for {raw:?}"
+                        );
+                    } else {
+                        assert_eq!(
+                            got.state,
+                            v["args"]["activity"]["state"].as_str().unwrap_or("")
+                        );
+                    }
+                    matched = true;
+                }
+            }
+            assert!(matched, "no preview recorded for {raw:?}");
+            v
+        };
+
+        let series_raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+        let movie_raw = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
+        // Positive control: the query kinds really are series vs movie here.
+        assert_eq!(
+            meta_query_for(series_raw).kind,
+            metadata::Kind::SERIES,
+            "series fixture query kind"
+        );
+        assert_eq!(
+            meta_query_for(movie_raw).kind,
+            metadata::Kind::MOVIE,
+            "movie fixture query kind"
+        );
+
+        let v_series = drive_raw(series_raw, 1000);
+        assert!(
+            v_series["args"]["activity"].get("state").is_some(),
+            "series title must carry the series (tag) state, got {v_series}"
+        );
+        let v_movie = drive_raw(movie_raw, 2000);
+        assert!(
+            v_movie["args"]["activity"].get("state").is_none(),
+            "movie title must carry the movie (none) state, got {v_movie}"
+        );
 
         let _ = dc.close();
         let _ = reader.join();
@@ -1145,12 +1352,15 @@ mod tests {
             ct: 1000,
             ..presence::Action::default()
         };
-        let mut record = |a: presence::Activity| st.record_preview(a);
+        let mut record =
+            |kind, raw: String, a: Option<presence::Action>, res: presence::Resolved| {
+                st.record_preview(kind, raw, a, res);
+            };
         push_activity(
             &log,
             &dc,
             &mut gate,
-            presence::CardSpec::default(),
+            config::CardSpecs::default(),
             &mut record,
             "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
             Some(&act),
@@ -1165,6 +1375,339 @@ mod tests {
             !st.preview_activity().1,
             "preview recorded after a failed send"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real push path over an in-process fake pipe: the caller drives
+    /// `push_activity` and reads the exact SET_ACTIVITY frames. Returns the
+    /// client, the frame channel, the reader thread, and the scratch dir the
+    /// log lives in; the caller closes, joins, and removes them.
+    fn live_pipe_harness(
+        tag: &str,
+    ) -> (
+        discord::Client,
+        mpsc::Receiver<Vec<u8>>,
+        std::thread::JoinHandle<()>,
+        std::path::PathBuf,
+    ) {
+        let srv = discord::FakeServer::new(0);
+        let base = srv.base.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(srv.accept());
+        });
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: base,
+            retry_delay: Duration::from_millis(30),
+            ..Default::default()
+        });
+        dc.start();
+        let sc = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client connects")
+            .expect("accept");
+        let (op, _) = sc.read_frame().expect("handshake frame");
+        assert_eq!(op, discord::OP_HANDSHAKE);
+        sc.write_frame(
+            discord::OP_FRAME,
+            br#"{"cmd":"DISPATCH","evt":"READY","data":{"v":1}}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dc.generation() < 1 {
+            assert!(Instant::now() < deadline, "never became ready");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (ftx, frx) = mpsc::channel::<Vec<u8>>();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match sc.read_frame() {
+                    Ok((discord::OP_FRAME, payload)) => {
+                        if ftx.send(payload).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        let dir = unique_dir(tag);
+        (dc, frx, reader, dir)
+    }
+
+    /// The body lines of one SET_ACTIVITY frame: details plus the state when
+    /// the wire carries it (an empty state is omitted, never sent blank).
+    fn wire_lines(payload: &[u8]) -> (String, Option<String>) {
+        let v: serde_json::Value = serde_json::from_slice(payload).expect("decode frame");
+        assert_eq!(v["cmd"], "SET_ACTIVITY");
+        let a = &v["args"]["activity"];
+        (
+            a["details"].as_str().unwrap_or("").to_string(),
+            a.get("state")
+                .and_then(|s| s.as_str())
+                .map(str::to_string),
+        )
+    }
+
+    /// What `push_activity` must compose for these inputs under these specs (no
+    /// resolver in tests, so the resolved inputs are empty and the kind follows
+    /// the query).
+    fn expect_lines(
+        raw: &str,
+        act: &presence::Action,
+        specs: &config::CardSpecs,
+    ) -> (String, String) {
+        let is_movie = meta_query_for(raw).kind == metadata::Kind::MOVIE;
+        let kind = if is_movie {
+            config::CardKind::Movie
+        } else {
+            config::CardKind::Series
+        };
+        let card = presence::compose_card(
+            raw,
+            Some(act),
+            &presence::Resolved::default(),
+            is_movie,
+            &specs.for_kind(kind),
+        );
+        (card.details, card.state)
+    }
+
+    /// The Card-view-preset regression test on the real path: push once under
+    /// the published specs, publish a different spec as a save would, and the
+    /// NEXT poll with identical inputs sends the new lines -- no restart, no
+    /// force flag, no re-push. Series and movie variants (the specs are per
+    /// kind).
+    #[test]
+    fn live_spec_change_reaches_next_poll_series_and_movie() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        config::set_live_card_specs(config::CardSpecs::default());
+        let (dc, frx, reader, dir) = live_pipe_harness("live-specs");
+        let log = Logger::new(dir.join("live-specs.log"), 0, 1);
+        const TOTAL: i64 = 2_832_979;
+        const NOW: i64 = 1_000_000_000_000;
+        let mut noop = |_: config::CardKind,
+                        _: String,
+                        _: Option<presence::Action>,
+                        _: presence::Resolved| {};
+        let mut gate = Gate::new();
+        let series_raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: NOW - 1000,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+
+        // Push once under the startup (default) specs, read through the app's
+        // live reader exactly as the poll loop does.
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            live_card_specs(),
+            &mut noop,
+            series_raw,
+            Some(&act),
+            1000,
+            TOTAL,
+            NOW,
+            true,
+            false,
+        );
+        let first = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first SET_ACTIVITY");
+        let (d1, s1) = wire_lines(&first);
+        let (ed1, es1) = expect_lines(series_raw, &act, &config::CardSpecs::default());
+        assert_eq!(d1, ed1);
+        assert_eq!(s1.as_deref().unwrap_or(""), es1);
+
+        // A save publishes new specs; the NEXT poll with the same title/ct/total
+        // and no event sends the new lines by itself.
+        let mut specs_b = config::CardSpecs::default();
+        assert!(specs_b.set_line(config::CardKind::Series, config::CardLine::Details, "title"));
+        assert!(specs_b.set_line(config::CardKind::Series, config::CardLine::State, "tag"));
+        config::set_live_card_specs(specs_b.clone());
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            live_card_specs(),
+            &mut noop,
+            series_raw,
+            Some(&act),
+            1000,
+            TOTAL,
+            NOW + 250,
+            false,
+            false,
+        );
+        let second = frx.recv_timeout(Duration::from_secs(2)).expect(
+            "a spec change must send on the next poll with no event",
+        );
+        let (d2, s2) = wire_lines(&second);
+        let (ed2, es2) = expect_lines(series_raw, &act, &specs_b);
+        assert_eq!(d2, ed2);
+        assert_eq!(s2.as_deref().unwrap_or(""), es2);
+        assert_ne!((d1, s1), (d2, s2), "the wire must carry the new lines");
+
+        // Movie variant: same-media spec change, so the send can only come from
+        // the published specs (the gate's content-change rule), not from a
+        // media change or a forced event. First push a MOVIE baseline and
+        // record the card the wire carried.
+        let movie_raw = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
+        let act_m = presence::Action {
+            running: true,
+            has_start: true,
+            start: NOW + 500 - 2000,
+            ct: 2000,
+            ..presence::Action::default()
+        };
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            live_card_specs(),
+            &mut noop,
+            movie_raw,
+            Some(&act_m),
+            2000,
+            TOTAL,
+            NOW + 500,
+            true,
+            false,
+        );
+        let movie_first = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("movie baseline SET_ACTIVITY");
+        let (dm1, sm1) = wire_lines(&movie_first);
+        let (edm1, esm1) = expect_lines(movie_raw, &act_m, &specs_b);
+        assert_eq!(dm1, edm1);
+        assert_eq!(sm1.as_deref().unwrap_or(""), esm1);
+
+        // A Card-view save publishes a different MOVIE spec (state `none`, so
+        // the state field is omitted); the NEXT poll with the SAME title, the
+        // same ct/total/action and `event = false` must still send the new
+        // movie lines by itself.
+        let mut specs_c = specs_b.clone();
+        assert!(specs_c.set_line(config::CardKind::Movie, config::CardLine::State, "none"));
+        config::set_live_card_specs(specs_c.clone());
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            live_card_specs(),
+            &mut noop,
+            movie_raw,
+            Some(&act_m),
+            2000,
+            TOTAL,
+            NOW + 750,
+            false,
+            false,
+        );
+        let third = frx.recv_timeout(Duration::from_secs(2)).expect(
+            "a movie spec change must send on the next poll with no event",
+        );
+        let (d3, s3) = wire_lines(&third);
+        let (ed3, es3) = expect_lines(movie_raw, &act_m, &specs_c);
+        assert_eq!(d3, ed3);
+        assert_eq!(s3.as_deref().unwrap_or(""), es3);
+        assert_ne!(
+            (dm1, sm1),
+            (d3.clone(), s3.clone()),
+            "the wire must carry the new movie lines"
+        );
+        assert!(s3.is_none(), "movie state 'none' must omit the state line");
+
+        config::set_live_card_specs(config::CardSpecs::default());
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pinned fact: YES -- while the card is parked paused, a spec change that
+    /// alters the composed lines still goes out on the next poll. `gate.rs`
+    /// parks only byte-identical paused content (name/details/state/paused/
+    /// images/buttons/has_start), so new lines fall through and re-park.
+    #[test]
+    fn live_spec_change_reaches_paused_card() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        config::set_live_card_specs(config::CardSpecs::default());
+        let (dc, frx, reader, dir) = live_pipe_harness("live-paused");
+        let log = Logger::new(dir.join("live-paused.log"), 0, 1);
+        const TOTAL: i64 = 2_832_979;
+        const NOW: i64 = 1_000_000_000_000;
+        let mut noop = |_: config::CardKind,
+                        _: String,
+                        _: Option<presence::Action>,
+                        _: presence::Resolved| {};
+        let mut gate = Gate::new();
+        let raw = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+        let paused = presence::Action {
+            paused: true,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            live_card_specs(),
+            &mut noop,
+            raw,
+            Some(&paused),
+            1000,
+            TOTAL,
+            NOW,
+            true,
+            false,
+        );
+        let first = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("paused SET_ACTIVITY");
+        let (d1, s1) = wire_lines(&first);
+        let parked = s1.as_deref().unwrap_or("");
+        assert!(
+            parked.ends_with(" - Paused"),
+            "first frame is the parked pause card, got {parked:?}"
+        );
+        // A save publishes the Minimal state preset; the next paused poll with
+        // the same title/ct/total and no event still sends the new lines.
+        let mut specs = config::CardSpecs::default();
+        assert!(specs.set_line(config::CardKind::Series, config::CardLine::State, "none"));
+        config::set_live_card_specs(specs.clone());
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            live_card_specs(),
+            &mut noop,
+            raw,
+            Some(&paused),
+            1000,
+            TOTAL,
+            NOW + 250,
+            false,
+            false,
+        );
+        let second = frx.recv_timeout(Duration::from_secs(2)).expect(
+            "a paused spec change must still go out with no event",
+        );
+        let (d2, s2) = wire_lines(&second);
+        let (ed2, es2) = expect_lines(raw, &paused, &specs);
+        assert_eq!(d2, ed2);
+        assert_eq!(s2.as_deref().unwrap_or(""), es2);
+        assert_eq!(d2, d1, "details unchanged");
+        assert!(s2.is_none(), "paused 'none' state must omit the state line");
+
+        config::set_live_card_specs(config::CardSpecs::default());
+        let _ = dc.close();
+        let _ = reader.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
