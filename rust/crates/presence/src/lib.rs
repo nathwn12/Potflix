@@ -380,6 +380,18 @@ pub(crate) const PAUSED_MARKER: &str = " - Paused";
 /// (`presence.go:275`).
 pub(crate) const STATE_SYNOPSIS_BUDGET: usize = 72;
 
+/// Slot budgets (UTF-16 units), named in one place: the header (`name`), the
+/// first body line (`details`) and the hover tooltip (`large_text`) each cap
+/// at 128; the second body line (`state`) caps at 128 plain and at
+/// [`STATE_SYNOPSIS_BUDGET`] when it carries a synopsis.
+pub(crate) const NAME_BUDGET: usize = 128;
+pub(crate) const DETAILS_BUDGET: usize = 128;
+pub(crate) const STATE_BUDGET: usize = 128;
+pub(crate) const LARGE_TEXT_BUDGET: usize = 128;
+
+/// The body-line joiner: U+00B7 MIDDLE DOT with single spaces.
+pub(crate) const JOINER: &str = " \u{b7} ";
+
 /// The `1<<28` "no cap" budget the sanitizers use before a real cap is applied.
 pub(crate) const HUGE: usize = 1 << 28;
 
@@ -591,16 +603,26 @@ pub(crate) fn rp_text(s: &str, max: usize) -> String {
 
 /// Sanitizes `s` via [`rp_text`], then caps it at `max` UTF-16 units at a word
 /// boundary (`presence.go:454`): when the sanitized text fits it is returned
-/// as-is; otherwise the prefix fitting in `max-1` units is cut at its last space
-/// and a single U+2026 is appended, so a synopsis never ends mid-word. With no
-/// space in the prefix it falls back to `rp_text`'s hard cut.
+/// as-is, byte for byte; otherwise the prefix fitting in `max-1` units is cut
+/// at its last space and a single U+2026 is appended, so a cut ends on a whole
+/// word wherever the text has word boundaries. With no space in the prefix it
+/// still signals the cut: the prefix fitting in `max-1` units (cut on a char
+/// boundary, never a split surrogate) carries a single trailing U+2026 within
+/// the `max` budget — a spaceless run (one long token, CJK text) cut on a
+/// character boundary. A cut landing on a sentence end — the last kept
+/// character is `.`/`!`/`?` and the character after it is whitespace or
+/// end-of-text — keeps that sentence with its own terminator and carries no
+/// ellipsis.
 ///
 /// DEPARTURE from the frozen reference (`presence.go:454`): the cut base is
 /// stripped of trailing punctuation before the ellipsis is appended. Go kept
 /// the comma/semicolon the clause cut stopped at, so the wire carried
 /// `Majin Buu,…` / `meet Elliot;…` (and a mid-word `…and Ernest` rode the
 /// tooltip's hard cut at the call site); here every truncated line ends on a
-/// word character plus U+2026, or on nothing extra when nothing was cut.
+/// word character plus U+2026, or on nothing extra when nothing was cut. A
+/// truncated line is always signalled — either a complete sentence that keeps
+/// its own terminator with no ellipsis, or a single U+2026 that ends the line.
+/// A line is never silently truncated.
 pub(crate) fn trim_word(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -632,9 +654,42 @@ pub(crate) fn trim_word(s: &str, max: usize) -> String {
         if base.is_empty() {
             return "\u{2026}".to_string();
         }
+        // Sentence-end cut (matches `smart_trim_synopsis`): the last kept
+        // character is `.`/`!`/`?` and the next character is whitespace or
+        // end-of-text, so keep the complete sentence with its own terminator
+        // and no ellipsis.
+        if let Some(last) = base.chars().next_back()
+            && matches!(last, '.' | '!' | '?')
+        {
+            let kept = base.chars().count();
+            if (kept == runes.len() || runes[kept].is_whitespace())
+                && utf16_units(base) <= max
+            {
+                return base.to_string();
+            }
+        }
         return format!("{base}\u{2026}");
     }
-    rp_text(s, max)
+    // No word boundary in the prefix: still signal the cut. The already
+    // sanitized `prefix` (char boundary, `max-1` units) carries a single
+    // trailing U+2026 within budget; stripping only shrinks, so the budget
+    // still holds and no surrogate pair is split.
+    let base = strip_cut_trail(&prefix);
+    if base.is_empty() {
+        return "\u{2026}".to_string();
+    }
+    // Same sentence-end rule on the spaceless fallback: a character-boundary
+    // cut landing on `.`/`!`/`?` followed by whitespace or end-of-text keeps
+    // the sentence with no ellipsis.
+    if let Some(last) = base.chars().next_back()
+        && matches!(last, '.' | '!' | '?')
+    {
+        let kept = base.chars().count();
+        if (kept == runes.len() || runes[kept].is_whitespace()) && utf16_units(base) <= max {
+            return base.to_string();
+        }
+    }
+    format!("{base}\u{2026}")
 }
 
 /// Trailing marks stripped from a cut BEFORE the U+2026 terminator is appended:
@@ -740,14 +795,19 @@ fn utf16_units(s: &str) -> usize {
 
 /// [`trim_word`] with a seamless cut (Netflix: break after punctuation, single
 /// U+2026; Discord: snippet, one line), all measured in UTF-16 units
-/// (`presence.go:573`): fits unchanged; else last sentence end (.!?, end-or-space)
-/// in the back half with NO ellipsis; else last clause boundary (, ; space-dash
-/// variants) in the back half plus U+2026; else last word boundary plus U+2026
-/// (dangling connectors stripped first); never mid-word, never "...".
+/// (`presence.go:573`): fits unchanged, byte for byte; else last sentence end
+/// (.!?, end-or-space) in the back half with NO ellipsis; else last clause
+/// boundary (, ; space-dash variants) in the back half plus U+2026; else last
+/// word boundary plus U+2026 (dangling connectors stripped first); else a
+/// char-boundary hard cut to `max-1` units plus U+2026 (never a split
+/// surrogate); never mid-word, never "...".
 ///
 /// DEPARTURE from the frozen reference (`presence.go:573-644`): every cut that
 /// takes the ellipsis also strips trailing punctuation first (see
-/// [`trim_word`]), so the wire carries `Buu…`, never `Buu,…`.
+/// [`trim_word`]), so the wire carries `Buu…`, never `Buu,…`. A truncated line
+/// is always signalled — either a complete sentence that keeps its own
+/// terminator with no ellipsis, or a single U+2026 that ends the line. A line
+/// is never silently truncated.
 pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -824,111 +884,423 @@ pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
             return format!("{base}\u{2026}");
         }
     }
-    rp_text(s, max)
+    // No boundary anywhere: still signal the cut. Hard-cut the sanitized text
+    // on a char boundary to `max-1` units with a single trailing U+2026,
+    // staying within budget without splitting a surrogate pair.
+    let prefix: String = runes[..end_ell].iter().collect();
+    let base = strip_cut_trail(&prefix);
+    if base.is_empty() {
+        return "\u{2026}".to_string();
+    }
+    format!("{base}\u{2026}")
 }
 
-/// [`build_activity`] with canonical title overrides applied
-/// (`presence.go:662`).
-///
-/// Movie (`r.is_movie`): details is the canonical title with " (YYYY)" when
-/// `year > 0`; state joins genres and length with " \u{b7} " (never the synopsis:
-/// the hover tooltip already carries it), capped word-aware at 128. Series:
-/// details is the episode override when present (else
-/// [`build_activity`]'s filename-derived line); state is the episode tag alone
-/// for the same reason. The synopsis-bearing line the default used to render
-/// moved to [`synopsis_state`] (the `CARD_STATE_SYNOPSIS` opt-in). The paused
-/// " - Paused" marker path is preserved for both.
-pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved) -> Activity {
-    let mut act = build_activity(raw_title, a);
-    let paused = a.is_some_and(|x| x.paused);
+/// The header identity: the canonical series/movie title, else the clean
+/// filename title. Empty only for the idle card (the caller returns early).
+fn compose_name_inner(raw_title: &str, r: &Resolved) -> String {
+    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+    if raw.trim().is_empty() || raw == APP_NAME {
+        return String::new();
+    }
     if !r.series.is_empty() {
-        act.name = trunc(&r.series, 128);
-        act.large_text = trunc(&r.series, 128);
+        return trunc(&r.series, NAME_BUDGET);
     }
-    // Hover slot: assets.large_text is the poster tooltip. `name` already carries
-    // the series title as the card header, so repeating it here wastes the slot;
-    // carry the complete short synopsis instead (capped at Discord's 128-unit
-    // asset-text cap, so it arrives whole). The cap is word-aware with a U+2026
-    // terminator when cut (never the hard mid-word cut `rp_text` does: the live
-    // card showed `...Zak Penn and Ernest`). No synopsis: keep today's fallback
-    // (series title when known, else "PotFlix").
-    let s = trim_word(&r.synopsis, 128);
+    let title = trunc(&clean(raw).title, NAME_BUDGET);
+    if title.is_empty() {
+        rp_text(raw.trim(), NAME_BUDGET)
+    } else {
+        title
+    }
+}
+
+/// The hover slot: the whole synopsis (word-aware, [`LARGE_TEXT_BUDGET`]), else
+/// the canonical series title, else "PotFlix".
+fn compose_large_text_inner(r: &Resolved) -> String {
+    let s = trim_word(&r.synopsis, LARGE_TEXT_BUDGET);
     if !s.is_empty() {
-        act.large_text = s;
+        return s;
     }
-    if r.is_movie {
-        if !r.series.is_empty() {
-            if r.year > 0 {
-                act.details = trunc(&format!("{} ({})", r.series, r.year), 128);
+    if !r.series.is_empty() {
+        return trunc(&r.series, LARGE_TEXT_BUDGET);
+    }
+    "PotFlix".to_string()
+}
+
+/// The artwork slot: the https URL when present, else "logo". Never empty.
+fn compose_large_image_inner(r: &Resolved) -> String {
+    if r.artwork.starts_with("http://") || r.artwork.starts_with("https://") {
+        r.artwork.clone()
+    } else {
+        "logo".to_string()
+    }
+}
+
+/// One state-ladder rung: the filename episode tag, or "" when absent. A
+/// present rung already carries the paused marker when paused.
+fn rung_tag(raw_title: &str, a: Option<&Action>) -> String {
+    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+    let mut tag_raw = String::new();
+    if !(raw.trim().is_empty() || raw == APP_NAME) {
+        tag_raw = clean(raw).episode_tag;
+    }
+    let tag = rp_text(&tag_raw, STATE_BUDGET);
+    if tag.is_empty() {
+        return String::new();
+    }
+    if a.is_some_and(|x| x.paused) {
+        with_state_time(&tag, PAUSED_MARKER)
+    } else {
+        tag
+    }
+}
+
+/// One state-ladder rung: genres and length joined with [`JOINER`], or "" when
+/// both are absent.
+fn rung_genres_length(r: &Resolved, a: Option<&Action>) -> String {
+    let g = rp_text(&r.genres, HUGE);
+    let l = rp_text(&r.length, HUGE);
+    let mut parts: Vec<&str> = Vec::new();
+    if !g.is_empty() {
+        parts.push(&g);
+    }
+    if !l.is_empty() {
+        parts.push(&l);
+    }
+    let prefix = parts.join(JOINER);
+    if prefix.is_empty() {
+        return String::new();
+    }
+    if a.is_some_and(|x| x.paused) {
+        with_state_time(
+            &trim_word(&prefix, STATE_BUDGET - PAUSED_MARKER.len()),
+            PAUSED_MARKER,
+        )
+    } else {
+        trim_word(&prefix, STATE_BUDGET)
+    }
+}
+
+/// One state-ladder rung: the synopsis alone at [`STATE_SYNOPSIS_BUDGET`], or
+/// "" when absent.
+fn rung_synopsis_alone(r: &Resolved, a: Option<&Action>) -> String {
+    if rp_text(&r.synopsis, HUGE).is_empty() {
+        return String::new();
+    }
+    if a.is_some_and(|x| x.paused) {
+        with_state_time(
+            &smart_trim_synopsis(&r.synopsis, STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len()),
+            PAUSED_MARKER,
+        )
+    } else {
+        smart_trim_synopsis(&r.synopsis, STATE_SYNOPSIS_BUDGET)
+    }
+}
+
+/// One state-ladder rung: the movie year, or "" when `year <= 0`.
+fn rung_year(r: &Resolved, a: Option<&Action>) -> String {
+    if r.year <= 0 {
+        return String::new();
+    }
+    let y = r.year.to_string();
+    if a.is_some_and(|x| x.paused) {
+        with_state_time(&y, PAUSED_MARKER)
+    } else {
+        y
+    }
+}
+
+/// The tail rung of every ladder: the clean filename title, so a slot is never
+/// blank. Falls back to the sanitized raw title when the parser yields nothing.
+fn rung_clean_title(raw_title: &str, a: Option<&Action>) -> String {
+    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+    if raw.trim().is_empty() || raw == APP_NAME {
+        return String::new();
+    }
+    let title = trunc(&clean(raw).title, STATE_BUDGET);
+    let base = if title.is_empty() {
+        rp_text(raw.trim(), STATE_BUDGET)
+    } else {
+        title
+    };
+    if base.is_empty() {
+        return String::new();
+    }
+    if a.is_some_and(|x| x.paused) {
+        with_state_time(&base, PAUSED_MARKER)
+    } else {
+        base
+    }
+}
+
+/// The details fill ladder (never blank outside idle). Series: the canonical
+/// episode name, else the filename episode line (name, else tag, else clean
+/// title). Movie: `Title (YYYY)` when `year > 0`, else the title, else the
+/// filename line. The `title` preset is the header identity; `episode` is the
+/// episode name else the ladder; `series` is the canonical series (`(YYYY)`
+/// appended for a movie) else the ladder; `default` is today's behavior.
+pub(crate) fn compose_details_for(
+    raw_title: &str,
+    r: &Resolved,
+    is_movie: bool,
+    details_preset: &str,
+) -> String {
+    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+    let c = clean(raw);
+    let clean_title = trunc(&c.title, DETAILS_BUDGET);
+    let file_ep = trunc(&c.episode_name, DETAILS_BUDGET);
+    let file_tag = trunc(&c.episode_tag, DETAILS_BUDGET);
+    let mut file_line = clean_title.clone();
+    if !file_ep.is_empty() {
+        file_line = file_ep;
+    } else if !file_tag.is_empty() {
+        file_line = file_tag;
+    }
+    if file_line.is_empty() {
+        file_line = rp_text(raw.trim(), DETAILS_BUDGET);
+    }
+    let canonical_ep = if r.episode_name.is_empty() {
+        String::new()
+    } else {
+        trunc(&r.episode_name, DETAILS_BUDGET)
+    };
+    let canonical_series = if r.series.is_empty() {
+        String::new()
+    } else {
+        trunc(&r.series, DETAILS_BUDGET)
+    };
+    let canonical_series_year = if !r.series.is_empty() && is_movie && r.year > 0 {
+        trunc(&format!("{} ({})", r.series, r.year), DETAILS_BUDGET)
+    } else {
+        canonical_series.clone()
+    };
+    let default_line = if is_movie {
+        if !canonical_series.is_empty() {
+            canonical_series_year.clone()
+        } else {
+            file_line.clone()
+        }
+    } else if !canonical_ep.is_empty() {
+        canonical_ep.clone()
+    } else {
+        file_line.clone()
+    };
+    match details_preset {
+        cardspec::CARD_DETAILS_TITLE => {
+            let header = compose_name_inner(raw_title, r);
+            if header.is_empty() {
+                default_line
             } else {
-                act.details = trunc(&r.series, 128);
+                header
             }
         }
-        // Default state: genres and length only -- never the synopsis, which
-        // already fills the hover tooltip. The synopsis-bearing line lives on
-        // as the CARD_STATE_SYNOPSIS opt-in (see `synopsis_state`).
-        let g = rp_text(&r.genres, HUGE);
-        let l = rp_text(&r.length, HUGE);
-        let mut prefix_parts: Vec<&str> = Vec::new();
-        if !g.is_empty() {
-            prefix_parts.push(&g);
+        cardspec::CARD_DETAILS_EPISODE => {
+            if !canonical_ep.is_empty() {
+                canonical_ep
+            } else {
+                default_line
+            }
         }
-        if !l.is_empty() {
-            prefix_parts.push(&l);
+        cardspec::CARD_DETAILS_SERIES => {
+            if !canonical_series.is_empty() {
+                canonical_series_year
+            } else {
+                default_line
+            }
         }
-        let prefix = prefix_parts.join(" \u{b7} ");
-        if prefix.is_empty() {
-            // Empty join: keep build_activity's state (including any Paused
-            // marker).
-        } else if paused {
-            // Paused: keep the 128 ceiling (non-synopsis states untouched).
-            act.state = with_state_time(
-                &trim_word(&prefix, 128 - PAUSED_MARKER.len()),
-                PAUSED_MARKER,
-            );
-        } else {
-            act.state = trim_word(&prefix, 128);
-        }
-        // Empty join: keep build_activity's state (including any Paused marker).
+        _ => default_line,
+    }
+}
+
+/// The state fill ladder (first non-empty rung wins; only `none` may empty the
+/// line). Series: `default` is tag-plus-synopsis, else tag, else synopsis,
+/// else the clean title; `tag` is tag, else synopsis, else clean; `synopsis`
+/// is tag-plus-synopsis, else tag, else clean. Movie: `default` is
+/// genres-plus-length, else synopsis, else year, else clean; `tag` is the
+/// filename tag, else genres-plus-length, else synopsis, else clean;
+/// `synopsis` is genres-length-plus-synopsis, else synopsis, else clean. Every
+/// rung carries the paused marker when paused; paused with nothing reads
+/// "Paused".
+pub(crate) fn compose_state_for(
+    raw_title: &str,
+    a: Option<&Action>,
+    r: &Resolved,
+    is_movie: bool,
+    state_preset: &str,
+) -> String {
+    if state_preset == cardspec::CARD_STATE_NONE {
+        return String::new();
+    }
+    let paused = a.is_some_and(|x| x.paused);
+    // The combined rung follows the explicit kind, not the stored flag. It is
+    // only live when a synopsis exists: `synopsis_state` parks an empty
+    // synopsis as "Paused", which must fall through the ladder instead.
+    let mut shadow = r.clone();
+    shadow.is_movie = is_movie;
+    let combined = if rp_text(&r.synopsis, HUGE).is_empty() {
+        String::new()
     } else {
-        if !r.episode_name.is_empty() {
-            act.details = trunc(&r.episode_name, 128);
+        synopsis_state(raw_title, a, &shadow)
+    };
+    let tag = rung_tag(raw_title, a);
+    let synopsis = rung_synopsis_alone(r, a);
+    let clean = rung_clean_title(raw_title, a);
+    if is_movie {
+        match state_preset {
+            cardspec::CARD_STATE_TAG => {
+                if !tag.is_empty() {
+                    return tag;
+                }
+                let gl = rung_genres_length(r, a);
+                if !gl.is_empty() {
+                    return gl;
+                }
+                if !synopsis.is_empty() {
+                    return synopsis;
+                }
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
+            cardspec::CARD_STATE_SYNOPSIS => {
+                if !combined.is_empty() {
+                    return combined;
+                }
+                if !synopsis.is_empty() {
+                    return synopsis;
+                }
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
+            _ => {
+                let gl = rung_genres_length(r, a);
+                if !gl.is_empty() {
+                    return gl;
+                }
+                if !synopsis.is_empty() {
+                    return synopsis;
+                }
+                let year = rung_year(r, a);
+                if !year.is_empty() {
+                    return year;
+                }
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
         }
-        // Episode tag for the state line, derived from the title the same way
-        // build_activity derives it. Default state: the tag alone -- never the
-        // synopsis, which already fills the hover tooltip (the synopsis-bearing
-        // line lives on as the CARD_STATE_SYNOPSIS opt-in: `synopsis_state`).
-        let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
-        let mut tag_raw = String::new();
-        if !(raw.trim().is_empty() || raw == APP_NAME) {
-            tag_raw = clean(raw).episode_tag;
-        }
-        let tag_t = rp_text(&tag_raw, 128);
-        if tag_t.is_empty() {
-            // No tag: keep build_activity's state (including any Paused marker).
-        } else if paused {
-            // Tag-only paused: keep the 128 ceiling.
-            act.state =
-                with_state_time(&trim_word(&tag_t, 128 - PAUSED_MARKER.len()), PAUSED_MARKER);
-        } else {
-            act.state = tag_t;
+    } else {
+        match state_preset {
+            cardspec::CARD_STATE_TAG => {
+                if !tag.is_empty() {
+                    return tag;
+                }
+                if !synopsis.is_empty() {
+                    return synopsis;
+                }
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
+            cardspec::CARD_STATE_SYNOPSIS => {
+                if !combined.is_empty() {
+                    return combined;
+                }
+                if !tag.is_empty() {
+                    return tag;
+                }
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
+            _ => {
+                if !combined.is_empty() {
+                    return combined;
+                }
+                if !tag.is_empty() {
+                    return tag;
+                }
+                if !synopsis.is_empty() {
+                    return synopsis;
+                }
+                if !clean.is_empty() {
+                    return clean;
+                }
+            }
         }
     }
-    if r.artwork.starts_with("http://") || r.artwork.starts_with("https://") {
-        act.large_image = r.artwork.clone();
+    if paused {
+        return with_state_time("", PAUSED_MARKER);
     }
-    // Otherwise large_image stays as build_activity produced it ("logo"): an
-    // empty large image is never emitted.
-    // No buttons: the pristine card carries no click-through links, so
-    // Resolved::buttons is always ignored.
+    String::new()
+}
+
+/// The single card composer the app's push path and the Card-view preview both
+/// call (`presence.go:662`): one always-filled card with a per-kind fill
+/// ladder, so a card never ships an empty body line. `is_movie` drives the
+/// kind branches; the idle card keeps its shipped lines under any spec.
+pub fn compose_card(
+    raw_title: &str,
+    a: Option<&Action>,
+    r: &Resolved,
+    is_movie: bool,
+    spec: &CardSpec,
+) -> Activity {
+    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+    if raw.trim().is_empty() || raw == APP_NAME {
+        return Activity {
+            type_: "PLAYING".to_string(),
+            details: "Browsing".to_string(),
+            state: "Idle".to_string(),
+            large_image: "logo".to_string(),
+            large_text: "PotFlix".to_string(),
+            ..Activity::default()
+        };
+    }
+    let (details, state) = spec.render_kind(raw_title, a, r, is_movie);
+    let name = compose_name_inner(raw_title, r);
+    let mut act = Activity {
+        type_: "PLAYING".to_string(),
+        details,
+        state,
+        large_image: compose_large_image_inner(r),
+        large_text: compose_large_text_inner(r),
+        paused: a.is_some_and(|x| x.paused),
+        ..Activity::default()
+    };
+    if ACTIVITY_NAME_HEADER {
+        act.name = name;
+    }
+    if let Some(x) = a
+        && x.has_start
+    {
+        act.has_start = true;
+        act.start = x.start;
+    }
     act
 }
 
-/// The synopsis-bearing state line the default rendered before the S3
-/// de-duplication: a movie joins genres, length and the synopsis with " \u{b7} ",
-/// a series joins the episode tag and the synopsis the same way, both capped
-/// word-aware at [`STATE_SYNOPSIS_BUDGET`]. Now opt-in behind
-/// [`cardspec::CARD_STATE_SYNOPSIS`]; the default state carries no synopsis.
+/// [`compose_card`] with the stored kind and the shipped default spec
+/// (`presence.go:662`).
+///
+/// Movie (`r.is_movie`): details is the canonical title with " (YYYY)" when
+/// `year > 0`, else the filename line; state is genres-plus-length, else the
+/// synopsis, else the year, else the clean title, so the line is never blank.
+/// Series: details is the episode override when present (else the
+/// filename-derived line); state is the episode tag plus the synopsis teaser
+/// when a synopsis is known, else the tag, else the synopsis, else the clean
+/// title. The hover tooltip carries the whole synopsis; the paused
+/// " - Paused" marker path is preserved on every rung.
+pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved) -> Activity {
+    compose_card(raw_title, a, r, r.is_movie, &cardspec::default_card_spec())
+}
+
+/// The synopsis-bearing state line: a movie joins genres, length and the
+/// synopsis with " \u{b7} ", a series joins the episode tag and the synopsis
+/// the same way, both capped word-aware at [`STATE_SYNOPSIS_BUDGET`]. It backs
+/// the combined rung of the [`compose_state_for`] ladder (the series default
+/// and the `CARD_STATE_SYNOPSIS` preset) and stays the opt-in behind
+/// [`cardspec::CARD_STATE_SYNOPSIS`] for movies.
 /// With no synopsis the slot hides (`""`, `"Paused"` when paused), so the
 /// preset honors the empty-hides contract (`cardspec_test::card_spec_empty_hide`).
 pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) -> String {
@@ -980,8 +1352,14 @@ pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) 
         if !(raw.trim().is_empty() || raw == APP_NAME) {
             tag_raw = clean(raw).episode_tag;
         }
-        let tag_t = rp_text(&tag_raw, 128);
+        let tag_t = rp_text(&tag_raw, STATE_BUDGET);
         if tag_t.is_empty() {
+            if paused {
+                return with_state_time(
+                    &smart_trim_synopsis(&s_full, STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len()),
+                    PAUSED_MARKER,
+                );
+            }
             return smart_trim_synopsis(&s_full, STATE_SYNOPSIS_BUDGET);
         }
         if paused {

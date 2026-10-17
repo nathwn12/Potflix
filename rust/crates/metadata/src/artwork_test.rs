@@ -7,7 +7,7 @@ use std::sync::Arc;
 use metadata_core::types::{Episode, Kind, Media, Query};
 use metadata_http::cancel::Cancel;
 
-use crate::artwork::{MAX_SYNOPSIS_RUNES, cap_synopsis, first_non_empty, strip_html};
+use crate::artwork::{MAX_SYNOPSIS_UNITS, cap_synopsis, first_non_empty, strip_html};
 use crate::cache::{cache_file_name, cache_key, cache_load, cache_store};
 use crate::resolver::Source;
 use crate::testsupport::{FakeServer, FakeSource, Request, Response, TempDir, resolver_with};
@@ -44,20 +44,24 @@ fn first_non_empty_trims_and_skips_blanks() {
 #[test]
 fn cap_synopsis_caps_at_a_sentence_or_word_boundary() {
     assert_eq!(
-        MAX_SYNOPSIS_RUNES, 128,
-        "maxSynopsisRunes must stay 128 (Discord 128-unit asset-text cap)"
+        MAX_SYNOPSIS_UNITS, 128,
+        "maxSynopsisUnits must stay 128 (Discord 128-unit asset-text cap)"
     );
     let short = "A short synopsis.";
     assert_eq!(cap_synopsis(short), short);
+
+    // Plain ASCII at exactly the budget is returned unchanged.
+    let ascii_at_cap = "a".repeat(MAX_SYNOPSIS_UNITS);
+    assert_eq!(cap_synopsis(&ascii_at_cap), ascii_at_cap);
 
     // Long word-runs: capped at a word boundary within the cap.
     let long = "word ".repeat(100);
     let long = long.trim();
     let got = cap_synopsis(long);
     assert!(
-        got.chars().count() <= MAX_SYNOPSIS_RUNES,
-        "capSynopsis runes = {}",
-        got.chars().count()
+        got.encode_utf16().count() <= MAX_SYNOPSIS_UNITS,
+        "capSynopsis units = {}",
+        got.encode_utf16().count()
     );
     assert!(
         !got.ends_with("wor") && !got.ends_with('w'),
@@ -71,11 +75,23 @@ fn cap_synopsis_caps_at_a_sentence_or_word_boundary() {
         "filler text here. ".repeat(30)
     );
     let got = cap_synopsis(&sentences);
-    assert!(got.chars().count() <= MAX_SYNOPSIS_RUNES);
+    assert!(got.encode_utf16().count() <= MAX_SYNOPSIS_UNITS);
     assert!(
         got.ends_with('.'),
         "capSynopsis sentence boundary = {got:?}"
     );
+
+    // Astral runes cost 2 UTF-16 units each: 128 emoji are 256 units, so the
+    // stored note must cap to 64 whole emoji (128 units), never a split
+    // surrogate, and never over the hover budget.
+    let emoji = "\u{1F600}".repeat(MAX_SYNOPSIS_UNITS);
+    let got = cap_synopsis(&emoji);
+    assert!(
+        got.encode_utf16().count() <= MAX_SYNOPSIS_UNITS,
+        "capSynopsis emoji units = {}",
+        got.encode_utf16().count()
+    );
+    assert_eq!(got, "\u{1F600}".repeat(MAX_SYNOPSIS_UNITS / 2));
 }
 
 /// `TestCacheSchemaMismatchIsMiss`: pre-art entries (Schema 1 or absent) are a

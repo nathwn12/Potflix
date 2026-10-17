@@ -22,10 +22,15 @@
 //! * `start_with_windows` -- `false`.
 //! * `scan_speed` -- `turbo`, normalised on load AND on save: `turbo` |
 //!   `balanced` | `gentle`, anything else (including empty) becomes `turbo`.
-//! * `card` -- `{}` when unset; `{"details": "...", "state": "..."}` otherwise,
-//!   each line one of the preset ids below and each defaulting to `default`.
-//!   Go's `json:"card,omitempty"` is a no-op for a struct, so the key is always
-//!   written -- matched here.
+//! * `card` -- `{}` when unset; otherwise
+//!   `{"series": {...}, "movie": {...}}`, one [`CardSpec`] per kind (SERIES
+//!   covers TV + anime; MOVIE is movies). Each kind object carries
+//!   `{"details": "...", "state": "..."}`, each line one of the preset ids
+//!   below defaulting to `default`. A kind object equal to the default is
+//!   OMITTED, so an unset/default config still writes `"card": {}`. The legacy
+//!   flat object `{"details": "...", "state": "..."}` still loads (as the
+//!   series spec, movie default). Go's `json:"card,omitempty"` is a no-op for a
+//!   struct, so the key is always written -- matched here.
 //!
 //! Go marshals a nil `Dirs` as `null`; this port always writes `[]`, and accepts
 //! `null` on read (Go's `json.Unmarshal` treats a JSON `null` for any non-pointer
@@ -45,16 +50,19 @@
 //!
 //! # The `card` type
 //!
-//! Go stores `presence.CardSpec` (`go\internal\presence\cardspec.go`), and so
-//! does this crate: the stored shape is [`presence::cardspec::CardSpec`],
-//! re-exported here rather than mirrored, because presence owns `normalized()`,
-//! the behaviour-critical part. That type's own serde shape is the JSON contract
+//! Go stores `presence.CardSpec` (`go\internal\presence\cardspec.go`); this crate
+//! now stores one spec per kind ([`CardSpecs`]: `series` + `movie`), each side
+//! the stored shape [`presence::cardspec::CardSpec`], re-exported here rather
+//! than mirrored, because presence owns `normalized()`, the behaviour-critical
+//! part. That type's own serde shape is the JSON contract per kind
 //! (`details`/`state`, both `omitempty`, unknown ids normalised to `default`).
+//! The legacy flat `card` object loads as the series spec.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -112,6 +120,114 @@ impl CardSpecStore for CardSpec {
     }
 }
 
+/// The card settings' kind axis. `Series` covers TV and anime (metadata-core
+/// has no separate anime kind: UNKNOWN | SERIES | MOVIE).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CardKind {
+    /// TV + anime.
+    #[default]
+    Series,
+    /// Movies.
+    Movie,
+}
+
+impl CardKind {
+    /// Reports whether this kind is the movie axis.
+    pub fn is_movie(self) -> bool {
+        matches!(self, CardKind::Movie)
+    }
+}
+
+/// Which body line a preset id applies to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CardLine {
+    /// The details line.
+    #[default]
+    Details,
+    /// The state line.
+    State,
+}
+
+/// Reports whether a stored kind object is the shipped default (empty and
+/// explicit-default both count: both normalise to [`default_card_spec`]).
+fn is_default_card_spec(spec: &CardSpec) -> bool {
+    spec.is_default()
+}
+
+/// The per-kind card settings: one line-choice set for SERIES and one for
+/// MOVIE. The serde shape is `{"series": {...}, "movie": {...}}`; a kind
+/// object equal to [`default_card_spec`] (empty or explicit) is omitted, so an
+/// unset/default config still writes `"card": {}` byte-for-byte as before.
+/// Each kind keeps today's per-line `omitempty` from [`CardSpec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardSpecs {
+    /// TV + anime line choices.
+    #[serde(
+        default,
+        deserialize_with = "de::opt_spec",
+        skip_serializing_if = "is_default_card_spec"
+    )]
+    pub series: CardSpec,
+    /// Movie line choices.
+    #[serde(
+        default,
+        deserialize_with = "de::opt_spec",
+        skip_serializing_if = "is_default_card_spec"
+    )]
+    pub movie: CardSpec,
+}
+
+impl CardSpecs {
+    /// The effective spec for one kind: a line that is empty or an unknown id
+    /// falls back to the default id (never a stored typo on the card).
+    pub fn for_kind(&self, kind: CardKind) -> CardSpec {
+        match kind {
+            CardKind::Series => self.series.normalized(),
+            CardKind::Movie => self.movie.normalized(),
+        }
+    }
+
+    /// Both kinds equal `default_card_spec()`.
+    pub fn is_default(&self) -> bool {
+        self.series.is_default() && self.movie.is_default()
+    }
+
+    /// Stores the normalised id for one line of one kind; returns false when
+    /// nothing changed.
+    pub fn set_line(&mut self, kind: CardKind, line: CardLine, id: &str) -> bool {
+        let normalized_id = match line {
+            CardLine::Details => CardSpec {
+                details: id.to_string(),
+                state: CARD_STATE_DEFAULT.to_string(),
+            }
+            .normalized()
+            .details,
+            CardLine::State => CardSpec {
+                details: CARD_DETAILS_DEFAULT.to_string(),
+                state: id.to_string(),
+            }
+            .normalized()
+            .state,
+        };
+        let target = match kind {
+            CardKind::Series => &mut self.series,
+            CardKind::Movie => &mut self.movie,
+        };
+        let current = match line {
+            CardLine::Details => &target.details,
+            CardLine::State => &target.state,
+        };
+        if *current == normalized_id {
+            return false;
+        }
+        match line {
+            CardLine::Details => target.details = normalized_id,
+            CardLine::State => target.state = normalized_id,
+        }
+        true
+    }
+}
+
 /// The settings store (`go\config.go:22`). Field names and defaults are the Go
 /// struct's, so the file stays byte-compatible.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,17 +242,18 @@ pub struct Config {
     /// [`Config::effective_scan_speed`].
     #[serde(default, deserialize_with = "de::string")]
     pub scan_speed: String,
-    /// The Card view's chosen presets; read through
-    /// [`Config::effective_card_spec`].
+    /// The Card view's chosen presets per kind; read through
+    /// [`Config::effective_card_specs`] (or [`Config::effective_card_spec`]
+    /// for the series side).
     #[serde(default, deserialize_with = "de::card")]
-    pub card: CardSpec,
+    pub card: CardSpecs,
 }
 
 /// JSON `null` tolerance, one function per field: Go's `json.Unmarshal` leaves a
 /// non-pointer field untouched when the JSON value is `null`, so a store
 /// carrying `"dirs": null` must load its other fields instead of failing.
 mod de {
-    use super::{CardSpec, Deserialize, Deserializer};
+    use super::{CardSpec, CardSpecs, Deserialize, Deserializer, default_card_spec};
 
     pub fn dirs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
         Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
@@ -150,8 +267,62 @@ mod de {
         Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
     }
 
-    pub fn card<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CardSpec, D::Error> {
+    /// Null-tolerant single kind object: `null` loads as the zero [`CardSpec`].
+    pub fn opt_spec<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CardSpec, D::Error> {
         Ok(Option::<CardSpec>::deserialize(deserializer)?.unwrap_or_default())
+    }
+
+    /// Parses one nested kind value: `null` is the zero spec, an object is the
+    /// [`CardSpec`] shape (unknown keys ignored), anything else errors like the
+    /// old flat shape did on a wrong type.
+    fn nested_spec(
+        value: &serde_json::Value,
+    ) -> Result<CardSpec, serde_json::Error> {
+        if value.is_null() {
+            return Ok(CardSpec::default());
+        }
+        serde_json::from_value::<CardSpec>(value.clone())
+    }
+
+    /// The `card` field: the new nested `{"series": {...}, "movie": {...}}`
+    /// shape plus the legacy flat `{"details": "...", "state": "..."}` every
+    /// shipped config holds (series = that normalized pair, movie = the
+    /// shipped default). Absent is handled by serde's `default`; here `null`,
+    /// `{}`, and unknown-only objects all load as the all-default
+    /// [`CardSpecs`]. A wrong (non-object) type errors, as before.
+    pub fn card<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CardSpecs, D::Error> {
+        use serde::de::Error as _;
+        let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+        let Some(value) = opt else {
+            return Ok(CardSpecs::default());
+        };
+        let serde_json::Value::Object(map) = &value else {
+            return Err(D::Error::custom("invalid type for card"));
+        };
+        if map.contains_key("series") || map.contains_key("movie") {
+            let series = map
+                .get("series")
+                .map(nested_spec)
+                .transpose()
+                .map_err(D::Error::custom)?
+                .unwrap_or_default();
+            let movie = map
+                .get("movie")
+                .map(nested_spec)
+                .transpose()
+                .map_err(D::Error::custom)?
+                .unwrap_or_default();
+            return Ok(CardSpecs { series, movie });
+        }
+        if map.contains_key("details") || map.contains_key("state") {
+            let flat: CardSpec =
+                serde_json::from_value(value).map_err(D::Error::custom)?;
+            return Ok(CardSpecs {
+                series: flat.normalized(),
+                movie: default_card_spec(),
+            });
+        }
+        Ok(CardSpecs::default())
     }
 }
 
@@ -172,25 +343,42 @@ impl Config {
         normalize_scan_speed(&self.scan_speed)
     }
 
-    /// The stored card spec with per-line fallback to the shipped default, so a
-    /// zero value (pre-card stores) needs no migration and a stored typo can
-    /// never reach the card.
+    /// The stored SERIES card spec with per-line fallback to the shipped
+    /// default, so a zero value (pre-card stores) needs no migration and a
+    /// stored typo can never reach the card.
     pub fn effective_card_spec(&self) -> CardSpec {
-        self.card.normalized()
+        self.card.for_kind(CardKind::Series)
     }
 
-    /// Stores the normalised spec; reports whether it changed.
+    /// Both kinds, each normalised per line.
+    pub fn effective_card_specs(&self) -> CardSpecs {
+        CardSpecs {
+            series: self.card.series.normalized(),
+            movie: self.card.movie.normalized(),
+        }
+    }
+
+    /// Stores the normalised spec on BOTH kinds; reports whether it changed.
     pub fn set_card_spec(&mut self, details: &str, state: &str) -> bool {
         let normalized = CardSpec {
             details: details.to_string(),
             state: state.to_string(),
         }
         .normalized();
-        if self.card == normalized {
+        let next = CardSpecs {
+            series: normalized.clone(),
+            movie: normalized,
+        };
+        if self.card == next {
             return false;
         }
-        self.card = normalized;
+        self.card = next;
         true
+    }
+
+    /// Stores one normalised line on one kind; reports whether it changed.
+    pub fn set_card_line(&mut self, kind: CardKind, line: CardLine, id: &str) -> bool {
+        self.card.set_line(kind, line, id)
     }
 
     /// Stores the normalised profile; reports whether it changed. The comparison
@@ -239,6 +427,27 @@ impl Config {
         }
         false
     }
+}
+
+/// The process-wide live card specs: the sender composes with these at its next
+/// poll, so a Card-view save takes effect with no restart and no re-push.
+static LIVE_CARD_SPECS: LazyLock<Mutex<Option<CardSpecs>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Publish the effective card specs to the running process: the sender composes
+/// with them at its next poll. No push, no restart -- it mirrors the
+/// `metadata_http::set_rate_profile` live-apply seam.
+pub fn set_live_card_specs(specs: CardSpecs) {
+    *LIVE_CARD_SPECS.lock().unwrap_or_else(|e| e.into_inner()) = Some(specs);
+}
+
+/// The published specs, or the shipped default when nothing was published.
+pub fn live_card_specs() -> CardSpecs {
+    LIVE_CARD_SPECS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
 }
 
 /// The Windows cache root (`os.UserCacheDir()`), or `None` when it is unset or
@@ -391,6 +600,12 @@ fn create_temp(dir: &Path) -> io::Result<(PathBuf, File)> {
 mod tests {
     use super::*;
     use crate::testutil::Scratch;
+    use std::sync::Mutex;
+
+    /// Serializes the live-mirror tests: the mirror is process-wide, so a
+    /// concurrent publisher would leak into another test's read (the same
+    /// reason `UI_GLOBAL_SERIAL` exists in `potflix-win`).
+    static LIVE_SPECS_SERIAL: Mutex<()> = Mutex::new(());
 
     /// The store path a test uses: a nested directory that does not exist yet, so
     /// the atomic write must create it (`t.TempDir()/Potflix/config.json`).
@@ -571,24 +786,29 @@ mod tests {
         let mut unknown = Config::default();
         unknown.set_card_spec("fancy-template", "");
         assert_eq!(unknown.effective_card_spec(), default_card_spec());
-        assert_eq!(unknown.card.details, CARD_DETAILS_DEFAULT);
-        assert!(!unknown.card.is_empty());
+        assert_eq!(unknown.card.series.details, CARD_DETAILS_DEFAULT);
+        assert_eq!(unknown.card.movie.details, CARD_DETAILS_DEFAULT);
+        assert!(!unknown.card.series.is_empty());
     }
 
-    /// The `card` wire shape is Go's `omitempty` per line: an empty line is
-    /// OMITTED from the object, while the `card` key itself is always written
-    /// (Go's `json:"card,omitempty"` on a struct is a no-op). Pins the exact
-    /// bytes the two stores exchange.
+    /// The `card` wire shape is per-kind with Go's `omitempty` per line: an
+    /// empty line is OMITTED from its kind object, a kind object equal to the
+    /// default is omitted entirely, while the `card` key itself is always
+    /// written. Pins the exact bytes the stores exchange.
     #[test]
     fn card_lines_omit_empty_but_the_card_key_always_writes() {
         let scratch = Scratch::new("config-card-wire");
         let path = store_path(&scratch);
 
-        // Details set, state empty: the state key is omitted.
+        // Details set, state empty: the state key is omitted (series only;
+        // movie stays default and is omitted as a kind).
         let details_only = Config {
-            card: CardSpec {
-                details: CARD_DETAILS_TITLE.to_string(),
-                state: String::new(),
+            card: CardSpecs {
+                series: CardSpec {
+                    details: CARD_DETAILS_TITLE.to_string(),
+                    state: String::new(),
+                },
+                movie: CardSpec::default(),
             },
             ..Config::default()
         };
@@ -596,15 +816,18 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"details":"title"}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title"}}}"#
         );
 
         // State set, details empty: the details key is omitted, and the line
         // falls back to the shipped default on read.
         let state_only = Config {
-            card: CardSpec {
-                details: String::new(),
-                state: CARD_STATE_TAG.to_string(),
+            card: CardSpecs {
+                series: CardSpec {
+                    details: String::new(),
+                    state: CARD_STATE_TAG.to_string(),
+                },
+                movie: CardSpec::default(),
             },
             ..Config::default()
         };
@@ -612,7 +835,7 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"state":"tag"}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"state":"tag"}}}"#
         );
         let got = load_config_from(&path).expect("loadConfigFrom");
         assert_eq!(
@@ -623,9 +846,9 @@ mod tests {
             }
         );
 
-        // Both lines empty: the key is still written, as `{}`.
+        // Both kinds empty: the key is still written, as `{}`.
         let empty = Config {
-            card: CardSpec::default(),
+            card: CardSpecs::default(),
             ..Config::default()
         };
         save_config_to(&path, &empty).expect("saveConfigTo");
@@ -634,6 +857,248 @@ mod tests {
             wire,
             r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{}}"#
         );
+    }
+
+    /// The per-kind wire contract, byte for byte: (a) all-default writes
+    /// `"card":{}`, (b) series-only set writes only the series object, (c)
+    /// both kinds set writes both objects in series/movie order.
+    #[test]
+    fn card_per_kind_wire_shapes() {
+        let scratch = Scratch::new("config-card-kinds-wire");
+        let path = store_path(&scratch);
+        let read_wire = |path: &PathBuf| {
+            String::from_utf8(std::fs::read(path).expect("read store")).expect("utf-8")
+        };
+
+        // (a) All-default.
+        save_config_to(&path, &Config::default()).expect("saveConfigTo");
+        assert_eq!(
+            read_wire(&path),
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{}}"#
+        );
+
+        // (b) Series-only set: the movie object (default) is omitted.
+        let mut series_only = Config::default();
+        assert!(series_only.set_card_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(series_only.set_card_line(CardKind::Series, CardLine::State, "tag"));
+        save_config_to(&path, &series_only).expect("saveConfigTo");
+        assert_eq!(
+            read_wire(&path),
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title","state":"tag"}}}"#
+        );
+
+        // (c) Both kinds set.
+        let mut both = Config::default();
+        assert!(both.set_card_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(both.set_card_line(CardKind::Series, CardLine::State, "tag"));
+        assert!(both.set_card_line(CardKind::Movie, CardLine::Details, "episode"));
+        assert!(both.set_card_line(CardKind::Movie, CardLine::State, "synopsis"));
+        save_config_to(&path, &both).expect("saveConfigTo");
+        assert_eq!(
+            read_wire(&path),
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title","state":"tag"},"movie":{"details":"episode","state":"synopsis"}}}"#
+        );
+    }
+
+    /// Per-kind round-trip through the atomic write: both specs survive
+    /// save -> load, and the effective view is normalised per kind.
+    #[test]
+    fn card_per_kind_round_trip() {
+        let scratch = Scratch::new("config-card-kinds-round-trip");
+        let path = store_path(&scratch);
+        let mut want = Config {
+            dirs: vec![r"C:\Media".to_string()],
+            scan_speed: SCAN_SPEED_TURBO.to_string(),
+            ..Config::default()
+        };
+        assert!(want.set_card_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(want.set_card_line(CardKind::Series, CardLine::State, "tag"));
+        assert!(want.set_card_line(CardKind::Movie, CardLine::Details, "episode"));
+        assert!(want.set_card_line(CardKind::Movie, CardLine::State, "synopsis"));
+
+        save_config_to(&path, &want).expect("saveConfigTo");
+        let got = load_config_from(&path).expect("loadConfigFrom");
+        assert_eq!(got, want);
+        assert_eq!(
+            got.card.for_kind(CardKind::Series),
+            CardSpec {
+                details: CARD_DETAILS_TITLE.to_string(),
+                state: CARD_STATE_TAG.to_string(),
+            }
+        );
+        assert_eq!(
+            got.card.for_kind(CardKind::Movie),
+            CardSpec {
+                details: "episode".to_string(),
+                state: "synopsis".to_string(),
+            }
+        );
+        assert!(!got.card.is_default());
+        let effective = got.effective_card_specs();
+        assert_eq!(effective.series, got.card.for_kind(CardKind::Series));
+        assert_eq!(effective.movie, got.card.for_kind(CardKind::Movie));
+    }
+
+    /// The legacy flat object every shipped config holds loads as series =
+    /// that normalized pair and movie = the shipped default, and re-saves as
+    /// the nested series-only shape.
+    #[test]
+    fn card_legacy_flat_read() {
+        let scratch = Scratch::new("config-card-legacy");
+        let legacy = scratch.write(
+            "legacy-card.json",
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"details":"title","state":"tag"}}"#,
+        );
+        let got = load_config_from(&legacy).expect("load legacy flat card");
+        assert_eq!(
+            got.card.series,
+            CardSpec {
+                details: CARD_DETAILS_TITLE.to_string(),
+                state: CARD_STATE_TAG.to_string(),
+            }
+        );
+        assert_eq!(got.card.movie, default_card_spec());
+        assert_eq!(
+            got.effective_card_spec(),
+            CardSpec {
+                details: CARD_DETAILS_TITLE.to_string(),
+                state: CARD_STATE_TAG.to_string(),
+            }
+        );
+        assert_eq!(
+            got.effective_card_specs().movie,
+            default_card_spec(),
+            "movie defaults to the shipped pair"
+        );
+
+        let path = store_path(&scratch);
+        save_config_to(&path, &got).expect("saveConfigTo");
+        let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
+        assert_eq!(
+            wire,
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title","state":"tag"}}}"#
+        );
+    }
+
+    /// Absent / `null` / `{}` / unknown-only `card` values all load as the
+    /// all-default [`CardSpecs`].
+    #[test]
+    fn card_absent_null_empty_and_unknown_load_default() {
+        let scratch = Scratch::new("config-card-default-loads");
+
+        let absent = scratch.write("absent.json", r#"{"dirs":[]}"#);
+        let got = load_config_from(&absent).expect("absent card");
+        assert_eq!(got.card, CardSpecs::default());
+        assert!(got.card.is_default());
+
+        let null = scratch.write("null.json", r#"{"dirs":[],"card":null}"#);
+        let got = load_config_from(&null).expect("null card");
+        assert_eq!(got.card, CardSpecs::default());
+        assert!(got.card.is_default());
+
+        let empty = scratch.write("empty.json", r#"{"dirs":[],"card":{}}"#);
+        let got = load_config_from(&empty).expect("empty card");
+        assert_eq!(got.card, CardSpecs::default());
+        assert!(got.card.is_default());
+
+        let unknown = scratch.write("unknown.json", r#"{"dirs":[],"card":{"future":"ignored"}}"#);
+        let got = load_config_from(&unknown).expect("unknown card keys");
+        assert_eq!(got.card, CardSpecs::default());
+        assert!(got.card.is_default());
+
+        assert!(!CardKind::Series.is_movie());
+        assert!(CardKind::Movie.is_movie());
+    }
+
+    /// Unknown ids never reach the card: `for_kind` falls back per line, and
+    /// `set_line` normalises (a second identical set reports no change).
+    #[test]
+    fn card_unknown_ids_normalise_and_set_line_reports_change() {
+        let stored_typo = CardSpecs {
+            series: CardSpec {
+                details: "fancy-template".to_string(),
+                state: String::new(),
+            },
+            movie: CardSpec::default(),
+        };
+        assert_eq!(stored_typo.for_kind(CardKind::Series), default_card_spec());
+        assert_eq!(stored_typo.for_kind(CardKind::Movie), default_card_spec());
+
+        let mut config = Config::default();
+        assert!(
+            config.set_card_line(CardKind::Series, CardLine::Details, "fancy-template"),
+            "unknown details id stores the default"
+        );
+        assert_eq!(config.effective_card_spec(), default_card_spec());
+        assert!(
+            !config.set_card_line(CardKind::Series, CardLine::Details, "fancy-template"),
+            "same unknown id is no change"
+        );
+        assert!(
+            !config.set_card_line(CardKind::Series, CardLine::Details, "default"),
+            "explicit default over normalised default is no change"
+        );
+        assert!(
+            config.set_card_line(CardKind::Movie, CardLine::State, "tag"),
+            "movie state change"
+        );
+        assert!(
+            !config.set_card_line(CardKind::Movie, CardLine::State, "tag"),
+            "same movie value is no change"
+        );
+    }
+
+    /// The live mirror: nothing published reads as the shipped default. The
+    /// global is cleared first under the serial, so no test can observe
+    /// another's publish.
+    #[test]
+    fn live_card_specs_default_when_nothing_published() {
+        let _serial = LIVE_SPECS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        *LIVE_CARD_SPECS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        assert_eq!(live_card_specs(), CardSpecs::default());
+        assert!(live_card_specs().is_default());
+    }
+
+    /// The live mirror: a published spec reads back per kind, and a republish
+    /// overwrites. Serialized with the default test above, and every assertion
+    /// is on an explicitly published value.
+    #[test]
+    fn live_card_specs_publish_read_round_trip() {
+        let _serial = LIVE_SPECS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut specs = CardSpecs::default();
+        assert!(specs.set_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(specs.set_line(CardKind::Movie, CardLine::State, "synopsis"));
+        set_live_card_specs(specs.clone());
+        assert_eq!(live_card_specs(), specs);
+        assert_eq!(
+            live_card_specs().for_kind(CardKind::Series).details,
+            CARD_DETAILS_TITLE
+        );
+        assert_eq!(
+            live_card_specs().for_kind(CardKind::Movie).state,
+            CARD_STATE_SYNOPSIS
+        );
+        set_live_card_specs(CardSpecs::default());
+        assert_eq!(live_card_specs(), CardSpecs::default());
+    }
+
+    /// `set_card_spec` sets BOTH kinds to the same normalized pair.
+    #[test]
+    fn card_set_card_spec_sets_both_kinds() {
+        let mut config = Config::default();
+        assert!(config.set_card_spec("title", "tag"), "first set");
+        assert!(
+            !config.set_card_spec("title", "tag"),
+            "same value is unchanged"
+        );
+        let pair = CardSpec {
+            details: CARD_DETAILS_TITLE.to_string(),
+            state: CARD_STATE_TAG.to_string(),
+        };
+        assert_eq!(config.card.series, pair);
+        assert_eq!(config.card.movie, pair);
+        assert_eq!(config.effective_card_specs().series, pair);
+        assert_eq!(config.effective_card_specs().movie, pair);
     }
 
     /// The privacy scrub: a store carrying retired credential fields loads its
@@ -704,14 +1169,15 @@ mod tests {
             r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{}}"#
         );
 
-        // A card with both lines set writes both keys.
+        // A card with both lines set writes both kinds (set_card_spec sets
+        // BOTH kinds to the same pair).
         let mut with_card = Config::default();
         with_card.set_card_spec("episode", "synopsis");
         save_config_to(&path, &with_card).expect("saveConfigTo");
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"details":"episode","state":"synopsis"}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"synopsis"},"movie":{"details":"episode","state":"synopsis"}}}"#
         );
 
         // start_with_windows is a real stored field.
@@ -785,14 +1251,16 @@ mod tests {
         );
     }
 
-    /// The Go-compat golden guard: a fixture mirroring the Go-written config
-    /// shape (`go\config.go:22-30`) with SYNTHETIC values -- parse, round-trip,
-    /// assert no key is lost and no default silently changes. Fails first if a
-    /// real Go/Rust mismatch ever appears.
+    /// The Go-compat golden guard: a fixture mirroring the legacy Go-written
+    /// config shape (`go\config.go:22-30`, flat `card`) with SYNTHETIC values --
+    /// parse, migrate, assert no key is lost and no default silently changes.
+    /// The legacy flat card loads as the series spec (movie default) and
+    /// re-saves as the nested shape.
     #[test]
     fn go_written_shape_round_trips_without_key_loss() {
         // Synthetic stand-in for a Go-written store: all four keys, non-default
-        // values on every field, key order as Go's Marshal emits it.
+        // values on every field, key order as Go's Marshal emits it. The card
+        // is the legacy flat object every shipped config holds.
         let fixture = r#"{"dirs":["/synth/movies","/synth/shows"],"start_with_windows":true,"scan_speed":"balanced","card":{"details":"title","state":"tag"}}"#;
         let parsed: Config = serde_json::from_str(fixture).expect("parse Go shape");
         assert_eq!(
@@ -809,15 +1277,20 @@ mod tests {
             }
         );
 
-        // Round-trip through the atomic write: the wire keeps exactly the Go
-        // key set, in Go's order, with every value intact.
+        // Round-trip through the atomic write: the legacy flat card migrates to
+        // the nested shape (series = the pair, movie default = omitted) while
+        // the top-level key set stays exactly the Go contract.
         let scratch = Scratch::new("config-golden");
         let fixture_path = scratch.write("golden.json", fixture);
         let loaded = load_config_from(&fixture_path).expect("loadConfigFrom");
         let path = store_path(&scratch);
         save_config_to(&path, &loaded).expect("saveConfigTo");
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
-        assert_eq!(wire, fixture, "round-trip must be byte-identical");
+        assert_eq!(
+            wire,
+            r#"{"dirs":["/synth/movies","/synth/shows"],"start_with_windows":true,"scan_speed":"balanced","card":{"series":{"details":"title","state":"tag"}}}"#,
+            "legacy flat card must migrate to the nested series shape"
+        );
         let wire_value: serde_json::Value = serde_json::from_str(&wire).expect("wire JSON");
         let mut keys: Vec<&str> = wire_value
             .as_object()

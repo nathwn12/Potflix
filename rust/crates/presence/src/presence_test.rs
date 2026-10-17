@@ -1035,9 +1035,11 @@ fn build_activity_resolved_rich() {
     assert_eq!(got.name, want, "name");
     let want = trunc("Canonical Episode", 128);
     assert_eq!(got.details, want, "details");
-    let want = rp_text("S1 E2", 128);
+    // The series default carries the teaser after the tag; the tooltip keeps
+    // the whole note.
+    let want = "S1 E2 \u{b7} A brave synopsis";
     assert_eq!(got.state, want, "state");
-    assert_eq!(got.state, "S1 E2", "state exact");
+    assert_eq!(got.state, "S1 E2 \u{b7} A brave synopsis", "state exact");
     // Hover slot: large_text carries the complete short synopsis, not a
     // duplicate of name (the card header already shows the series).
     assert_eq!(
@@ -1046,7 +1048,8 @@ fn build_activity_resolved_rich() {
         "large_text"
     );
 
-    // synopsis stays in the tooltip, never the state (S3 de-duplication)
+    // The series default carries the teaser when a synopsis is known: with no
+    // tag the state is the synopsis alone, and the tooltip keeps the whole note.
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -1055,14 +1058,15 @@ fn build_activity_resolved_rich() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "", "state");
+    assert_eq!(got.state, "Just a synopsis", "state");
     assert_eq!(got.large_text, "Just a synopsis", "large_text");
 
     // tag only becomes state
     let got = build_activity_resolved(TV_TAG_ONLY_RAW, Some(&run_act), &Resolved::default());
     assert_eq!(got.state, "S1 E2", "state");
 
-    // long synopsis reaches the tooltip (hard-cut at 128); the state stays empty
+    // A long synopsis reaches the tooltip (word-aware cut at 128) and the
+    // state ladder falls back to the synopsis teaser at 72.
     let long = "s".repeat(200);
     let got = build_activity_resolved(
         MOVIE_RAW,
@@ -1072,7 +1076,7 @@ fn build_activity_resolved_rich() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "", "state");
+    assert_eq!(got.state, rp_text(&long, STATE_SYNOPSIS_BUDGET), "state");
     assert_eq!(got.large_text, rp_text(&long, 128), "large_text");
     let n = java_units(&got.state);
     assert!(
@@ -1119,12 +1123,74 @@ fn trim_word_cases() {
     );
     let n = java_units(&got);
     assert!(n <= 128, "trim_word length {n} exceeds 128: {got:?}");
-    // No spaces: fall back to the hard cut.
+    // No spaces: the cut is still signalled with a trailing ellipsis within
+    // budget (never a silent hard cut, never a split surrogate).
     let nospace = "s".repeat(200);
+    let got = trim_word(&nospace, 128);
+    assert!(
+        got.ends_with('\u{2026}'),
+        "trim_word nospace = {got:?}, want trailing ellipsis"
+    );
     assert_eq!(
-        trim_word(&nospace, 128),
-        rp_text(&nospace, 128),
+        got,
+        format!("{}\u{2026}", "s".repeat(127)),
         "trim_word nospace"
+    );
+    let n = java_units(&got);
+    assert!(
+        n <= 128,
+        "trim_word nospace length {n} exceeds 128: {got:?}"
+    );
+    // CJK run (no spaces): the same signalled cut.
+    let cjk = "\u{6f22}".repeat(300);
+    let got = trim_word(&cjk, 128);
+    assert!(
+        got.ends_with('\u{2026}'),
+        "trim_word cjk = {got:?}, want trailing ellipsis"
+    );
+    let n = java_units(&got);
+    assert!(n <= 128, "trim_word cjk length {n} exceeds 128: {got:?}");
+    let body = got.trim_end_matches('\u{2026}');
+    let last = body.chars().next_back().unwrap();
+    assert!(
+        last.is_alphanumeric(),
+        "trim_word cjk cut ends on {last:?}, want a word character: {got:?}"
+    );
+    // Surrogate safety: an emoji straddling the cut is dropped whole, never
+    // split (the old UTF-16 hard cut left a `?` from the lone surrogate).
+    let split = format!("{}\u{1f600}{}", "a".repeat(126), "b".repeat(100));
+    let got = trim_word(&split, 128);
+    assert!(
+        got.ends_with('\u{2026}'),
+        "trim_word surrogate = {got:?}, want trailing ellipsis"
+    );
+    assert!(
+        !got.contains('?'),
+        "trim_word split a surrogate (`?`): {got:?}"
+    );
+    assert_eq!(
+        got,
+        format!("{}\u{2026}", "a".repeat(126)),
+        "trim_word surrogate"
+    );
+    // Sentence-end cut: the word-boundary cut lands on `.` followed by a
+    // space, so the complete sentence is kept with its own terminator and no
+    // ellipsis (the `x×120 + ".…"` shape was the live defect).
+    let sentence = format!("{}. {}", "x".repeat(120), "y".repeat(20));
+    let got = trim_word(&sentence, 128);
+    assert_eq!(
+        got,
+        "x".repeat(120) + ".",
+        "trim_word sentence cut"
+    );
+    assert!(
+        !got.contains('\u{2026}'),
+        "complete sentence needs no ellipsis: {got:?}"
+    );
+    let n = java_units(&got);
+    assert!(
+        n <= 128,
+        "trim_word sentence length {n} exceeds 128: {got:?}"
     );
     assert_eq!(trim_word("", 128), "", "trim_word empty");
 }
@@ -1173,11 +1239,12 @@ fn trim_word_strips_cut_punctuation() {
     assert_eq!(got, want, "trim_word cut");
 }
 
-/// The default movie state carries no synopsis (the live `…Majin Buu,` cut now
-/// lives on the SYNOPSIS preset, pinned in cardspec_test): with no genres or
-/// length the state stays empty and the tooltip carries the synopsis.
+/// The default movie ladder falls to the synopsis teaser when genres and
+/// length are absent (the live `…Majin Buu,` cut now lives on the default
+/// line too, pinned in cardspec_test): the state carries the teaser and the
+/// tooltip carries the whole note.
 #[test]
-fn movie_default_state_has_no_synopsis() {
+fn movie_default_state_ladder_to_synopsis() {
     const MOVIE_RAW: &str = "Dragon.Ball.Movie.1990.1080p.mkv - PotPlayer";
     let run_act = Action {
         running: true,
@@ -1198,14 +1265,18 @@ fn movie_default_state_has_no_synopsis() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "", "state");
+    assert_eq!(
+        got.state, "Years after the battle with Earth's greatest enemy, Majin Buu\u{2026}",
+        "state"
+    );
     assert_eq!(got.large_text, trim_word(syn, 128), "large_text");
 }
 
-/// The default series state is the episode tag alone (the live `…meet Elliot;`
-/// cut now lives on the SYNOPSIS preset, pinned in cardspec_test).
+/// The default series state carries the synopsis teaser after the tag (the
+/// live `…meet Elliot;` cut now lives on the default line too, pinned in
+/// cardspec_test).
 #[test]
-fn series_default_state_is_tag_only() {
+fn series_default_state_carries_teaser() {
     const TV_RAW: &str = "Show.S02E04.Episode.1080p.mkv - PotPlayer";
     let run_act = Action {
         running: true,
@@ -1224,7 +1295,11 @@ fn series_default_state_is_tag_only() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "S2 E4", "state");
+    assert_eq!(
+        got.state,
+        "S2 E4 \u{b7} Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}",
+        "state"
+    );
     assert_eq!(got.large_text, trim_word(syn, 128), "large_text");
 }
 
@@ -1416,7 +1491,7 @@ fn build_activity_resolved_series_state() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "S1 E2", "state");
+    assert_eq!(got.state, "S1 E2 \u{b7} A brave new world unfolds", "state");
 }
 
 #[test]
@@ -1594,6 +1669,29 @@ fn smart_trim_synopsis_word_ellipsis() {
     assert!(
         body.ends_with("epic"),
         "should land on a whole word: {got:?}"
+    );
+    let n = java_units(&got);
+    assert!(
+        n <= STATE_SYNOPSIS_BUDGET,
+        "length {n} exceeds {STATE_SYNOPSIS_BUDGET}: {got:?}"
+    );
+}
+
+/// No boundary anywhere (single token, no spaces): the tail still signals the
+/// cut with a single trailing U+2026 within budget, never a silent hard cut.
+#[test]
+fn smart_trim_synopsis_nospace_ellipsis() {
+    let s = "y".repeat(300);
+    let got = smart_trim_synopsis(&s, STATE_SYNOPSIS_BUDGET);
+    assert!(
+        got.ends_with('\u{2026}'),
+        "nospace cut should end with U+2026: {got:?}"
+    );
+    assert!(!got.contains("..."), "never three dots: {got:?}");
+    assert_eq!(
+        got,
+        format!("{}\u{2026}", "y".repeat(STATE_SYNOPSIS_BUDGET - 1)),
+        "nospace cut"
     );
     let n = java_units(&got);
     assert!(
