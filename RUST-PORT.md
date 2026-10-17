@@ -253,10 +253,10 @@ further where the owner's live card proved the Go behaviour wrong:
     records heal on decode (`rust\crates\metadata\src\cache.rs`,
     `decode_cache_entry`, no schema bump). Go stored the raw page title
     (`go\internal\metadata\wikipedia.go:504`).
-12. Truncated card lines end cleanly. `rust\crates\presence\src\lib.rs`
-    (`trim_word`, `smart_trim_synopsis`, the `large_text` build) cuts on word
-    boundaries, strips trailing `, ; : - – — ·` before the terminator, and ends
-    with `…` when cut; the tooltip no longer hard-cuts mid-word. Go kept the
+12. Truncated card lines are always signalled, never silent. `rust\crates\presence\src\lib.rs`
+    (`trim_word`, `smart_trim_synopsis`, the `large_text` build): a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…` — a whole-word end wherever the text has word boundaries, always a terminator otherwise, so a note with no spaces at all (a long token, CJK text) is cut on a character boundary and still ends with that `…`.
+    The tooltip now always carries its terminator, and a
+    spaceless note is cut on a character boundary with that terminator attached. Guarantee: never silently truncated. Go kept the
     cut punctuation and hard-cut the tooltip
     (`go\internal\presence\presence.go:573-644,673-675`).
 13. Wikipedia artwork accepts the article's own file. `rust\crates\metadata\src\wikipedia.rs`
@@ -291,3 +291,48 @@ further where the owner's live card proved the Go behaviour wrong:
     `not-found=` (`go\window.go:2749`): the per-file counter is honest but sampled
     before the async catch-up pass, so a nonzero value can coexist with a later
     successful fetch — Go's name reads as final at a moment that is not final.
+18. The card is always filled, per kind, as teaser plus full note — reversing
+    S3 for series on the owner's request. `rust\crates\presence\src\lib.rs`
+    (`compose_card`, `compose_details_for`, `compose_state_for`,
+    `synopsis_state`, `compose_large_text_inner`) builds each body line as a
+    fill ladder: the first non-empty rung wins and the last rung is identity
+    from the file itself, so a card is never blank; `rust\crates\presence\src\cardspec.rs`
+    (`CardSpec`, `render_kind`, `card_presets`, `CARD_STATE_NONE`) keeps every
+    preset as a re-head that never removes the fill, except the `Minimal`
+    state preset (stored `none`) — the only choice that may shorten the card
+    to a single body line. SERIES covers TV + anime, MOVIE is movies. Shipped
+    default: SERIES line 1 the episode name, line 2 the episode tag plus a
+    synopsis teaser; MOVIE line 1 `Title (Year)`, line 2 `genres · length`,
+    else synopsis, else year, else clean title. The hover text of the LARGE
+    image slot — the cover when artwork resolved, the PotFlix `logo` asset
+    otherwise — carries the whole stored note. Slot budgets in UTF-16 units
+    held in one place (`NAME_BUDGET`,
+    `DETAILS_BUDGET`, `STATE_BUDGET`, `STATE_SYNOPSIS_BUDGET`,
+    `LARGE_TEXT_BUDGET`): header 128, line 1 128, line 2 128 plain / 72 with
+    a synopsis, hover 128; body lines join with `JOINER` (U+00B7 with single
+    spaces); cuts (`trim_word`, `smart_trim_synopsis`) are always signalled: a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…` —
+    never silently truncated; a whole-word end wherever the text has word boundaries; always a terminator otherwise (a spaceless note — long token, CJK text — cut on a character boundary, still ending with that `…`). Every provider mapper caps the note at fetch time
+    (`cap_synopsis`, `MAX_SYNOPSIS_UNITS` = 128 UTF-16 code units), so the
+    stored note always fits the 128-unit hover whole. Per-kind choices persist in
+    `rust\crates\app-support\src\config.rs` (`CardSpecs`, `CardKind`,
+    `CardLine`, `for_kind`) as
+    `"card":{"series":{"details":"…","state":"…"},"movie":{…}}`; the legacy
+    flat `{"details":"…","state":"…"}` still loads as the series pair with the
+    movie pair default and re-saves nested — a backward-compatible read, not a
+    byte-identical re-write; an all-default config still writes `"card":{}`. The earlier S3 rule (the default state never
+    duplicates the tooltip synopsis) is reversed for series: teaser on the
+    card, full note on hover — not duplication; the movie default still avoids
+    the synopsis while genres/length answer.
+19. The Card-view preview is what Discord gets, row for row. The preview renders through the
+    same composer the send path uses (`compose_card` via
+    `CardSpec::render_kind`), so picking a line changes the preview
+    immediately; it is exact for the rows it shows (Header / Details / State
+    / Images / Buttons / Tooltip). The progress-bar end timestamp is
+    projected by the send gate from the player clock, not by the composer,
+    so the preview shows no timestamps. The Card view's `Card lines for` row
+    (a Series/Movie toggle, `BTN_CARD_KIND_AT`) picks which kind the Details
+    and State preset rows edit — writes go to the SELECTED kind only. A preset save publishes the new specs to the running sender, in-process, through the
+    store's live mirror (`app_support::config::set_live_card_specs()` / `live_card_specs()`, backed by a process-wide lock) — the same live-apply shape as the
+    scan-speed path (`metadata_http::set_rate_profile`); the poll loop (`push_activity` / `poll_loop` in `rust\crates\app\src\main.rs`, preset choice via
+    `rust\crates\potflix-win\src\window.rs` `on_select_card_preset`) reads the published specs on every push, so the change reaches the live Discord card
+    at the next poll tick: no restart, and no push from the click itself. The send gate compares name/details/state/paused/images/buttons/has_start against the last-sent card and sends when they differ (`rust\crates\presence\src\gate.rs:209-221`), so the changed lines go out by themselves — while paused too, where the card is re-parked when the compared content is unchanged — the header, the two body lines, the large image, the button list and the paused flag — and a change to any of those still goes out with a fresh pause anchor; a change confined to the hover text does not re-park on its own. That set mirrors the ported gate's paused comparison (`rust\crates\presence\src\gate.rs:170-193`), and no card preset changes the hover text alone.
