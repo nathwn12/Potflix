@@ -117,6 +117,9 @@ fn count(counts: &HashMap<String, i32>, name: &str) -> i32 {
 /// INVOKES cinemeta.Find but a movie miss still INVOKES the series-only fakes.
 #[test]
 fn chain_call_counts() {
+    // NOTE: the fixtures below carry no artwork, so every non-AniList winner
+    // also costs exactly one `anilist` backfill call (`fetch_media` fires it
+    // for unusable artwork); an AniList winner and a miss cost none.
     let tv_q = resolve_query("Breaking Bad S01E01.mkv", "");
     assert_eq!(tv_q.kind, Kind::SERIES, "tv fixture kind");
     let anime_q = resolve_query("[Anime Time] Re Zero - 01.mkv", "");
@@ -145,19 +148,24 @@ fn chain_call_counts() {
             name: "tv hit at first provider",
             q: tv_q.clone(),
             answer_at: "tvmaze",
-            want: vec![("tvmaze", 1)],
+            want: vec![("tvmaze", 1), ("anilist", 1)],
         },
         Case {
             name: "movie hit at cinemeta",
             q: movie_q.clone(),
             answer_at: "cinemeta",
-            want: vec![("cinemeta", 1)],
+            want: vec![("cinemeta", 1), ("anilist", 1)],
         },
         Case {
             name: "movie hit at justwatch walks past cinemeta and wikipedia",
             q: movie_q.clone(),
             answer_at: "justwatch",
-            want: vec![("cinemeta", 1), ("wikipedia", 1), ("justwatch", 1)],
+            want: vec![
+                ("cinemeta", 1),
+                ("wikipedia", 1),
+                ("justwatch", 1),
+                ("anilist", 1),
+            ],
         },
         Case {
             name: "movie definitive miss walks cinemeta, wikipedia, justwatch then the unranked tail",
@@ -187,13 +195,13 @@ fn chain_call_counts() {
             name: "anime hit at tenrai walks past tvmaze and anilist",
             q: anime_q.clone(),
             answer_at: "tenrai",
-            want: vec![("tvmaze", 1), ("anilist", 1), ("tenrai", 1)],
+            want: vec![("tvmaze", 1), ("anilist", 2), ("tenrai", 1)],
         },
         Case {
             name: "anime hit at kitsu walks past tvmaze, anilist and tenrai",
             q: anime_q.clone(),
             answer_at: "kitsu",
-            want: vec![("tvmaze", 1), ("anilist", 1), ("tenrai", 1), ("kitsu", 1)],
+            want: vec![("tvmaze", 1), ("anilist", 2), ("tenrai", 1), ("kitsu", 1)],
         },
         Case {
             name: "series hit at episodate walks past the first five legs",
@@ -201,7 +209,7 @@ fn chain_call_counts() {
             answer_at: "episodate",
             want: vec![
                 ("tvmaze", 1),
-                ("anilist", 1),
+                ("anilist", 2),
                 ("tenrai", 1),
                 ("kitsu", 1),
                 ("cinemeta", 1),
@@ -214,7 +222,7 @@ fn chain_call_counts() {
             answer_at: "ann",
             want: vec![
                 ("tvmaze", 1),
-                ("anilist", 1),
+                ("anilist", 2),
                 ("tenrai", 1),
                 ("kitsu", 1),
                 ("cinemeta", 1),

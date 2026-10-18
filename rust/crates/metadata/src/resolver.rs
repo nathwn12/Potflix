@@ -58,6 +58,11 @@ use crate::{kitsu::KitsuSource, tenrai::TenraiSource};
 /// on-disk cache stays additive forever.
 pub const NEGATIVE_BACKOFF: Duration = Duration::from_secs(10 * 60);
 
+/// Discord caps `large_image` at 300 chars: an artwork URL longer than that
+/// (or empty, non-http(s), or signed/expiring) degrades to the app logo
+/// downstream. The backfill budget mirrors the presence guard exactly.
+const ARTWORK_BUDGET: usize = 300;
+
 /// `Source` is one keyless metadata provider. Go's `Source` interface:
 /// `Name() string` and `Find(ctx, q) (*Media, error)`.
 ///
@@ -724,11 +729,14 @@ impl Chain {
 
 impl Resolver {
     /// `fetchMedia`: the chain, then ONE bounded retry under the alternate title
-    /// and ONLY after a definitive primary miss.
+    /// and ONLY after a definitive primary miss. A winning media whose artwork
+    /// is unusable for Discord gets ONE bounded AniList backfill attempt
+    /// ([`Resolver::backfill_artwork`]) before it is returned, so both the
+    /// blocking and the background paths persist the stable cover.
     fn fetch_media(&self, cancel: &Cancel, q: &Query) -> Chain {
         let primary = self.fetch_chain(cancel, q);
         if let Some(media) = primary.media {
-            return Chain::found(media);
+            return Chain::found(self.backfill_artwork(cancel, q, media));
         }
         // An unknown primary outcome (transient failure) must never be replaced
         // by a substituted alternate match that the caller then persists under
@@ -756,7 +764,7 @@ impl Resolver {
         // resolves under the ORIGINAL query key.
         let secondary = self.fetch_chain(cancel, &alt);
         if let Some(media) = secondary.media {
-            return Chain::found(media);
+            return Chain::found(self.backfill_artwork(cancel, &alt, media));
         }
         // The primary was a definitive miss, so a transient alternate is still
         // unknown and surfaces the alternate's error; the primary error is nil
@@ -765,6 +773,48 @@ impl Resolver {
             return Chain::transient(secondary.err);
         }
         Chain::missed()
+    }
+
+    /// `backfillArtwork`: when the winner's artwork is unusable for Discord and
+    /// the winner is not AniList itself, try ONE direct AniList lookup (never
+    /// `fetch_media`: no recursion) in a bounded child scope, and keep its
+    /// cover only on an exact title match against the winner. Every other
+    /// outcome -- a miss, timeout, parse error, a different title, or an
+    /// unusable/absent cover -- leaves the artwork untouched, so the presence
+    /// guards still degrade to `logo`. Never fails the lookup: the winner is
+    /// always returned, with or without a backfilled cover.
+    fn backfill_artwork(&self, cancel: &Cancel, q: &Query, mut media: Media) -> Media {
+        if media.source == "anilist" || !artwork_unusable(&media.artwork) {
+            return media;
+        }
+        let Some(anilist) = self.inner.sources.iter().find(|s| s.name() == "anilist") else {
+            return media;
+        };
+        if cancel.err().is_some() {
+            return media;
+        }
+        // Bounded by the resolver's per-request budget inside the existing
+        // scope; released as soon as the find returns. A miss or a failure
+        // keeps the winner untouched and is never cached negative here.
+        let scope = child_scope(cancel, self.inner.timeout);
+        let found = anilist.find(&scope, q);
+        scope.cancel();
+        let Ok(Some(hit)) = found else {
+            return media;
+        };
+        // Exact-title match only: a looser match could backfill the wrong
+        // work's poster (the 2015 `Dragon Ball Super` series over the 2026
+        // `Dragon Ball Super: Beerus` season).
+        if hit.title.trim() != media.title.trim() {
+            return media;
+        }
+        // `AnilistSource` already picks `extra_large → large → banner_image`;
+        // only a usable cover replaces the winner's.
+        if artwork_unusable(&hit.artwork) {
+            return media;
+        }
+        media.artwork = hit.artwork;
+        media
     }
 
     /// `fetchChain`: iterate the ordered sources; an error is recorded and the
@@ -873,6 +923,22 @@ pub(crate) fn episode_complete(media: &Media, q: &Query) -> bool {
         return false;
     };
     !ep.synopsis.trim().is_empty() || !media.synopsis.trim().is_empty()
+}
+
+/// `artworkUnusable`: the artwork can never survive Discord -- empty, not
+/// http(s), over the 300-char `large_image` budget, or a signed/expiring URL
+/// (Kitsu serves Backblaze URLs carrying `Expires=`).
+fn artwork_unusable(artwork: &str) -> bool {
+    let art = artwork.trim();
+    if art.is_empty()
+        || !(art.starts_with("http://") || art.starts_with("https://"))
+        || art.len() > ARTWORK_BUDGET
+    {
+        return true;
+    }
+    art.contains("X-Amz-Signature")
+        || art.contains("X-Amz-Credential")
+        || art.contains("Expires=")
 }
 
 /// `matchEpisode` is number-exact: only `Number == q.Episode` (plus
