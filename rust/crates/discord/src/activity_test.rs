@@ -192,6 +192,46 @@ fn test_large_image_fallback_to_logo() {
     );
 }
 
+/// Discord rejects `large_image` longer than 300 chars (`code=4000`), which a
+/// Kitsu-signed Backblaze URL can exceed. The wire composer must omit the
+/// over-budget image (fallback to `"logo"`), never truncate it and never emit
+/// the oversized field.
+#[test]
+fn test_large_image_over_300_falls_back_to_logo() {
+    let long_art = format!("https://example.com/{}", "x".repeat(400));
+    assert!(long_art.len() > 300, "fixture must exceed the Discord cap");
+    let got = wire_json(&Activity {
+        details: "Show".to_string(),
+        state: "S1 E2".to_string(),
+        large_image: long_art.clone(),
+        ..Activity::default()
+    });
+    let a = decode_frame(got.as_bytes());
+    assert_eq!(
+        as_map(&a["assets"], "assets")["large_image"].as_str(),
+        Some("logo"),
+        "over-budget LargeImage must be omitted, got {got}"
+    );
+    // Boundary: exactly 300 chars rides verbatim.
+    let edge = format!(
+        "https://example.com/{}",
+        "y".repeat(300 - "https://example.com/".len())
+    );
+    assert_eq!(edge.len(), 300, "edge fixture must be exactly 300 chars");
+    let got = wire_json(&Activity {
+        details: "Show".to_string(),
+        state: "S1 E2".to_string(),
+        large_image: edge.clone(),
+        ..Activity::default()
+    });
+    let a = decode_frame(got.as_bytes());
+    assert_eq!(
+        as_map(&a["assets"], "assets")["large_image"].as_str(),
+        Some(edge.as_str()),
+        "300-char LargeImage must pass through, got {got}"
+    );
+}
+
 #[test]
 fn test_set_activity_no_timer() {
     // The idle card: details Browsing / state Idle and no timestamps object at

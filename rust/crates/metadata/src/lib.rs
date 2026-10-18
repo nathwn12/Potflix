@@ -52,6 +52,8 @@ mod anilist_test;
 #[cfg(test)]
 mod ann_test;
 #[cfg(test)]
+mod artwork_backfill_test;
+#[cfg(test)]
 mod artwork_test;
 #[cfg(test)]
 mod bangumi_test;

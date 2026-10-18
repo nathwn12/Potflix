@@ -55,7 +55,7 @@ pub struct Activity {
     pub name: String,
     pub details: String,
     pub state: String,
-    /// https artwork URL; empty/invalid falls back to "logo".
+    /// https artwork URL within Discord's 300-char limit; empty/invalid/over-budget falls back to "logo".
     pub large_image: String,
     /// "PotFlix"; empty is omitted on the wire.
     pub large_text: String,
@@ -87,6 +87,12 @@ pub struct ActivityButton {
 /// or Watching (3); Watching fits a video player and renders "Watching <title>".
 /// Deliberate, user-visible deviation (see the file header).
 const ACTIVITY_TYPE_WATCHING: i32 = 3;
+
+/// Discord caps `large_image` at 300 chars (`code=4000` otherwise). An
+/// over-budget URL is omitted (fallback to `"logo"`), never truncated (a cut
+/// signed URL is a broken link). Local copy of the presence crate's cap: the
+/// crates share no edge, so the value is duplicated, not imported.
+const LARGE_IMAGE_BUDGET: usize = 300;
 
 /// The wire activity object. Every empty string field is omitted so Discord
 /// never sees `"large_text":""`. The pristine card has no small image/text and
@@ -149,15 +155,18 @@ fn is_zero(v: &i64) -> bool {
 }
 
 /// Maps one card to the wire payload. `type` is Watching (3); `large_image` is
-/// the caller's `large_image` when it is an http(s) URL, else "logo" (never
-/// empty); empty text stays omitted; `name` carries the header override.
+/// the caller's `large_image` when it is an http(s) URL within
+/// [`LARGE_IMAGE_BUDGET`], else "logo" (never empty, never truncated, never
+/// over budget); empty text stays omitted; `name` carries the header override.
 pub(crate) fn new_activity(a: &Activity) -> ActivityPayload {
-    let large_image =
-        if a.large_image.starts_with("http://") || a.large_image.starts_with("https://") {
-            a.large_image.clone()
-        } else {
-            "logo".to_string()
-        };
+    let large_image = if (a.large_image.starts_with("http://")
+        || a.large_image.starts_with("https://"))
+        && a.large_image.len() <= LARGE_IMAGE_BUDGET
+    {
+        a.large_image.clone()
+    } else {
+        "logo".to_string()
+    };
     let mut p = ActivityPayload {
         activity_type: ACTIVITY_TYPE_WATCHING,
         name: a.name.clone(),
