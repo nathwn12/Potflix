@@ -389,6 +389,13 @@ pub(crate) const DETAILS_BUDGET: usize = 128;
 pub(crate) const STATE_BUDGET: usize = 128;
 pub(crate) const LARGE_TEXT_BUDGET: usize = 128;
 
+/// Discord caps `large_image` at 300 chars (`code=4000` otherwise). A
+/// Kitsu-signed Backblaze URL can exceed it, so an over-budget URL is omitted
+/// (fallback to `"logo"`) rather than truncated (a cut signed URL is a broken
+/// link). `Resolved` carries no alternative short artwork URL, so `"logo"` is
+/// the stable short asset; no new network calls.
+pub(crate) const LARGE_IMAGE_BUDGET: usize = 300;
+
 /// The body-line joiner: U+00B7 MIDDLE DOT with single spaces.
 pub(crate) const JOINER: &str = " \u{b7} ";
 
@@ -926,9 +933,13 @@ fn compose_large_text_inner(r: &Resolved) -> String {
     "PotFlix".to_string()
 }
 
-/// The artwork slot: the https URL when present, else "logo". Never empty.
+/// The artwork slot: the https URL when present and within
+/// [`LARGE_IMAGE_BUDGET`], else "logo". Never empty, never truncated, never
+/// over budget (Discord rejects `large_image` longer than 300 chars).
 fn compose_large_image_inner(r: &Resolved) -> String {
-    if r.artwork.starts_with("http://") || r.artwork.starts_with("https://") {
+    if (r.artwork.starts_with("http://") || r.artwork.starts_with("https://"))
+        && r.artwork.len() <= LARGE_IMAGE_BUDGET
+    {
         r.artwork.clone()
     } else {
         "logo".to_string()

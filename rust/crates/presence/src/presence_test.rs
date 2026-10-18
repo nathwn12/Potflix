@@ -1088,6 +1088,58 @@ fn build_activity_resolved_rich() {
     assert!(n <= 128, "state length {n} exceeds 128: {:?}", got.state);
 }
 
+/// Discord rejects `large_image` longer than 300 chars (`code=4000`), which a
+/// Kitsu-signed Backblaze URL can exceed. The composer must omit the
+/// over-budget image (fallback to `"logo"`), never truncate it (a cut signed
+/// URL is a broken link) and never emit the oversized field.
+#[test]
+fn large_image_over_300_falls_back_to_logo() {
+    const TV_RAW: &str = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+    let run_act = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let long_art = format!("https://example.com/{}", "x".repeat(400));
+    assert!(long_art.len() > 300, "fixture must exceed the Discord cap");
+    let got = build_activity_resolved(
+        TV_RAW,
+        Some(&run_act),
+        &Resolved {
+            artwork: long_art.clone(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(
+        got.large_image, "logo",
+        "over-budget artwork must be omitted, got {:?}",
+        got.large_image
+    );
+    assert!(
+        got.large_image.len() <= 300,
+        "large_image still oversized: {:?}",
+        got.large_image
+    );
+    // Boundary: exactly 300 chars rides verbatim.
+    let edge = format!("https://example.com/{}", "y".repeat(300 - "https://example.com/".len()));
+    assert_eq!(edge.len(), 300, "edge fixture must be exactly 300 chars");
+    let got_edge = build_activity_resolved(
+        TV_RAW,
+        Some(&run_act),
+        &Resolved {
+            artwork: edge.clone(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(
+        got_edge.large_image, edge,
+        "300-char artwork must pass through, got {:?}",
+        got_edge.large_image
+    );
+}
+
 #[test]
 fn rp_text_cases() {
     assert_eq!(rp_text("a\n\nb  c", 128), "a b c", "collapse");
