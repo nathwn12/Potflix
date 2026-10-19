@@ -15,16 +15,6 @@ powershell -ExecutionPolicy Bypass -File tools\rust-build.ps1
 
 First run opens the settings window: add a media folder, then Scan. Keep PotPlayer playing and the Discord desktop app open and your card goes live.
 
-### Or let your AI install it
-
-```text
-Clone https://github.com/nathwn12/Potflix.git, build it with
-powershell -ExecutionPolicy Bypass -File tools\rust-build.ps1,
-launch .\dist\potflix.exe, then prove it with
-.\dist\potflix.exe --selftest (exit any running copy first)
-and report the M1 SELFTEST PASS line.
-```
-
 ## Use it
 
 Run `.\dist\potflix.exe` (or `run.bat`) and look for the tray icon. Right-click it for Open and Exit; closing the window parks it back in the tray.
