@@ -38,7 +38,9 @@ pub mod episodate;
 pub mod kitsu;
 pub mod justwatch;
 pub mod livechart;
+pub mod overrides;
 pub mod resolver;
+pub mod search;
 mod serdeutil;
 pub mod tenrai;
 pub mod timefmt;
@@ -91,7 +93,9 @@ use std::fmt;
 use metadata_http::cancel::CancelError;
 
 pub use metadata_core::types::{Button, Episode, Kind, Media, Query, Resolution};
+pub use overrides::{Override, Scope, Store, load};
 pub use resolver::{Options, Resolver, Source, default_sources};
+pub use search::{Candidate, pin_from_candidate, refresh, search};
 
 /// The text of Go's `ErrLookupUnavailable` sentinel.
 pub const LOOKUP_UNAVAILABLE_MESSAGE: &str = "metadata lookup unavailable";

@@ -7,10 +7,11 @@
 use player::control::PlayStatus;
 use titleclean::trunc;
 
+use crate::cardspec::{CARD_DETAILS_DEFAULT, CARD_STATE_SYNOPSIS, CardSpec};
 use crate::{
     Action, Activity, Button, PAUSED_MARKER, Resolved, STATE_SYNOPSIS_BUDGET, Tracker, action_tag,
-    build_activity, build_activity_resolved, fmt_ms, rp_text, smart_trim_synopsis, trim_word,
-    with_state_time,
+    build_activity, build_activity_resolved, compose_card, fmt_ms, rp_text, smart_trim_synopsis,
+    trim_word, with_state_time,
 };
 
 /// One poll of the transition matrix.
@@ -1035,11 +1036,14 @@ fn build_activity_resolved_rich() {
     assert_eq!(got.name, want, "name");
     let want = trunc("Canonical Episode", 128);
     assert_eq!(got.details, want, "details");
-    // The series default carries the teaser after the tag; the tooltip keeps
-    // the whole note.
-    let want = "S1 E2 \u{b7} A brave synopsis";
-    assert_eq!(got.state, want, "state");
-    assert_eq!(got.state, "S1 E2 \u{b7} A brave synopsis", "state exact");
+    // The default state is the tag alone: the synopsis is off by default and
+    // the tooltip keeps the whole note.
+    assert_eq!(got.state, "S1 E2", "state");
+    assert!(
+        !got.state.contains("A brave synopsis"),
+        "default state must not carry the synopsis: {:?}",
+        got.state
+    );
     // Hover slot: large_text carries the complete short synopsis, not a
     // duplicate of name (the card header already shows the series).
     assert_eq!(
@@ -1048,8 +1052,8 @@ fn build_activity_resolved_rich() {
         "large_text"
     );
 
-    // The series default carries the teaser when a synopsis is known: with no
-    // tag the state is the synopsis alone, and the tooltip keeps the whole note.
+    // With no tag the default state falls to the clean filename title (never
+    // the synopsis, which stays in the tooltip).
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -1058,15 +1062,15 @@ fn build_activity_resolved_rich() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "Just a synopsis", "state");
+    assert_eq!(got.state, "Movie", "state");
     assert_eq!(got.large_text, "Just a synopsis", "large_text");
 
     // tag only becomes state
     let got = build_activity_resolved(TV_TAG_ONLY_RAW, Some(&run_act), &Resolved::default());
     assert_eq!(got.state, "S1 E2", "state");
 
-    // A long synopsis reaches the tooltip (word-aware cut at 128) and the
-    // state ladder falls back to the synopsis teaser at 72.
+    // A long synopsis reaches the tooltip (word-aware cut at 128); the
+    // default state stays the clean title, never a synopsis teaser.
     let long = "s".repeat(200);
     let got = build_activity_resolved(
         MOVIE_RAW,
@@ -1076,14 +1080,8 @@ fn build_activity_resolved_rich() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, rp_text(&long, STATE_SYNOPSIS_BUDGET), "state");
+    assert_eq!(got.state, "Movie", "state");
     assert_eq!(got.large_text, rp_text(&long, 128), "large_text");
-    let n = java_units(&got.state);
-    assert!(
-        n <= STATE_SYNOPSIS_BUDGET,
-        "state length {n} exceeds {STATE_SYNOPSIS_BUDGET}: {:?}",
-        got.state
-    );
     let n = java_units(&got.state);
     assert!(n <= 128, "state length {n} exceeds 128: {:?}", got.state);
 }
@@ -1291,12 +1289,12 @@ fn trim_word_strips_cut_punctuation() {
     assert_eq!(got, want, "trim_word cut");
 }
 
-/// The default movie ladder falls to the synopsis teaser when genres and
-/// length are absent (the live `…Majin Buu,` cut now lives on the default
-/// line too, pinned in cardspec_test): the state carries the teaser and the
-/// tooltip carries the whole note.
+/// The default movie ladder skips the synopsis: with genres and length
+/// absent the state falls to the year (then the clean title), never the
+/// teaser; the tooltip carries the whole note. The same ladder shape is
+/// pinned over the preset table in cardspec_test.
 #[test]
-fn movie_default_state_ladder_to_synopsis() {
+fn movie_default_state_skips_synopsis() {
     const MOVIE_RAW: &str = "Dragon.Ball.Movie.1990.1080p.mkv - PotPlayer";
     let run_act = Action {
         running: true,
@@ -1317,18 +1315,20 @@ fn movie_default_state_ladder_to_synopsis() {
             ..Resolved::default()
         },
     );
-    assert_eq!(
-        got.state, "Years after the battle with Earth's greatest enemy, Majin Buu\u{2026}",
-        "state"
+    assert_eq!(got.state, "1990", "state");
+    assert!(
+        !got.state.contains("Majin Buu"),
+        "default state must not carry the synopsis: {:?}",
+        got.state
     );
     assert_eq!(got.large_text, trim_word(syn, 128), "large_text");
 }
 
-/// The default series state carries the synopsis teaser after the tag (the
-/// live `…meet Elliot;` cut now lives on the default line too, pinned in
-/// cardspec_test).
+/// The default series state is the tag alone: the synopsis teaser stays off
+/// the card by default (the tooltip keeps the whole note), pinned over the
+/// preset table in cardspec_test.
 #[test]
-fn series_default_state_carries_teaser() {
+fn series_default_state_is_tag_alone() {
     const TV_RAW: &str = "Show.S02E04.Episode.1080p.mkv - PotPlayer";
     let run_act = Action {
         running: true,
@@ -1347,10 +1347,11 @@ fn series_default_state_carries_teaser() {
             ..Resolved::default()
         },
     );
-    assert_eq!(
-        got.state,
-        "S2 E4 \u{b7} Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}",
-        "state"
+    assert_eq!(got.state, "S2 E4", "state");
+    assert!(
+        !got.state.contains("Elliot"),
+        "default state must not carry the synopsis: {:?}",
+        got.state
     );
     assert_eq!(got.large_text, trim_word(syn, 128), "large_text");
 }
@@ -1543,7 +1544,12 @@ fn build_activity_resolved_series_state() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "S1 E2 \u{b7} A brave new world unfolds", "state");
+    assert_eq!(got.state, "S1 E2", "state");
+    assert!(
+        !got.state.contains("brave"),
+        "default state must not carry the synopsis: {:?}",
+        got.state
+    );
 }
 
 #[test]
@@ -1795,6 +1801,9 @@ fn idle_card_budget() {
     );
 }
 
+/// The synopsis-bearing State line (the explicit Synopsis preset) trims the
+/// longest note well below its tooltip: the same synopsis fills the 128-unit
+/// tooltip but lands on the card state inside the 72-unit budget.
 #[test]
 fn synopsis_before_after_longest() {
     const MOVIE_RAW: &str = "Dune.Part.Two.2024.1080p.mkv - PotPlayer";
@@ -1805,12 +1814,16 @@ fn synopsis_before_after_longest() {
         ct: 1000,
         ..Action::default()
     };
+    let syn_spec = CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
     let long_syn = "Paul Atreides unites with the Fremen and wages war against House Harkonnen. As betrayal surrounds him, he faces a choice between the love of his life and the fate of the known universe, striving to prevent a terrible future only he can foresee and more beyond.";
     let before = trim_word(
         &format!("Sci-Fi \u{b7} 2h 46m \u{b7} {}", rp_text(long_syn, 1 << 28)),
         128,
     );
-    let after = build_activity_resolved(
+    let after = compose_card(
         MOVIE_RAW,
         Some(&run_act),
         &Resolved {
@@ -1822,6 +1835,8 @@ fn synopsis_before_after_longest() {
             synopsis: long_syn.to_string(),
             ..Resolved::default()
         },
+        true,
+        &syn_spec,
     )
     .state;
     let n = java_units(&after);
@@ -1837,6 +1852,10 @@ fn synopsis_before_after_longest() {
     );
 }
 
+/// The synopsis-bearing State line (the explicit Synopsis preset; the default
+/// state no longer carries the synopsis) stays within the 72-unit
+/// [`STATE_SYNOPSIS_BUDGET`] in every running/paused, movie/series shape, and
+/// its structured prefixes survive whole.
 #[test]
 fn synopsis_state_budget_72() {
     const TV_RAW: &str = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
@@ -1854,10 +1873,19 @@ fn synopsis_state_budget_72() {
         ..Action::default()
     };
     let long_syn = "A retired operative living quietly is pulled back when a ruthless syndicate burns his home. He crosses continents, gathers old allies, and faces a final choice that will decide everything he loves and more.";
+    // The 72-unit synopsis budget lives on the explicit Synopsis preset: the
+    // default state carries no synopsis, so compose through the preset.
+    let syn_spec = CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
+    let compose = |raw: &str, act: &Action, res: &Resolved| {
+        compose_card(raw, Some(act), res, res.is_movie, &syn_spec)
+    };
     let movie = |act: &Action| {
-        build_activity_resolved(
+        compose(
             MOVIE_RAW,
-            Some(act),
+            act,
             &Resolved {
                 is_movie: true,
                 genres: "Action, Drama".to_string(),
@@ -1868,18 +1896,18 @@ fn synopsis_state_budget_72() {
         )
     };
     let series = |act: &Action| {
-        build_activity_resolved(
+        compose(
             TV_RAW,
-            Some(act),
+            act,
             &Resolved {
                 synopsis: long_syn.to_string(),
                 ..Resolved::default()
             },
         )
     };
-    let paused_movie = build_activity_resolved(
+    let paused_movie = compose(
         MOVIE_RAW,
-        Some(&paused_act),
+        &paused_act,
         &Resolved {
             is_movie: true,
             genres: "Sci-Fi".to_string(),
@@ -1888,9 +1916,9 @@ fn synopsis_state_budget_72() {
             ..Resolved::default()
         },
     );
-    let paused_series = build_activity_resolved(
+    let paused_series = compose(
         TV_RAW,
-        Some(&paused_act),
+        &paused_act,
         &Resolved {
             synopsis: long_syn.to_string(),
             ..Resolved::default()
@@ -1903,9 +1931,9 @@ fn synopsis_state_budget_72() {
         ("series paused tag+synopsis", paused_series),
         (
             "series synopsis only",
-            build_activity_resolved(
+            compose(
                 MOVIE_RAW,
-                Some(&run_act),
+                &run_act,
                 &Resolved {
                     synopsis: long_syn.to_string(),
                     ..Resolved::default()
@@ -1952,10 +1980,11 @@ fn synopsis_state_budget_72() {
     );
 }
 
-/// Proves the two surfaces agree on one synopsis: the same Resolved input yields
-/// a State line within the 72-unit budget and a LargeText hover tooltip within
-/// Discord's 128-unit asset-text cap. The mid-length synopsis (~99 units) exceeds
-/// the State budget so the card trims it, but fits the tooltip whole.
+/// Proves the two surfaces agree on one synopsis under the explicit Synopsis
+/// preset: the same Resolved input yields a State line within the 72-unit
+/// budget and a LargeText hover tooltip within Discord's 128-unit asset-text
+/// cap. The mid-length synopsis (~99 units) exceeds the State budget so the
+/// preset trims it, but fits the tooltip whole.
 #[test]
 fn hover_tooltip_whole_and_state_budget_agree() {
     const TV_RAW: &str = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
@@ -1967,6 +1996,13 @@ fn hover_tooltip_whole_and_state_budget_agree() {
         ct: 1000,
         ..Action::default()
     };
+    let syn_spec = CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
+    let compose = |raw: &str, res: &Resolved| {
+        compose_card(raw, Some(&run_act), res, res.is_movie, &syn_spec)
+    };
     // ~99 units: over the 72 State budget, under the 128 tooltip cap.
     let mid_syn = "word ".repeat(20).trim().to_string();
     let n = java_units(&mid_syn);
@@ -1977,9 +2013,8 @@ fn hover_tooltip_whole_and_state_budget_agree() {
     let cases: [(&str, Activity, &str); 2] = [
         (
             "movie synopsis-only",
-            build_activity_resolved(
+            compose(
                 MOVIE_RAW,
-                Some(&run_act),
                 &Resolved {
                     is_movie: true,
                     series: "Mid Film".to_string(),
@@ -1991,9 +2026,8 @@ fn hover_tooltip_whole_and_state_budget_agree() {
         ),
         (
             "series tag+synopsis",
-            build_activity_resolved(
+            compose(
                 TV_RAW,
-                Some(&run_act),
                 &Resolved {
                     series: "Mid Series".to_string(),
                     synopsis: mid_syn.clone(),
@@ -2033,9 +2067,8 @@ fn hover_tooltip_whole_and_state_budget_agree() {
     }
     // Over-cap synopsis still respects both ceilings on the same input.
     let over_syn = "s".repeat(200);
-    let over = build_activity_resolved(
+    let over = compose(
         MOVIE_RAW,
-        Some(&run_act),
         &Resolved {
             is_movie: true,
             series: "Over Film".to_string(),

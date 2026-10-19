@@ -51,6 +51,11 @@ use presence::{Action, Activity, CardPreset, CardSpec, Resolved};
 
 use app_support::config::{CardKind, CardLine, CardSpecs};
 
+// The picker's own two imports: the latch types the dialog reads/writes and the
+// store's key derivations it keys those writes with.
+use metadata::overrides::{season_key_for, series_key_for};
+use metadata::{Candidate, Kind, Override, Scope};
+
 // ---------------------------------------------------------------------------
 // Button ids (`go\window.go:39-70`): rect-table keys, not child control ids.
 // ---------------------------------------------------------------------------
@@ -99,6 +104,10 @@ pub const BTN_SCAN_TURBO: i32 = 22;
 pub const BTN_REPORT: i32 = 23;
 /// Settings LIBRARY "Clear index".
 pub const BTN_CLEAR_INDEX: i32 = 24;
+/// Card view "Fix match..." -- the manual latch picker. Enabled only while
+/// [`app_support::config::live_now_playing`] answers `Some`; dimmed and
+/// input-refused otherwise (see [`fix_match_blocked_reason`]).
+pub const BTN_FIX_MATCH: i32 = 10;
 
 // ---------------------------------------------------------------------------
 // Worker -> UI messages (`go\window.go:74-93`).
@@ -107,6 +116,10 @@ pub const BTN_CLEAR_INDEX: i32 = 24;
 pub const WM_APP_SCAN_PROGRESS: u32 = crate::win32::WM_APP + 3;
 pub const WM_APP_SCAN_DONE: u32 = crate::win32::WM_APP + 4;
 pub const WM_APP_REPORT_DONE: u32 = crate::win32::WM_APP + 5;
+/// The "Fix match" picker's worker -> dialog wakeup (`WM_APP + 6`): the worker
+/// published its outcome into the dialog's slot and this message tells the
+/// dialog's own message loop to read it.
+pub const WM_APP_FIX_MATCH_DONE: u32 = crate::win32::WM_APP + 6;
 /// The Win32 timer message (`go\window.go:83`).
 pub const WM_TIMER: u32 = 0x0113;
 
@@ -1192,7 +1205,7 @@ pub fn card_kind_button(i: i32) -> i32 {
 }
 
 /// `cardFocusOrder` (`go\window.go:1256`), in visual order: the strip, the way
-/// back, the kind toggle, then the two preset rows.
+/// back, the kind toggle, then the two preset rows, then the picker.
 #[must_use]
 pub fn card_focus_order() -> Vec<i32> {
     let mut order = vec![
@@ -1208,6 +1221,7 @@ pub fn card_focus_order() -> Vec<i32> {
     for i in 0..4 {
         order.push(card_state_button(i));
     }
+    order.push(BTN_FIX_MATCH);
     order
 }
 
@@ -1451,6 +1465,19 @@ pub fn compute_card_layout(
             left: margin,
             top: footer_top,
             right: margin + col_w,
+            bottom: footer_top + sc(BTN_H),
+        },
+    });
+    // The card view's action area, second column: the manual latch picker.
+    // `paint_button`/`do_card_action` gate it on the live now-playing state.
+    l.btns.push(UiButton {
+        id: BTN_FIX_MATCH,
+        label: FIX_MATCH_LABEL.into(),
+        style: BTN_OUTLINE,
+        rc: Rect {
+            left: margin + col_w + sc(BTN_GAP_L),
+            top: footer_top,
+            right: margin + content_w,
             bottom: footer_top + sc(BTN_H),
         },
     });
@@ -1738,6 +1765,49 @@ pub fn scan_blocked_reason(scan_active: bool, id: i32) -> &'static str {
 pub fn remove_has_target(sel_row: i32, hover_row: i32, dirs_len: usize) -> bool {
     let n = dirs_len as i32;
     (sel_row >= 0 && sel_row < n) || (hover_row >= 0 && hover_row < n)
+}
+
+/// The Main list's Up/Down step: the absolute row `sel` moves by `delta`
+/// inside a list of `len` rows, clamped to `[0, len - 1]`. Nothing selected
+/// (`-1`) lands on row 0 first; an empty list stays `-1` (no row to select).
+/// Pure, so the keyboard and the click hit-test (`row_at_point` + `list_top`)
+/// both speak absolute folder indices and cannot disagree about the current row.
+#[must_use]
+pub fn step_sel_row(sel: i32, len: usize, delta: i32) -> i32 {
+    if len == 0 {
+        return -1;
+    }
+    if sel < 0 {
+        return 0;
+    }
+    (sel + delta).clamp(0, len as i32 - 1)
+}
+
+/// Home/End: the first (`last = false`) or last (`last = true`) row of a `len`
+/// row list; `-1` when the list is empty.
+#[must_use]
+pub fn edge_sel_row(len: usize, last: bool) -> i32 {
+    if len == 0 {
+        return -1;
+    }
+    if last {
+        len as i32 - 1
+    } else {
+        0
+    }
+}
+
+/// Clamp an absolute selection to a list of `len` rows -- the guard
+/// `refreshDirList` runs when rows are removed: a shrunk list must never leave
+/// the selection pointing past its end. `-1` for an empty list and for an
+/// existing no-selection (nothing to clamp to). Pure, so the shrink guard is
+/// testable with no config I/O.
+#[must_use]
+pub fn clamp_sel_row(sel: i32, len: usize) -> i32 {
+    if len == 0 || sel < 0 {
+        return -1;
+    }
+    sel.min(len as i32 - 1)
 }
 
 /// The scan error the terminal path distinguishes (`go\window.go:2018`: a bare
@@ -2188,42 +2258,46 @@ pub fn live_status_avail_px(hwnd: HWND) -> i32 {
     scan_status_avail_px(96)
 }
 
-/// `measureScanStatusWidth` (`go\window.go:2271`): real GDI font metrics in the
-/// status font (Segoe UI at the section size) at `dpi`. `None` when no DC/font
-/// is available.
+/// The status line's font: the ONE source both the fit measurement and the
+/// paint read. The measure path used to build its own "Segoe UI" at 12px while
+/// the paint drew the brand face at `FS_HINT`, so a fitted line's width was
+/// measured in a face and size nothing rendered. Both callers now build here
+/// (`status_fit_measures_the_painted_font` pins them to it).
+#[must_use]
+fn status_font(dpi: i32) -> Gdi::HFONT {
+    #[cfg(test)]
+    STATUS_FONT_BUILDS.with(|n| n.set(n.get() + 1));
+    create_ui_font(scale_px(dpi, FS_HINT), brand::UI_WEIGHT)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of [`status_font`] builds, so a test can see exactly
+    /// which path built the font without racing the sibling tests that also
+    /// call the measure.
+    static STATUS_FONT_BUILDS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// `measureScanStatusWidth` (`go\window.go:2271`): real GDI font metrics in
+/// [`status_font`] -- the very font the status line paints, so the fitted width
+/// is the rendered width. `None` when no DC/font is available.
 #[must_use]
 pub fn measure_scan_status_width(dpi: i32, s: &str) -> Option<i32> {
     use windows_sys::Win32::Foundation::SIZE;
     use windows_sys::Win32::Graphics::Gdi::{
-        CreateFontW, DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
+        DeleteObject, GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject,
     };
     if s.is_empty() {
         return Some(0);
     }
-    // SAFETY: a screen DC + a created font, both released below; extents do not
-    // depend on the target surface.
+    // SAFETY: a screen DC + a font, both released below; extents do not depend
+    // on the target surface.
     unsafe {
         let hdc = GetDC(std::ptr::null_mut());
         if hdc.is_null() {
             return None;
         }
-        let face = utf16_z("Segoe UI");
-        let font = CreateFontW(
-            -scale_px(dpi, 12),
-            0,
-            0,
-            0,
-            crate::win32::FW_NORMAL,
-            0,
-            0,
-            0,
-            crate::win32::DEFAULT_CHARSET,
-            0,
-            0,
-            0,
-            0,
-            face.as_ptr(),
-        );
+        let font = status_font(dpi);
         if font.is_null() {
             ReleaseDC(std::ptr::null_mut(), hdc);
             return None;
@@ -2329,6 +2403,13 @@ pub fn report_launch_text(url: &str) -> String {
 }
 
 /// `reportIssueStatus` (`go\window.go:1177`).
+///
+/// The failure is made visible twice: the `(gh)` log line carries the FULL
+/// error (message plus cause), and the status strip names the reason while the
+/// prefilled issue stays in reach -- `open` is still handed the URL so the
+/// browser can offer the manual path, and the URL itself is shown when that
+/// open failed. A URL gh filed (including a retry that dropped the labels)
+/// shows the issue URL.
 #[must_use]
 pub fn report_issue_status(
     url: &str,
@@ -2338,18 +2419,59 @@ pub fn report_issue_status(
     if url.is_empty() {
         app_logf(&format!(
             "report: create issue: {}",
-            err.map_or("", repair::Error::message)
+            err.map_or(String::new(), report_error_text)
         ));
         return REPORT_FAILED_TEXT.to_string();
     }
     if let Some(e) = err {
-        app_logf(&format!("report: create issue (gh): {}", e.message()));
+        app_logf(&format!(
+            "report: create issue (gh): {}",
+            report_error_text(e)
+        ));
     }
-    if open(url) {
-        return report_opened_text(err.is_some()).to_string();
+    let opened = open(url);
+    if !opened {
+        app_logf(&format!("report: open {url} failed"));
     }
-    app_logf(&format!("report: open {url} failed"));
-    report_launch_text(url)
+    match err {
+        None => report_launch_text(url),
+        Some(_) if !is_prefilled_issue_url(url) => report_launch_text(url),
+        Some(e) => report_failed_text(&report_error_text(e), url, opened),
+    }
+}
+
+/// The full text of a failed filing for the debug log: the message plus, when
+/// there is one, the cause's text. Logging only [`repair::Error::message`] is
+/// what hid today's label failure.
+#[must_use]
+fn report_error_text(e: &repair::Error) -> String {
+    match e.cause_text() {
+        Some(cause) if !cause.is_empty() => format!("{}: {cause}", e.message()),
+        _ => e.message().to_string(),
+    }
+}
+
+/// The prefilled URL [`repair::issue::create_issue`] falls back to always
+/// carries the `issues/new` path; a URL gh printed after filing never does.
+#[must_use]
+fn is_prefilled_issue_url(url: &str) -> bool {
+    url.contains("/issues/new")
+}
+
+/// The short failure line: the reason, plus the manual path still in reach --
+/// opened in the browser when that worked, shown as the URL when it did not.
+#[must_use]
+fn report_failed_text(reason: &str, url: &str, opened: bool) -> String {
+    let said = if reason.is_empty() {
+        "Report failed".to_string()
+    } else {
+        format!("Report failed: {reason}")
+    };
+    if opened {
+        format!("{said}. Opened a prefilled issue instead.")
+    } else {
+        format!("{said}. Prefilled issue: {url}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2583,7 +2705,1817 @@ pub fn open_external_url(url: &str) -> bool {
     ret as isize > 32
 }
 
-/// A UI action that BLOCKS: it opens a modal dialog (`SHBrowseForFolderW`,
+// ---------------------------------------------------------------------------
+// "Fix match" -- the manual latch picker's pure half.
+//
+// Everything in this section is UI-free and unit-tested: the copy (frozen), the
+// enable rule, the pre-fill, the scope/keys table and the status strings. The
+// dialog window and its worker live further down; nothing here touches an HWND
+// except through the [`Rect`] table the paint/creation paths both read.
+//
+// # Scope -> key rules (the store's own derivations; spelled out here once)
+//
+//   * `Scope::Movie`  -> `movie_key(path)`    (`overrides::movie_key`): the
+//     media file's FULL path. A movie offers NO scope radios -- there is only
+//     one target -- and the dialog pins it directly.
+//   * `Scope::Season` -> `season_key_for(path)`: the folder that directly
+//     holds the episode (the `Season N` / `SNN` folder itself, otherwise the
+//     release-style folder that IS that season).
+//   * `Scope::Series` -> `series_key_for(path)`: the show folder, one level
+//     above a `Season N` folder when there is one.
+//
+// When the two derived keys are EQUAL the folder is both the season and the
+// show (a release-style folder like `Atri S01 1080p BDRip`, or an
+// absolute-numbered show folder with the episodes inside it): the dialog then
+// offers ONE radio for that folder instead of two identical targets, and says
+// so in its note. The choice is `Scope::Series` because the label describes the
+// folder as the show; the keys are identical either way.
+// ---------------------------------------------------------------------------
+
+/// The Card view's picker label. U+2026 ellipsis; frozen copy.
+pub const FIX_MATCH_LABEL: &str = "Fix match\u{2026}";
+/// The dialog's title line. Frozen copy.
+pub const FIX_MATCH_TITLE: &str = "Fix match";
+/// The busy static while a provider pass runs. Frozen copy.
+pub const FIX_MATCH_SEARCHING: &str = "Searching\u{2026}";
+/// Empty-results copy. Frozen copy.
+pub const FIX_MATCH_NO_RESULTS: &str =
+    "No results. Try the title without the episode number, or add the year.";
+/// The provider-free latch button. Frozen copy.
+pub const FIX_MATCH_USE_TEXT: &str = "Use my text as the title";
+/// The failure copy for a provider/store error: the dialog stays open. Frozen
+/// copy; `Nothing was saved` is the promise every failure path keeps.
+pub const FIX_MATCH_ERROR: &str = "Couldn't reach the metadata providers. Nothing was saved.";
+/// The reason a dimmed picker reports when it is clicked with nothing playing
+/// (the enable rule's second half; there is no tooltip to lie in).
+pub const FIX_MATCH_IDLE_REASON: &str =
+    "Nothing is playing - start a video to fix its match.";
+/// The scope section's label. Frozen copy.
+pub const FIX_MATCH_SCOPE_LABEL: &str = "Apply to";
+/// The name field's label. Frozen copy (two spaces before the parenthetical).
+pub const FIX_MATCH_NAME_LABEL: &str = "Name";
+pub const FIX_MATCH_YEAR_LABEL: &str = "Year  (optional)";
+/// The buttons. Frozen copy.
+pub const FIX_MATCH_SEARCH_LABEL: &str = "Search";
+pub const FIX_MATCH_MATCH_LABEL: &str = "Match";
+pub const FIX_MATCH_CANCEL_LABEL: &str = "Cancel";
+pub const FIX_MATCH_REFRESH_LABEL: &str = "Refresh metadata";
+pub const FIX_MATCH_CHANGE_LABEL: &str = "Change match\u{2026}";
+pub const FIX_MATCH_AUTO_LABEL: &str = "Use automatic matching";
+/// The "Use automatic matching" status line. Frozen copy.
+pub const FIX_MATCH_AUTO_STATUS: &str = "Back to automatic matching.";
+/// The already-open guard: a second open while the modal picker lives is
+/// refused with this status instead of stacking a nested loop.
+pub const FIX_MATCH_ALREADY_OPEN_REASON: &str = "Fix match is already open.";
+/// The visible reason when the playing file yields no latch target: the path
+/// is empty or unresolvable, so both scope keys are `None` and `Match` would
+/// otherwise die silently.
+pub const FIX_MATCH_NO_TARGET_REASON: &str =
+    "Nothing to match — the playing file has no folder to latch.";
+/// The visible reason when the whole-show target would be a bare volume: a
+/// file directly under a drive root (`C:\Season 2\...`) must never latch the
+/// drive, so the show key is refused and the dialog says so.
+pub const FIX_MATCH_DRIVE_ROOT_REASON: &str =
+    "Whole-show match refused — the file sits directly under a drive root.";
+
+/// The enable rule: the picker is offered only while something plays. `None`
+/// when the player is gone (or the poll loop has not published yet).
+#[must_use]
+pub fn fix_match_enabled(now: Option<&app_support::config::NowPlaying>) -> bool {
+    now.is_some()
+}
+
+/// The picker's blocked reason for `id`: non-empty exactly when `id` is the
+/// picker button and nothing plays. Any other id never blocks. The paint path
+/// dims on a non-empty reason and the click path refuses on the same value, so
+/// the two can never disagree.
+#[must_use]
+pub fn fix_match_blocked_reason(playing: bool, id: i32) -> &'static str {
+    if id == BTN_FIX_MATCH && !playing {
+        return FIX_MATCH_IDLE_REASON;
+    }
+    ""
+}
+
+/// Whether the playing path sits directly under a drive root, so the
+/// whole-show key would be a bare volume (`c:`) and must be refused. Pure so
+/// the picker and its tests pin it without a window: a file whose parent is
+/// a drive, or whose season folder's parent is a drive.
+#[must_use]
+pub fn fix_match_drive_rooted(path: &str) -> bool {
+    let key = metadata::overrides::normalize_key(path);
+    let Some((parent, _)) = key.rsplit_once('\\') else {
+        return false;
+    };
+    if metadata::overrides::is_volume_key(parent) {
+        return true;
+    }
+    let Some((above, folder)) = parent.rsplit_once('\\') else {
+        return false;
+    };
+    let lower = folder.to_lowercase();
+    let is_season = {
+        if let Some(rest) = lower.strip_prefix("season") {
+            let digits = rest.trim();
+            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
+        } else if let Some(digits) = lower.strip_prefix('s') {
+            !digits.is_empty()
+                && digits.len() <= 2
+                && digits.bytes().all(|b| b.is_ascii_digit())
+        } else {
+            false
+        }
+    };
+    is_season && metadata::overrides::is_volume_key(above)
+}
+
+/// The visible reason when the search screen has no latch target: the
+/// drive-root refusal wins over the generic empty-path reason, and `None`
+/// means there IS a target (the dialog stays quiet). Pure so tests pin the
+/// copy without a window.
+#[must_use]
+pub fn fix_match_no_target_reason(path: &str, is_movie: bool) -> Option<&'static str> {
+    if is_movie {
+        if metadata::overrides::movie_key(path).is_empty() {
+            return Some(FIX_MATCH_NO_TARGET_REASON);
+        }
+        return None;
+    }
+    if fix_match_drive_rooted(path) {
+        return Some(FIX_MATCH_DRIVE_ROOT_REASON);
+    }
+    if metadata::overrides::season_key_for(path).is_none()
+        || metadata::overrides::series_key_for(path).is_none()
+    {
+        return Some(FIX_MATCH_NO_TARGET_REASON);
+    }
+    None
+}
+
+/// The name field's starting text: the folder-aware query for what's playing,
+/// the same [`metadata_core::context::resolve_query`] merge the repair path
+/// and the card path use. A series filename rarely carries the show (an
+/// episode-only file like `S01E02-A Warm View Together [..].mkv` parses to the
+/// EPISODE title), so for a series the folder's show name wins: the user sees
+/// `Atri`, never `A Warm View Together`. The folder show runs through the
+/// card path's own [`titleclean::clean`] pass (episode tag dropped) so a
+/// release-junk folder (`Atri S01 1080p BDRip 10 bits DD+ ...`) prefills the
+/// searchable show title (`Atri`), never the folder string. A movie filename
+/// already carries its own title, so it keeps the resolver's parse (`Dune
+/// Part Two`, never the dotted filename); unknown kinds keep the old
+/// cleaned-filename text. With no usable folder show the prefill falls back
+/// to the resolver's own parse of the raw window title, and then to the card
+/// path's titleclean pass. [`metadata_core::context::context_from_path`]
+/// yields no show for a bare filename, so a movie with no folder context
+/// still prefills its own title.
+#[must_use]
+pub fn fix_match_prefill_name(raw_title: &str, path: &str) -> String {
+    let q = metadata_core::context::resolve_query(raw_title, path);
+    if q.kind == Kind::SERIES {
+        let (show, _) = metadata_core::context::context_from_path(path);
+        if !show.trim().is_empty() {
+            let cleaned = titleclean::clean(&show).title;
+            let trimmed = cleaned.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+            return show;
+        }
+    }
+    let title = q.title.trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    titleclean::clean(raw_title).title.trim().to_string()
+}
+
+/// The provider id as the dialog shows it ("anilist" -> "AniList").
+#[must_use]
+pub fn provider_display_name(provider: &str) -> String {
+    match provider {
+        "anilist" => "AniList".to_string(),
+        "tvmaze" => "TVmaze".to_string(),
+        "cinemeta" => "Cinemeta".to_string(),
+        "wikipedia" => "Wikipedia".to_string(),
+        "justwatch" => "JustWatch".to_string(),
+        "tenrai" => "Tenrai".to_string(),
+        "kitsu" => "Kitsu".to_string(),
+        "episodate" => "Episodate".to_string(),
+        "bangumi" => "Bangumi".to_string(),
+        "livechart" => "LiveChart".to_string(),
+        "ann" => "ANN".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// One result row: `Attack on Titan (2013) · AniList · 25 episodes`. A movie
+/// omits ` · N episodes` (it has no episode table); a series with no table
+/// omits it too, and a zero year is dropped rather than printed `(0)`.
+#[must_use]
+pub fn candidate_row_text(c: &Candidate) -> String {
+    let mut s = c.title.trim().to_string();
+    if c.year > 0 {
+        s.push_str(&format!(" ({})", c.year));
+    }
+    let provider = provider_display_name(&c.provider);
+    if !provider.is_empty() {
+        s.push_str(" · ");
+        s.push_str(&provider);
+    }
+    if c.kind != Kind::MOVIE && c.episode_count > 0 {
+        let plural = if c.episode_count == 1 { "" } else { "s" };
+        s.push_str(&format!(" · {} episode{}", c.episode_count, plural));
+    }
+    s
+}
+
+/// The unmatched sub-line: `Nothing matched for "<media title>"` (the raw
+/// title minus the player suffix, quoted). The strip is the card path's own:
+/// `presence` strips `player::window::SUFFIX` for the idle check and
+/// `metadata_core::parse::parse_raw` strips its `POT_PLAYER_SUFFIX` twin for
+/// the prefill — neither constant is reachable from this crate's deps, so the
+/// value is spelled at this one call site. Frozen copy apart from the strip.
+#[must_use]
+pub fn fix_match_sub_line(raw_title: &str) -> String {
+    let media = raw_title.strip_suffix(" - PotPlayer").unwrap_or(raw_title);
+    format!("Nothing matched for \"{media}\"")
+}
+
+/// The matched sub-line: `Matched by you · AniList — Attack on Titan, all 25
+/// episodes`. A provider-free latch (the typed title) drops the provider
+/// segment; a movie drops the episode clause (it has no pins).
+#[must_use]
+pub fn fix_match_matched_sub_line(over: &Override) -> String {
+    let provider = provider_display_name(&over.provider);
+    let mut s = String::from("Matched by you");
+    if !provider.is_empty() {
+        s.push_str(" · ");
+        s.push_str(&provider);
+    }
+    s.push_str(" — ");
+    s.push_str(&over.title);
+    if over.scope != Scope::Movie && !over.episodes.is_empty() {
+        s.push_str(&format!(", all {} episodes", over.episodes.len()));
+    }
+    s
+}
+
+/// The matched line: `Applied to  Attack on Titan \ Season 2` (two spaces after
+/// `to`; frozen copy). A movie reports its file, a show its title, a season its
+/// title plus the season component of the stored key (case restored for the
+/// `Season N` / `SNN` shapes; a release-style folder keeps its stored form).
+#[must_use]
+pub fn fix_match_applied_text(over: &Override, path: &str) -> String {
+    let label = match over.scope {
+        Scope::Movie => path_last(path).to_string(),
+        Scope::Series => over.title.clone(),
+        Scope::Season => format!(
+            "{} \\ {}",
+            over.title,
+            season_component_display(key_last(&over.key))
+        ),
+    };
+    format!("Applied to  {label}")
+}
+
+/// The match status: `Matched to <title> — <N> episodes now show their own
+/// title and cover.` A movie (and any latch with no pinned episodes) is
+/// `Matched to <title>.` -- never a fabricated episode count.
+#[must_use]
+pub fn fix_match_matched_status(title: &str, episodes: usize) -> String {
+    if episodes == 0 {
+        return format!("Matched to {title}.");
+    }
+    format!("Matched to {title} — {episodes} episodes now show their own title and cover.")
+}
+
+/// The refresh status: `Refreshed <title>.`
+#[must_use]
+pub fn fix_match_refreshed_status(title: &str) -> String {
+    format!("Refreshed {title}.")
+}
+
+/// One scope radio: the store target it writes plus the frozen-copy label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScopeChoice {
+    /// The scope a pick writes.
+    pub scope: Scope,
+    /// The normalised store key ([`season_key_for`]/[`series_key_for`]).
+    pub key: String,
+    /// The radio's label.
+    pub label: String,
+    /// A plain one-line explanation, only where two targets would otherwise be
+    /// identical (the release-style folder).
+    pub note: Option<String>,
+    /// Whether this radio starts selected.
+    pub default: bool,
+}
+
+/// The scope targets the picker offers for one playing file. A movie offers
+/// none (one target, pinned directly); a file in a `Season N` folder offers the
+/// season (default) and the whole show; a folder that is both at once offers
+/// the one real target and says so. A bare-volume key (a file directly under
+/// a drive root, whose whole-show key would be `c:`) offers nothing: latching
+/// the drive is refused and [`fix_match_no_target_reason`] says so in the UI.
+/// See the section comment for the key rules.
+#[must_use]
+pub fn fix_match_scope_choices(path: &str, is_movie: bool) -> Vec<ScopeChoice> {
+    if is_movie {
+        // No radios: the one target is the movie file's own key.
+        return Vec::new();
+    }
+    let (Some(season_key), Some(series_key)) =
+        (season_key_for(path), series_key_for(path))
+    else {
+        return Vec::new();
+    };
+    if metadata::overrides::is_volume_key(&season_key)
+        || metadata::overrides::is_volume_key(&series_key)
+    {
+        return Vec::new();
+    }
+    let folder = path_parent_name(path).to_string();
+    if season_key == series_key {
+        // One folder is both the season and the show: one radio, labelled with
+        // that folder, plus the plain note the brief asks for.
+        let note = if picker_is_season_folder(&folder) || folder_reads_as_season(&folder) {
+            Some(
+                "This folder is both the show folder and its season, so one match covers every \
+                 episode in it."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        return vec![ScopeChoice {
+            scope: Scope::Series,
+            key: series_key,
+            label: format!("Whole show  — {folder}"),
+            note,
+            default: true,
+        }];
+    }
+    let show = path_grandparent_name(path).to_string();
+    vec![
+        ScopeChoice {
+            scope: Scope::Season,
+            key: season_key,
+            label: format!("This season — {show} \\ {folder}"),
+            note: None,
+            default: true,
+        },
+        ScopeChoice {
+            scope: Scope::Series,
+            key: series_key,
+            label: format!("Whole show  — {show}"),
+            note: None,
+            default: false,
+        },
+    ]
+}
+
+/// The plugin-free latch `Use my text as the title` writes: the typed name as
+/// the title, the typed year (0 for none), the chosen scope and key -- and NO
+/// provider identity, cover or episode pins. The ladder keeps every field the
+/// latch does not carry.
+#[must_use]
+pub fn fix_match_text_override(title: &str, year: i32, scope: Scope, key: &str) -> Override {
+    Override {
+        scope,
+        key: key.to_string(),
+        title: title.trim().to_string(),
+        year: year.max(0),
+        provider: String::new(),
+        provider_id: String::new(),
+        poster: String::new(),
+        media: None,
+        episodes: Vec::new(),
+        created_at_ms: metadata::overrides::now_ms(),
+    }
+}
+
+/// The last `\`- or `/`-separated component of a path (`""` when none).
+fn path_last(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or("")
+}
+
+/// The containing folder's display name (second-to-last component).
+fn path_parent_name(path: &str) -> &str {
+    let mut parts = path.rsplit(['\\', '/']).filter(|s| !s.is_empty());
+    let _file = parts.next();
+    parts.next().unwrap_or("")
+}
+
+/// The show folder's display name (third-to-last component), used when the
+/// containing folder is the season folder.
+fn path_grandparent_name(path: &str) -> &str {
+    let mut parts = path.rsplit(['\\', '/']).filter(|s| !s.is_empty());
+    let _file = parts.next();
+    let _parent = parts.next();
+    parts.next().unwrap_or("")
+}
+
+/// The last component of a normalised store key.
+fn key_last(key: &str) -> &str {
+    key.rsplit('\\').next().unwrap_or(key)
+}
+
+/// `season 2` -> `Season 2`, `s02` -> `S02`; anything else is kept as stored.
+fn season_component_display(component: &str) -> String {
+    let lower = component.to_lowercase();
+    if let Some(rest) = lower.strip_prefix("season") {
+        let digits = rest.trim();
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("Season {digits}");
+        }
+    }
+    if let Some(digits) = lower.strip_prefix('s')
+        && !digits.is_empty()
+        && digits.len() <= 2
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return format!("S{digits}");
+    }
+    component.to_string()
+}
+
+/// Whether one folder name is exactly a season folder (`Season N` / `SNN`), the
+/// same rule `metadata::overrides` applies internally. Only the LABEL/note uses
+/// it; every store key still comes from `season_key_for`/`series_key_for`.
+fn picker_is_season_folder(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    if let Some(rest) = lower.strip_prefix("season") {
+        let digits = rest.trim();
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if let Some(digits) = lower.strip_prefix('s') {
+        return !digits.is_empty()
+            && digits.len() <= 2
+            && digits.bytes().all(|b| b.is_ascii_digit());
+    }
+    false
+}
+
+/// Whether a folder name READS as a season release (`Atri S01 1080p BDRip`,
+/// `Show Season 2 [1080p]`): an `sNN` token or `season` followed by a number.
+/// This only decides whether the one-target case carries its plain note.
+fn folder_reads_as_season(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    for (i, token) in tokens.iter().enumerate() {
+        if let Some(digits) = token.strip_prefix('s')
+            && !digits.is_empty()
+            && digits.len() <= 2
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return true;
+        }
+        if (*token == "season" || *token == "seasons")
+            && tokens.get(i + 1).is_some_and(|n| {
+                !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+            })
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// The picker's window class.
+pub const FIX_MATCH_CLASS_NAME: &str = "PotflixFixMatchWnd";
+
+/// The picker's stock-control ids (WM_COMMAND ids; distinct from the rect-table
+/// button ids which are another vocabulary entirely).
+const FM_ID_TITLE: i32 = 200;
+const FM_ID_SUB: i32 = 201;
+const FM_ID_NAME_LABEL: i32 = 202;
+const FM_ID_NAME: i32 = 203;
+const FM_ID_YEAR_LABEL: i32 = 204;
+const FM_ID_YEAR: i32 = 205;
+const FM_ID_SEARCH: i32 = 206;
+const FM_ID_LIST: i32 = 207;
+const FM_ID_SEARCHING: i32 = 208;
+const FM_ID_SCOPE_LABEL: i32 = 209;
+const FM_ID_RADIO_A: i32 = 210;
+const FM_ID_RADIO_B: i32 = 211;
+const FM_ID_NOTE: i32 = 212;
+const FM_ID_STATUS: i32 = 213;
+const FM_ID_MATCH: i32 = 214;
+const FM_ID_CANCEL: i32 = 215;
+const FM_ID_USE_TEXT: i32 = 216;
+const FM_ID_APPLIED: i32 = 217;
+const FM_ID_REFRESH: i32 = 218;
+const FM_ID_CHANGE: i32 = 219;
+const FM_ID_AUTO: i32 = 220;
+
+/// The live picker window, or null: set while the modal dialog exists. The
+/// capture harness reaches the dialog through this instead of guessing a
+/// handle; the real UI never needs it.
+static FIX_MATCH_HWND: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The picker's window handle while it is open (null otherwise).
+#[must_use]
+pub fn fix_match_dialog_hwnd() -> HWND {
+    FIX_MATCH_HWND.load(std::sync::atomic::Ordering::SeqCst) as HWND
+}
+
+/// One picker screen: the search form or the already-latched state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixScreen {
+    Search,
+    Matched,
+}
+
+/// The picker's control rects at one DPI for one screen. Pure; the dialog
+/// window and the layout tests both read this one table.
+#[derive(Clone, Debug, Default)]
+pub struct FixMatchLayout {
+    pub client_w: i32,
+    pub client_h: i32,
+    pub title: Rect,
+    pub sub: Rect,
+    pub name_label: Rect,
+    pub name_edit: Rect,
+    pub year_label: Rect,
+    pub year_edit: Rect,
+    pub search: Rect,
+    pub list: Rect,
+    pub searching: Rect,
+    pub scope_label: Rect,
+    pub radios: Vec<Rect>,
+    pub note: Rect,
+    pub applied: Rect,
+    pub status: Rect,
+    /// `(control id, rect)` in creation order.
+    pub buttons: Vec<(i32, Rect)>,
+}
+
+/// `fixMatchLayout`: the dialog's geometry, in logical px scaled by `dpi`.
+#[must_use]
+pub fn fix_match_layout(dpi: i32, screen: FixScreen, radios: usize) -> FixMatchLayout {
+    let sc = |v: i32| scale_px(dpi, v);
+    let m = sc(20);
+    let right = sc(520) - m;
+    let mut l = FixMatchLayout { client_w: sc(520), ..FixMatchLayout::default() };
+    let title = Rect { left: m, top: sc(14), right, bottom: sc(38) };
+    let sub = Rect { left: m, top: sc(44), right, bottom: sc(64) };
+    l.title = title;
+    l.sub = sub;
+    match screen {
+        FixScreen::Search => {
+            l.client_h = sc(588);
+            l.name_label = Rect { left: m, top: sc(78), right, bottom: sc(96) };
+            l.name_edit = Rect { left: m, top: sc(98), right: m + sc(300), bottom: sc(126) };
+            l.search = Rect { left: m + sc(312), top: sc(98), right, bottom: sc(126) };
+            l.year_label = Rect { left: m, top: sc(136), right, bottom: sc(154) };
+            l.year_edit = Rect { left: m, top: sc(156), right: m + sc(72), bottom: sc(184) };
+            l.list = Rect { left: m, top: sc(198), right, bottom: sc(398) };
+            l.searching = l.list;
+            l.scope_label = Rect { left: m, top: sc(410), right, bottom: sc(428) };
+            let mut top = sc(430);
+            for _ in 0..radios.min(2) {
+                l.radios.push(Rect { left: m, top, right, bottom: top + sc(22) });
+                top += sc(24);
+            }
+            l.note = Rect { left: m, top: sc(480), right, bottom: sc(498) };
+            l.status = Rect { left: m, top: sc(502), right, bottom: sc(522) };
+            let (bt, bb) = (sc(532), sc(568));
+            l.buttons = vec![
+                (FM_ID_USE_TEXT, Rect { left: m, top: bt, right: m + sc(260), bottom: bb }),
+                (FM_ID_MATCH, Rect { left: m + sc(280), top: bt, right: m + sc(380), bottom: bb }),
+                (FM_ID_CANCEL, Rect { left: m + sc(390), top: bt, right, bottom: bb }),
+            ];
+        }
+        FixScreen::Matched => {
+            l.client_h = sc(244);
+            l.applied = Rect { left: m, top: sc(74), right, bottom: sc(94) };
+            let (bt, bb) = (sc(112), sc(148));
+            l.buttons = vec![
+                (FM_ID_REFRESH, Rect { left: m, top: bt, right: m + sc(230), bottom: bb }),
+                (FM_ID_CHANGE, Rect { left: m + sc(250), top: bt, right, bottom: bb }),
+                (FM_ID_AUTO, Rect { left: m, top: sc(158), right, bottom: sc(194) }),
+            ];
+            l.status = Rect { left: m, top: sc(204), right, bottom: sc(224) };
+        }
+    }
+    l
+}
+
+/// How long one provider pass may take: the same 90 s budget the CLIs hand
+/// their scopes. The scope is built and used on the WORKER thread only.
+pub const FIX_MATCH_DEADLINE: Duration = Duration::from_secs(90);
+
+/// One job the dialog hands its worker thread.
+enum FixJob {
+    /// The typed name/year over the kind's legs.
+    Search { name: String, year: i32, want: Kind },
+    /// Pin one picked candidate into the store.
+    Latch { cand: Candidate, scope: Scope, key: String },
+    /// Re-fetch a stored latch's identity. Boxed: `Override` is the enum's
+    /// largest variant by far, and an unboxed field makes every `FixJob`
+    /// that size.
+    Refresh { over: Box<Override> },
+    /// Drop a stored latch (the `Use automatic matching` path).
+    Unmatch { scope: Scope, key: String },
+    /// The plugin-free latch: the typed title with no provider identity.
+    UseText { title: String, year: i32, scope: Scope, key: String },
+}
+
+/// What a worker published for the dialog to apply.
+enum FixOutcome {
+    /// A finished search: the rows to list (empty = the no-results copy).
+    Search(Vec<Candidate>),
+    /// The latch is written and saved; the dialog closes with this status.
+    Latched(String),
+    /// The job failed: the dialog shows [`FIX_MATCH_ERROR`] and stays open.
+    Failed,
+}
+
+/// The worker body: one bounded pass, then publish. Never touches the UI.
+fn fix_match_worker(job: FixJob) -> FixOutcome {
+    let cancel = metadata_http::cancel::Cancel::with_deadline(FIX_MATCH_DEADLINE);
+    match job {
+        FixJob::Search { name, year, want } => {
+            FixOutcome::Search(metadata::search(&cancel, &name, year, want))
+        }
+        FixJob::Latch { cand, scope, key } => match metadata::pin_from_candidate(
+            &cancel, &cand, scope, &key,
+        ) {
+            Ok(over) => match fix_match_put(&over) {
+                Ok(()) => FixOutcome::Latched(fix_match_matched_status(
+                    &over.title,
+                    over.episodes.len(),
+                )),
+                Err(_) => FixOutcome::Failed,
+            },
+            Err(_) => FixOutcome::Failed,
+        },
+        FixJob::Refresh { over } => match metadata::refresh(&cancel, &over) {
+            Ok(fresh) => match fix_match_put(&fresh) {
+                Ok(()) => FixOutcome::Latched(fix_match_refreshed_status(&fresh.title)),
+                Err(_) => FixOutcome::Failed,
+            },
+            Err(_) => FixOutcome::Failed,
+        },
+        FixJob::UseText { title, year, scope, key } => {
+            let over = fix_match_text_override(&title, year, scope, &key);
+            match fix_match_put(&over) {
+                Ok(()) => FixOutcome::Latched(fix_match_matched_status(&over.title, 0)),
+                Err(_) => FixOutcome::Failed,
+            }
+        }
+        FixJob::Unmatch { scope, key } => match metadata::overrides::load() {
+            Ok(mut store) => match store.remove(scope, &key) {
+                Ok(()) => FixOutcome::Latched(FIX_MATCH_AUTO_STATUS.to_string()),
+                Err(_) => FixOutcome::Failed,
+            },
+            Err(_) => FixOutcome::Failed,
+        },
+    }
+}
+
+/// Load + put in one call, so no caller can write a half latch: a failed load
+/// carries on with the documented empty recovery store, and a failed save is
+/// reported ([`FixOutcome::Failed`]) instead of silently dropping the latch.
+fn fix_match_put(over: &Override) -> Result<(), metadata::Error> {
+    let mut store = metadata::overrides::load()
+        .unwrap_or_else(|_| metadata::overrides::Store::empty());
+    store.put(over.clone())
+}
+
+/// The dialog's live state: owned by the stack frame running the modal loop,
+/// reached from the wndproc through `GWLP_USERDATA`.
+struct FixMatchState {
+    owner: HWND,
+    dlg: HWND,
+    dpi: i32,
+    raw_title: String,
+    path: String,
+    is_movie: bool,
+    /// The latch already resolving for `path`, if any: selects the matched
+    /// screen (`None` = the search screen).
+    matched: Option<Override>,
+    /// The scope targets the search screen offers (the key rules above).
+    choices: Vec<ScopeChoice>,
+    /// The rows currently listed.
+    candidates: Vec<Candidate>,
+    /// Every created control: `(id, hwnd)`.
+    ctl: Vec<(i32, HWND)>,
+    /// Fonts the dialog owns; freed on teardown, after the window is destroyed.
+    fonts: Vec<Gdi::HFONT>,
+    /// The dark canvas brush returned from `WM_CTLCOLORSTATIC`.
+    bg_brush: Gdi::HBRUSH,
+    /// The in-flight job's outcome slot; the generation rejects a stale post.
+    slot: Arc<Mutex<Option<(u64, FixOutcome)>>>,
+    generation: u64,
+    /// True while a provider job runs (the action controls are disabled and the
+    /// busy static reads `Searching…`).
+    busy: bool,
+    screen: FixScreen,
+    /// The status this run reports when it closes; `None` = cancelled.
+    status: Option<String>,
+    /// Whether a search has finished at least once on this screen: tells "not
+    /// searched yet" from "nothing found" (the no-results copy).
+    searched: bool,
+    /// True while the status static carries the error copy (paint color).
+    status_error: bool,
+    layout: FixMatchLayout,
+}
+
+impl FixMatchState {
+    /// One control's handle by id (null when not created).
+    fn h(&self, id: i32) -> HWND {
+        self.ctl
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map_or(std::ptr::null_mut(), |(_, h)| *h)
+    }
+
+    /// `SetWindowTextW` from a Rust string.
+    fn set_text(&self, id: i32, text: &str) {
+        let u = utf16_z(text);
+        unsafe { crate::win32::SetWindowTextW(self.h(id), u.as_ptr()) };
+    }
+
+    /// The static's current text.
+    fn text(&self, id: i32) -> String {
+        let mut buf = [0u16; 512];
+        let n = unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetWindowTextW(
+                self.h(id),
+                buf.as_mut_ptr(),
+                buf.len() as i32,
+            )
+        };
+        if n <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..n as usize])
+    }
+
+    /// The checked radio's index, or `None` when neither is checked.
+    fn checked_scope_index(&self) -> Option<usize> {
+        for (i, id) in [FM_ID_RADIO_A, FM_ID_RADIO_B].iter().enumerate() {
+            let on = unsafe {
+                crate::win32::SendMessageW(self.h(*id), BM_GETCHECK, 0, 0) as u32 == BST_CHECKED
+            };
+            if on {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// The (scope, key) the current selection would write: the movie file's own
+    /// key for a movie, otherwise the checked radio's target. `None` when
+    /// neither exists (an odd path, or no radio).
+    fn selected_target(&self) -> Option<(Scope, String)> {
+        if self.is_movie {
+            let key = metadata::overrides::movie_key(&self.path);
+            return (!key.is_empty()).then_some((Scope::Movie, key));
+        }
+        let index = self.checked_scope_index()?;
+        self.choices
+            .get(index)
+            .map(|c| (c.scope, c.key.clone()))
+    }
+}
+
+/// Stock-control class names (`CreateWindowExW` classes, not our own).
+const CLASS_STATIC: &str = "STATIC";
+const CLASS_EDIT: &str = "EDIT";
+const CLASS_BUTTON: &str = "BUTTON";
+const CLASS_LISTBOX: &str = "LISTBOX";
+
+// Control styles the picker composes with (stable Win32 values).
+const WS_POPUP_W: u32 = 0x8000_0000;
+const WS_CAPTION_W: u32 = crate::win32::WS_CAPTION;
+const WS_SYSMENU_W: u32 = crate::win32::WS_SYS_MENU;
+const WS_GROUP_STYLE: u32 = 0x0002_0000;
+const ES_AUTOHSCROLL: u32 = 0x0080;
+const ES_NUMBER: u32 = 0x2000;
+const BS_DEFPUSHBUTTON: u32 = 0x0001;
+const BS_AUTORADIOBUTTON: u32 = 0x0009;
+const BM_GETCHECK: u32 = 0x00F0;
+const BM_SETCHECK: u32 = 0x00F1;
+const BST_CHECKED: u32 = 1;
+const BST_UNCHECKED: u32 = 0;
+const LBN_SELCHANGE: u32 = 1;
+const LBN_DBLCLK: u32 = 2;
+const WM_SETFONT: u32 = 0x0030;
+const WM_NCCREATE: u32 = 0x0081;
+const EM_SETLIMITTEXT: u32 = 0x00C5;
+const WM_CTLCOLORSTATIC: u32 = 0x0138;
+/// `IDCANCEL`: the id the dialog manager sends for Esc (and the id a stock
+/// dialog's Cancel button would carry; the picker's own id is `FM_ID_CANCEL`).
+const IDCANCEL: i32 = 2;
+
+/// Register the picker's window class once per process.
+fn ensure_fix_match_class(hinst: windows_sys::Win32::Foundation::HINSTANCE) -> bool {
+    static REGISTERED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REGISTERED.get_or_init(|| {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{RegisterClassExW, WNDCLASSEXW};
+        let class = utf16_z(FIX_MATCH_CLASS_NAME);
+        let cursor = unsafe {
+            crate::win32::LoadCursorW(
+                std::ptr::null_mut(),
+                crate::win32::IDC_ARROW as usize as *const u16,
+            )
+        };
+        let mut wc: WNDCLASSEXW = unsafe { std::mem::zeroed() };
+        wc.cbSize = std::mem::size_of::<WNDCLASSEXW>() as u32;
+        wc.lpfnWndProc = Some(fix_match_wnd_proc);
+        wc.hInstance = hinst;
+        wc.hCursor = cursor;
+        // The class brush erases the dialog canvas; kept for the process life
+        // like the main window's own class brush.
+        wc.hbrBackground = unsafe { crate::win32::CreateSolidBrush(COL_BG) } as usize
+            as *mut core::ffi::c_void;
+        wc.lpszClassName = class.as_ptr();
+        let atom = unsafe { RegisterClassExW(&wc) };
+        atom != 0
+            || unsafe { windows_sys::Win32::Foundation::GetLastError() }
+                == ERROR_CLASS_ALREADY_EXISTS
+    })
+}
+
+/// `CreateWindowExW` one child control of the picker.
+fn fix_match_add_control(
+    parent: HWND,
+    hinst: windows_sys::Win32::Foundation::HINSTANCE,
+    class: &str,
+    text: &str,
+    style: u32,
+    rc: Rect,
+    id: i32,
+) -> HWND {
+    let class = utf16_z(class);
+    let text = utf16_z(text);
+    unsafe {
+        crate::win32::CreateWindowExW(
+            0,
+            class.as_ptr(),
+            text.as_ptr(),
+            style,
+            rc.left,
+            rc.top,
+            rc.right - rc.left,
+            rc.bottom - rc.top,
+            parent,
+            id as usize as *mut core::ffi::c_void,
+            hinst,
+            std::ptr::null(),
+        )
+    }
+}
+
+const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+
+impl FixMatchState {
+    /// Create the modal popup, its controls and its fonts for `now`, owned by
+    /// `owner`. Hands ownership of the state box to the dialog window (via
+    /// `GWLP_USERDATA`; `WM_DESTROY` frees it) and returns the raw pointer for
+    /// the run loop's loop-level work. Does not run the loop and does not
+    /// touch the owner's enabled state -- [`fix_match_run`] owns both.
+    fn open(owner: HWND, now: &app_support::config::NowPlaying) -> Result<*mut Self, String> {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, WS_CAPTION, WS_POPUP, WS_SYSMENU};
+        let hinst = unsafe { crate::win32::GetModuleHandleW(std::ptr::null()) };
+        if !ensure_fix_match_class(hinst) {
+            return Err("fix match: RegisterClassExW failed".into());
+        }
+        let q = metadata_core::context::resolve_query(&now.raw_title, &now.path);
+        let is_movie = q.kind == Kind::MOVIE;
+        let choices = fix_match_scope_choices(&now.path, is_movie);
+        let matched = metadata::overrides::load()
+            .ok()
+            .and_then(|store| store.resolve_for(&now.path, is_movie).cloned());
+        let screen = if matched.is_some() {
+            FixScreen::Matched
+        } else {
+            FixScreen::Search
+        };
+        let bg_brush = unsafe { crate::win32::CreateSolidBrush(COL_BG) };
+        let mut state = Box::new(FixMatchState {
+            owner,
+            dlg: std::ptr::null_mut(),
+            dpi: 96,
+            raw_title: now.raw_title.clone(),
+            path: now.path.clone(),
+            is_movie,
+            matched,
+            choices,
+            candidates: Vec::new(),
+            ctl: Vec::new(),
+            fonts: Vec::new(),
+            bg_brush: bg_brush as Gdi::HBRUSH,
+            slot: Arc::new(Mutex::new(None)),
+            generation: 0,
+            busy: false,
+            screen,
+            status: None,
+            searched: false,
+            status_error: false,
+            layout: FixMatchLayout::default(),
+        });
+        let class = utf16_z(FIX_MATCH_CLASS_NAME);
+        let title = utf16_z(FIX_MATCH_TITLE);
+        let dlg = unsafe {
+            CreateWindowExW(
+                0,
+                class.as_ptr(),
+                title.as_ptr(),
+                WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                crate::win32::CW_USEDEFAULT,
+                crate::win32::CW_USEDEFAULT,
+                100,
+                100,
+                owner,
+                std::ptr::null_mut(),
+                hinst,
+                (&mut *state) as *mut FixMatchState as *const core::ffi::c_void,
+            )
+        };
+        if dlg.is_null() {
+            // SAFETY: the brush was created above and never handed out.
+            unsafe { Gdi::DeleteObject(state.bg_brush) };
+            return Err("fix match: CreateWindowExW failed".into());
+        }
+        state.dlg = dlg;
+        state.dpi = window_dpi(dlg).max(96);
+        if let Err(message) = state.create_controls(hinst) {
+            // Tear the half-built window down NOW: its wndproc's userdata
+            // still points at `state`, which drops with this frame -- so clear
+            // the slot first, or `WM_DESTROY` would free the box out from
+            // under this return. The teardown in `WM_DESTROY` is skipped once
+            // the slot is cleared, so free the GDI objects here or the brush
+            // plus up to 3 fonts leak.
+            // SAFETY: `dlg` is this thread's popup; the brush and every font
+            // in `state.fonts` were created above and are freed exactly once
+            // here (the wndproc frees nothing once userdata is zero).
+            for f in &state.fonts {
+                unsafe { Gdi::DeleteObject(*f) };
+            }
+            unsafe { Gdi::DeleteObject(state.bg_brush) };
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                    dlg,
+                    windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+                    0,
+                );
+                crate::win32::DestroyWindow(dlg)
+            };
+            return Err(message);
+        }
+        // The name field starts from the resolver's own parse of the raw
+        // title; the user edits from there.
+        state.set_text(FM_ID_NAME, &fix_match_prefill_name(&now.raw_title, &now.path));
+        state.apply_screen();
+        // SAFETY: `dlg` is this thread's popup; the calls only affect it.
+        unsafe {
+            crate::win32::apply_dark_caption(dlg, COL_BG, COL_TEXT);
+            crate::win32::ShowWindow(dlg, crate::win32::SW_SHOW);
+            crate::win32::UpdateWindow(dlg);
+        }
+        let focus = if screen == FixScreen::Search {
+            state.h(FM_ID_NAME)
+        } else {
+            state.h(FM_ID_REFRESH)
+        };
+        // SAFETY: SetFocus only moves the thread's keyboard focus.
+        fix_match_focus(focus);
+        FIX_MATCH_HWND.store(dlg as usize, std::sync::atomic::Ordering::SeqCst);
+        Ok(Box::into_raw(state))
+    }
+
+    /// Create every control once (all at 1x1; [`Self::apply_screen`] owns
+    /// geometry) and apply the dialog's fonts to each.
+    fn create_controls(&mut self, hinst: windows_sys::Win32::Foundation::HINSTANCE) -> Result<(), String> {
+        let sc = |v: i32| scale_px(self.dpi, v);
+        let title_font = brand::display(sc(FS_TITLE));
+        let body_font = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
+        let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+        for f in [title_font, body_font, hint_font] {
+            if f.is_null() {
+                // The half-created fonts never reach `self.fonts`, so free
+                // them here: the `open` failure path only frees `self.fonts`
+                // plus the brush, and must not leak this trio.
+                // SAFETY: each handle was just created above and is non-null
+                // when freed; null handles are never freed.
+                for live in [title_font, body_font, hint_font] {
+                    if !live.is_null() {
+                        unsafe { Gdi::DeleteObject(live) };
+                    }
+                }
+                return Err("fix match: CreateFontW failed".into());
+            }
+        }
+        self.fonts = vec![title_font, body_font, hint_font];
+        let base = crate::win32::WS_CHILD | crate::win32::WS_VISIBLE;
+        let tab = crate::win32::WS_TAB_STOP;
+        let zero = Rect { left: 0, top: 0, right: 1, bottom: 1 };
+        let mut add = |id: i32, class: &str, style: u32| -> Result<(), String> {
+            let h = fix_match_add_control(self.dlg, hinst, class, "", style, zero, id);
+            if h.is_null() {
+                return Err(format!("fix match: control {id} failed"));
+            }
+            self.ctl.push((id, h));
+            let font = match id {
+                FM_ID_TITLE => title_font,
+                FM_ID_NAME | FM_ID_YEAR | FM_ID_LIST | FM_ID_SEARCH | FM_ID_MATCH
+                | FM_ID_CANCEL | FM_ID_USE_TEXT | FM_ID_REFRESH | FM_ID_CHANGE | FM_ID_AUTO => {
+                    body_font
+                }
+                _ => hint_font,
+            };
+            // SAFETY: `font` lives in `self.fonts` for the dialog's whole life.
+            unsafe { crate::win32::SendMessageW(h, WM_SETFONT, font as usize, 1) };
+            Ok(())
+        };
+        // Statics.
+        for id in [
+            FM_ID_TITLE,
+            FM_ID_SUB,
+            FM_ID_NAME_LABEL,
+            FM_ID_YEAR_LABEL,
+            FM_ID_SCOPE_LABEL,
+            FM_ID_NOTE,
+            FM_ID_STATUS,
+            FM_ID_SEARCHING,
+            FM_ID_APPLIED,
+        ] {
+            add(id, CLASS_STATIC, base)?;
+        }
+        // The two edits: the name, and the ES_NUMBER year (max 4 chars).
+        add(FM_ID_NAME, CLASS_EDIT, base | crate::win32::WS_BORDER | tab | ES_AUTOHSCROLL)?;
+        add(FM_ID_YEAR, CLASS_EDIT, base | crate::win32::WS_BORDER | tab | ES_NUMBER)?;
+        // The results list.
+        add(
+            FM_ID_LIST,
+            CLASS_LISTBOX,
+            base | crate::win32::WS_BORDER | crate::win32::WS_V_SCROLL | crate::win32::LBS_NOTIFY | tab,
+        )?;
+        // Buttons: Search, the two radios (A opens the group), the secondary
+        // Use-my-text, Match (the default button) and Cancel.
+        add(FM_ID_SEARCH, CLASS_BUTTON, base | tab)?;
+        add(FM_ID_RADIO_A, CLASS_BUTTON, base | tab | BS_AUTORADIOBUTTON | WS_GROUP_STYLE)?;
+        add(FM_ID_RADIO_B, CLASS_BUTTON, base | tab | BS_AUTORADIOBUTTON)?;
+        add(FM_ID_USE_TEXT, CLASS_BUTTON, base | tab)?;
+        add(FM_ID_MATCH, CLASS_BUTTON, base | tab | BS_DEFPUSHBUTTON)?;
+        add(FM_ID_CANCEL, CLASS_BUTTON, base | tab)?;
+        // The matched screen's three actions.
+        add(FM_ID_REFRESH, CLASS_BUTTON, base | tab)?;
+        add(FM_ID_CHANGE, CLASS_BUTTON, base | tab)?;
+        add(FM_ID_AUTO, CLASS_BUTTON, base | tab)?;
+        // SAFETY: the year edit was created above; `add` is dead here so the
+        // `self.h` borrow no longer overlaps the closure's `&mut self` borrow.
+        unsafe { crate::win32::SendMessageW(self.h(FM_ID_YEAR), EM_SETLIMITTEXT, 4, 0) };
+        Ok(())
+    }
+
+    /// Position every control, set every text and resize/center the dialog for
+    /// the current screen. One function owns which control is where, so the
+    /// two screens cannot drift from each other.
+    fn apply_screen(&mut self) {
+        use windows_sys::Win32::Foundation::RECT;
+        self.layout = fix_match_layout(self.dpi, self.screen, self.choices.len());
+        let l = self.layout.clone();
+        let place = |id: i32, rc: Rect, show: bool| {
+            let h = self.h(id);
+            unsafe {
+                crate::win32::MoveWindow(h, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, 1);
+                crate::win32::ShowWindow(h, if show { crate::win32::SW_SHOW } else { crate::win32::SW_HIDE });
+            }
+        };
+        // The window's own outer size follows the screen's client size.
+        let mut wrc = wr(Rect {
+            left: 0,
+            top: 0,
+            right: l.client_w,
+            bottom: l.client_h,
+        });
+        let style = WS_POPUP_W | WS_CAPTION_W | WS_SYSMENU_W;
+        unsafe { crate::win32::AdjustWindowRectEx(&mut wrc, style, 0, 0) };
+        let (ow, oh) = (wrc.right - wrc.left, wrc.bottom - wrc.top);
+        let mut orc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        // SAFETY: `orc` is a live RECT; the owner is this thread's window.
+        let have_owner = unsafe { crate::win32::GetWindowRect(self.owner, &mut orc) } != 0;
+        let (x, y) = if have_owner {
+            (
+                orc.left + (orc.right - orc.left - ow) / 2,
+                orc.top + (orc.bottom - orc.top - oh) / 2,
+            )
+        } else {
+            (crate::win32::CW_USEDEFAULT, crate::win32::CW_USEDEFAULT)
+        };
+        // SAFETY: MoveWindow only moves/resizes this dialog.
+        unsafe { crate::win32::MoveWindow(self.dlg, x, y, ow, oh, 1) };
+        match self.screen {
+            FixScreen::Search => {
+                place(FM_ID_TITLE, l.title, true);
+                place(FM_ID_SUB, l.sub, true);
+                place(FM_ID_NAME_LABEL, l.name_label, true);
+                place(FM_ID_NAME, l.name_edit, true);
+                place(FM_ID_SEARCH, l.search, true);
+                place(FM_ID_YEAR_LABEL, l.year_label, true);
+                place(FM_ID_YEAR, l.year_edit, true);
+                place(FM_ID_SCOPE_LABEL, l.scope_label, !self.choices.is_empty());
+                let radios = [FM_ID_RADIO_A, FM_ID_RADIO_B];
+                for (i, id) in radios.iter().enumerate() {
+                    let rc = l.radios.get(i).copied().unwrap_or(Rect { left: 0, top: 0, right: 0, bottom: 0 });
+                    place(*id, rc, i < self.choices.len());
+                }
+                place(FM_ID_NOTE, l.note, self.note_text().is_some());
+                let status = self.status_text_for_screen();
+                place(FM_ID_STATUS, l.status, !status.is_empty());
+                place(FM_ID_SEARCHING, l.searching, self.busy);
+                place(FM_ID_LIST, l.list, !self.busy);
+                for (id, rc) in l.buttons.clone() {
+                    // The quiet secondary appears with the no-results copy only;
+                    // Match and Cancel are always available.
+                    place(id, rc, id != FM_ID_USE_TEXT || self.no_results_shown());
+                }
+                // The matched screen's controls are hidden here.
+                for id in [FM_ID_APPLIED, FM_ID_REFRESH, FM_ID_CHANGE, FM_ID_AUTO] {
+                    place(id, Rect { left: 0, top: 0, right: 1, bottom: 1 }, false);
+                }
+                self.set_text(FM_ID_TITLE, FIX_MATCH_TITLE);
+                self.set_text(FM_ID_SUB, &fix_match_sub_line(&self.raw_title));
+                self.set_text(FM_ID_NAME_LABEL, FIX_MATCH_NAME_LABEL);
+                self.set_text(FM_ID_YEAR_LABEL, FIX_MATCH_YEAR_LABEL);
+                self.set_text(FM_ID_SEARCH, FIX_MATCH_SEARCH_LABEL);
+                self.set_text(FM_ID_SCOPE_LABEL, FIX_MATCH_SCOPE_LABEL);
+                self.set_text(FM_ID_SEARCHING, FIX_MATCH_SEARCHING);
+                let radios = [FM_ID_RADIO_A, FM_ID_RADIO_B];
+                for (i, id) in radios.iter().enumerate() {
+                    let label = self.choices.get(i).map_or(String::new(), |c| c.label.clone());
+                    self.set_text(*id, &label);
+                }
+                self.set_text(FM_ID_NOTE, self.note_text().as_deref().unwrap_or(""));
+                self.set_text(FM_ID_STATUS, &self.status_text_for_screen());
+                self.set_text(FM_ID_MATCH, FIX_MATCH_MATCH_LABEL);
+                self.set_text(FM_ID_CANCEL, FIX_MATCH_CANCEL_LABEL);
+                self.set_text(FM_ID_USE_TEXT, FIX_MATCH_USE_TEXT);
+                self.reset_radio_state();
+            }
+            FixScreen::Matched => {
+                place(FM_ID_TITLE, l.title, true);
+                place(FM_ID_SUB, l.sub, true);
+                place(FM_ID_APPLIED, l.applied, true);
+                for (id, rc) in l.buttons.clone() {
+                    place(id, rc, true);
+                }
+                let status = self.status_text_for_screen();
+                place(FM_ID_STATUS, l.status, !status.is_empty());
+                // The search screen's controls are hidden here.
+                for id in [
+                    FM_ID_NAME_LABEL,
+                    FM_ID_NAME,
+                    FM_ID_SEARCH,
+                    FM_ID_YEAR_LABEL,
+                    FM_ID_YEAR,
+                    FM_ID_LIST,
+                    FM_ID_SEARCHING,
+                    FM_ID_SCOPE_LABEL,
+                    FM_ID_RADIO_A,
+                    FM_ID_RADIO_B,
+                    FM_ID_NOTE,
+                    FM_ID_MATCH,
+                    FM_ID_CANCEL,
+                    FM_ID_USE_TEXT,
+                ] {
+                    place(id, Rect { left: 0, top: 0, right: 1, bottom: 1 }, false);
+                }
+                self.set_text(FM_ID_TITLE, FIX_MATCH_TITLE);
+                let sub = self
+                    .matched
+                    .as_ref()
+                    .map_or(String::new(), fix_match_matched_sub_line);
+                let applied = self
+                    .matched
+                    .as_ref()
+                    .map_or(String::new(), |o| fix_match_applied_text(o, &self.path));
+                self.set_text(FM_ID_SUB, &sub);
+                self.set_text(FM_ID_APPLIED, &applied);
+                self.set_text(FM_ID_STATUS, &status);
+                self.set_text(FM_ID_REFRESH, FIX_MATCH_REFRESH_LABEL);
+                self.set_text(FM_ID_CHANGE, FIX_MATCH_CHANGE_LABEL);
+                self.set_text(FM_ID_AUTO, FIX_MATCH_AUTO_LABEL);
+            }
+        }
+    }
+}
+
+/// An `LB_*` value the crate's `win32` mirror does not carry: `LB_SETCURSEL`
+/// (`0x0186`), the selection the results list opens with so `Match` has a
+/// target without a click.
+const LB_SETCURSEL_W: u32 = 0x0186;
+/// `WM_CTLCOLOREDIT` / `WM_CTLCOLORLISTBOX`: the edit/listbox dark-theme
+/// queries, next to [`WM_CTLCOLORSTATIC`].
+const WM_CTLCOLOREDIT_W: u32 = 0x0133;
+const WM_CTLCOLORLISTBOX_W: u32 = 0x0134;
+
+/// The modal run's outcome slot: `WM_DESTROY` moves the closing status here
+/// before freeing the state box, and [`fix_match_run`] reads it after its
+/// loop ends. The slot is per-dialog: it carries the destroyed dialog's own
+/// `HWND` with the status, so a nested open can neither steal nor overwrite
+/// the outer run's outcome. The singleton guard in [`open_fix_match`] means
+/// only one picker runs at a time (it is modal), so one slot is exact.
+static FIX_MATCH_RESULT: Mutex<(usize, Option<String>)> = Mutex::new((0, None));
+
+/// Move the keyboard focus; null-safe (the matched screen has no name field).
+fn fix_match_focus(h: HWND) {
+    if h.is_null() {
+        return;
+    }
+    // SAFETY: SetFocus only moves the thread's keyboard focus.
+    unsafe {
+        windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(h);
+    }
+}
+
+/// The state pointer stashed in `GWLP_USERDATA`: null before `WM_NCCREATE`
+/// installs it or after `WM_DESTROY` clears it.
+fn fix_match_state_ptr(hwnd: HWND) -> *mut FixMatchState {
+    // SAFETY: reads only the window's own userdata slot.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(
+            hwnd,
+            windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+        ) as *mut FixMatchState
+    }
+}
+
+impl FixMatchState {
+    /// The name edit's trimmed text.
+    fn find_text(&self) -> String {
+        self.text(FM_ID_NAME).trim().to_string()
+    }
+
+    /// The year edit's trimmed text (digits only; the edit is `ES_NUMBER`).
+    fn year_text(&self) -> String {
+        self.text(FM_ID_YEAR).trim().to_string()
+    }
+
+    /// The parsed year both search jobs carry: digits, or `0` for none.
+    fn parsed_year(&self) -> i32 {
+        self.year_text().parse::<i32>().unwrap_or(0).clamp(0, 9999)
+    }
+
+    /// The one-target note: the single choice's note when the folder is both
+    /// the season and the show, else `None` (two radios need no explanation).
+    fn note_text(&self) -> Option<String> {
+        self.choices.iter().find_map(|c| c.note.clone())
+    }
+
+    /// The status static's text for the current screen. The busy static covers
+    /// a running job, the error copy covers a failure, the no-target reason
+    /// covers a playing file with no latch target (empty/unresolvable path or
+    /// a drive-root whole-show refusal) so `Match` never dies silently, the
+    /// empty copy covers a finished-but-empty search; otherwise the transient
+    /// close status (which only exists in the instant before the dialog closes
+    /// with it).
+    fn status_text_for_screen(&self) -> String {
+        if self.busy {
+            return String::new();
+        }
+        if self.status_error {
+            return FIX_MATCH_ERROR.to_string();
+        }
+        if self.screen == FixScreen::Search
+            && let Some(reason) = fix_match_no_target_reason(&self.path, self.is_movie)
+        {
+            return reason.to_string();
+        }
+        if self.screen == FixScreen::Search && self.searched && self.candidates.is_empty() {
+            return FIX_MATCH_NO_RESULTS.to_string();
+        }
+        self.status.clone().unwrap_or_default()
+    }
+
+    /// Whether the no-results copy (and its `Use my text` secondary) shows.
+    fn no_results_shown(&self) -> bool {
+        !self.busy
+            && !self.status_error
+            && self.screen == FixScreen::Search
+            && self.searched
+            && self.candidates.is_empty()
+    }
+
+    /// Check the default radio (the season when there are two), uncheck the
+    /// other. Runs after every `apply_screen` on the search screen, so the
+    /// default the scope table declares and the checked radio cannot drift.
+    fn reset_radio_state(&self) {
+        for (i, id) in [FM_ID_RADIO_A, FM_ID_RADIO_B].iter().enumerate() {
+            let on = self.choices.get(i).is_some_and(|c| c.default);
+            // SAFETY: async check-set on this dialog's own radio.
+            unsafe {
+                crate::win32::SendMessageW(
+                    self.h(*id),
+                    BM_SETCHECK,
+                    if on { BST_CHECKED as usize } else { BST_UNCHECKED as usize },
+                    0,
+                );
+            }
+        }
+    }
+
+    /// Freeze the action controls while a provider job runs (`Cancel` stays
+    /// live); the busy static covers the list meanwhile.
+    fn set_busy(&mut self, busy: bool) {
+        self.busy = busy;
+        for id in [
+            FM_ID_NAME,
+            FM_ID_YEAR,
+            FM_ID_SEARCH,
+            FM_ID_LIST,
+            FM_ID_RADIO_A,
+            FM_ID_RADIO_B,
+            FM_ID_USE_TEXT,
+            FM_ID_MATCH,
+            FM_ID_REFRESH,
+            FM_ID_CHANGE,
+            FM_ID_AUTO,
+        ] {
+            let h = self.h(id);
+            if !h.is_null() {
+                // SAFETY: enabling/disabling this dialog's own control only.
+                unsafe {
+                    crate::win32::EnableWindow(h, i32::from(!busy));
+                }
+            }
+        }
+    }
+
+    /// Refill the results listbox from [`Self::candidates`], selecting the
+    /// first row so `Match` has a target without a click.
+    fn repopulate_list(&self) {
+        let h = self.h(FM_ID_LIST);
+        if h.is_null() {
+            return;
+        }
+        // SAFETY: listbox messages on this dialog's own control; `u` outlives
+        // the add call.
+        unsafe {
+            crate::win32::SendMessageW(h, crate::win32::LB_RESET_CONTENT, 0, 0);
+            for c in &self.candidates {
+                let u = utf16_z(&candidate_row_text(c));
+                crate::win32::SendMessageW(h, crate::win32::LB_ADD_STRING, 0, u.as_ptr() as isize);
+            }
+            if !self.candidates.is_empty() {
+                crate::win32::SendMessageW(h, LB_SETCURSEL_W, 0, 0);
+            }
+        }
+    }
+
+    /// Hand `job` to a worker thread and mark the dialog busy: the worker
+    /// never touches the UI, it publishes into [`Self::slot`] and posts
+    /// [`WM_APP_FIX_MATCH_DONE`] for the dialog's own loop to apply.
+    fn spawn_job(&mut self, job: FixJob) {
+        self.generation += 1;
+        let job_gen = self.generation;
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        self.status_error = false;
+        self.set_busy(true);
+        self.apply_screen();
+        let slot = self.slot.clone();
+        let dlg = self.dlg as usize;
+        std::thread::spawn(move || {
+            let out = fix_match_worker(job);
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((job_gen, out));
+            // SAFETY: async post only; the worker never touches a control.
+            unsafe {
+                crate::win32::PostMessageW(dlg as HWND, WM_APP_FIX_MATCH_DONE, 0, 0);
+            }
+        });
+    }
+
+    /// `Search`: one bounded pass over the typed name/year on a worker.
+    fn start_search(&mut self) {
+        if self.busy {
+            return;
+        }
+        let name = self.find_text();
+        if name.is_empty() {
+            return;
+        }
+        let year = self.parsed_year();
+        let want = if self.is_movie {
+            Kind::MOVIE
+        } else {
+            Kind::SERIES
+        };
+        self.spawn_job(FixJob::Search { name, year, want });
+    }
+
+    /// `Match`: pin the selected candidate into the selected scope. A missing
+    /// candidate or a missing scope target reports the visible reason instead
+    /// of dying silently (the empty-path/no-radio case).
+    fn start_latch(&mut self) {
+        if self.busy {
+            return;
+        }
+        // SAFETY: synchronous query of this dialog's own listbox.
+        let idx = unsafe {
+            crate::win32::SendMessageW(self.h(FM_ID_LIST), crate::win32::LB_GET_CUR_SEL, 0, 0)
+        } as i32;
+        let cand = (idx >= 0)
+            .then(|| self.candidates.get(idx as usize).cloned())
+            .flatten();
+        let (Some(cand), Some((scope, key))) = (cand, self.selected_target()) else {
+            let reason = fix_match_no_target_reason(&self.path, self.is_movie)
+                .unwrap_or(FIX_MATCH_NO_TARGET_REASON);
+            self.status = Some(reason.to_string());
+            self.apply_screen();
+            return;
+        };
+        self.spawn_job(FixJob::Latch { cand, scope, key });
+    }
+
+    /// `Refresh metadata`: re-fetch the stored latch's own identity.
+    fn start_refresh(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(over) = self.matched.clone() else {
+            return;
+        };
+        self.spawn_job(FixJob::Refresh { over: Box::new(over) });
+    }
+
+    /// `Use my text as the title`: the plugin-free latch (typed title only).
+    /// A missing scope target reports the visible reason instead of dying
+    /// silently, mirroring [`Self::start_latch`].
+    fn start_use_text(&mut self) {
+        if self.busy {
+            return;
+        }
+        let title = self.find_text();
+        if title.is_empty() {
+            return;
+        }
+        let year = self.parsed_year();
+        let Some((scope, key)) = self.selected_target() else {
+            let reason = fix_match_no_target_reason(&self.path, self.is_movie)
+                .unwrap_or(FIX_MATCH_NO_TARGET_REASON);
+            self.status = Some(reason.to_string());
+            self.apply_screen();
+            return;
+        };
+        self.spawn_job(FixJob::UseText { title, year, scope, key });
+    }
+
+    /// `Use automatic matching`: drop the stored latch on a worker, then close
+    /// with the auto status. A failure keeps the dialog open on the error copy.
+    fn start_auto(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(over) = self.matched.clone() else {
+            return;
+        };
+        self.spawn_job(FixJob::Unmatch {
+            scope: over.scope,
+            key: over.key,
+        });
+    }
+
+    /// Apply the worker's published outcome (the `WM_APP_FIX_MATCH_DONE` arm):
+    /// a finished search repopulates the list, a saved latch closes with its
+    /// status, a failure keeps the dialog open on the error copy.
+    fn on_job_done(&mut self) {
+        let got = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some((job_gen, out)) = got else {
+            return;
+        };
+        if job_gen != self.generation {
+            return;
+        }
+        self.set_busy(false);
+        match out {
+            FixOutcome::Search(rows) => {
+                self.searched = true;
+                self.candidates = rows;
+                self.status_error = false;
+                self.repopulate_list();
+                self.apply_screen();
+            }
+            FixOutcome::Latched(status) => {
+                self.status = Some(status);
+                // SAFETY: destroys this dialog; returns without touching `self`
+                // (the wndproc's `WM_DESTROY` arm frees the box).
+                unsafe {
+                    crate::win32::DestroyWindow(self.dlg);
+                }
+            }
+            FixOutcome::Failed => {
+                self.status_error = true;
+                self.apply_screen();
+            }
+        }
+    }
+
+    /// `Change match…`: back to the search screen, keeping the typed text.
+    fn on_change(&mut self) {
+        if self.busy {
+            return;
+        }
+        self.screen = FixScreen::Search;
+        self.apply_screen();
+        fix_match_focus(self.h(FM_ID_NAME));
+    }
+}
+
+/// The picker's window procedure: stock-control routing only. `WM_CLOSE` is
+/// cancel (no status), `WM_COMMAND` routes the `FM_ID_*` space, a finished job
+/// applies on `WM_APP_FIX_MATCH_DONE`, and `WM_DESTROY` frees the state box
+/// after moving its closing status to the run slot.
+///
+/// INVARIANT: `WM_DESTROY` never posts a thread quit (`PostQuitMessage`). The
+/// modal loop in [`fix_match_run`] exits on the dialog ceasing to exist, so a
+/// quit posted here would outlive the dialog and be consumed by the app's own
+/// main loop (`tray::message_loop` in `run_ui`), ending the whole process.
+/// The app's Exit path (`tray::on_exit`) never needs such a quit.
+///
+/// # Safety
+/// Called by the OS as the dialog's window procedure for `FIX_MATCH_CLASS`;
+/// `hwnd` must be a dialog window whose `GWLP_USERDATA` holds (between
+/// `WM_NCCREATE` and `WM_DESTROY`) a pointer to a live `FixMatchState` box.
+pub unsafe extern "system" fn fix_match_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    // SAFETY: every arm upholds the wndproc contract; the state pointer is
+    // only dereferenced while the dialog owns it (between `WM_NCCREATE` and
+    // `WM_DESTROY`).
+    unsafe {
+        if msg == WM_NCCREATE {
+            #[allow(clippy::cast_ptr_alignment)]
+            let cs =
+                lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
+            let ptr = if cs.is_null() {
+                0
+            } else {
+                (*cs).lpCreateParams as isize
+            };
+            windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+                ptr,
+            );
+            return 1;
+        }
+        if msg == crate::win32::WM_CLOSE {
+            crate::win32::DestroyWindow(hwnd);
+            return 0;
+        }
+        if msg == crate::win32::WM_DESTROY {
+            let ptr = fix_match_state_ptr(hwnd);
+            // No thread quit here, ever (see the invariant on
+            // [`fix_match_wnd_proc`]): the modal loop exits when this dialog
+            // ceases to exist, so every close route -- Cancel, the titlebar
+            // X, Esc, Match, Refresh, Use-automatic -- ends at the
+            // `IsWindow(dlg) == 0` check with nothing left queued. A nested
+            // or stale destroy (the `create_controls` failure path zeroes
+            // userdata first, or a second open racing the first) must not
+            // clear the outer dialog's handle.
+            let is_tracked =
+                hwnd as usize == FIX_MATCH_HWND.load(std::sync::atomic::Ordering::SeqCst);
+            if !ptr.is_null() {
+                // Move the closing status out BEFORE freeing the box: the
+                // modal run reads it after its loop ends.
+                let state = Box::from_raw(ptr);
+                if is_tracked {
+                    *FIX_MATCH_RESULT
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        (hwnd as usize, state.status.clone());
+                }
+                for f in &state.fonts {
+                    Gdi::DeleteObject(*f);
+                }
+                Gdi::DeleteObject(state.bg_brush);
+                drop(state);
+                if is_tracked {
+                    FIX_MATCH_HWND.store(0, std::sync::atomic::Ordering::SeqCst);
+                }
+                windows_sys::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(
+                    hwnd,
+                    windows_sys::Win32::UI::WindowsAndMessaging::GWLP_USERDATA,
+                    0,
+                );
+            } else if is_tracked {
+                FIX_MATCH_HWND.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+            // Deliberately no `PostQuitMessage`: see the invariant above.
+            return 0;
+        }
+        if msg == WM_CTLCOLORSTATIC || msg == WM_CTLCOLOREDIT_W || msg == WM_CTLCOLORLISTBOX_W {
+            let ptr = fix_match_state_ptr(hwnd);
+            if ptr.is_null() {
+                return crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            let hdc = wparam as Gdi::HDC;
+            windows_sys::Win32::Graphics::Gdi::SetTextColor(hdc, COL_TEXT);
+            windows_sys::Win32::Graphics::Gdi::SetBkColor(hdc, COL_BG);
+            return (*ptr).bg_brush as isize;
+        }
+        if msg == WM_APP_FIX_MATCH_DONE {
+            let ptr = fix_match_state_ptr(hwnd);
+            if !ptr.is_null() {
+                (*ptr).on_job_done();
+            }
+            return 0;
+        }
+        if msg == crate::win32::WM_COMMAND {
+            let ptr = fix_match_state_ptr(hwnd);
+            if ptr.is_null() {
+                return crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
+            let state = &mut *ptr;
+            let id = (wparam & 0xFFFF) as i32;
+            let code = ((wparam >> 16) & 0xFFFF) as u32;
+            match id {
+                FM_ID_SEARCH => state.start_search(),
+                FM_ID_MATCH => state.start_latch(),
+                FM_ID_CANCEL | IDCANCEL => {
+                    crate::win32::DestroyWindow(hwnd);
+                }
+                FM_ID_USE_TEXT => state.start_use_text(),
+                FM_ID_REFRESH => state.start_refresh(),
+                FM_ID_CHANGE => state.on_change(),
+                FM_ID_AUTO => state.start_auto(),
+                FM_ID_LIST if code == LBN_DBLCLK => state.start_latch(),
+                FM_ID_LIST if code == LBN_SELCHANGE => {}
+                FM_ID_RADIO_A | FM_ID_RADIO_B => {}
+                _ => {}
+            }
+            return 0;
+        }
+        crate::win32::DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+/// One modal-loop step for the picker: pure so tests pin the quit contract
+/// without a window.
+///
+/// The loop exits on its own condition only -- its dialog window ceasing to
+/// exist (`dialog_exists == false`: every close route funnels through
+/// `DestroyWindow`, so Cancel, the titlebar X, Esc, Match, Refresh metadata,
+/// Use-automatic and Change-match all end here) -- and that exit posts NO
+/// thread quit (`repost_quit == false`), so the app's main loop
+/// (`tray::message_loop`) never sees a quit from the dialog. A thread quit
+/// already sitting in the queue (`got_quit`, i.e. `GetMessageW` returning 0)
+/// is never ours: the loop still exits, but with `repost_quit == true` so the
+/// caller reposts it and the app's own Exit path keeps working. A `GetMessageW`
+/// error (`got_error`) exits quietly. Otherwise the loop keeps pumping.
+///
+/// Returns `(should_exit, repost_quit)`.
+#[must_use]
+pub fn fix_match_pump_step(dialog_exists: bool, got_quit: bool, got_error: bool) -> (bool, bool) {
+    if got_quit {
+        return (true, true);
+    }
+    if got_error {
+        return (true, false);
+    }
+    if !dialog_exists {
+        return (true, false);
+    }
+    (false, false)
+}
+
+/// Run the picker modal for `now`: disable `owner`, pump this thread's queue
+/// until the dialog closes, then re-enable `owner`, restore its focus, and
+/// report the closing status (`None` = cancelled). The owner's enabled state
+/// is per-dialog: only a run that disabled the owner re-enables it, so a
+/// nested open can never re-enable the owner under the outer picker. The loop
+/// posts no thread quit of its own -- it ends when the dialog window is gone
+/// (see [`fix_match_pump_step`]) and reposts a quit it did not create, so the
+/// app's Exit path is untouched.
+fn fix_match_run(owner: HWND, now: &app_support::config::NowPlaying) -> Option<String> {
+    *FIX_MATCH_RESULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = (0, None);
+    let ptr = match FixMatchState::open(owner, now) {
+        Ok(ptr) => ptr,
+        Err(message) => {
+            app_logf(&message);
+            return None;
+        }
+    };
+    // SAFETY: `ptr` is the live dialog state until `WM_DESTROY` frees it.
+    let dlg = unsafe { (*ptr).dlg };
+    if dlg.is_null() {
+        return None;
+    }
+    // Per-dialog owner state: remember whether THIS run disabled the owner.
+    // SAFETY: `IsWindowEnabled` only reads the window's style.
+    let owner_was_enabled = if !owner.is_null() {
+        let enabled = unsafe {
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled(owner) != 0
+        };
+        if enabled {
+            // SAFETY: enabling/disabling the owner window only.
+            unsafe {
+                crate::win32::EnableWindow(owner, 0);
+            }
+        }
+        enabled
+    } else {
+        false
+    };
+    // SAFETY: the standard modal loop on this thread; `IsDialogMessageW`
+    // gives the stock controls their Tab travel. Esc cancels at this level
+    // (an EDIT with focus would otherwise swallow it). The loop stops pumping
+    // once its own dialog is gone ([`fix_match_pump_step`]), so it never
+    // dispatches into a destroyed window -- and it never posts a thread quit
+    // of its own, so the app's main loop cannot mistake a dialog close for an
+    // exit request.
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            DispatchMessageW, IsDialogMessageW, IsWindow, TranslateMessage, MSG,
+        };
+        let mut msg: MSG = std::mem::zeroed();
+        loop {
+            if fix_match_pump_step(IsWindow(dlg) != 0, false, false).0 {
+                break;
+            }
+            let r = crate::win32::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0);
+            let (exit, repost) = fix_match_pump_step(true, r == 0, r == -1);
+            if exit {
+                if repost {
+                    // Not ours: hand the app's own quit back to the queue so
+                    // `tray::message_loop` still sees it.
+                    crate::win32::PostQuitMessage(msg.wParam as i32);
+                }
+                break;
+            }
+            if fix_match_pump_step(IsWindow(dlg) != 0, false, false).0 {
+                break;
+            }
+            if msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE as usize {
+                crate::win32::DestroyWindow(dlg);
+                continue;
+            }
+            if IsDialogMessageW(dlg, &msg) != 0 {
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if !owner.is_null() && owner_was_enabled {
+            crate::win32::EnableWindow(owner, 1);
+            windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(owner);
+        }
+    }
+    let (dlg_done, status) = FIX_MATCH_RESULT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if dlg_done == dlg as usize { status } else { None }
+}
+
+/// The public entry: the manual latch picker for whatever is playing now.
+/// Singleton-safe: a second open while the modal dialog lives is refused with
+/// [`FIX_MATCH_ALREADY_OPEN_REASON`] instead of stacking a nested message
+/// loop (the live tray menu pumps every thread message, so it could otherwise
+/// re-enter here). Seeded from [`app_support::config::live_now_playing`];
+/// with nothing playing it reports the idle reason on the main status line
+/// and opens nothing. The closing status (match, refresh, unmatch) lands on
+/// the main status line; the card itself refreshes on the next poll tick --
+/// the UI never forces a push.
+pub fn open_fix_match() {
+    if !fix_match_dialog_hwnd().is_null() {
+        ui().set_status_text(FIX_MATCH_ALREADY_OPEN_REASON);
+        return;
+    }
+    let Some(now) = app_support::config::live_now_playing() else {
+        ui().set_status_text(FIX_MATCH_IDLE_REASON);
+        return;
+    };
+    let owner = ui().main_hwnd as HWND;
+    let status = fix_match_run(owner, &now);
+    if let Some(status) = status {
+        ui().set_status_text(status);
+    }
+}
 /// `MessageBoxW`, `GetOpen/SaveFileNameW`) or shells out (`ShellExecuteW`) /
 /// shows a window (`ShowWindow`). Each pumps the message queue, so the OS
 /// re-enters `main_wnd_proc` on this same UI thread; its handlers
@@ -2599,7 +4531,14 @@ pub enum BlockingUi {
     ExportBundle,
     ImportBundle,
     OpenLogFolder,
+    /// Open the selected Main folder in Explorer (the list's Enter key): the
+    /// same `ShellExecuteW` path the report URL and the log-folder button use.
+    OpenFolder,
     HideWindow,
+    /// Open the "Fix match" picker (the manual latch UI): a modal popup owned
+    /// by the main window with its own message loop. Same re-entrancy law as
+    /// every other arm -- it pumps, so `UI` must be free when it runs.
+    FixMatch,
 }
 
 impl UiState {
@@ -2734,6 +4673,62 @@ impl UiState {
         .max(1)
     }
 
+    /// The Main folder list's keyboard map: Up/Down step the absolute
+    /// selection, Home/End jump to its first/last row, and Enter stashes the
+    /// selected folder's open ([`BlockingUi::OpenFolder`]) for the wndproc to
+    /// run outside the `UI` guard. The list owns these keys only while it has
+    /// rows: with an empty list Up/Down/Home/End fall through to the focus
+    /// order and the scroll they drove before, and the Settings/Card views
+    /// never reach it (`sel_row` is Main-only state). A list move clears
+    /// `focus_id`, so Enter after arrowing targets the row, not a stale button,
+    /// and the keyboard offers no Remove/rename/delete path on the list.
+    fn on_main_list_key(&mut self, hwnd: HWND, vk: u32) -> bool {
+        if self.cur_view != View::Main {
+            return false;
+        }
+        let n = self.ui_dirs.len();
+        match vk {
+            VK_UP | VK_DOWN | VK_HOME | VK_END if n > 0 => {
+                let want = match vk {
+                    VK_UP => step_sel_row(self.sel_row, n, -1),
+                    VK_DOWN => step_sel_row(self.sel_row, n, 1),
+                    VK_HOME => edge_sel_row(n, false),
+                    _ => edge_sel_row(n, true),
+                };
+                self.focus_id = 0;
+                self.sel_row = want;
+                self.reveal_sel_row(hwnd);
+                true
+            }
+            VK_RETURN
+                if n > 0 && self.focus_id == 0 && self.sel_row >= 0 && (self.sel_row as usize) < n =>
+            {
+                // Stash the blocking shell-out; the wndproc runs it with `UI`
+                // released (`run_blocking_ui`), never under the guard.
+                self.pending_blocking = Some(BlockingUi::OpenFolder);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Keep the keyboard selection inside the viewport: when a list key moves
+    /// `sel_row` off the visible band, the viewport follows by the same row
+    /// step the wheel uses. The band is the [`UiLayout`] the click hit-test and
+    /// the paint both read, so a shown row and a selectable row cannot
+    /// disagree. No-op on a null/hidden window (no layout).
+    fn reveal_sel_row(&mut self, hwnd: HWND) {
+        let Some(l) = self.layout(hwnd) else {
+            return;
+        };
+        let last = l.list_top + l.list_capacity.max(1) - 1;
+        if self.sel_row < l.list_top {
+            self.scroll_list(hwnd, self.sel_row - l.list_top);
+        } else if self.sel_row > last {
+            self.scroll_list(hwnd, self.sel_row - last);
+        }
+    }
+
     /// `layoutForHwnd` (`go\window.go:731`).
     #[must_use]
     pub fn layout(&self, hwnd: HWND) -> Option<UiLayout> {
@@ -2782,7 +4777,13 @@ impl UiState {
     /// `scanBlockedReason` (`go\window.go:1992`) reading this instance's flag.
     #[must_use]
     pub fn scan_blocked_reason(&self, id: i32) -> &'static str {
-        scan_blocked_reason(self.scan_active, id)
+        let reason = scan_blocked_reason(self.scan_active, id);
+        if !reason.is_empty() || id != BTN_FIX_MATCH {
+            return reason;
+        }
+        // The picker's own enable rule (no tooltip lie: the same rule dims the
+        // button and refuses the click).
+        fix_match_blocked_reason(app_support::config::live_now_playing().is_some(), id)
     }
 
     /// `removeHasTarget` (`go\window.go:2006`).
@@ -2927,7 +4928,7 @@ impl UiState {
                 if pb != 0 {
                     if button_at_point(&l.btns, x, y) == pb {
                         self.focus_id = pb;
-                        self.do_card_action(hwnd, pb);
+                        return self.do_card_action(hwnd, pb);
                     } else {
                         self.invalidate();
                     }
@@ -3008,7 +5009,12 @@ impl UiState {
                 let r = row_at_point(&l.rows, x, y);
                 if r >= 0 {
                     let abs = l.list_top + r;
-                    if self.sel_row != abs {
+                    // The list takes focus on click, mirroring the keyboard: a
+                    // stale button ring would otherwise keep Enter on a button
+                    // instead of the row just clicked.
+                    let was_focused = self.focus_id != 0;
+                    self.focus_id = 0;
+                    if self.sel_row != abs || was_focused {
                         self.sel_row = abs;
                         self.invalidate();
                     }
@@ -3120,7 +5126,27 @@ impl UiState {
     }
 
     /// `doCardAction` (`go\window.go:1721`).
-    pub fn do_card_action(&mut self, _hwnd: HWND, id: i32) {
+    ///
+    /// Returns a [`BlockingUi`] the wndproc must run with `UI` RELEASED
+    /// ([`BlockingUi::FixMatch`] opens the manual latch picker).
+    #[must_use]
+    pub fn do_card_action(&mut self, _hwnd: HWND, id: i32) -> Option<BlockingUi> {
+        if id == BTN_FIX_MATCH {
+            // Singleton-safe: a second open while the modal dialog lives is
+            // refused here as well as in `open_fix_match` (the tray menu
+            // pumps every thread message while the loop runs).
+            if !fix_match_dialog_hwnd().is_null() {
+                self.set_status_text(FIX_MATCH_ALREADY_OPEN_REASON);
+                return None;
+            }
+            // The enable rule, enforced AT INPUT as well as in the paint: a
+            // dimmed button that still opened the picker would be a lie.
+            if fix_match_enabled(app_support::config::live_now_playing().as_ref()) {
+                return Some(BlockingUi::FixMatch);
+            }
+            self.set_status_text(FIX_MATCH_IDLE_REASON);
+            return None;
+        }
         if id == BTN_CARD_BACK {
             self.close_card();
         } else if id == card_kind_button(0) {
@@ -3130,6 +5156,7 @@ impl UiState {
         } else if let Some((line, preset)) = card_preset_for_button(id) {
             self.on_select_card_preset(line, &preset);
         }
+        None
     }
 
     /// `activateFocused` (`go\window.go:1328`).
@@ -3140,10 +5167,7 @@ impl UiState {
         self.focus_id = id;
         match self.cur_view {
             View::Settings => self.do_settings_action(hwnd, id),
-            View::Card => {
-                self.do_card_action(hwnd, id);
-                None
-            }
+            View::Card => self.do_card_action(hwnd, id),
             View::Main => match id {
                 BTN_SETTINGS => {
                     self.enter_settings();
@@ -3165,6 +5189,11 @@ impl UiState {
 
     /// `onSettingsKeyDownEx` (`go\window.go:1358`).
     pub fn on_settings_key_down_ex(&mut self, hwnd: HWND, vk: u32, shift: bool) -> bool {
+        // The Main folder list owns its navigation keys while it has rows;
+        // every other key keeps the ported focus/scroll/activate behaviour.
+        if self.on_main_list_key(hwnd, vk) {
+            return true;
+        }
         match vk {
             VK_ESCAPE => {
                 if self.cur_view == View::Card {
@@ -3213,12 +5242,8 @@ impl UiState {
     pub fn refresh_dir_list(&mut self) {
         self.ui_dirs = app_support::config::load_config().dirs;
         let n = self.ui_dirs.len() as i32;
-        if self.sel_row >= n {
-            self.sel_row = n - 1;
-        }
-        if self.ui_dirs.is_empty() {
-            self.sel_row = -1;
-        }
+        // A shrunk list must never leave the selection pointing past its end.
+        self.sel_row = clamp_sel_row(self.sel_row, self.ui_dirs.len());
         if self.hover_row >= n {
             self.hover_row = -1;
             self.hover_x = false;
@@ -4912,7 +6937,7 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     }
 
     let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
-    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let status_font = status_font(dpi);
     let fmt_left = crate::win32::DT_LEFT
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
@@ -4942,7 +6967,7 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         &st.status_text,
         l.status,
         fmt_left,
-        hint_font,
+        status_font,
         COL_MUTED,
     );
     paint_scan_bar(hdc, l.status, dpi, st);
@@ -4950,7 +6975,7 @@ fn paint_main_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     // SAFETY: fonts created above are deleted here.
     unsafe {
         Gdi::DeleteObject(button_font);
-        Gdi::DeleteObject(hint_font);
+        Gdi::DeleteObject(status_font);
     }
 }
 
@@ -4962,6 +6987,7 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
 
     let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
     let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let status_font = status_font(dpi);
     let fmt_left = crate::win32::DT_LEFT
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
@@ -5018,7 +7044,7 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         &st.status_text,
         l.status,
         fmt_left,
-        hint_font,
+        status_font,
         COL_MUTED,
     );
     paint_scan_bar(hdc, l.status, dpi, st);
@@ -5027,6 +7053,7 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     unsafe {
         Gdi::DeleteObject(button_font);
         Gdi::DeleteObject(hint_font);
+        Gdi::DeleteObject(status_font);
     }
 }
 
@@ -5039,6 +7066,7 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
     let body_font = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
     let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let status_font = status_font(dpi);
     let fmt_left = crate::win32::DT_LEFT
         | crate::win32::DT_SINGLE_LINE
         | crate::win32::DT_NO_PREFIX
@@ -5100,7 +7128,7 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         &st.status_text,
         l.status,
         fmt_left,
-        hint_font,
+        status_font,
         COL_MUTED,
     );
     paint_scan_bar(hdc, l.status, dpi, st);
@@ -5110,6 +7138,7 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         Gdi::DeleteObject(button_font);
         Gdi::DeleteObject(body_font);
         Gdi::DeleteObject(hint_font);
+        Gdi::DeleteObject(status_font);
     }
 }
 
@@ -5199,12 +7228,29 @@ fn run_blocking_ui(hwnd: HWND, action: BlockingUi) {
             }
         }
         BlockingUi::OpenLogFolder => crate::settings::on_open_log_folder(),
+        BlockingUi::OpenFolder => {
+            // The row is read under a short guard, then the shell call runs
+            // with the guard released, like every other arm.
+            let dir = {
+                let st = ui();
+                let idx = clamp_sel_row(st.sel_row, st.ui_dirs.len());
+                if idx < 0 {
+                    None
+                } else {
+                    st.ui_dirs.get(idx as usize).cloned()
+                }
+            };
+            if let Some(dir) = dir {
+                let _ = open_external_url(&dir);
+            }
+        }
         BlockingUi::HideWindow => {
             // SAFETY: ShowWindow only hides the window.
             unsafe {
                 crate::win32::ShowWindow(hwnd, crate::win32::SW_HIDE);
             }
         }
+        BlockingUi::FixMatch => open_fix_match(),
     }
 }
 
@@ -6085,7 +8131,7 @@ mod tests {
         for (order, want_len) in [
             (main_focus_order(), 8usize),
             (settings_focus_order(), 12),
-            (card_focus_order(), 13),
+            (card_focus_order(), 14),
         ] {
             assert_eq!(order.len(), want_len);
             let mut seen = std::collections::HashSet::new();
@@ -6095,7 +8141,7 @@ mod tests {
         }
         assert_eq!(focus_order_for_view(View::Main).len(), 8);
         assert_eq!(focus_order_for_view(View::Settings).len(), 12);
-        assert_eq!(focus_order_for_view(View::Card).len(), 13);
+        assert_eq!(focus_order_for_view(View::Card).len(), 14);
         for id in [
             BTN_ADD,
             BTN_REMOVE,
@@ -6261,6 +8307,105 @@ mod tests {
         assert_eq!(st.scroll_top, 0);
     }
 
+    /// The Main list's keyboard selection core: clamped at both ends, nothing
+    /// selected lands on row 0, an empty list stays unselected, a list shorter
+    /// than the viewport never steps past its own last row, and a shrunk list
+    /// clamps the stale selection to the surviving rows.
+    #[test]
+    fn folder_list_selection_core() {
+        // Both ends clamp.
+        assert_eq!(step_sel_row(0, 3, -1), 0);
+        assert_eq!(step_sel_row(2, 3, 1), 2);
+        assert_eq!(step_sel_row(1, 3, 1), 2);
+        assert_eq!(step_sel_row(1, 3, -1), 0);
+        // Nothing selected: the first step lands on row 0.
+        assert_eq!(step_sel_row(-1, 3, -1), 0);
+        assert_eq!(step_sel_row(-1, 3, 1), 0);
+        // Home/End.
+        assert_eq!(edge_sel_row(3, false), 0);
+        assert_eq!(edge_sel_row(3, true), 2);
+        // Empty list: no row to select.
+        assert_eq!(step_sel_row(-1, 0, 1), -1);
+        assert_eq!(step_sel_row(0, 0, -1), -1);
+        assert_eq!(edge_sel_row(0, false), -1);
+        assert_eq!(edge_sel_row(0, true), -1);
+        // A list shorter than the visible rows: the viewport could show more,
+        // but the selection ends are the LIST's ends.
+        let l = compute_layout(&dirs(2), MAIN_CLIENT_W, MAIN_CLIENT_H, 96);
+        assert!(
+            l.list_capacity > 2,
+            "this case needs a list shorter than the viewport, got {}",
+            l.list_capacity
+        );
+        assert_eq!(step_sel_row(1, 2, 1), 1);
+        assert_eq!(step_sel_row(0, 2, -1), 0);
+        assert_eq!(edge_sel_row(2, true), 1);
+        // A shrunk list clamps the selection (the refreshDirList guard).
+        assert_eq!(clamp_sel_row(2, 1), 0);
+        assert_eq!(clamp_sel_row(2, 0), -1);
+        assert_eq!(clamp_sel_row(-1, 3), -1);
+        assert_eq!(clamp_sel_row(1, 3), 1);
+    }
+
+    /// The handler wiring: Up/Down/Home/End drive the Main selection and take
+    /// the button focus with them; Settings/Card never touch it; a shrunk list
+    /// clamps it through the same guard `refresh_dir_list` runs.
+    #[test]
+    fn folder_list_keyboard_navigation() {
+        let mut st = UiState::default();
+        st.ui_dirs = dirs(3);
+        st.focus_id = BTN_SCAN;
+        assert!(st.on_settings_key_down_ex(NULL, VK_DOWN, false));
+        assert_eq!(st.sel_row, 0);
+        assert_eq!(st.focus_id, 0, "the list owns the key: no stale ring");
+        assert!(st.on_settings_key_down_ex(NULL, VK_DOWN, false));
+        assert_eq!(st.sel_row, 1);
+        assert!(st.on_settings_key_down_ex(NULL, VK_UP, false));
+        assert_eq!(st.sel_row, 0);
+        assert!(st.on_settings_key_down_ex(NULL, VK_UP, false));
+        assert_eq!(st.sel_row, 0, "clamped at the top");
+        assert!(st.on_settings_key_down_ex(NULL, VK_END, false));
+        assert_eq!(st.sel_row, 2);
+        assert!(st.on_settings_key_down_ex(NULL, VK_HOME, false));
+        assert_eq!(st.sel_row, 0);
+        // The Settings and Card views ignore the Main selection.
+        for view in [View::Settings, View::Card] {
+            st.cur_view = view;
+            assert!(st.on_settings_key_down_ex(NULL, VK_DOWN, false));
+            assert_eq!(st.sel_row, 0, "{view:?} must not move the Main selection");
+        }
+        // A shrunk list clamps the stale selection.
+        st.cur_view = View::Main;
+        st.sel_row = 2;
+        st.sel_row = clamp_sel_row(st.sel_row, 1);
+        assert_eq!(st.sel_row, 0);
+    }
+
+    /// Enter on the list opens the selected folder through the same shell path
+    /// the pointer uses (`BlockingUi::OpenFolder`, stashed so the wndproc runs
+    /// `ShellExecuteW` with `UI` released) and never a Remove; with no
+    /// selection, or with a button focused, Enter keeps its old meaning.
+    #[test]
+    fn enter_opens_selected_folder() {
+        let mut st = UiState::default();
+        st.ui_dirs = dirs(3);
+        st.sel_row = 1;
+        assert!(st.on_settings_key_down_ex(NULL, VK_RETURN, false));
+        assert_eq!(st.pending_blocking, Some(BlockingUi::OpenFolder));
+        assert_eq!(st.sel_row, 1);
+        assert_eq!(st.ui_dirs.len(), 3, "open is read-only");
+        // No selection: Enter stays the focused-control key, and with nothing
+        // focused it is inert.
+        st.pending_blocking = None;
+        st.sel_row = -1;
+        assert!(!st.on_settings_key_down_ex(NULL, VK_RETURN, false));
+        assert_eq!(st.pending_blocking, None);
+        // A focused button keeps Enter, so Add/Scan/Remove stay reachable.
+        st.focus_id = BTN_ADD;
+        assert!(st.on_settings_key_down_ex(NULL, VK_RETURN, false));
+        assert_eq!(st.pending_blocking, Some(BlockingUi::AddDir));
+    }
+
     #[test]
     fn focus_tab_cycle() {
         let mut st = UiState::default();
@@ -6322,6 +8467,9 @@ mod tests {
     enum Drive {
         /// `WM_KEYDOWN`/`VK_RETURN` with `BTN_ADD` focused.
         Key { vk: u32 },
+        /// `WM_KEYDOWN`/`VK_RETURN` on the Main folder list: one folder
+        /// selected, no button focused.
+        ListKey { vk: u32 },
         /// A mouse click: `WM_L_BUTTON_DOWN`+`WM_L_BUTTON_UP` on a button.
         Btn { view: View, btn: i32 },
     }
@@ -6329,6 +8477,11 @@ mod tests {
     /// Every fixed blocking action, with the real route that reaches it.
     const ROUTES: &[(&str, Drive, BlockingUi)] = &[
         ("AddDir (VK_RETURN keyboard)", Drive::Key { vk: VK_RETURN }, BlockingUi::AddDir),
+        (
+            "OpenFolder (VK_RETURN on a selected folder)",
+            Drive::ListKey { vk: VK_RETURN },
+            BlockingUi::OpenFolder,
+        ),
         ("AddDir (button)", Drive::Btn { view: View::Main, btn: BTN_ADD }, BlockingUi::AddDir),
         ("HideWindow ('Close to tray' button)", Drive::Btn { view: View::Main, btn: BTN_CLOSE }, BlockingUi::HideWindow),
         ("ClearMetadata ('Clear metadata' button)", Drive::Btn { view: View::Settings, btn: BTN_CLEAR_CACHE }, BlockingUi::ClearMetadata),
@@ -6336,6 +8489,7 @@ mod tests {
         ("ExportBundle ('Export...' button)", Drive::Btn { view: View::Settings, btn: BTN_EXPORT }, BlockingUi::ExportBundle),
         ("ImportBundle ('Import...' button)", Drive::Btn { view: View::Settings, btn: BTN_IMPORT }, BlockingUi::ImportBundle),
         ("OpenLogFolder ('Open log folder' button)", Drive::Btn { view: View::Settings, btn: BTN_OPEN_LOG }, BlockingUi::OpenLogFolder),
+        ("FixMatch ('Fix match...' button)", Drive::Btn { view: View::Card, btn: BTN_FIX_MATCH }, BlockingUi::FixMatch),
     ];
 
     /// One route's observation, recorded from inside its blocking call.
@@ -6390,16 +8544,37 @@ mod tests {
                         st.focus_id = 0;
                         st.pressed_btn = 0;
                         st.pressed_x = -1;
+                        st.ui_dirs.clear();
+                        st.sel_row = -1;
+                        // The picker route needs a live item: without it the
+                        // Card action refuses with the idle reason and the
+                        // blocking path is never exercised.
+                        app_support::config::set_live_now_playing(None);
                         match drive {
                             Drive::Key { .. } => {
                                 st.cur_view = View::Main;
                                 st.focus_id = BTN_ADD;
                             }
-                            Drive::Btn { view, .. } => st.cur_view = view,
+                            Drive::ListKey { .. } => {
+                                st.cur_view = View::Main;
+                                st.ui_dirs = dirs(1);
+                                st.sel_row = 0;
+                            }
+                            Drive::Btn { view, btn } => {
+                                st.cur_view = view;
+                                if view == View::Card && btn == BTN_FIX_MATCH {
+                                    app_support::config::set_live_now_playing(Some(
+                                        app_support::config::NowPlaying {
+                                            raw_title: "Show.S01E02.Pilot.1080p.mkv - PotPlayer".to_string(),
+                                            path: format!("{}:{}", 'D', r"\Anime\Show\Season 1\S01E02.mkv"),
+                                        },
+                                    ));
+                                }
+                            }
                         }
                     }
                     let sent = match drive {
-                        Drive::Key { vk } => {
+                        Drive::Key { vk } | Drive::ListKey { vk } => {
                             // SAFETY: owned by this thread -> synchronous WNDPROC.
                             unsafe {
                                 crate::win32::SendMessageW(hwnd, WM_KEYDOWN, vk as usize, 0);
@@ -6411,7 +8586,8 @@ mod tests {
                                 let st = ui();
                                 match view {
                                     View::Settings => st.layout_settings(hwnd).map(|l| l.btns),
-                                    _ => st.layout(hwnd).map(|l| l.btns),
+                                    View::Card => st.layout_card(hwnd).map(|l| l.btns),
+                                    View::Main => st.layout(hwnd).map(|l| l.btns),
                                 }
                             };
                             match btns.and_then(|b| b.into_iter().find(|b| b.id == btn)) {
@@ -6488,6 +8664,12 @@ mod tests {
                 "route `{label}`: UI guard was HELD during the blocking call: the re-entrant deadlock is back"
             );
         }
+        {
+            // Leave no route state on the process-wide UI for the next test.
+            let mut st = ui();
+            st.ui_dirs.clear();
+            st.sel_row = -1;
+        }
         let show = rx
             .recv_timeout(Duration::from_secs(15))
             .expect("deadlock: show/center did not complete within 15s")
@@ -6507,7 +8689,7 @@ mod tests {
     #[test]
     fn remove_without_selection_feedback() {
         let mut st = UiState::default();
-        st.ui_dirs = vec![r"C:\Media\Movies".into()];
+        st.ui_dirs = vec![format!("{}:{}", 'C', r"\Media\Movies")];
         st.sel_row = -1;
         st.hover_row = -1;
         st.remove_dir_at(-1);
@@ -7305,6 +9487,44 @@ mod tests {
         );
     }
 
+    /// The status line is measured for fitting in exactly the font it paints:
+    /// both the measure path and the painter build from `status_font`, counted
+    /// per test thread. If either path grows its own face/size again (the old
+    /// "Segoe UI" measure drift), its build count for that path drops and this
+    /// fails.
+    #[test]
+    fn status_fit_measures_the_painted_font() {
+        let before = STATUS_FONT_BUILDS.with(std::cell::Cell::get);
+        let Some(_) = measure_scan_status_width(96, "fit me") else {
+            return; // no GDI DC: skip (the one native exception)
+        };
+        assert!(
+            STATUS_FONT_BUILDS.with(std::cell::Cell::get) > before,
+            "the measure path stopped building the painted status font"
+        );
+        let before = STATUS_FONT_BUILDS.with(std::cell::Cell::get);
+        let st = UiState::default();
+        let rc = Rect {
+            left: 0,
+            top: 0,
+            right: MAIN_CLIENT_W,
+            bottom: MAIN_CLIENT_H,
+        };
+        // SAFETY: a screen-compatible DC for the paint, deleted after.
+        let dc = unsafe { Gdi::CreateCompatibleDC(std::ptr::null_mut()) };
+        if dc.is_null() {
+            return;
+        }
+        paint_main_card(dc, rc, 96, &st);
+        unsafe {
+            Gdi::DeleteDC(dc);
+        }
+        assert!(
+            STATUS_FONT_BUILDS.with(std::cell::Cell::get) > before,
+            "the paint path stopped building the measured status font"
+        );
+    }
+
     #[test]
     fn scan_bar_geometry() {
         for dpi in [96, 120, 144, 192] {
@@ -7502,6 +9722,139 @@ mod tests {
         assert!(st.status_text.contains(WANT));
     }
 
+    /// A failing filing is visible twice: the log line carries the cause (not
+    /// just the window-level message), and the status strip names the reason
+    /// while the prefilled URL is still offered to the open path.
+    #[test]
+    fn report_failure_logs_cause_and_names_reason_in_status() {
+        const CAUSE: &str = "could not add label: 'needs-repair' not found";
+        const PREFILLED: &str =
+            "https://github.com/nathwn12/Potflix/issues/new?title=a&body=b";
+        let scratch = Scratch::new("report-failure-visible");
+        let log_path = scratch.join("potflix-debug.log");
+        let log: &'static app_support::debuglog::Logger =
+            Box::leak(Box::new(app_support::debuglog::Logger::new(
+                &log_path, 0, 1,
+            )));
+        assert!(
+            set_app_log(log).is_ok(),
+            "the process log was already installed"
+        );
+
+        let dir = scratch.join("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        repair::report::write_report(
+            &dir,
+            &repair::report::Report {
+                entries: vec![repair::report::Entry {
+                    name: "a.mkv".into(),
+                    ..repair::report::Entry::default()
+                }],
+                ..repair::report::Report::default()
+            },
+        )
+        .unwrap();
+
+        let mut st = UiState::default();
+        st.create_issue = Arc::new(|_| {
+            (
+                PREFILLED.to_string(),
+                Some(repair::Error::caused_by(
+                    "repair: gh issue: exit status 1",
+                    CAUSE,
+                )),
+            )
+        });
+        let opened = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&opened);
+        st.open_url = Arc::new(move |_| {
+            seen.store(true, Ordering::SeqCst);
+            false
+        });
+        st.on_report_at(NULL, &dir.join(repair::report::REPORT_JSON_NAME));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if !st.report_done_text.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "worker never published");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        st.on_report_done();
+
+        assert!(
+            st.status_text.contains("could not add label"),
+            "status hides the reason: {:?}",
+            st.status_text
+        );
+        assert!(
+            st.status_text.contains(PREFILLED),
+            "status hides the prefilled url: {:?}",
+            st.status_text
+        );
+        assert!(opened.load(Ordering::SeqCst), "the open path was not offered");
+
+        let logged = std::fs::read_to_string(&log_path).expect("read the debug log");
+        assert!(
+            logged.contains(CAUSE),
+            "the log line hides the cause:\n{logged}"
+        );
+    }
+
+    /// The status strip: a filed issue shows its URL (also when a labelled
+    /// retry filed it), and a failed filing names the reason with the prefilled
+    /// URL still handed to the open path.
+    #[test]
+    fn report_status_shows_filed_url_or_failure_reason() {
+        const FILED: &str = "https://github.com/nathwn12/Potflix/issues/12";
+        const PREFILLED: &str =
+            "https://github.com/nathwn12/Potflix/issues/new?title=a&body=b";
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let open_ok = Arc::new(AtomicBool::new(true));
+        let seen_calls = Arc::clone(&calls);
+        let seen_ok = Arc::clone(&open_ok);
+        let opened = move |url: &str| {
+            seen_calls.lock().unwrap().push(url.to_string());
+            seen_ok.load(Ordering::SeqCst)
+        };
+
+        // Filed on the first try: the filed URL is shown.
+        assert_eq!(
+            report_issue_status(FILED, None, &opened),
+            report_launch_text(FILED)
+        );
+
+        // Filed on the label-less retry: the URL shows; the cause is the log's.
+        let err = repair::Error::caused_by(
+            "repair: CreateIssue: filed without labels",
+            "could not add label: 'needs-repair' not found",
+        );
+        assert_eq!(
+            report_issue_status(FILED, Some(&err), &opened),
+            report_launch_text(FILED)
+        );
+
+        // Nothing filed: the reason and the prefilled URL both show.
+        open_ok.store(false, Ordering::SeqCst);
+        let text = report_issue_status(PREFILLED, Some(&err), &opened);
+        assert!(text.contains("could not add label"), "status = {text:?}");
+        assert!(text.contains(PREFILLED), "status = {text:?}");
+        assert!(
+            text.to_lowercase().contains("prefilled"),
+            "status = {text:?}"
+        );
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                FILED.to_string(),
+                FILED.to_string(),
+                PREFILLED.to_string()
+            ],
+            "every non-empty url reaches the open path"
+        );
+    }
+
     #[test]
     fn clear_actions_are_distinct() {
         assert_ne!(
@@ -7629,9 +9982,10 @@ mod tests {
         ];
         for (specs, kind) in &cases {
             let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, specs, *kind);
-            assert_eq!(l.btns.len(), 13);
+            assert_eq!(l.btns.len(), 14);
             for id in [
                 BTN_CARD_BACK,
+                BTN_FIX_MATCH,
                 card_kind_button(0),
                 card_kind_button(1),
                 card_details_button(0),
@@ -8140,9 +10494,9 @@ mod tests {
     fn card_kind_buttons_dispatch() {
         let mut st = UiState::default();
         assert_eq!(st.card_kind, CardKind::Series);
-        st.do_card_action(NULL, card_kind_button(1));
+        let _ = st.do_card_action(NULL, card_kind_button(1));
         assert_eq!(st.card_kind, CardKind::Movie);
-        st.do_card_action(NULL, card_kind_button(0));
+        let _ = st.do_card_action(NULL, card_kind_button(0));
         assert_eq!(st.card_kind, CardKind::Series);
         assert!(card_preset_for_button(card_kind_button(0)).is_none());
         assert!(card_preset_for_button(card_kind_button(1)).is_none());
@@ -8378,7 +10732,7 @@ mod tests {
 
     #[test]
     fn build_scan_options_contract() {
-        let d = vec![r"C:\Media\Movies".to_string(), r"D:\Shows".to_string()];
+        let d = vec![format!("{}:{}", 'C', r"\Media\Movies"), format!("{}:{}", 'D', r"\Shows")];
         let scan = build_scan_options(d.clone(), false, None);
         assert!(scan.use_index);
         assert_eq!(scan.index_path, crate::settings::scan_index_path());
@@ -8897,5 +11251,301 @@ mod tests {
         app_support::config::set_live_card_specs(mirror_before);
         assert_eq!(live, sentinel, "a failed save must publish nothing");
         assert_eq!(status, "Save failed.");
+    }
+
+    // -- Fix match picker (pure half) ----------------------------------------
+
+    fn fix_candidate(title: &str, year: i32, kind: Kind, provider: &str, episodes: usize) -> Candidate {
+        Candidate {
+            kind,
+            title: title.to_string(),
+            year,
+            provider: provider.to_string(),
+            provider_id: "p1".to_string(),
+            poster: String::new(),
+            episode_count: episodes,
+        }
+    }
+
+    fn fix_pin(season: i32, number: i32) -> metadata::overrides::EpisodePin {
+        metadata::overrides::EpisodePin {
+            season,
+            number,
+            absolute: 0,
+            title: format!("episode {number}"),
+            synopsis: String::new(),
+        }
+    }
+
+    #[test]
+    fn fix_match_enable_rule_needs_something_playing() {
+        assert!(!fix_match_enabled(None));
+        let now = app_support::config::NowPlaying {
+            raw_title: "Attack.on.Titan.S02E01.mkv - PotPlayer".to_string(),
+            path: format!("{}:{}", 'D', r"\Anime\Attack on Titan\Season 2\S02E01.mkv"),
+        };
+        assert!(fix_match_enabled(Some(&now)));
+    }
+
+    #[test]
+    fn fix_match_prefill_episode_only_filename_uses_folder_show() {
+        let raw = "S01E02-A Warm View Together [ACC73481].mkv - PotPlayer";
+        let path = format!("{}:{}", 'D', r"\2ANIMES\Atri S01 1080p BDRip 10 bits DD+ x265-EMBER\S01E02-A Warm View Together [ACC73481].mkv");
+        let prefill = fix_match_prefill_name(raw, &path);
+        assert!(
+            prefill.contains("Atri"),
+            "folder show must win: {prefill:?}"
+        );
+        assert!(
+            !prefill.contains("Warm View"),
+            "episode title must not leak into the search: {prefill:?}"
+        );
+    }
+
+    #[test]
+    fn fix_match_prefill_bare_movie_keeps_cleaned_title() {
+        let raw = "Dune.Part.Two.2024.1080p.mkv - PotPlayer";
+        for path in ["", "Dune.Part.Two.2024.1080p.mkv"] {
+            assert_eq!(
+                fix_match_prefill_name(raw, path),
+                "Dune Part Two",
+                "no folder context, cleaned filename wins (path {path:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn fix_match_blocked_reason_names_idle_only_for_picker() {
+        assert_eq!(
+            fix_match_blocked_reason(false, BTN_FIX_MATCH),
+            FIX_MATCH_IDLE_REASON
+        );
+        assert!(!fix_match_blocked_reason(false, BTN_FIX_MATCH).is_empty());
+        assert_eq!(fix_match_blocked_reason(true, BTN_FIX_MATCH), "");
+        assert_eq!(fix_match_blocked_reason(false, BTN_ADD), "");
+        assert_eq!(fix_match_blocked_reason(true, BTN_ADD), "");
+    }
+
+    #[test]
+    fn fix_match_scope_movie_offers_no_radios() {
+        let choices = fix_match_scope_choices(&format!("{}:{}", 'D', r"\Movies\Dune (2021)\Dune.2021.mkv"), true);
+        assert!(choices.is_empty());
+    }
+
+    #[test]
+    fn fix_match_scope_season_folder_offers_season_and_show() {
+        let path = format!("{}:{}", 'D', r"\Anime\Attack on Titan\Season 2\S02E01.mkv");
+        let choices = fix_match_scope_choices(&path, false);
+        assert_eq!(choices.len(), 2);
+        let season = &choices[0];
+        assert_eq!(season.scope, Scope::Season);
+        assert!(season.default);
+        assert_eq!(
+            season.key,
+            metadata::overrides::season_key_for(&path).unwrap()
+        );
+        assert!(season.key.ends_with("attack on titan\\season 2"));
+        assert_eq!(season.label, "This season \u{2014} Attack on Titan \\ Season 2");
+        assert_eq!(season.note, None);
+        let show = &choices[1];
+        assert_eq!(show.scope, Scope::Series);
+        assert!(!show.default);
+        assert_eq!(
+            show.key,
+            metadata::overrides::series_key_for(&path).unwrap()
+        );
+        assert!(show.key.ends_with("attack on titan"));
+        assert_ne!(season.key, show.key);
+        assert_eq!(show.label, "Whole show  \u{2014} Attack on Titan");
+        assert_eq!(show.note, None);
+    }
+
+    #[test]
+    fn fix_match_scope_release_folder_offers_single_radio() {
+        let path = format!("{}:{}", 'D', r"\Anime\Atri S01 1080p BDRip\S01E02.mkv");
+        let choices = fix_match_scope_choices(&path, false);
+        assert_eq!(choices.len(), 1, "one folder, one target, no duplicate");
+        let only = &choices[0];
+        assert_eq!(only.scope, Scope::Series);
+        assert!(only.default);
+        assert_eq!(
+            only.key,
+            metadata::overrides::series_key_for(&path).unwrap()
+        );
+        assert_eq!(
+            only.key,
+            metadata::overrides::season_key_for(&path).unwrap()
+        );
+        assert_eq!(only.label, "Whole show  \u{2014} Atri S01 1080p BDRip");
+        assert_eq!(
+            only.note.as_deref(),
+            Some(
+                "This folder is both the show folder and its season, so one match covers every \
+                 episode in it."
+            )
+        );
+    }
+
+    #[test]
+    fn fix_match_candidate_row_series_carries_episodes() {
+        let c = fix_candidate("Attack on Titan", 2013, Kind::SERIES, "anilist", 25);
+        assert_eq!(
+            candidate_row_text(&c),
+            "Attack on Titan (2013) \u{b7} AniList \u{b7} 25 episodes"
+        );
+        let one = fix_candidate("Show", 2020, Kind::SERIES, "tvmaze", 1);
+        assert_eq!(
+            candidate_row_text(&one),
+            "Show (2020) \u{b7} TVmaze \u{b7} 1 episode"
+        );
+    }
+
+    #[test]
+    fn fix_match_candidate_row_movie_omits_episodes() {
+        let c = fix_candidate("Dune", 2021, Kind::MOVIE, "cinemeta", 0);
+        assert_eq!(candidate_row_text(&c), "Dune (2021) \u{b7} Cinemeta");
+        let counted = fix_candidate("Dune", 2021, Kind::MOVIE, "cinemeta", 12);
+        assert_eq!(
+            candidate_row_text(&counted),
+            "Dune (2021) \u{b7} Cinemeta",
+            "a movie never prints an episode count"
+        );
+    }
+
+    #[test]
+    fn fix_match_status_strings_are_frozen() {
+        assert_eq!(
+            fix_match_matched_status("Attack on Titan", 25),
+            "Matched to Attack on Titan \u{2014} 25 episodes now show their own title and cover."
+        );
+        assert_eq!(fix_match_matched_status("Dune", 0), "Matched to Dune.");
+        assert_eq!(
+            fix_match_refreshed_status("Attack on Titan"),
+            "Refreshed Attack on Titan."
+        );
+        assert_eq!(
+            fix_match_sub_line("Attack.on.Titan.S02E01.mkv - PotPlayer"),
+            "Nothing matched for \"Attack.on.Titan.S02E01.mkv\""
+        );
+    }
+
+    #[test]
+    fn fix_match_sub_line_strips_player_suffix() {
+        let sub = fix_match_sub_line("Dune.Part.Two.2024.1080p.mkv - PotPlayer");
+        assert!(
+            !sub.contains(" - PotPlayer"),
+            "player suffix must not leak: {sub}"
+        );
+        assert_eq!(sub, "Nothing matched for \"Dune.Part.Two.2024.1080p.mkv\"");
+        assert_eq!(
+            fix_match_sub_line("Dune.Part.Two.2024.1080p.mkv"),
+            "Nothing matched for \"Dune.Part.Two.2024.1080p.mkv\"",
+            "a title without the suffix passes through quoted"
+        );
+    }
+
+    #[test]
+    fn fix_match_matched_sub_line_carries_provider_and_episodes() {
+        let over = Override {
+            scope: Scope::Series,
+            key: format!("{}:{}", 'd', r"\anime\attack on titan"),
+            title: "Attack on Titan".to_string(),
+            year: 2013,
+            provider: "anilist".to_string(),
+            provider_id: "p1".to_string(),
+            poster: String::new(),
+            media: None,
+            episodes: (1..=25).map(|n| fix_pin(2, n)).collect(),
+            created_at_ms: 0,
+        };
+        assert_eq!(
+            fix_match_matched_sub_line(&over),
+            "Matched by you \u{b7} AniList \u{2014} Attack on Titan, all 25 episodes"
+        );
+        let text = Override {
+            provider: String::new(),
+            provider_id: String::new(),
+            episodes: Vec::new(),
+            scope: Scope::Series,
+            key: format!("{}:{}", 'd', r"\anime\attack on titan"),
+            title: "My Title".to_string(),
+            year: 0,
+            poster: String::new(),
+            media: None,
+            created_at_ms: 0,
+        };
+        assert_eq!(
+            fix_match_matched_sub_line(&text),
+            "Matched by you \u{2014} My Title"
+        );
+        let movie = Override {
+            scope: Scope::Movie,
+            key: format!("{}:{}", 'd', r"\movies\dune.2021.mkv"),
+            title: "Dune".to_string(),
+            year: 2021,
+            provider: "cinemeta".to_string(),
+            provider_id: "p1".to_string(),
+            poster: String::new(),
+            media: None,
+            episodes: (1..=3).map(|n| fix_pin(0, n)).collect(),
+            created_at_ms: 0,
+        };
+        assert_eq!(
+            fix_match_matched_sub_line(&movie),
+            "Matched by you \u{b7} Cinemeta \u{2014} Dune"
+        );
+    }
+
+    #[test]
+    fn fix_match_text_override_latches_text_without_provider() {
+        let path = format!("{}:{}", 'D', r"\Anime\Attack on Titan\Season 2\S02E01.mkv");
+        let key = metadata::overrides::season_key_for(&path).unwrap();
+        let over = fix_match_text_override("  Attack on Titan  ", 2013, Scope::Season, &key);
+        assert_eq!(over.title, "Attack on Titan");
+        assert_eq!(over.year, 2013);
+        assert_eq!(over.scope, Scope::Season);
+        assert_eq!(over.key, key);
+        assert!(over.provider.is_empty());
+        assert!(over.provider_id.is_empty());
+        assert!(over.poster.is_empty());
+        assert!(over.media.is_none());
+        assert!(over.episodes.is_empty());
+        let show_key = metadata::overrides::series_key_for(&path).unwrap();
+        let show = fix_match_text_override("Attack on Titan", 0, Scope::Series, &show_key);
+        assert_eq!(show.scope, Scope::Series);
+        assert_eq!(show.key, show_key);
+        assert!(show.provider.is_empty());
+        let neg = fix_match_text_override("X", -1, Scope::Series, &show_key);
+        assert_eq!(neg.year, 0);
+    }
+
+    #[test]
+    fn fix_match_close_posts_no_thread_quit() {
+        // Every dialog close -- Cancel, the titlebar X (WM_CLOSE), Esc, Match,
+        // Refresh metadata, Use-automatic: they all funnel through
+        // `DestroyWindow`, which is the `dialog_exists == false` row here --
+        // must exit ONLY the modal loop and post NO thread quit for the app's
+        // main loop (`tray::message_loop`).
+        for dialog_exists in [true, false] {
+            let (exit, repost) = fix_match_pump_step(dialog_exists, false, false);
+            assert_eq!(exit, !dialog_exists, "dialog_exists={dialog_exists}");
+            assert!(!repost, "a dialog close must never repost a quit");
+        }
+        // A `GetMessageW` error still ends the loop, quietly.
+        assert_eq!(fix_match_pump_step(true, false, true), (true, false));
+        assert_eq!(fix_match_pump_step(false, false, true), (true, false));
+    }
+
+    #[test]
+    fn fix_match_foreign_quit_is_reposted_for_app_exit() {
+        // A thread quit already in the queue (`GetMessageW` returning 0) is
+        // never the dialog's: the loop exits but hands the quit back, so the
+        // app's own Exit path still ends the process.
+        assert_eq!(fix_match_pump_step(true, true, false), (true, true));
+        assert_eq!(fix_match_pump_step(false, true, false), (true, true));
+        assert_eq!(fix_match_pump_step(true, true, true), (true, true));
+        // A live dialog with a real message keeps pumping (all close routes
+        // exit via the dialog-gone row above, never here).
+        assert_eq!(fix_match_pump_step(true, false, false), (false, false));
     }
 }

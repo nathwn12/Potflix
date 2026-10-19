@@ -22,8 +22,11 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 
 use crate::window::fit_scan_status;
 
-/// `appVersion` (`go\settings_sections.go:38`).
-pub const APP_VERSION: &str = "1.0.0";
+/// `appVersion` (`go\settings_sections.go:38`). Derived from this crate's own
+/// version, which is the workspace version (`rust\Cargo.toml`), which in turn
+/// tracks the installer's `MyAppVersion` (`tools\potflix.iss`): the app version
+/// can never disagree with the binary that wrote it.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
 // Status strings (`go\settings_sections.go:48-91`).

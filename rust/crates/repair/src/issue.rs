@@ -131,29 +131,20 @@ fn which(bin: &str) -> Option<PathBuf> {
 ///
 /// When a runner exists and fails, both are returned: the prefilled URL and the
 /// error, so the caller can offer the manual path without hiding the failure.
-/// The body is sanitized in either case ([`issue_body`]).
+/// A request that carried label flags is retried the same way EXACTLY ONCE
+/// without them (a repo that lacks one label rejects the whole create): the
+/// retry's URL is returned while the error still carries the FIRST attempt's
+/// cause text, so the operator learns why the labels were dropped. With no
+/// label flags there is no retry, and when both attempts fail the error carries
+/// both causes' text. The body is sanitized in either case ([`issue_body`]).
 pub fn create_issue(r: &Report, opts: &Options) -> (String, Option<Error>) {
     let title = issue_title(r);
     let body = issue_body(r);
     let fallback = || issue_url(&opts.repo, &title, &body, &opts.labels);
     let args = issue_args(&opts.repo, &title, &body, &opts.labels);
-
-    let out = match &opts.runner {
-        Some(runner) => runner(&args),
-        None => {
-            if !opts.gh.is_installed() {
-                // No gh, nothing failed: the prefilled URL and no error.
-                return match fallback() {
-                    Ok(url) => (url, None),
-                    Err(e) => (String::new(), Some(e)),
-                };
-            }
-            run_gh(&opts.gh.bin_name(), &args)
-        }
-    };
-
-    match out {
-        Err(err) => match fallback() {
+    let labelled = args.iter().any(|a| a == "--label");
+    let failure = |err: Error| -> (String, Option<Error>) {
+        match fallback() {
             Ok(url) => (url, Some(Error::caused_by("repair: CreateIssue", err))),
             Err(ferr) => (
                 String::new(),
@@ -162,7 +153,48 @@ pub fn create_issue(r: &Report, opts: &Options) -> (String, Option<Error>) {
                     ferr,
                 )),
             ),
-        },
+        }
+    };
+
+    if opts.runner.is_none() && !opts.gh.is_installed() {
+        // No gh, nothing failed: the prefilled URL and no error.
+        return match fallback() {
+            Ok(url) => (url, None),
+            Err(e) => (String::new(), Some(e)),
+        };
+    }
+
+    match run_attempt(opts, &args) {
+        Err(first_err) if labelled => {
+            let bare = issue_args(&opts.repo, &title, &body, &[]);
+            match run_attempt(opts, &bare) {
+                Ok(stdout) => {
+                    let url = first_url(&stdout);
+                    if url.is_empty() {
+                        // The retry ran but printed no URL: nothing is known to
+                        // have been filed, so keep the manual path and the FIRST
+                        // cause.
+                        return failure(Error::caused_by(
+                            "repair: CreateIssue: retried without labels, gh printed no issue url",
+                            first_err,
+                        ));
+                    }
+                    (
+                        url,
+                        Some(Error::caused_by(
+                            "repair: CreateIssue: filed without labels",
+                            first_err,
+                        )),
+                    )
+                }
+                // No silent loss: the cause text carries BOTH attempts' text.
+                Err(retry_err) => failure(Error::caused_by(
+                    "repair: CreateIssue: retried without labels",
+                    format!("{first_err}; retry: {retry_err}"),
+                )),
+            }
+        }
+        Err(err) => failure(err),
         Ok(stdout) => {
             let url = first_url(&stdout);
             if !url.is_empty() {
@@ -181,6 +213,15 @@ pub fn create_issue(r: &Report, opts: &Options) -> (String, Option<Error>) {
                 ),
             }
         }
+    }
+}
+
+/// One create attempt: the injected runner when there is one, else the real
+/// `gh`. The retry path reuses it so the two branches can never drift.
+fn run_attempt(opts: &Options, args: &[String]) -> Result<String> {
+    match &opts.runner {
+        Some(runner) => runner(args),
+        None => run_gh(&opts.gh.bin_name(), args),
     }
 }
 
@@ -463,11 +504,14 @@ mod tests {
     }
 
     /// A runner that fails still hands back the prefilled URL, alongside the
-    /// error.
+    /// error. With no label flags there is no retry: exactly one attempt.
     #[test]
     fn TestCreateIssueRunnerFailureReturnsFallbackAndError() {
         const BOOM: &str = "gh: not logged in";
+        let calls = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&calls);
         let runner: Runner = Box::new(move |_args: &[String]| -> Result<String> {
+            *seen.lock().expect("lock") += 1;
             Err(Error::new(BOOM))
         });
         let opts = Options {
@@ -487,6 +531,120 @@ mod tests {
         assert!(
             got.starts_with("https://github.com/o/r/issues/new?"),
             "url = {got:?}, want a prefilled fallback"
+        );
+        assert_eq!(*calls.lock().expect("lock"), 1, "no labels, no retry");
+    }
+
+    /// A label gh cannot attach fails the first create; the retry omits the
+    /// label flags, its URL is returned, and the error still names the first
+    /// failure.
+    #[test]
+    fn TestCreateIssueRetriesOnceWithoutLabels() {
+        let r = sample_report();
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let runner: Runner = Box::new(move |args: &[String]| {
+            let n = {
+                let mut g = seen.lock().expect("lock");
+                g.push(args.to_vec());
+                g.len()
+            };
+            if n == 1 {
+                Err(Error::caused_by(
+                    "repair: gh issue: exit status 1",
+                    "could not add label: 'needs-repair' not found",
+                ))
+            } else {
+                Ok("https://github.com/o/r/issues/7\n".to_string())
+            }
+        });
+        let opts = Options {
+            repo: "o/r".to_string(),
+            runner: Some(runner),
+            labels: vec!["needs-repair".to_string()],
+            gh: gh(true, "gh"),
+        };
+
+        let (got, err) = create_issue(&r, &opts);
+        assert_eq!(got, "https://github.com/o/r/issues/7");
+        let err = err.expect("want the first attempt's failure kept");
+        let cause = err.cause_text().unwrap_or_default();
+        assert!(
+            cause.contains("could not add label: 'needs-repair' not found"),
+            "cause_text = {cause:?}"
+        );
+
+        let calls = calls.lock().expect("lock").clone();
+        assert_eq!(calls.len(), 2, "want exactly one retry");
+        assert_eq!(
+            calls[0],
+            issue_args(
+                "o/r",
+                &issue_title(&r),
+                &issue_body(&r),
+                &strings(&["needs-repair"])
+            ),
+            "first attempt argv"
+        );
+        assert_eq!(
+            calls[1],
+            issue_args("o/r", &issue_title(&r), &issue_body(&r), &[]),
+            "retry argv must be the same create with the labels omitted"
+        );
+        assert!(
+            !calls[1].iter().any(|a| a == "--label"),
+            "retry argv has --label: {:?}",
+            calls[1]
+        );
+    }
+
+    /// Both attempts failing loses nothing: the returned error's cause text
+    /// carries both causes.
+    #[test]
+    fn TestCreateIssueBothAttemptsFailCarriesBothCauses() {
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&calls);
+        let runner: Runner = Box::new(move |args: &[String]| {
+            let n = {
+                let mut g = seen.lock().expect("lock");
+                g.push(args.to_vec());
+                g.len()
+            };
+            Err(Error::caused_by(
+                format!("repair: gh issue attempt {n}"),
+                if n == 1 {
+                    "could not add label: 'needs-repair' not found"
+                } else {
+                    "could not create issue: 500 server error"
+                },
+            ))
+        });
+        let opts = Options {
+            repo: "o/r".to_string(),
+            runner: Some(runner),
+            labels: vec!["needs-repair".to_string()],
+            gh: gh(true, "gh"),
+        };
+
+        let (got, err) = create_issue(&sample_report(), &opts);
+        assert!(
+            got.starts_with("https://github.com/o/r/issues/new?"),
+            "url = {got:?}, want a prefilled fallback"
+        );
+        let err = err.expect("want an error");
+        let cause = err.cause_text().unwrap_or_default();
+        assert!(
+            cause.contains("could not add label: 'needs-repair' not found"),
+            "first cause lost: {cause:?}"
+        );
+        assert!(
+            cause.contains("could not create issue: 500 server error"),
+            "retry cause lost: {cause:?}"
+        );
+        assert_eq!(
+            calls.lock().expect("lock").len(),
+            2,
+            "want exactly one retry"
         );
     }
 

@@ -59,6 +59,18 @@ The self-test is headless: it proves the hidden window + tray add, log
 rotation, second-instance lock, and the full IPC round-trip against an
 in-process fake Discord pipe, with no live PotPlayer or Discord.
 
+`tools\live-check.ps1` is the repeatable live proof that closing PotPlayer
+clears the card: it launches the built app, plays a real file, waits for the
+card push and its Discord ack, closes PotPlayer gently (a `WM_CLOSE` request,
+never a force-kill), and requires the clear to be ACKNOWLEDGED with no
+`push ack timeout` in between — an unacked clear is the stuck-card bug.
+Usage: `powershell -ExecutionPolicy Bypass -File tools\live-check.ps1`
+(`-File` overrides the media file, `-CardTimeoutSeconds` /
+`-ClearTimeoutSeconds` bound the waits, `-KeepLog` keeps this run's log
+lines). Exit codes: 0 = pass, 1 = check failure, 2 =
+precondition/environment (Discord reachable, no PotPlayer or Potflix instance
+already running, built exe present), under which nothing was changed.
+
 ## The parity contract
 
 This implementation's core claim: the Rust title cleaner reproduces the retired Go
@@ -68,7 +80,9 @@ committed contract, [`rust\parity-golden.sha256`](./rust/parity-golden.sha256)
 — a 64-hex SHA-256 per corpus, nothing else.
 
 The oracle is now FROZEN: its Go reproducer is gone, so the hashes can never
-be regenerated — only matched.
+be regenerated — only matched. No 1.1.0 change touches
+`rust\crates\titleclean\` — the cleaner is byte-parity frozen — so the
+frozen hashes still match without re-proving.
 
 The corpora themselves (`tools\titles-sample4.txt`, `tools\titles-sample.txt`)
 are deliberately **not committed**: they carry real media filenames from a real
@@ -291,8 +305,8 @@ further where the owner's live card proved the Go behaviour wrong:
     `not-found=` (`go\window.go:2749`): the per-file counter is honest but sampled
     before the async catch-up pass, so a nonzero value can coexist with a later
     successful fetch — Go's name reads as final at a moment that is not final.
-18. The card is always filled, per kind, as teaser plus full note — reversing
-    S3 for series on the owner's request. `rust\crates\presence\src\lib.rs`
+18. The card is always filled, per kind, with no synopsis on the card by
+    default. `rust\crates\presence\src\lib.rs`
     (`compose_card`, `compose_details_for`, `compose_state_for`,
     `synopsis_state`, `compose_large_text_inner`) builds each body line as a
     fill ladder: the first non-empty rung wins and the last rung is identity
@@ -301,11 +315,13 @@ further where the owner's live card proved the Go behaviour wrong:
     preset as a re-head that never removes the fill, except the `Minimal`
     state preset (stored `none`) — the only choice that may shorten the card
     to a single body line. SERIES covers TV + anime, MOVIE is movies. Shipped
-    default: SERIES line 1 the episode name, line 2 the episode tag plus a
-    synopsis teaser; MOVIE line 1 `Title (Year)`, line 2 `genres · length`,
-    else synopsis, else year, else clean title. The hover text of the LARGE
-    image slot — the cover when artwork resolved, the PotFlix `logo` asset
-    otherwise — carries the whole stored note. Slot budgets in UTF-16 units
+    default: SERIES line 1 the episode name, line 2 the episode tag alone
+    (then the clean title, the synopsis only as the last resort before a
+    blank line); MOVIE line 1 `Title (Year)`, line 2 `genres · length`
+    (then year, clean title, synopsis last). The synopsis stays available as
+    the explicit `Synopsis` state preset and as the whole-note hover text of
+    the LARGE image slot — the cover when artwork resolved, the PotFlix `logo`
+    asset otherwise. Slot budgets in UTF-16 units
     held in one place (`NAME_BUDGET`,
     `DETAILS_BUDGET`, `STATE_BUDGET`, `STATE_SYNOPSIS_BUDGET`,
     `LARGE_TEXT_BUDGET`): header 128, line 1 128, line 2 128 plain / 72 with
@@ -319,10 +335,11 @@ further where the owner's live card proved the Go behaviour wrong:
     `"card":{"series":{"details":"…","state":"…"},"movie":{…}}`; the legacy
     flat `{"details":"…","state":"…"}` still loads as the series pair with the
     movie pair default and re-saves nested — a backward-compatible read, not a
-    byte-identical re-write; an all-default config still writes `"card":{}`. The earlier S3 rule (the default state never
-    duplicates the tooltip synopsis) is reversed for series: teaser on the
-    card, full note on hover — not duplication; the movie default still avoids
-    the synopsis while genres/length answer.
+    byte-identical re-write; an all-default config still writes `"card":{}`. The S3 rule (the default state never
+    duplicates the tooltip synopsis) holds for both kinds by construction:
+    neither default state carries the synopsis — the series default is the
+    tag alone and the movie default is genres/length — and the full note
+    stays on hover.
 19. The Card-view preview is what Discord gets, row for row. The preview renders through the
     same composer the send path uses (`compose_card` via
     `CardSpec::render_kind`), so picking a line changes the preview
@@ -336,3 +353,27 @@ further where the owner's live card proved the Go behaviour wrong:
     scan-speed path (`metadata_http::set_rate_profile`); the poll loop (`push_activity` / `poll_loop` in `rust\crates\app\src\main.rs`, preset choice via
     `rust\crates\potflix-win\src\window.rs` `on_select_card_preset`) reads the published specs on every push, so the change reaches the live Discord card
     at the next poll tick: no restart, and no push from the click itself. The send gate compares name/details/state/paused/images/buttons/has_start against the last-sent card and sends when they differ (`rust\crates\presence\src\gate.rs:209-221`), so the changed lines go out by themselves — while paused too, where the card is re-parked when the compared content is unchanged — the header, the two body lines, the large image, the button list and the paused flag — and a change to any of those still goes out with a fresh pause anchor; a change confined to the hover text does not re-park on its own. That set mirrors the ported gate's paused comparison (`rust\crates\presence\src\gate.rs:170-193`), and no card preset changes the hover text alone.
+20. A wrong card is fixed by hand, not by re-scanning. While something plays,
+    `Fix match…` (`rust\crates\potflix-win\src\window.rs`, `FIX_MATCH_*` copy
+    through `fix_match_scope_choices`) pre-fills the name from the resolver's
+    own parse, searches the provider chain on demand, and pins the pick as a
+    latch in `%LOCALAPPDATA%\Potflix\overrides.json`
+    (`rust\crates\metadata\src\overrides.rs`, keyed by movie path, season
+    folder, or show folder; `rust\crates\metadata\src\search.rs`,
+    `pin_from_candidate`, fetches the episode table once so every episode in
+    a season/show scope keeps its own title and synopsis under the scope's
+    shared cover). The latch wins for lookup (`rust\crates\library\src\catchup.rs`
+    resolves latched records with no fetch) and for display
+    (`rust\crates\app\src\main.rs`, `latch_resolved`), a latched record is
+    never searched again, and an already-matched item offers
+    `Refresh metadata`, `Change match…` and `Use automatic matching` from the
+    same door.
+21. The clear survives a stuck pipe. An ack timeout drops the connection so
+    the supervisor reconnects (`rust\crates\discord\src\lib.rs`,
+    `on_ack_timeout`, `ACK_TIMEOUT` 2 s; backoff `BACKOFF_MAX` 60 s,
+    `READY_GRACE` 10 s), the poll loop re-asserts the clear on a new
+    connection generation (`rust\crates\app\src\main.rs`, `clear_due`), a
+    window stopped for `STOP_GRACE_MS` (15 s) reads as no-player, and the
+    player reads are bounded by `SendMessageTimeoutW`
+    (`rust\crates\player\src\control.rs`), so a hung player window cannot
+    freeze the loop before it reaches the clear.

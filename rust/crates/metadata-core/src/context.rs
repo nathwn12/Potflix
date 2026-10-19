@@ -160,7 +160,11 @@ pub(crate) fn is_generic_folder(name: &str) -> bool {
 /// `underExtrasFolder` reports whether any folder on the path is an extras leaf
 /// (Deleted Scenes, Featurettes, ...). Such files stay KindUnknown even when a
 /// bare number is present: the inventory buckets them F.
-pub(crate) fn under_extras_folder(path: &str) -> bool {
+///
+/// Public for the repair inventory (`library::catchup`): a needs-repair row
+/// whose path sits under an extras leaf is not a metadata gap, so it must be
+/// excluded from the list rather than re-fetched forever.
+pub fn under_extras_folder(path: &str) -> bool {
     let (dirs, _) = split_dirs(path);
     for d in dirs {
         if extras_word_matches(d) {

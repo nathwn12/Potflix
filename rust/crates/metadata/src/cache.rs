@@ -57,11 +57,19 @@ use crate::timefmt::{now_rfc3339, parse_rfc3339};
 /// schema 8: that corroboration is judged by content token, not token length
 /// -- pre-fix misses like the 2009 `Dragon Ball Kai` for a `DBZ Kai`/2014
 /// query (the `kai` corroboration of `20635` was rejected by the length
-/// floor) must re-resolve).
-/// A record whose `schema` differs is a whole-record MISS, and the scan-index
-/// skip (`library::scanindex`, gated on `cache_schema()` + `cache_live`)
-/// follows the same version, so one bump re-resolves and re-scans together.
-pub const CACHE_SCHEMA: i32 = 8;
+/// floor) must re-resolve;
+/// schema 9: season-aware absolute episode matching (S2E1 == 26) plus a
+/// Cinemeta catalog seed for a romaji/junk title -- pre-fix misses like
+/// `series|shingeki no kyojin|0|2` (and positives answered by the wrong
+/// season) must re-resolve).
+/// A record whose `schema` differs is a whole-record MISS, a `not_found`
+/// record included: a repair that changes what a key SHOULD resolve to ships
+/// a bump, so no stale negative outlives the repair (the 30-day
+/// [`NEGATIVE_TTL`] only bounds how long a fresh miss stays quiet, it is not
+/// the repair clock), and the scan-index skip (`library::scanindex`, gated on
+/// `cache_schema()` + `cache_live`) follows the same version, so one bump
+/// re-resolves and re-scans together.
+pub const CACHE_SCHEMA: i32 = 9;
 
 /// `negativeTTL` bounds how long a persisted not-found entry counts as a cached
 /// miss: long enough that rescans stay fast, short enough that a provider

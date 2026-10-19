@@ -47,7 +47,8 @@ use crate::win32::{
     SetForegroundWindow, Shell_NotifyIconW, TrackPopupMenu, TranslateMessage, WndClassEx, WndProc,
     DRAWITEMSTRUCT, ICON_RESOURCE_VERSION, MEASUREITEMSTRUCT, MENUINFO, MENUITEMINFOW,
     MENU_INFO_BACKGROUND, MFS_ENABLED, MFT_OWNERDRAW, MIIM_DATA, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
-    MIIM_STRING, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, ODS_SELECTED, ODT_MENU,
+    MIIM_STRING, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, ODS_DISABLED, ODS_SELECTED,
+    ODT_MENU,
     TPM_BOTTOM_ALIGN, TPM_RETURN_CMD, TPM_RIGHT_BUTTON, WM_APP_QUIT, WM_APP_TRAY, WM_CLOSE,
     WM_CONTEXT_MENU, WM_DESTROY, WM_DRAWITEM, WM_MEASUREITEM, WM_NULL, WM_RBUTTON_UP,
 };
@@ -62,9 +63,17 @@ pub const TRAY_UID: u32 = 1;
 /// (`go\tray.go:109`).
 pub const TRAY_TIP: &str = "Potflix";
 
-/// Menu item ids (`go\tray.go:194-197`).
+/// Menu item ids (`go\tray.go:194-197`, plus the Rust-only picker row).
 pub const MENU_ITEM_OPEN: usize = 2;
 pub const MENU_ITEM_EXIT: usize = 1;
+/// The Rust-only `Fix match...` row: a fresh id outside Go's `{1, 2}`.
+pub const MENU_ITEM_FIX_MATCH: usize = 3;
+
+/// `MFS_GRAYED` (`0x0003`, same value as `MFS_DISABLED`): the `fState` spelling
+/// of the menu's `MF_GRAYED` flag for `MENUITEMINFOW` (`MF_GRAYED` itself is the
+/// `EnableMenuItem` spelling). `win32.rs` carries only `MFS_ENABLED`, and it is
+/// owned outside this brief, so the one grayed use lives here, next to it.
+const MFS_GRAYED: u32 = 0x0003;
 
 /// Go `iconICO` (`go\embed.go:10`, `//go:embed assets/icon.ico`): the repo's
 /// `assets\icon.ico` -- 262,206 bytes, a single 256x256 DIB frame. `tools\check.ps1`
@@ -157,6 +166,17 @@ fn log_line(message: &str) {
     if let Some(logger) = APP_LOG.get() {
         logger.log(message);
     }
+}
+
+/// The "Fix match..." enable rule: the picker is offered only while something
+/// plays, mirroring [`crate::window::fix_match_enabled`], and never while its
+/// own modal dialog is already open (the modal loop pumps every thread
+/// message, so the live tray menu could otherwise stack a nested open).
+/// Split out so tests pin the rule without a player.
+#[must_use]
+pub fn fix_match_tray_enabled() -> bool {
+    app_support::config::live_now_playing().is_some()
+        && crate::window::fix_match_dialog_hwnd().is_null()
 }
 
 /// Go `showMainWindow()`: call the installed seam, or report the gap once.
@@ -511,12 +531,16 @@ unsafe extern "system" fn wnd_proc(
 }
 
 /// The tray popup's items in display order: the label and the stable dispatch
-/// id. Ids, labels, order and dispatch are the Go contract (`go\tray.go`):
-/// only the PAINT is new (owner-drawn dark instead of the stock white popup).
-/// `dwItemData` carries the index into this table.
-pub fn tray_menu_items() -> [(&'static str, usize); 2] {
+/// id. Ids, labels, order and dispatch are the Go contract (`go\tray.go`) --
+/// `Open` and `Exit` exactly as shipped -- plus the Rust-only `Fix match...`
+/// row between them, which opens the picker through
+/// [`crate::window::open_fix_match`]. Only the PAINT is new (owner-drawn dark
+/// instead of the stock white popup). `dwItemData` carries the index into
+/// this table.
+pub fn tray_menu_items() -> [(&'static str, usize); 3] {
     [
         ("Open Potflix", MENU_ITEM_OPEN),
+        ("Fix match\u{2026}", MENU_ITEM_FIX_MATCH),
         ("Exit Potflix", MENU_ITEM_EXIT),
     ]
 }
@@ -626,7 +650,17 @@ pub unsafe fn draw_menu_item(dis: *const DRAWITEMSTRUCT) {
             crate::win32::FW_NORMAL,
         );
         if !font.is_null() {
-            SetTextColor(dis.hDC, crate::window::COL_TEXT);
+            // A grayed row (the picker with nothing playing) paints dimmed so
+            // the `MFS_GRAYED` state is visible, not just unclickable.
+            let disabled = dis.itemState & ODS_DISABLED != 0;
+            SetTextColor(
+                dis.hDC,
+                if disabled {
+                    crate::window::COL_MUTED_DIM
+                } else {
+                    crate::window::COL_TEXT
+                },
+            );
             SetBkMode(dis.hDC, crate::win32::TRANSPARENT);
             let old = SelectObject(dis.hDC, font);
             let u = utf16_z(label);
@@ -654,6 +688,7 @@ pub unsafe fn draw_menu_item(dis: *const DRAWITEMSTRUCT) {
 }
 
 /// `showTrayMenu` (`go\tray.go:186-214`): one popup, `Open Potflix` = 2,
+/// `Fix match...` = 3 (Rust-only, grayed while nothing plays),
 /// `Exit Potflix` = 1, and the selection dispatch.
 ///
 /// Rust-only paint: the popup interior is pinned dark (`SetMenuInfo` /
@@ -689,12 +724,20 @@ pub unsafe fn show_tray_menu(hwnd: HWND) {
             item.cbSize = core::mem::size_of::<MENUITEMINFOW>() as u32;
             item.fMask = MIIM_STRING | MIIM_ID | MIIM_FTYPE | MIIM_STATE | MIIM_DATA;
             item.fType = MFT_OWNERDRAW;
-            item.fState = MFS_ENABLED;
+            // The picker row is grayed at build time while nothing plays (the
+            // menu is built per show, so a build-time state is exact).
+            item.fState = if *id == MENU_ITEM_FIX_MATCH && !fix_match_tray_enabled() {
+                MFS_GRAYED
+            } else {
+                MFS_ENABLED
+            };
             item.wID = *id as u32;
             // `dwTypeData` is unread for `MFT_OWNERDRAW` (the label travels in
             // `dwItemData`); it is passed anyway for debuggers and tests.
             item.dwTypeData = text.as_ptr() as *mut u16;
-            item.cch = label.len() as u32;
+            // UTF-16 units without the terminator (byte length lies for the
+            // `...` in the picker label).
+            item.cch = text.len().saturating_sub(1) as u32;
             item.dwItemData = i;
             // `text` outlives this call; the system copies nothing for
             // owner-draw items and never reads it back.
@@ -722,6 +765,7 @@ pub unsafe fn show_tray_menu(hwnd: HWND) {
         // to process teardown -- reproduced by keeping the destroy last.
         match selection as usize {
             MENU_ITEM_OPEN => show_main_window(),
+            MENU_ITEM_FIX_MATCH => crate::window::open_fix_match(),
             MENU_ITEM_EXIT => on_exit(),
             _ => {}
         }
@@ -911,6 +955,7 @@ mod tests {
         assert_eq!(TRAY_CLASS_NAME, "PotflixTrayWnd");
         assert_eq!(MENU_ITEM_OPEN, 2);
         assert_eq!(MENU_ITEM_EXIT, 1);
+        assert_eq!(MENU_ITEM_FIX_MATCH, 3);
         assert_eq!(crate::win32::MF_STRING, 0);
         assert_eq!(TPM_RIGHT_BUTTON | TPM_BOTTOM_ALIGN | TPM_RETURN_CMD, 0x0122);
         assert_eq!(WM_APP_TRAY, 0x8001);
@@ -921,15 +966,32 @@ mod tests {
     }
 
     /// The owner-drawn popup keeps the Go contract: same order, same labels,
-    /// same dispatch ids; `dwItemData` is the index into this table.
+    /// same dispatch ids for `Open`/`Exit`, with the Rust-only picker row
+    /// between them; `dwItemData` is the index into this table.
     #[test]
     fn menu_model_matches_go() {
         let items = tray_menu_items();
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 3);
         assert_eq!(items[0], ("Open Potflix", MENU_ITEM_OPEN));
-        assert_eq!(items[1], ("Exit Potflix", MENU_ITEM_EXIT));
+        assert_eq!(items[1], ("Fix match\u{2026}", MENU_ITEM_FIX_MATCH));
+        assert_eq!(items[2], ("Exit Potflix", MENU_ITEM_EXIT));
         assert_eq!(MENU_ITEM_OPEN, 2);
+        assert_eq!(MENU_ITEM_FIX_MATCH, 3);
         assert_eq!(MENU_ITEM_EXIT, 1);
+    }
+
+    /// The picker row's enable rule mirrors the player: enabled while
+    /// something plays, grayed with nothing playing.
+    #[test]
+    fn fix_match_row_tracks_now_playing() {
+        use app_support::config::{NowPlaying, set_live_now_playing};
+        set_live_now_playing(Some(NowPlaying {
+            raw_title: "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+            path: format!("{}:{}", 'C', r"\Media\Dune.Part.Two.2024.1080p.mkv"),
+        }));
+        assert!(fix_match_tray_enabled());
+        set_live_now_playing(None);
+        assert!(!fix_match_tray_enabled());
     }
 
     /// The owner-draw measure path sizes every item positively at 96 and 144

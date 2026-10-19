@@ -9,7 +9,13 @@
 //! 4 pong. The client sends the handshake, a read-pump thread answers PING with
 //! PONG and surfaces READY/dispatch frames, and any transport error triggers a
 //! reconnect after `Config::retry_delay` (5000 ms default), with the contract's
-//! `session dropped: <err>` line emitted through `Config::on_drop`.
+//! `session dropped: <err>` line emitted through `Config::on_drop`. The delay is
+//! damped: the first retry after a drop waits exactly `retry_delay`, and every
+//! consecutive unhealthy session -- never READY, or dropped within `READY_GRACE`
+//! of READY -- doubles the wait up to `BACKOFF_MAX` (60 s). A session that
+//! survives the grace resets the backoff, so a single transient drop still
+//! recovers at the plain `retry_delay`; a peer that accepts and never acks
+//! settles at the cap instead of reconnecting on every `retry_delay`.
 //!
 //! Discord answers every command with the SAME nonce. `send` records each
 //! outstanding nonce in a nonce-keyed set and the read pump matches an incoming
@@ -22,6 +28,9 @@
 //! connection but stopped draining would otherwise stall the poll loop forever.
 //! Nothing on this path is swallowed: the caller logs every reply, every send
 //! error, a `push ack timeout` when a command gets no reply, and a write expiry.
+//! An unanswered command is unproven, so its timeout drops the connection too:
+//! the supervisor reconnects with a fresh handshake and the caller re-delivers,
+//! instead of leaving the session limping on a connection that never answered.
 //!
 //! The Win32 plumbing -- the `FILE_FLAG_OVERLAPPED` contract, one event per
 //! operation, deadline cancellation -- lives in `win.rs`.
@@ -39,7 +48,7 @@ mod win;
 use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -79,6 +88,20 @@ const MAX_FRAME_BYTES: i32 = 1 << 20;
 /// the write path as unproven (`push ack timeout`): a write that left the process
 /// but was starved/dead gets said out loud, not swallowed.
 const ACK_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The reconnect backoff cap: each consecutive unhealthy session doubles the
+/// wait up to this, so a flapping peer settles at one attempt a minute instead
+/// of reconnecting on every `Config::retry_delay` (Discord's community guidance
+/// is about two connections a minute).
+const BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// How long a session must stay up after Discord's READY dispatch to count as a
+/// healthy session: a drop within this grace means the peer never really
+/// worked, so the reconnect backoff doubles; surviving the grace resets it.
+/// 45 s keeps the sustained worst case (a peer dying just past the grace:
+/// 5 s `retry_delay` + 45 s alive = one reconnect every ~50 s, ~1.2/min)
+/// inside the ~2/min guidance the backoff cites.
+const READY_GRACE: Duration = Duration::from_secs(45);
 
 /// One transport failure.
 #[derive(Debug)]
@@ -160,7 +183,8 @@ pub struct Config {
     pub client_id: String,
     /// Default `DEFAULT_PIPE_BASE`.
     pub pipe_base: String,
-    /// Default 5s; the contract's reconnect delay.
+    /// Default 5s; the wait before the first retry after a drop. Consecutive
+    /// unhealthy sessions back off from this up to `BACKOFF_MAX`.
     pub retry_delay: Duration,
     pub on_connect: Option<ConnectFn>,
     pub on_frame: Option<FrameFn>,
@@ -186,6 +210,10 @@ pub struct Reply {
 struct State {
     conn: Option<Arc<NamedPipe>>,
     ready: bool,
+    /// When the published session's first READY arrived (`None` until then).
+    /// `abort` does not clear it, so a session that reached READY is still
+    /// recognisable when it ends; the supervisor times the session from it.
+    ready_at: Option<Instant>,
     shut: bool,
 }
 
@@ -197,8 +225,10 @@ struct Inner {
     retry: Condvar,
     /// Serializes frame writes.
     wmu: Mutex<()>,
-    /// In-flight commands, keyed by nonce.
-    pending: Mutex<HashMap<String, ()>>,
+    /// In-flight commands, keyed by nonce, each remembering the connection the
+    /// command was written to: an ack timeout must drop exactly that connection,
+    /// never a healthy successor.
+    pending: Mutex<HashMap<String, Arc<NamedPipe>>>,
     generation: AtomicI64,
 }
 
@@ -211,6 +241,15 @@ pub struct Client {
     /// across a write, so without this a non-draining peer stalls the poll loop.
     /// Test seam: set it before `start`.
     write_timeout: Duration,
+    /// How long a session must stay up after READY to count as healthy (default
+    /// `READY_GRACE`). Test seam: a test shrinks it so the healthy/short-lived
+    /// classification is reachable without a real 45 s wait; set it before
+    /// `start`.
+    ready_grace: Duration,
+    /// Test seam: receives one `RetryEvent` per supervisor retry, so a test can
+    /// assert the backoff delay (and that a shutdown wakes a long wait) without
+    /// sleeping it. `None` in production; set it before `start`.
+    retry_probe: Option<mpsc::Sender<RetryEvent>>,
 }
 
 impl Client {
@@ -228,6 +267,7 @@ impl Client {
                 state: Mutex::new(State {
                     conn: None,
                     ready: false,
+                    ready_at: None,
                     shut: false,
                 }),
                 retry: Condvar::new(),
@@ -236,6 +276,8 @@ impl Client {
                 generation: AtomicI64::new(0),
             }),
             write_timeout: ACK_TIMEOUT,
+            ready_grace: READY_GRACE,
+            retry_probe: None,
         }
     }
 
@@ -243,7 +285,11 @@ impl Client {
     pub fn start(&self) {
         let inner = Arc::clone(&self.inner);
         let write_timeout = self.write_timeout;
-        drop(thread::spawn(move || supervise(inner, write_timeout)));
+        let ready_grace = self.ready_grace;
+        let retry_probe = self.retry_probe.clone();
+        drop(thread::spawn(move || {
+            supervise(inner, write_timeout, ready_grace, retry_probe);
+        }));
     }
 
     /// Stops the supervisor and closes the pipe. Safe to call twice.
@@ -308,7 +354,7 @@ impl Client {
         }
         // Record the outstanding nonce before the bytes leave, so a reply that
         // arrives immediately still matches, and arm the ack timeout.
-        self.inner.begin_pending(&cmd.nonce);
+        self.inner.begin_pending(&cmd.nonce, &conn);
         let _wmu = self.inner.wmu.lock().expect("write mutex");
         // The write mutex is held across the write, so bound it: a peer that
         // accepted the connection but stopped draining must not stall this send
@@ -319,7 +365,7 @@ impl Client {
         conn.set_write_deadline(None);
         match res {
             Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                self.abort(&conn);
+                self.inner.abort(&conn);
                 Err(Error::WriteTimeout {
                     after: self.write_timeout,
                     source: e,
@@ -328,20 +374,6 @@ impl Client {
             other => other.map_err(Error::Io),
         }
     }
-
-    /// Drops the current connection so the blocked read pump unblocks and the
-    /// supervisor reconnects. Used when a write expired mid-frame: the byte
-    /// stream is now truncated, so the connection is not reusable.
-    fn abort(&self, conn: &Arc<NamedPipe>) {
-        {
-            let mut st = self.inner.state.lock().expect("client state");
-            if st.conn.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, conn)) {
-                st.conn = None;
-                st.ready = false;
-            }
-        }
-        conn.close();
-    }
 }
 
 impl Inner {
@@ -349,17 +381,36 @@ impl Inner {
         self.state.lock().expect("client state").shut
     }
 
+    /// Drops `conn` from the state -- only while it is still the published
+    /// connection -- then closes the handle, so a read pump parked in
+    /// `read_frame` unblocks (`NamedPipe::close` cancels the pending read) and
+    /// the supervisor reconnects. Used when a write expired mid-frame (the byte
+    /// stream is now truncated, so the connection is not reusable) and when a
+    /// command was never acked (the session is unproven). The state lock is
+    /// released before the close, and `wmu` is never taken here.
+    fn abort(&self, conn: &Arc<NamedPipe>) {
+        {
+            let mut st = self.state.lock().expect("client state");
+            if st.conn.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, conn)) {
+                st.conn = None;
+                st.ready = false;
+            }
+        }
+        conn.close();
+    }
+
     /// Records one outstanding command nonce and arms its ack timeout: if the
     /// nonce is still outstanding after `ACK_TIMEOUT`, the write path is reported
     /// as unproven rather than silently trusted. Commands are keyed by nonce, not
     /// held in one slot, so two overlapping sends (clear-on-exit racing the poll
     /// loop) each keep their own verdict instead of the later one overwriting the
-    /// earlier.
-    fn begin_pending(self: &Arc<Inner>, nonce: &str) {
+    /// earlier. The connection the command went out on is kept beside the nonce,
+    /// so the timeout drops exactly that connection, never a healthy successor.
+    fn begin_pending(self: &Arc<Inner>, nonce: &str, conn: &Arc<NamedPipe>) {
         self.pending
             .lock()
             .expect("pending")
-            .insert(nonce.to_string(), ());
+            .insert(nonce.to_string(), Arc::clone(conn));
         if self.cfg.on_ack_timeout.is_none() {
             return;
         }
@@ -371,17 +422,25 @@ impl Inner {
         }));
     }
 
-    /// Reports a command still unanswered after `ACK_TIMEOUT`, once.
+    /// Reports a command still unanswered after `ACK_TIMEOUT`, once, then drops
+    /// the connection it was written to: a session that never answered may never
+    /// answer again, and a command Discord swallowed leaves the caller's card
+    /// stale forever, so the supervisor must reconnect with a fresh handshake
+    /// and let the caller re-deliver. `abort` closes only the connection the
+    /// command went out on (a timeout that raced a reconnect cannot blame the
+    /// new session), and the nonce was removed here, so a reply arriving later
+    /// cannot abort a healthy connection.
     fn ack_expired(&self, nonce: &str) {
-        let was_pending = self
-            .pending
-            .lock()
-            .expect("pending")
-            .remove(nonce)
-            .is_some();
-        if was_pending && !self.closed() && let Some(cb) = &self.cfg.on_ack_timeout {
+        let Some(conn) = self.pending.lock().expect("pending").remove(nonce) else {
+            return;
+        };
+        if self.closed() {
+            return;
+        }
+        if let Some(cb) = &self.cfg.on_ack_timeout {
             cb(nonce);
         }
+        self.abort(&conn);
     }
 
     /// Clears and reports whether `nonce` is an outstanding command, and disarms
@@ -410,42 +469,128 @@ impl Inner {
     }
 }
 
-/// Connects, pumps until the transport drops, then retries after the retry
-/// delay.
-fn supervise(inner: Arc<Inner>, write_timeout: Duration) {
+/// One supervisor retry, reported to the test-only `retry_probe`: the delay the
+/// supervisor is about to wait out, then the moment the wait ended (the delay
+/// elapsed, or `close` woke it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryEvent {
+    /// The supervisor is about to wait `delay` before the next attempt.
+    Wait(Duration),
+    /// The wait ended: the supervisor retries, or returns when `close` set the
+    /// shutdown flag.
+    Woke,
+}
+
+/// One connect/pump session: the transport result, and how long the session
+/// lived after Discord's READY dispatch (`None` = it never reached READY).
+struct SessionOutcome {
+    result: Result<(), Error>,
+    ready_for: Option<Duration>,
+}
+
+impl SessionOutcome {
+    /// A session that never started (dial/handshake failed, or `close` raced
+    /// it): it can never count as a healthy session.
+    fn failed(result: Error) -> SessionOutcome {
+        SessionOutcome {
+            result: Err(result),
+            ready_for: None,
+        }
+    }
+
+    /// A session that reached READY and stayed up at least `grace` is healthy;
+    /// one that never reached READY, or dropped within the grace, is not.
+    fn healthy(&self, grace: Duration) -> bool {
+        self.ready_for.is_some_and(|d| d >= grace)
+    }
+}
+
+/// The wait before a reconnect, after `consecutive_unhealthy` consecutive
+/// unhealthy sessions (0 = the first retry after a drop): exactly `base`, then
+/// doubled per further consecutive unhealthy session, capped so a flapping peer
+/// settles at `BACKOFF_MAX` between attempts. Pure and total: a very large
+/// counter saturates at the cap instead of overflowing, and a base larger than
+/// the cap is never sped up.
+fn backoff_delay(base: Duration, consecutive_unhealthy: u32) -> Duration {
+    // 2^n as a u32, saturating past the widest shift; the multiply below also
+    // saturates and the cap clamps, so no shift value can overflow.
+    let factor = 1u32.checked_shl(consecutive_unhealthy).unwrap_or(u32::MAX);
+    base.saturating_mul(factor).min(BACKOFF_MAX.max(base))
+}
+
+/// Connects, pumps until the transport drops, then retries. The first retry
+/// after a drop waits exactly `Config::retry_delay`; consecutive unhealthy
+/// sessions double the wait up to `BACKOFF_MAX`, and a session that survived
+/// `ready_grace` after READY resets the counter, so a single transient drop
+/// still recovers at the plain retry delay and a long-lived healthy connection
+/// is never penalised. `retry_probe` (test-only) observes each wait.
+fn supervise(
+    inner: Arc<Inner>,
+    write_timeout: Duration,
+    ready_grace: Duration,
+    retry_probe: Option<mpsc::Sender<RetryEvent>>,
+) {
+    let mut consecutive_unhealthy: u32 = 0;
     loop {
-        let err = connect_and_pump(&inner, write_timeout);
+        let session = connect_and_pump(&inner, write_timeout);
         if inner.closed() {
             return;
         }
-        if let Err(e) = err && let Some(cb) = &inner.cfg.on_drop {
-            cb(&e);
+        if let Err(e) = &session.result && let Some(cb) = &inner.cfg.on_drop {
+            cb(e);
         }
-        if inner.retry_wait(inner.cfg.retry_delay) {
+        let healthy = session.healthy(ready_grace);
+        if healthy {
+            // A healthy session resets the backoff: the next drop recovers at
+            // the plain retry_delay.
+            consecutive_unhealthy = 0;
+        }
+        let delay = backoff_delay(inner.cfg.retry_delay, consecutive_unhealthy);
+        if !healthy {
+            consecutive_unhealthy = consecutive_unhealthy.saturating_add(1);
+        }
+        if let Some(tx) = &retry_probe {
+            let _ = tx.send(RetryEvent::Wait(delay));
+        }
+        let shut = inner.retry_wait(delay);
+        if let Some(tx) = &retry_probe {
+            let _ = tx.send(RetryEvent::Woke);
+        }
+        if shut {
             return;
         }
     }
 }
 
 /// Dials one suffix, sends the handshake, and reads frames until an error. The
-/// connection is published only after the handshake is out.
-fn connect_and_pump(inner: &Arc<Inner>, write_timeout: Duration) -> Result<(), Error> {
-    let conn = Arc::new(dial(inner).map_err(Error::Io)?);
+/// connection is published only after the handshake is out. The returned
+/// outcome carries how long the session lived after READY, which the supervisor
+/// classifies for the backoff.
+fn connect_and_pump(inner: &Arc<Inner>, write_timeout: Duration) -> SessionOutcome {
+    let conn = match dial(inner) {
+        Ok(pipe) => Arc::new(pipe),
+        Err(e) => return SessionOutcome::failed(Error::Io(e)),
+    };
 
-    let handshake = serde_json::to_vec(&Handshake {
+    let handshake = match serde_json::to_vec(&Handshake {
         v: 1,
         client_id: &inner.cfg.client_id,
-    })
-    .map_err(Error::Json)?;
+    }) {
+        Ok(h) => h,
+        Err(e) => return SessionOutcome::failed(Error::Json(e)),
+    };
     {
         let _wmu = inner.wmu.lock().expect("write mutex");
-        write_frame_bounded(&conn, OP_HANDSHAKE, &handshake, write_timeout)?;
+        if let Err(e) = write_frame_bounded(&conn, OP_HANDSHAKE, &handshake, write_timeout) {
+            return SessionOutcome::failed(e);
+        }
     }
 
     {
         let mut st = inner.state.lock().expect("client state");
         st.conn = Some(Arc::clone(&conn));
         st.ready = false;
+        st.ready_at = None;
     }
     // The connection is published but NOT usable yet: Discord discards commands
     // sent before its READY dispatch, so `send` returns `Error::NotReady` until
@@ -456,22 +601,27 @@ fn connect_and_pump(inner: &Arc<Inner>, write_timeout: Duration) -> Result<(), E
         let mut st = inner.state.lock().expect("client state");
         st.conn = None;
         st.ready = false;
+        st.ready_at = None;
         drop(st);
         conn.close();
-        return Err(Error::NotConnected);
+        return SessionOutcome::failed(Error::NotConnected);
     }
 
     let result = pump(inner, &conn, write_timeout);
 
-    // The connection is gone: no reply can arrive.
-    {
+    // The connection is gone: no reply can arrive. Stamp how long the session
+    // lived after READY before clearing the session state.
+    let ready_for = {
         let mut st = inner.state.lock().expect("client state");
+        let ready_for = st.ready_at.map(|t| t.elapsed());
         st.conn = None;
         st.ready = false;
-    }
+        st.ready_at = None;
+        ready_for
+    };
     inner.clear_pending();
     conn.close();
-    result
+    SessionOutcome { result, ready_for }
 }
 
 /// Probes suffix 0..9 and returns the first pipe that opens. A failure on every
@@ -548,6 +698,9 @@ fn dispatch_frame(inner: &Arc<Inner>, payload: &[u8]) {
             let mut st = inner.state.lock().expect("client state");
             let already = st.ready;
             st.ready = true;
+            // Stamped once per session, at its first READY: the supervisor
+            // classifies the session by how long it lived after this.
+            st.ready_at.get_or_insert_with(Instant::now);
             already
         };
         if !already {

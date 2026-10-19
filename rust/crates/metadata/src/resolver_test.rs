@@ -164,6 +164,171 @@ fn match_episode_never_positional() {
     assert_eq!(matched.title, "Theatrical Malice");
 }
 
+/// Season-aware absolute matching: a table carrying earlier seasons that
+/// numbers the wanted season continuously (S2E1 == 26) or flattens it into
+/// season 0 answers by TOTAL number; a table that cannot establish that total
+/// (a single-season absolute list, or the wrong season's table) stays a miss
+/// and never fabricates a match.
+#[test]
+fn match_episode_season_aware_absolute() {
+    let eps = vec![
+        Episode {
+            season: 1,
+            number: 1,
+            title: "S1E1".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 1,
+            number: 2,
+            title: "S1E2".to_string(),
+            ..Episode::default()
+        },
+        // The wanted season flattened into season 0, numbered continuously:
+        // S2E1 is total 3.
+        Episode {
+            season: 0,
+            number: 3,
+            title: "S2E1".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 0,
+            number: 4,
+            title: "S2E2".to_string(),
+            ..Episode::default()
+        },
+    ];
+    let q = Query {
+        kind: Kind::SERIES,
+        title: "Show".to_string(),
+        season: 2,
+        episode: 1,
+        ..Query::default()
+    };
+    let matched = match_episode(&eps, &q).expect("S2E1 must match by total number");
+    assert_eq!(matched.title, "S2E1");
+    assert!(
+        match_episode(&mislabeled_media().episodes, &q).is_none(),
+        "a single-season absolute list must not fabricate a match"
+    );
+    let s1_only = vec![
+        Episode {
+            season: 1,
+            number: 1,
+            ..Episode::default()
+        },
+        Episode {
+            season: 1,
+            number: 2,
+            ..Episode::default()
+        },
+    ];
+    assert!(
+        match_episode(&s1_only, &q).is_none(),
+        "the wrong season's table must not answer S2"
+    );
+}
+
+/// A season-0 special whose number collides with the absolute fallback total
+/// never binds as a genuinely absent season episode: S3E1 missing from a
+/// table that already carries S3 stays a miss, while the flattened case (no
+/// rows at all for the wanted season) still answers through season 0.
+#[test]
+fn match_episode_refuses_season_zero_special_for_present_season() {
+    let eps = vec![
+        Episode {
+            season: 1,
+            number: 1,
+            title: "S1E1".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 1,
+            number: 2,
+            title: "S1E2".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 2,
+            number: 1,
+            title: "S2E1".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 2,
+            number: 2,
+            title: "S2E2".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 3,
+            number: 2,
+            title: "S3E2".to_string(),
+            ..Episode::default()
+        },
+        Episode {
+            season: 0,
+            number: 5,
+            title: "Special".to_string(),
+            ..Episode::default()
+        },
+    ];
+    let q = Query {
+        kind: Kind::SERIES,
+        title: "Show".to_string(),
+        season: 3,
+        episode: 1,
+        ..Query::default()
+    };
+    assert!(
+        match_episode(&eps, &q).is_none(),
+        "a season-0 special must not bind as the absent S3E1"
+    );
+}
+
+/// The repair cooldown: a `not_found` record written by the PRE-repair build
+/// (schema 8) is a whole-record miss for the repaired build, so it no longer
+/// suppresses a lookup that can now succeed -- the provider is called and the
+/// winner replaces the stale miss.
+#[test]
+fn stale_schema_negative_never_suppresses_a_fresh_lookup() {
+    let dir = TempDir::new();
+    let d = dir.path();
+    let q = show_query(1, 2);
+    let key = cache_key(&q);
+    let data = serde_json::to_vec(&CacheFile {
+        key: key.clone(),
+        schema: 8, // the schema the pre-repair build wrote; CACHE_SCHEMA is 9
+        not_found: true,
+        checked_at: now_rfc3339(),
+        ..CacheFile::default()
+    })
+    .unwrap();
+    crate::cache_test::store_raw_record(&d, &key, &data);
+
+    let fake = FakeSource::with_media("fake", series_media());
+    let calls = fake.counter();
+    let resolver = resolver_with(&d, vec![fake.shared()]);
+    let res = resolver
+        .lookup_now(&Cancel::background(), &q)
+        .expect("LookupNow");
+    assert!(
+        res.found && res.episode == "Pilot",
+        "resolution = {res:?}, want the stale miss to stop suppressing"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the stale negative must not suppress the fetch"
+    );
+    let entry = cache_load_entry(&d, &key).expect("rewritten entry");
+    assert!(
+        !entry.not_found && entry.media.is_some(),
+        "the winner must replace the stale miss"
+    );
+}
+
 /// `TestCrossSourceFallthrough`: the mislabeled first source is skipped and the
 /// second source carrying Number 1 answers.
 #[test]

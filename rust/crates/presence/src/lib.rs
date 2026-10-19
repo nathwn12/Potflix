@@ -1123,10 +1123,11 @@ pub(crate) fn compose_details_for(
 }
 
 /// The state fill ladder (first non-empty rung wins; only `none` may empty the
-/// line). Series: `default` is tag-plus-synopsis, else tag, else synopsis,
-/// else the clean title; `tag` is tag, else synopsis, else clean; `synopsis`
-/// is tag-plus-synopsis, else tag, else clean. Movie: `default` is
-/// genres-plus-length, else synopsis, else year, else clean; `tag` is the
+/// line). Series: `default` is the tag alone, else the clean title, else the
+/// synopsis only as the last resort so the line can never go empty; `tag` is
+/// tag, else synopsis, else clean; `synopsis` is tag-plus-synopsis, else tag,
+/// else clean. Movie: `default` is genres-plus-length, else the year, else the
+/// clean title, else the synopsis only as the last resort; `tag` is the
 /// filename tag, else genres-plus-length, else synopsis, else clean;
 /// `synopsis` is genres-length-plus-synopsis, else synopsis, else clean. Every
 /// rung carries the paused marker when paused; paused with nothing reads
@@ -1188,15 +1189,17 @@ pub(crate) fn compose_state_for(
                 if !gl.is_empty() {
                     return gl;
                 }
-                if !synopsis.is_empty() {
-                    return synopsis;
-                }
                 let year = rung_year(r, a);
                 if !year.is_empty() {
                     return year;
                 }
                 if !clean.is_empty() {
                     return clean;
+                }
+                // Never blank: the synopsis is the very last resort, only
+                // reached when even the clean title yields nothing.
+                if !synopsis.is_empty() {
+                    return synopsis;
                 }
             }
         }
@@ -1225,17 +1228,16 @@ pub(crate) fn compose_state_for(
                 }
             }
             _ => {
-                if !combined.is_empty() {
-                    return combined;
-                }
                 if !tag.is_empty() {
                     return tag;
                 }
-                if !synopsis.is_empty() {
-                    return synopsis;
-                }
                 if !clean.is_empty() {
                     return clean;
+                }
+                // Never blank: the synopsis is the very last resort, only
+                // reached when even the clean title yields nothing.
+                if !synopsis.is_empty() {
+                    return synopsis;
                 }
             }
         }
@@ -1296,12 +1298,12 @@ pub fn compose_card(
 ///
 /// Movie (`r.is_movie`): details is the canonical title with " (YYYY)" when
 /// `year > 0`, else the filename line; state is genres-plus-length, else the
-/// synopsis, else the year, else the clean title, so the line is never blank.
-/// Series: details is the episode override when present (else the
-/// filename-derived line); state is the episode tag plus the synopsis teaser
-/// when a synopsis is known, else the tag, else the synopsis, else the clean
-/// title. The hover tooltip carries the whole synopsis; the paused
-/// " - Paused" marker path is preserved on every rung.
+/// year, else the clean title, else the synopsis only as the last resort, so
+/// the line is never blank. Series: details is the episode override when
+/// present (else the filename-derived line); state is the episode tag alone,
+/// else the clean title, else the synopsis only as the last resort. The hover
+/// tooltip carries the whole synopsis; the paused " - Paused" marker path is
+/// preserved on every rung.
 pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved) -> Activity {
     compose_card(raw_title, a, r, r.is_movie, &cardspec::default_card_spec())
 }
@@ -1309,9 +1311,8 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
 /// The synopsis-bearing state line: a movie joins genres, length and the
 /// synopsis with " \u{b7} ", a series joins the episode tag and the synopsis
 /// the same way, both capped word-aware at [`STATE_SYNOPSIS_BUDGET`]. It backs
-/// the combined rung of the [`compose_state_for`] ladder (the series default
-/// and the `CARD_STATE_SYNOPSIS` preset) and stays the opt-in behind
-/// [`cardspec::CARD_STATE_SYNOPSIS`] for movies.
+/// the combined rung of the [`compose_state_for`] ladder under the
+/// [`cardspec::CARD_STATE_SYNOPSIS`] preset; the default carries no synopsis.
 /// With no synopsis the slot hides (`""`, `"Paused"` when paused), so the
 /// preset honors the empty-hides contract (`cardspec_test::card_spec_empty_hide`).
 pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) -> String {

@@ -155,13 +155,215 @@ pub(crate) fn is_theme(title: &str, tag: &str) -> bool {
 }
 
 /// `ParseRaw` strips the " - PotPlayer" suffix, runs `titleclean::clean`, then
-/// [`parse`].
+/// [`parse`], and finally repairs the year scars the ALT_EP split can leave
+/// ([`salvage_year`]).
 pub fn parse_raw(raw_title: &str) -> Query {
     let s = raw_title
         .strip_suffix(POT_PLAYER_SUFFIX)
         .unwrap_or(raw_title);
     let c = titleclean::clean(s);
-    parse(&c.title, &c.episode_tag, &c.episode_name)
+    let mut q = parse(&c.title, &c.episode_tag, &c.episode_name);
+    salvage_year(&mut q, &c.episode_tag, s);
+    q
+}
+
+/// Repairs the year scars `parse` cannot see.
+///
+/// `titleclean` moves a trailing release year into the cleaned title, but its
+/// ALT_EP split can instead eat the digit before a parenthesised year as a
+/// weak absolute tag AND drop the year with the tag's tail: `Now You See Me 2
+/// (2016)` arrives here as title `Now You See Me`, tag `E2`, no parenthesised
+/// year anywhere in the returned fields. When the raw name still holds the
+/// `N (YYYY)` shape and the weak tag's number IS that N, the N is a sequel
+/// digit, not an episode: the query is the MOVIE `Now You See Me 2`, year
+/// 2016. Otherwise a cleaned title that carries no year but whose raw name
+/// holds a plausible one (1900-2100) gets that year for the movie query, the
+/// title untouched (`The Blair Witch Project 1999 REMUX AVC MA 2 0` keeps its
+/// junk title and queries with year 1999). A strong SxxEyy tag is never
+/// touched.
+fn salvage_year(q: &mut Query, tag: &str, raw: &str) {
+    if q.kind == Kind::SERIES
+        && q.absolute
+        && q.season == 0
+        && q.episode > 0
+        && tag.trim() == format!("E{}", q.episode)
+        && let Some((n, year, num_start)) = sequel_year_pos(raw)
+        && n == q.episode
+        && !is_dash_connector_before(raw, num_start)
+    {
+        let title = format!("{} {}", q.title, n);
+        *q = Query {
+            kind: Kind::MOVIE,
+            title: title.trim().to_string(),
+            year,
+            ..Query::default()
+        };
+        return;
+    }
+    // A bare year titleclean mistook for the release year: raw
+    // `Blade Runner 2049 (2017)` arrives as title `Blade Runner` year 2049
+    // because the parenthesised year was stripped and the bare 2049 took its
+    // place. When the raw parenthesised year disagrees and the title year sits
+    // immediately before it in the raw, the bare number belongs to the title.
+    if q.kind == Kind::MOVIE
+        && q.season == 0
+        && q.episode == 0
+        && let Some(p) = paren_year(raw)
+        && q.year != p
+        && q.year != 0
+        && bare_year_before_paren(raw, q.year, p)
+    {
+        let title = format!("{} {}", q.title, q.year);
+        *q = Query {
+            kind: Kind::MOVIE,
+            title: title.trim().to_string(),
+            year: p,
+            ..Query::default()
+        };
+        return;
+    }
+    if q.year == 0 && q.kind == Kind::MOVIE {
+        q.year = raw_year(raw).unwrap_or(0);
+    }
+}
+
+/// `rawYear`: the release year for a junk-laden movie filename. A
+/// parenthesised year wins when one exists (`Blade Runner 2049 (2017)` is
+/// 2017, never the bare 2049); otherwise the LAST plausible standalone
+/// four-digit token wins (`Stone Rider 2051 2017` is 2017, never the buried
+/// 2051). Boundaries are non-alphanumeric, so `x264`, `1080p` and digits
+/// glued into a longer run never count.
+fn raw_year(s: &str) -> Option<i32> {
+    if let Some(p) = paren_year(s) {
+        return Some(p);
+    }
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut last: Option<i32> = None;
+    while i < b.len() {
+        if !b[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i - start != 4 {
+            continue;
+        }
+        let before_ok = start == 0 || !b[start - 1].is_ascii_alphanumeric();
+        let after_ok = i == b.len() || !b[i].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            let year: i32 = s[start..i].parse().unwrap_or(0);
+            if is_year_num(year) {
+                last = Some(year);
+            }
+        }
+    }
+    last
+}
+
+/// `sequelYearPos`: the `N (YYYY)` shape -- a bare one-to-three digit number
+/// immediately before a parenthesised plausible year -- as
+/// `(N, year, digit_offset)`, so the caller can tell a genuine sequel digit
+/// (`Now You See Me 2 (2016)`) from a dash-number episode connector
+/// (`Show - 05 (2019)`).
+fn sequel_year_pos(s: &str) -> Option<(i32, i32, usize)> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'(' {
+            i += 1;
+            continue;
+        }
+        if let Some(year) = paren_year_at(b, i + 1) {
+            let mut j = i;
+            while j > 0 && matches!(b[j - 1], b' ' | b'\t' | b'.' | b'_' | b'-') {
+                j -= 1;
+            }
+            let end = j;
+            let mut start = j;
+            while start > 0 && b[start - 1].is_ascii_digit() {
+                start -= 1;
+            }
+            if start < end
+                && end - start <= 3
+                && (start == 0 || !b[start - 1].is_ascii_alphanumeric())
+                && let Ok(n) = s[start..end].parse::<i32>()
+                && n > 0
+            {
+                return Some((n, year, start));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// A dash-number episode connector before a sequel-shaped digit run: skipping
+/// spaces/tabs back from the digit run reaches a `-` (`Show - 05 (2019)`,
+/// `Show-05 (2019)`, `Show - 5 (2019)`). A genuine sequel digit
+/// (`Now You See Me 2 (2016)`) is preceded by a letter, never such a dash.
+fn is_dash_connector_before(s: &str, num_start: usize) -> bool {
+    let b = s.as_bytes();
+    let mut j = num_start.min(b.len());
+    while j > 0 && matches!(b[j - 1], b' ' | b'\t') {
+        j -= 1;
+    }
+    j > 0 && b[j - 1] == b'-'
+}
+
+/// The first parenthesised plausible release year in the raw filename.
+fn paren_year(s: &str) -> Option<i32> {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'(' && let Some(year) = paren_year_at(b, i + 1) {
+            return Some(year);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether the title year sits immediately before the parenthesised year in
+/// the raw (`Blade Runner 2049 (2017)` with year 2049 and paren 2017): the
+/// bare number belongs to the title, not the release year.
+fn bare_year_before_paren(raw: &str, year: i32, paren: i32) -> bool {
+    let b = raw.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'(' && paren_year_at(b, i + 1) == Some(paren) {
+            let mut j = i;
+            while j > 0 && matches!(b[j - 1], b' ' | b'\t' | b'.' | b'_' | b'-') {
+                j -= 1;
+            }
+            if j >= 4 && b[j - 4..j].iter().all(u8::is_ascii_digit) {
+                let before_ok = j == 4 || !b[j - 5].is_ascii_alphanumeric();
+                if before_ok
+                    && let Ok(y) = std::str::from_utf8(&b[j - 4..j])
+                        .unwrap_or("")
+                        .parse::<i32>()
+                    && y == year
+                {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Four ASCII digits at `i` in `b` forming a plausible release year, closed by
+/// the parenthesis `)`.
+fn paren_year_at(b: &[u8], i: usize) -> Option<i32> {
+    if i + 5 > b.len() || !b[i..i + 4].iter().all(u8::is_ascii_digit) || b[i + 4] != b')' {
+        return None;
+    }
+    let year: i32 = std::str::from_utf8(&b[i..i + 4]).ok()?.parse().ok()?;
+    if is_year_num(year) { Some(year) } else { None }
 }
 
 /// `Parse` builds a [`Query`] from titleclean fields. `episode_name` is used

@@ -208,6 +208,54 @@ fn file_record_query_round_trip() {
     }
 }
 
+/// The stored columns of a folder-context episode are a filename-only parse;
+/// the rebuild must recover show/season from the stored path exactly as the live
+/// path does (`resolve_query`), or an index written by an older parser never
+/// repairs.
+#[test]
+fn file_record_query_rebuilds_folder_context() {
+    let _rx = ResolverScope::new();
+    let rec = FileRecord {
+        path: crate::pathutil::join(&["D:\\lib", "Zentaro", "Season 4", "01.mkv"]),
+        name: "01.mkv".into(),
+        kind: crate::index::FILE_KIND_UNKNOWN.into(),
+        ..FileRecord::default()
+    };
+    let q = rec.query();
+    assert_eq!(q.kind, metadata::Kind::SERIES, "kind");
+    assert_eq!(q.title, "Zentaro", "folder show");
+    assert_eq!(q.season, 4, "folder season");
+    assert_eq!(q.episode, 1, "bare episode number");
+    assert!(!q.absolute, "a season-folder query is not absolute");
+}
+
+/// An unusable (empty or blank) stored path still reads the stored columns: the
+/// rebuild never invents folder context it does not have.
+#[test]
+fn file_record_query_empty_path_falls_back_to_stored_columns() {
+    let _rx = ResolverScope::new();
+    for path in ["", "   "] {
+        let rec = FileRecord {
+            path: path.to_string(),
+            name: "Show.S02E03.mkv".into(),
+            kind: crate::index::FILE_KIND_SERIES.into(),
+            title: "Stored Title".into(),
+            season: 2,
+            episode: 3,
+            year: 1999,
+            absolute: true,
+            ..FileRecord::default()
+        };
+        let q = rec.query();
+        assert_eq!(q.kind, metadata::Kind::SERIES, "path={path:?}");
+        assert_eq!(q.title, "Stored Title", "path={path:?}");
+        assert_eq!(q.season, 2, "path={path:?}");
+        assert_eq!(q.episode, 3, "path={path:?}");
+        assert_eq!(q.year, 1999, "path={path:?}");
+        assert!(q.absolute, "path={path:?}");
+    }
+}
+
 #[test]
 fn file_record_encoding_budget() {
     let _rx = ResolverScope::new();

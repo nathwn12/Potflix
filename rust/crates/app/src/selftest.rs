@@ -150,6 +150,14 @@ pub fn event_cleared_window_gone(log: &Logger) {
     log.log("cleared (player window gone)");
 }
 
+/// Cleared when the tracked window is still alive but its action has been Stop
+/// for the whole grace (`sustained_stop`): the window stays up while the card
+/// must not stay parked on the last movie. No Go original -- the Go/Java stop
+/// path kept the card -- so this line exists to make that clear observable.
+pub fn event_cleared_stopped(log: &Logger) {
+    log.log("cleared (stopped player)");
+}
+
 /// The transport dropped; the supervisor will reconnect (`events.go:110`).
 pub fn event_session_dropped(log: &Logger, err: &impl std::fmt::Display) {
     log.log(&format!("session dropped: {err}"));

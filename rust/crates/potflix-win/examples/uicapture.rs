@@ -17,6 +17,7 @@
 //! uicapture window <out.png> <main|settings|card> [focus <id>] [tabs <n>] [wheel <notches>]
 //! uicapture menu <out.png>
 //! uicapture offscreen <out.png> <dpi> <main|settings|card>
+//! uicapture fixmatch <out_unmatched.png> <out_matched.png>
 //! uicapture trace
 //! ```
 //! Every capture prints `MEASURE min/max/mean uniform=<bool>` (a blank bitmap
@@ -414,6 +415,149 @@ fn mode_menu(args: &[String]) -> Result<(), String> {
     r
 }
 
+/// `fixmatch <out_unmatched.png> <out_matched.png>` -- capture the REAL "Fix
+/// match" picker dialog in BOTH states on the hidden desktop.
+///
+/// The picker has no `paint_to_hdc` twin: it is stock STATIC/EDIT/BUTTON/
+/// LISTBOX controls painted by the dialog manager, not a GDI paint function,
+/// so there is no offscreen entry point to reuse. This captures the live
+/// dialog with `PrintWindow` instead, the same way `mode_menu` captures the
+/// tray popup: seed `live_now_playing`, run the public `open_fix_match()`
+/// modal on this thread, and let a watcher thread on the same hidden desktop
+/// wait for `fix_match_dialog_hwnd()`, capture it, and close it with
+/// `WM_CLOSE` (which ends the modal loop).
+///
+/// State 1 (unmatched/Search screen) runs with no override store; state 2
+/// (matched screen) pre-seeds a provider-free movie latch for the same fake
+/// path. A scratch `LOCALAPPDATA` (restored afterwards) keeps the seed out of
+/// owner state. No provider is ever contacted: the Search screen lists only
+/// after the user clicks Search, and the Matched screen reads the local store.
+/// The expected screen is asserted by client height (Search ~= 588px, Matched
+/// ~= 244px at 96 DPI), so the two PNGs can never silently show the same
+/// state.
+fn mode_fixmatch(args: &[String]) -> Result<(), String> {
+    let out_un = args
+        .get(2)
+        .cloned()
+        .ok_or("fixmatch <out_unmatched.png> <out_matched.png>")?;
+    let out_m = args
+        .get(3)
+        .cloned()
+        .ok_or("fixmatch <out_unmatched.png> <out_matched.png>")?;
+    // Scratch the cache root BEFORE any store/config read, restored below.
+    let scratch =
+        std::env::temp_dir().join(format!("potflix-cap-fixmatch-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).map_err(|e| format!("scratch dir: {e}"))?;
+    let prev_localappdata = std::env::var_os("LOCALAPPDATA");
+    // SAFETY: this harness owns its process environment for its own lifetime.
+    unsafe { std::env::set_var("LOCALAPPDATA", &scratch) };
+    let (desk, prev) = enter_hidden_desktop("fixmatch")?;
+    let r = (|| {
+        window::create_main_window().map_err(|e| format!("create_main_window: {e}"))?;
+        {
+            let mut st = window::ui();
+            st.cur_view = window::View::Main;
+            st.focus_id = 0;
+            st.refresh_dir_list();
+        }
+        window::show_main_window();
+        pump(800);
+        let path = format!("{}:{}", 'C', r"\Media\Dune.Part.Two.2024.1080p.mkv");
+        app_support::config::set_live_now_playing(Some(
+            app_support::config::NowPlaying {
+                raw_title: "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+                path: path.clone(),
+            },
+        ));
+        // State 1: no store file on the scratch root -> the Search screen.
+        capture_fix_match_once(desk, &out_un, "fixmatch-unmatched", true)?;
+        // State 2: a provider-free movie latch for the same path -> Matched.
+        let mut store =
+            metadata::overrides::Store::empty_at(metadata::overrides::default_path());
+        store
+            .put(metadata::overrides::Override {
+                scope: metadata::overrides::Scope::Movie,
+                key: metadata::overrides::movie_key(&path),
+                title: "Dune: Part Two".to_string(),
+                year: 2024,
+                provider: String::new(),
+                provider_id: String::new(),
+                poster: String::new(),
+                media: None,
+                episodes: Vec::new(),
+                created_at_ms: 0,
+            })
+            .map_err(|e| format!("seed latch: {e}"))?;
+        capture_fix_match_once(desk, &out_m, "fixmatch-matched", false)?;
+        app_support::config::set_live_now_playing(None);
+        Ok(())
+    })();
+    leave_hidden_desktop(desk, prev);
+    // SAFETY: restoring this process's own environment (see above).
+    unsafe {
+        match prev_localappdata {
+            Some(v) => std::env::set_var("LOCALAPPDATA", v),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+    }
+    r
+}
+
+/// Run the public picker modal once and capture its dialog: a watcher thread
+/// on the same hidden desktop waits for the dialog, captures it with
+/// `PrintWindow`, and closes it, which ends the modal loop on this thread.
+/// `want_tall` selects the expected screen by client height (Search is the
+/// tall screen, Matched the short one); a mismatch fails, so both states are
+/// proven distinct.
+fn capture_fix_match_once(
+    desk: usize,
+    out: &str,
+    tag: &str,
+    want_tall: bool,
+) -> Result<(), String> {
+    let out2 = out.to_string();
+    let tag2 = tag.to_string();
+    let watcher = std::thread::spawn(move || -> Result<(), String> {
+        // SAFETY: this thread owns no windows, so the switch is legal.
+        if unsafe { SetThreadDesktop(desk as *mut c_void) } == 0 {
+            return Err("watcher SetThreadDesktop failed".into());
+        }
+        for _ in 0..150 {
+            let dlg = window::fix_match_dialog_hwnd();
+            if !dlg.is_null() {
+                std::thread::sleep(std::time::Duration::from_millis(700));
+                let (w, h) = client_size(dlg);
+                let (w, h) = (w.max(1), h.max(1));
+                // The tall screen is Search (588 logical px), the short one
+                // Matched (244); the midpoint never equals either.
+                if (h >= 400) != want_tall {
+                    return Err(format!("{tag2}: client {w}x{h} is not the expected screen"));
+                }
+                let dpi = window::window_dpi(dlg);
+                match print_window(dlg, w, h) {
+                    Ok((px, hbm)) => {
+                        let extra = format!("dpi={dpi} client={w}x{h}");
+                        let res = report_and_save(tag2.as_str(), &px, hbm, &out2, &extra);
+                        // SAFETY: bitmap released after the save.
+                        unsafe { DeleteObject(hbm as *mut c_void) };
+                        res?;
+                    }
+                    Err(e) => return Err(e),
+                }
+                // SAFETY: our dialog; WM_CLOSE runs its teardown path, which
+                // ends the modal loop on the main thread.
+                unsafe { win32::PostMessageW(dlg, win32::WM_CLOSE, 0, 0) };
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        Err(format!("{tag2}: dialog never appeared"))
+    });
+    // The modal picker on THIS thread (it owns the main window).
+    window::open_fix_match();
+    watcher.join().map_err(|_| "watcher panicked".to_string())?
+}
+
 fn mode_offscreen(args: &[String]) -> Result<(), String> {
     let out = args
         .get(2)
@@ -694,10 +838,11 @@ fn main() {
         "window" => mode_window(&args),
         "menu" => mode_menu(&args),
         "offscreen" => mode_offscreen(&args),
+        "fixmatch" => mode_fixmatch(&args),
         "trace" => mode_trace(),
         "hold" => mode_hold(&args),
         "facts" => mode_facts(),
-        _ => Err("usage: uicapture (window|menu|offscreen|trace|hold|facts) ...".into()),
+        _ => Err("usage: uicapture (window|menu|offscreen|fixmatch|trace|hold|facts) ...".into()),
     };
     if let Err(e) = r {
         eprintln!("UICAPTURE-FAIL: {e}");

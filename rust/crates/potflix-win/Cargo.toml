@@ -35,6 +35,13 @@ metadata = { path = "../metadata" }
 metadata-http = { path = "../metadata-http" }
 presence = { path = "../presence" }
 repair = { path = "../repair" }
+# The "Fix match" picker's two in-repo edges (intra-workspace path deps, no
+# external crate): `metadata-core` for the resolver's own filename parse
+# (`parse_raw`, so the name field starts from the same cleaned title the
+# resolver and the card path use) and `titleclean` for that path's cleaning
+# pass as the fallback when the parse declines a title.
+metadata-core = { path = "../metadata-core" }
+titleclean = { path = "../titleclean" }
 
 [dev-dependencies]
 serde_json = { workspace = true }

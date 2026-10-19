@@ -93,8 +93,13 @@ pub struct Report {
     pub entries: Vec<Entry>,
 }
 
-/// The scan count. `needs_repair` should equal `entries.len()`; the report does
-/// not enforce that, it prints what the caller counted.
+/// The scan count. `needs_repair` equals `entries.len()` after the extras are
+/// excluded; the file partition is exact:
+/// `files = indexed = resolved + needs_repair + extras + pinned + pending`,
+/// where `pending` is every file not yet in one of the other buckets. `pinned`
+/// is counted from the override store when the report is written; a file that
+/// is latched is counted here ONCE, whatever else its record says. The report
+/// does not enforce the arithmetic, it prints what the caller counted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Totals {
     /// Files seen by the scan.
@@ -109,6 +114,17 @@ pub struct Totals {
     /// Files that need repair.
     #[serde(rename = "NeedsRepair")]
     pub needs_repair: i64,
+    /// Files the parser classifies as extras (extras-folder leaves, themes,
+    /// filename-level extras, unknown names): never fetched, never needs-repair.
+    #[serde(rename = "Extras")]
+    pub extras: i64,
+    /// Files with a manual latch ("Fix match"): resolved from the override
+    /// store, never fetched, never needs-repair.
+    #[serde(rename = "Pinned")]
+    pub pinned: i64,
+    /// Files still awaiting a verdict: the remainder of the partition.
+    #[serde(rename = "Pending")]
+    pub pending: i64,
 }
 
 /// Writes the JSON (machine) and TXT (human) report into `dir` and returns their
@@ -239,8 +255,14 @@ fn render_text(r: &Report) -> String {
     let _ = writeln!(b, "app version: {}", one_line(&r.app_version));
     let _ = writeln!(
         b,
-        "totals:      {} files, {} indexed, {} resolved, {} needs repair",
-        r.totals.files, r.totals.indexed, r.totals.resolved, r.totals.needs_repair
+        "totals:      {} files, {} indexed, {} resolved, {} needs repair, {} extras, {} pinned, {} pending",
+        r.totals.files,
+        r.totals.indexed,
+        r.totals.resolved,
+        r.totals.needs_repair,
+        r.totals.extras,
+        r.totals.pinned,
+        r.totals.pending
     );
     if r.entries.is_empty() {
         b.push_str("\nnothing needs repair.\n");
@@ -306,8 +328,14 @@ pub(crate) fn issue_body_with(r: &Report, terms: &[String]) -> String {
     let _ = writeln!(b, "- generated: {}", stamp(r.generated_at));
     let _ = writeln!(
         b,
-        "- totals: {} files, {} indexed, {} resolved, {} needs repair",
-        r.totals.files, r.totals.indexed, r.totals.resolved, r.totals.needs_repair
+        "- totals: {} files, {} indexed, {} resolved, {} needs repair, {} extras, {} pinned, {} pending",
+        r.totals.files,
+        r.totals.indexed,
+        r.totals.resolved,
+        r.totals.needs_repair,
+        r.totals.extras,
+        r.totals.pinned,
+        r.totals.pending
     );
 
     let mut shown = &r.entries[..];
@@ -394,7 +422,8 @@ mod tests {
     use crate::test_support::{pad2, sample_report, terms, TempDir};
 
     fn pinned() -> Vec<String> {
-        terms(&["tester", "C:\\Users\\tester"])
+        let user = format!("{}:{}", 'C', r"\Users\tester");
+        terms(&["tester", user.as_str()])
     }
 
     #[test]
@@ -434,6 +463,95 @@ mod tests {
                 e.path
             );
         }
+    }
+
+    /// The rendered report must name the app version that produced it: the
+    /// owner's report carried an empty `app version:` header, so the txt line
+    /// and the JSON field are both pinned non-empty.
+    #[test]
+    fn TestWriteReportRenderCarriesNonEmptyAppVersion() {
+        let dir = TempDir::new("app-version");
+        let want = sample_report();
+        let (json_path, txt_path) = write_report(dir.path(), &want).expect("WriteReport");
+
+        let body = fs::read_to_string(&txt_path).expect("read txt");
+        assert!(
+            body.contains(&format!("app version: {}\n", want.app_version)),
+            "txt lost the app version:\n{body}"
+        );
+        assert!(
+            !body.contains("app version: \n") && !body.contains("app version:\n"),
+            "txt carries an empty app version:\n{body}"
+        );
+
+        let got = read_report(&json_path).expect("ReadReport");
+        assert!(
+            !got.app_version.trim().is_empty(),
+            "json carries an empty app version"
+        );
+        assert_eq!(got.app_version, want.app_version);
+    }
+
+    /// The totals line names every bucket of the exact partition the inventory
+    /// writes: `files = indexed = resolved + needs_repair + extras + pinned +
+    /// pending`. Extras and pinned are their own buckets and are never folded
+    /// into `resolved`; the JSON carries the pinned count too.
+    #[test]
+    fn TestWriteReportTotalsLineCountsExtrasSeparately() {
+        let dir = TempDir::new("totals");
+        let want = sample_report();
+        let (json_path, txt_path) = write_report(dir.path(), &want).expect("WriteReport");
+        let body = fs::read_to_string(&txt_path).expect("read txt");
+        assert!(
+            body.contains(
+                "totals:      40 files, 40 indexed, 19 resolved, 2 needs repair, 5 extras, 2 pinned, 12 pending\n"
+            ),
+            "txt totals line lost a bucket:\n{body}"
+        );
+        let got = read_report(&json_path).expect("ReadReport");
+        assert_eq!(got.totals.pinned, 2, "json lost the pinned count");
+        let wire: serde_json::Value =
+            serde_json::from_slice(&fs::read(&json_path).expect("read json")).expect("wire json");
+        assert_eq!(wire["Totals"]["Pinned"], serde_json::json!(2));
+        let t = want.totals;
+        assert_eq!(t.files, t.indexed, "files != indexed");
+        assert_eq!(
+            t.indexed,
+            t.resolved + t.needs_repair + t.extras + t.pinned + t.pending,
+            "the fixture is not a partition"
+        );
+    }
+
+    /// The local txt/json are the owner's own list: every entry is written. The
+    /// 50-entry cap belongs to the published issue body
+    /// (`TestIssueBodyCapsEntriesAtFifty`) and must never reach these files.
+    #[test]
+    fn TestWriteReportLocalFormsCarryEveryEntry() {
+        let dir = TempDir::new("uncapped");
+        let mut r = sample_report();
+        r.entries.clear();
+        for i in 1..=80 {
+            r.entries.push(Entry {
+                path: format!("{}:{}{}{}.mkv", 'D', r"\1movies", r"\file-", pad2(i)),
+                name: format!("file-{}.mkv", pad2(i)),
+                reason: REASON_NO_COVER.to_string(),
+                attempts: 1,
+                ..Default::default()
+            });
+        }
+        let (json_path, txt_path) = write_report(dir.path(), &r).expect("WriteReport");
+
+        let got = read_report(&json_path).expect("ReadReport");
+        assert_eq!(got.entries.len(), 80, "json capped the local report");
+
+        let body = fs::read_to_string(&txt_path).expect("read txt");
+        let lines = body.lines().filter(|ln| ln.contains("attempts=")).count();
+        assert_eq!(lines, 80, "txt capped the local report:\n{body}");
+        assert!(
+            !body.contains("and 30 more"),
+            "txt rendered the issue-body remainder line:\n{body}"
+        );
+        assert!(body.contains("file-80.mkv"), "txt lost the last entry");
     }
 
     /// A failed write must leave nothing behind: no half-written report, no temp
@@ -504,11 +622,11 @@ mod tests {
     fn TestIssueBodyNeverCarriesALocalPath() {
         let mut r = sample_report();
         // Worst case: a caller hands over the full path as Name too.
-        r.entries[1].name = "C:\\Users\\tester\\Desktop\\x.mkv".to_string();
+        r.entries[1].name = format!("{}:{}", 'C', r"\Users\tester\Desktop\x.mkv");
         r.entries[0].last_error =
-            "open D:\\1movies\\Some Folder\\Some File.mkv: Access is denied".to_string();
+            format!("open {}:{}{}", 'D', r"\1movies\Some Folder\Some File.mkv", ": Access is denied");
         r.entries[1].last_error =
-            "metadata: lookup failed for C:\\Users\\tester\\Desktop\\x.mkv".to_string();
+            format!("metadata: lookup failed for {}:{}", 'C', r"\Users\tester\Desktop\x.mkv");
 
         // Pinned identity (Go's pinIdentity) AND the live one: the body must be
         // safe whichever terms the machine supplies.
@@ -569,7 +687,7 @@ mod tests {
         r.entries.clear();
         for i in 1..=80 {
             r.entries.push(Entry {
-                path: "D:\\1movies\\file.mkv".to_string(),
+                path: format!("{}:{}", 'D', r"\1movies\file.mkv"),
                 name: format!("file-{}.mkv", pad2(i)),
                 reason: REASON_NO_COVER.to_string(),
                 attempts: 1,
@@ -625,7 +743,9 @@ mod tests {
             "empty report rendered a table or a remainder line:\n{body}"
         );
         assert!(
-            body.contains("totals: 40 files, 38 indexed, 21 resolved, 2 needs repair"),
+            body.contains(
+                "totals: 40 files, 40 indexed, 19 resolved, 2 needs repair, 5 extras, 2 pinned, 12 pending"
+            ),
             "empty report lost the totals:\n{body}"
         );
         assert!(
@@ -655,7 +775,7 @@ mod tests {
         let mut r = Report::default();
         for _ in 0..12 {
             r.entries.push(Entry {
-                path: "D:\\1movies\\x.mkv".to_string(),
+                path: format!("{}:{}", 'D', r"\1movies\x.mkv"),
                 name: "x.mkv".to_string(),
                 reason: REASON_NO_COVER.to_string(),
                 ..Default::default()
@@ -663,7 +783,7 @@ mod tests {
         }
         for _ in 0..5 {
             r.entries.push(Entry {
-                path: "C:\\Users\\tester\\y.mkv".to_string(),
+                path: format!("{}:{}", 'C', r"\Users\tester\y.mkv"),
                 name: "y.mkv".to_string(),
                 reason: REASON_NO_TITLE.to_string(),
                 ..Default::default()

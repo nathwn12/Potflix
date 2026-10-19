@@ -188,17 +188,14 @@ fn build_episode(video: &CinemetaVideo, season: i32, number: i32) -> Episode {
 }
 
 impl CinemetaSource {
-    /// One validated catalog pick for `catalog` (`"movie"` or `"series"`):
-    /// the title-ranked best, with a known query year preferring any
-    /// challenger that both carries it and fully covers the query title.
-    /// `Ok(None)` is a definitive miss. Year never gates beyond that soft
-    /// preference.
-    fn pick(
+    /// The catalog search rows for `catalog` (`"movie"` or `"series"`), in the
+    /// provider's own rank order. Rows without an id or a name are dropped.
+    fn catalog(
         &self,
         cancel: &Cancel,
         q: &Query,
         catalog: &str,
-    ) -> Result<Option<CinemetaMeta>, Error> {
+    ) -> Result<Vec<CinemetaMeta>, Error> {
         let search_url = format!(
             "{}/catalog/{catalog}/top/search={}.json",
             self.base_url(),
@@ -207,50 +204,42 @@ impl CinemetaSource {
         let response = self.client.get(cancel, &search_url)?;
         if response.status() == StatusCode::NOT_FOUND {
             drain_and_close(response);
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let catalog_resp: CinemetaCatalogResp = decode_capped(response)?;
-        let mut cands: Vec<ShowCand> = Vec::with_capacity(catalog_resp.metas.len());
         let mut entries: Vec<CinemetaMeta> = Vec::with_capacity(catalog_resp.metas.len());
         for meta in catalog_resp.metas {
             if meta.id.trim().is_empty() || meta.name.trim().is_empty() {
                 continue;
             }
-            cands.push(ShowCand {
+            entries.push(meta);
+        }
+        Ok(entries)
+    }
+
+    /// `pickIndex`: the title-ranked best row, with a known query year
+    /// preferring any challenger that both carries it and fully covers the
+    /// query title. `None` when the best similarity is below the matcher's
+    /// floor. Year never gates beyond that soft preference.
+    fn pick_index(q: &Query, entries: &[CinemetaMeta]) -> Option<usize> {
+        let cands: Vec<ShowCand> = entries
+            .iter()
+            .map(|meta| ShowCand {
                 name: meta.name.clone(),
                 weight: 0,
                 episode_count: 0,
                 aliases: Vec::new(),
-            });
-            entries.push(meta);
-        }
-        if cands.is_empty() {
-            return Ok(None);
-        }
-        let Some(winner) = pick_best_show(&q.title, &cands) else {
-            // Low-confidence best: a wrong title is worse than no title.
-            return Ok(None);
-        };
-        let mut winner_idx = None;
-        for (i, cand) in cands.iter().enumerate() {
-            if *cand == winner {
-                winner_idx = Some(i);
-                break;
-            }
-        }
-        let Some(winner_idx) = winner_idx else {
-            return Ok(None);
-        };
-        // A known query year prefers any challenger that both carries it and
-        // fully covers the query title (the live catalog ranks the 2015
-        // "Dragon Ball Super" above the 2026 "Dragon Ball Super: Beerus" on
-        // title alone). Soft only: no year match keeps the title winner.
+            })
+            .collect();
+        let winner = pick_best_show(&q.title, &cands)?;
+        let winner_idx = cands.iter().position(|cand| *cand == winner)?;
         let years: Vec<i32> = entries
             .iter()
             .map(|entry| release_year(&entry.release_info))
             .collect();
-        let take = crate::yearpref::prefer_year_match(&q.title, q.year, &cands, &years, winner_idx);
-        Ok(Some(entries[take].clone()))
+        Some(crate::yearpref::prefer_year_match(
+            &q.title, q.year, &cands, &years, winner_idx,
+        ))
     }
 
     /// The `/meta` details for a validated catalog pick.
@@ -275,10 +264,17 @@ impl CinemetaSource {
     }
 
     fn find_movie(&self, cancel: &Cancel, q: &Query) -> Result<Option<Media>, Error> {
-        let Some(picked) = self.pick(cancel, q, "movie")? else {
+        let entries = self.catalog(cancel, q, "movie")?;
+        // A title below the floor is still the right work when the search
+        // engine's own top row carries the query year (parse_raw salvages that
+        // year out of junk-laden scene names): two independent keys -- the
+        // engine's rank and the year -- so an unrelated first row still loses.
+        let Some(idx) = Self::pick_index(q, &entries).or_else(|| year_seed_index(q, &entries))
+        else {
             return Ok(None);
         };
-        let Some(details) = self.details(cancel, "movie", &picked)? else {
+        let picked = &entries[idx];
+        let Some(details) = self.details(cancel, "movie", picked)? else {
             return Ok(None);
         };
         let title = details.name.trim();
@@ -308,55 +304,98 @@ impl CinemetaSource {
         }))
     }
 
+    /// Candidate order: the title-ranked row first (when one clears the
+    /// floor), then the catalog's own top row. The top row is where a romaji
+    /// or junk-laden query lands on the work's other-named entry (token
+    /// scoring cannot see `Shingeki no Kyojin` in `Attack on Titan`); it must
+    /// prove itself by its own episode table, so a genuinely different show
+    /// still loses. A query with no episode number never takes the top-row
+    /// path.
     fn find_series(&self, cancel: &Cancel, q: &Query) -> Result<Option<Media>, Error> {
-        let Some(picked) = self.pick(cancel, q, "series")? else {
-            return Ok(None);
-        };
-        let Some(details) = self.details(cancel, "series", &picked)? else {
-            return Ok(None);
-        };
-        let title = details.name.trim();
-        if title.is_empty() {
-            return Ok(None);
+        let entries = self.catalog(cancel, q, "series")?;
+        let mut order: Vec<usize> = Vec::new();
+        if let Some(i) = Self::pick_index(q, &entries) {
+            order.push(i);
         }
-        let mut year = release_year(&details.year);
-        if year == 0 {
-            year = release_year(&picked.release_info);
+        if q.episode > 0 && order.first() != Some(&0) {
+            order.push(0);
         }
-        let mut episodes: Vec<Episode> = Vec::with_capacity(details.videos.len());
-        for video in &details.videos {
-            let Some(number) = video.number else {
+        for i in order {
+            let pinned = &entries[i];
+            let Some(details) = self.details(cancel, "series", pinned)? else {
                 continue;
             };
-            episodes.push(build_episode(video, video.season.unwrap_or(0), number));
-        }
-        episodes.sort_by_key(|episode| (episode.season, episode.number));
-        if q.absolute {
-            // Absolute N maps to the Nth entry in (season, number) air order,
-            // exactly as the TVmaze source renumbers, so number-exact matching
-            // holds for absolute anime queries.
-            for (i, episode) in episodes.iter_mut().enumerate() {
-                episode.number = i as i32 + 1;
+            let Some(media) = series_media(q, pinned, details) else {
+                continue;
+            };
+            if q.episode > 0 && crate::resolver::match_episode(&media.episodes, q).is_none() {
+                continue;
             }
+            return Ok(Some(media));
         }
-        Ok(Some(Media {
-            source: "cinemeta".to_string(),
-            source_id: picked.id.trim().to_string(),
-            kind: Kind::SERIES,
-            title: title.to_string(),
-            year,
-            artwork: normalize_url(&details.poster),
-            synopsis: cap_synopsis(&strip_html(&details.description)),
-            genres: join_genres(&details.genre),
-            length: String::new(),
-            show_url: imdb_url(picked.id.trim()),
-            episode_url: String::new(),
-            movie_url: String::new(),
-            trailer_url: String::new(),
-            episodes,
-            fetched_at: crate::timefmt::now_rfc3339(),
-        }))
+        Ok(None)
     }
+}
+
+/// A low-confidence seed for the movie leg: when the title floor rejects every
+/// catalog row but the query carries a known year and the catalog's OWN top
+/// row carries that same year, the top row is the work the search engine found
+/// under a title token scoring cannot see (a junk-laden scene name whose year
+/// `parse_raw` salvaged). Two independent keys -- the engine's rank and the
+/// year -- so an unrelated first row still loses, and a query without a year
+/// never seeds.
+fn year_seed_index(q: &Query, entries: &[CinemetaMeta]) -> Option<usize> {
+    if q.year <= 0 {
+        return None;
+    }
+    let first = entries.first()?;
+    (release_year(&first.release_info) == q.year).then_some(0)
+}
+
+/// The series `Media` for one catalog row plus its details. `None` when the
+/// details carry no usable name (the caller then tries the next candidate).
+fn series_media(q: &Query, picked: &CinemetaMeta, details: CinemetaDetails) -> Option<Media> {
+    let title = details.name.trim();
+    if title.is_empty() {
+        return None;
+    }
+    let mut year = release_year(&details.year);
+    if year == 0 {
+        year = release_year(&picked.release_info);
+    }
+    let mut episodes: Vec<Episode> = Vec::with_capacity(details.videos.len());
+    for video in &details.videos {
+        let Some(number) = video.number else {
+            continue;
+        };
+        episodes.push(build_episode(video, video.season.unwrap_or(0), number));
+    }
+    episodes.sort_by_key(|episode| (episode.season, episode.number));
+    if q.absolute {
+        // Absolute N maps to the Nth entry in (season, number) air order,
+        // exactly as the TVmaze source renumbers, so number-exact matching
+        // holds for absolute anime queries.
+        for (i, episode) in episodes.iter_mut().enumerate() {
+            episode.number = i as i32 + 1;
+        }
+    }
+    Some(Media {
+        source: "cinemeta".to_string(),
+        source_id: picked.id.trim().to_string(),
+        kind: Kind::SERIES,
+        title: title.to_string(),
+        year,
+        artwork: normalize_url(&details.poster),
+        synopsis: cap_synopsis(&strip_html(&details.description)),
+        genres: join_genres(&details.genre),
+        length: String::new(),
+        show_url: imdb_url(picked.id.trim()),
+        episode_url: String::new(),
+        movie_url: String::new(),
+        trailer_url: String::new(),
+        episodes,
+        fetched_at: crate::timefmt::now_rfc3339(),
+    })
 }
 
 impl crate::resolver::Source for CinemetaSource {

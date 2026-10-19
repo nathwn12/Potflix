@@ -76,8 +76,25 @@ pub struct FileRecord {
 }
 
 impl FileRecord {
-    /// Rebuilds the parsed query this record was written from.
+    /// Rebuilds the query this record was written from, exactly as the live
+    /// path builds it: [`metadata_core::context::resolve_query`] over the stored
+    /// filename plus the stored full path, so a folder-only show/season is
+    /// recovered at repair time and the current parser replaces stale stored
+    /// columns (a scan leaves unchanged files' columns untouched, so an index
+    /// written by an older parser would otherwise never repair).
+    ///
+    /// The stored columns are the fallback only when the path is unusable
+    /// (empty); no schema is changed and no rescan is needed.
     pub fn query(&self) -> metadata::Query {
+        if !self.path.trim().is_empty() {
+            return metadata_core::context::resolve_query(&self.name, &self.path);
+        }
+        self.stored_query()
+    }
+
+    /// The query from the stored columns alone: the fallback for a record whose
+    /// path is unusable (see [`FileRecord::query`]).
+    fn stored_query(&self) -> metadata::Query {
         let kind = match self.kind.as_str() {
             FILE_KIND_SERIES => metadata::Kind::SERIES,
             FILE_KIND_MOVIE => metadata::Kind::MOVIE,

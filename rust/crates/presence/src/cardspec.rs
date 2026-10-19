@@ -10,10 +10,13 @@
 //!
 //! [`default_card_spec`] reproduces [`build_activity_resolved`]'s lines
 //! exactly: both delegate to the [`compose_card`](crate::compose_card) fill
-//! ladder, so the default state carries the synopsis teaser after the episode
-//! tag for a series (genres/length for a movie); the whole synopsis stays one
-//! click away in the tooltip. The paused " - Paused" marker path is preserved
-//! on every rung, and only [`CARD_STATE_NONE`] may empty the line.
+//! ladder, so the default state is the episode tag alone for a series
+//! (genres/length for a movie) and never the synopsis; the synopsis stays
+//! available as the explicit [`CARD_STATE_SYNOPSIS`] preset and whole in the
+//! tooltip. The default falls back to the clean filename title, and only as
+//! the very last resort to the synopsis, so the line is never blank. The
+//! paused " - Paused" marker path is preserved on every rung, and only
+//! [`CARD_STATE_NONE`] may empty the line.
 
 use player::window::{APP_NAME, SUFFIX};
 use serde::{Deserialize, Serialize};
@@ -104,11 +107,11 @@ impl CardSpec {
     /// Returns the (details, state) body lines for the given inputs under this
     /// spec (`cardspec.go:147`). The default spec returns
     /// [`build_activity_resolved`](crate::build_activity_resolved)'s lines
-    /// exactly (both delegate to the same fill ladder); the series default
-    /// state carries the synopsis teaser after the episode tag, and every
-    /// ladder ends on the clean filename title so the line is never blank.
-    /// Only [`CARD_STATE_NONE`] empties the line. The idle card keeps its
-    /// shipped lines under any spec.
+    /// exactly (both delegate to the same fill ladder); the default state is
+    /// the episode tag alone for a series (genres/length for a movie), falling
+    /// back to the clean filename title and only as the very last resort to
+    /// the synopsis, so the line is never blank. Only [`CARD_STATE_NONE`]
+    /// empties the line. The idle card keeps its shipped lines under any spec.
     pub fn render(&self, raw_title: &str, a: Option<&Action>, r: &Resolved) -> (String, String) {
         self.render_kind(raw_title, a, r, r.is_movie)
     }

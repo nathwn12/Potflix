@@ -10,7 +10,9 @@ use crate::cardspec::{
     CARD_STATE_DEFAULT, CARD_STATE_NONE, CARD_STATE_SYNOPSIS, CARD_STATE_TAG, CardPreset, CardSpec,
     card_presets, default_card_spec, is_idle_title,
 };
-use crate::{Action, PAUSED_MARKER, Resolved, build_activity_resolved, compose_card};
+use crate::{
+    Action, PAUSED_MARKER, Resolved, STATE_SYNOPSIS_BUDGET, build_activity_resolved, compose_card,
+};
 
 struct CardSpecCase {
     name: &'static str,
@@ -493,8 +495,8 @@ fn card_spec_kind_adapt() {
             res: series.clone(),
             spec: default_card_spec(),
             want_d: "Canonical Episode",
-            // The series default carries the synopsis teaser after the tag.
-            want_s: mid("S1 E2", "A brave synopsis"),
+            // The series default is the tag alone: no synopsis teaser.
+            want_s: "S1 E2".to_string(),
         },
         Case {
             name: "series episode",
@@ -524,7 +526,7 @@ fn card_spec_kind_adapt() {
             res: anime.clone(),
             spec: default_card_spec(),
             want_d: "The Hero's Rest",
-            want_s: mid("S1 E1", "An elf mourns"),
+            want_s: "S1 E1".to_string(),
         },
         Case {
             name: "anime series ignores year",
@@ -802,12 +804,13 @@ fn card_spec_serde_matches_go_omitempty() {
     assert!(parsed.is_default(), "and normalizes to the default");
 }
 
-/// S3 (revised): the movie default still never duplicates the tooltip
-/// synopsis, while the series default now carries the synopsis teaser right
-/// after the episode tag (the owner asked for the synopsis on the card, right
-/// after the `S1E1`); the hover tooltip keeps the whole note. Drives the real
-/// builder for a movie and a series, and the default spec must agree
-/// byte-for-byte with the builder on both.
+/// The default state carries no synopsis on either kind: the movie state is
+/// genres-plus-length and the series state is the episode tag alone, while the
+/// hover tooltip keeps the whole note. Drives the real builder for a movie and
+/// a series, and the default spec must agree byte-for-byte with the builder on
+/// both. Also pins the never-blank tail: a movie with no genres/length/year
+/// still renders a non-empty line (the clean title, preferred over the
+/// synopsis).
 #[test]
 fn default_state_carries_no_synopsis() {
     let run = Action {
@@ -862,10 +865,10 @@ fn default_state_carries_no_synopsis() {
         Some(&run),
         &series,
     );
-    assert_eq!(got.state, "S1 E2 \u{b7} A brave synopsis", "series state");
+    assert_eq!(got.state, "S1 E2", "series state");
     assert!(
-        got.state.contains("A brave synopsis"),
-        "series state must carry the teaser after the tag: {:?}",
+        !got.state.contains("A brave synopsis"),
+        "series default state must not carry the synopsis: {:?}",
         got.state
     );
     assert_eq!(
@@ -881,6 +884,62 @@ fn default_state_carries_no_synopsis() {
         (d.as_str(), s.as_str()),
         (got.details.as_str(), got.state.as_str()),
         "default spec must agree with the builder"
+    );
+    // The never-blank tail: no genres, no length, no year still yields a
+    // non-empty state -- the clean filename title, preferred over the
+    // synopsis, which stays in the tooltip.
+    let bare_movie = Resolved {
+        is_movie: true,
+        synopsis: "Paul unites the Fremen".to_string(),
+        ..Resolved::default()
+    };
+    let got = build_activity_resolved("Movie.mkv - PotPlayer", Some(&run), &bare_movie);
+    assert_eq!(got.state, "Movie", "bare movie state");
+    assert!(
+        !got.state.contains("Paul unites the Fremen"),
+        "bare movie state must prefer the clean title over the synopsis: {:?}",
+        got.state
+    );
+    assert_eq!(got.large_text, "Paul unites the Fremen", "bare movie tooltip");
+    let (d, s) = default_card_spec().render("Movie.mkv - PotPlayer", Some(&run), &bare_movie);
+    assert_eq!(
+        (d.as_str(), s.as_str()),
+        (got.details.as_str(), got.state.as_str()),
+        "default spec must agree with the builder"
+    );
+}
+
+/// The explicitly chosen Synopsis preset still renders the synopsis inline --
+/// the default no longer does -- joined after the tag for a series, within the
+/// 72-unit [`STATE_SYNOPSIS_BUDGET`].
+#[test]
+fn synopsis_preset_renders_inline() {
+    let run = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let spec = CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
+    let (_, s) = spec.render(
+        "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+        Some(&run),
+        &Resolved {
+            series: "Canonical Series".to_string(),
+            episode_name: "Canonical Episode".to_string(),
+            synopsis: "A brave synopsis".to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(s, "S1 E2 \u{b7} A brave synopsis", "series preset state");
+    let n = java_units(&s);
+    assert!(
+        n <= STATE_SYNOPSIS_BUDGET,
+        "preset state length {n} exceeds {STATE_SYNOPSIS_BUDGET}: {s:?}"
     );
 }
 

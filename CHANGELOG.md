@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-19
+
+### Added
+
+- Manual match for a wrong card: while something is playing, `Fix match…`
+  opens a picker (`rust\crates\potflix-win\src\window.rs`, the `FIX_MATCH_*`
+  copy, `fix_match_prefill_name`, `fix_match_scope_choices`) — the name field
+  is pre-filled with the resolver's own parse of the playing title (so it
+  reads `Attack on Titan`, never the raw filename), plus an optional year;
+  Search walks the provider chain and each candidate row reads
+  `Attack on Titan (2013) · AniList · 25 episodes` (a movie omits the episode
+  count). The scope radios choose the latch target — `This season` (default)
+  or `Whole show` for a series file (one radio when the folder is both at
+  once), while a movie pins its own file directly with no radios. The latch is
+  stored locally in `%LOCALAPPDATA%\Potflix\overrides.json`
+  (`rust\crates\metadata\src\overrides.rs`, `STORE_FILE_NAME`), keyed by path
+  (the movie file, the season folder, the show folder), and wins over the
+  automatic ladder for both lookup and display: the catch-up pass resolves a
+  latched record from the store itself with no provider fetch
+  (`rust\crates\library\src\catchup.rs`), and the poll loop renders the card
+  from the latch (`rust\crates\app\src\main.rs`, `latch_resolved`). Pinning a
+  season or a whole show fetches the episode table once
+  (`rust\crates\metadata\src\search.rs`, `pin_from_candidate`), so every
+  episode in scope renders its own title and synopsis under the scope's shared
+  cover, and a latched record is never searched again. On an already-matched
+  item the same door offers `Refresh metadata`, `Change match…` and
+  `Use automatic matching`.
+- Folder-list keyboard navigation: Up/Down step the selection, Home/End jump
+  to the first/last row, Enter opens the selected folder
+  (`rust\crates\potflix-win\src\window.rs`, `on_main_list_key`).
+- A repeatable end-to-end clear check: `tools\live-check.ps1` plays a real file
+  through the real player, waits for the card push and its Discord ack, closes
+  PotPlayer gently and requires the clear to be ACKNOWLEDGED with no
+  `push ack timeout` in between. Exit codes: 0 = pass, 1 = check failure,
+  2 = precondition/environment (nothing was changed).
+
+### Changed
+
+- The card State line no longer carries the synopsis by default: the series
+  default is the episode tag alone (then the clean title, the synopsis only as
+  the last resort before a blank line), the movie default is
+  `genres · length` (then year, clean title, synopsis last)
+  (`rust\crates\presence\src\lib.rs`, `compose_state_for`). The synopsis stays
+  available two ways: the explicit `Synopsis` preset (the 72-unit
+  `STATE_SYNOPSIS_BUDGET`) and the whole-note hover text of the cover slot
+  (`large_text`). The shipped per-kind defaults below are updated to match.
+- The needs-repair report now carries the running app version (`APP_VERSION`,
+  `rust\crates\potflix-win\src\settings.rs`); extras and featurettes are
+  excluded from the repair list and counted separately, and a latched record
+  is counted once as `pinned` (`rust\crates\library\src\catchup.rs`,
+  `rust\crates\repair\src\report.rs`).
+- `titleclean` is untouched: no file under `rust\crates\titleclean\` changed,
+  so the byte-parity contract still matches without re-proving.
+
+### Fixed
+
+- The stuck card after the player closes: an ack timeout now drops the
+  connection so the supervisor reconnects (`rust\crates\discord\src\lib.rs`,
+  `on_ack_timeout`, `ACK_TIMEOUT`), the poll loop re-asserts the clear on a
+  new connection generation (`rust\crates\app\src\main.rs`, `clear_due`), a
+  window stopped for `STOP_GRACE_MS` (15 s) is treated as no-player, and the
+  player reads are bounded by `SendMessageTimeoutW` so a hung player window
+  cannot freeze the loop (`rust\crates\player\src\control.rs`). Reconnect
+  backoff (`BACKOFF_MAX` 60 s, `READY_GRACE` 10 s) keeps a dead-but-accepting
+  Discord pipe from causing a reconnect storm.
+- Filing the repair report as a GitHub issue no longer dies when the label is
+  missing: the create is retried once without the label flags, the error keeps
+  the first attempt's cause text, and the prefilled new-issue URL is still
+  shown (`rust\crates\repair\src\issue.rs`).
+- Episode-only filenames resolve using the folder's series context: a bare
+  number like `01.mkv` under a usable show folder becomes a series query
+  carrying the folder's show and season
+  (`rust\crates\metadata-core\src\context.rs`, `resolve_query`).
+- Three resolver misses now resolve: `Now You See Me 2 (2016)` classifies as
+  the MOVIE `Now You See Me 2` (the parenthesised sequel year is salvaged,
+  never an episode), `The.Blair.Witch.Project.1999…-LEGi0N.mkv` queries with
+  the raw's plausible year and answers on the year-confirmed catalog row, and
+  `Shingeki no Kyojin` S02E01/S03E05 resolve — the S02 case returns Attack on
+  Titan S2E1 `Beast Titan`. Measured live 2026-10-19. The metadata cache
+  schema bumped 8 → 9 so stale negative entries cannot suppress the fixes;
+  older records are a whole-record miss and re-resolve on their own, as before.
+
 ### Rust port (rewrite)
 
 #### Added
@@ -48,8 +130,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `"card":{"series":{"details":"…","state":"…"},"movie":{…}}` (a legacy flat
   pair still loads as the series pair and re-saves nested, and an
   all-default config still writes `"card":{}`). Shipped SERIES
-  default is the episode name plus `S1 E1 · teaser`, MOVIE default is
-  `Title (Year)` plus `genres · length` (then synopsis, year, clean title);
+  default is the episode name plus the episode tag, MOVIE default is
+  `Title (Year)` plus `genres · length` (then year, clean title, with the
+  synopsis only as the last resort before a blank line);
   the hover text of the LARGE image slot — the cover when artwork resolved,
   the PotFlix `logo` asset otherwise — carries the whole stored note.
   Budgets in UTF-16 units (`NAME_BUDGET`, `DETAILS_BUDGET`, `STATE_BUDGET` /

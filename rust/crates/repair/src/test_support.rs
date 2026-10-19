@@ -46,9 +46,12 @@ pub(crate) fn sample_report() -> Report {
         app_version: "1.2.3".to_string(),
         totals: Totals {
             files: 40,
-            indexed: 38,
-            resolved: 21,
+            indexed: 40,
+            resolved: 19,
             needs_repair: 2,
+            extras: 5,
+            pinned: 2,
+            pending: 12,
         },
         entries: vec![
             Entry {

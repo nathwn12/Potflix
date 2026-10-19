@@ -23,6 +23,8 @@ Run `.\dist\potflix.exe` (or `run.bat`) and look for the tray icon. Right-click 
 
 You add library folders with Add folder, keep them fresh with Scan for new files or Refresh for a full re-walk, and preview the card in the Card view before it reaches Discord.
 
+While something plays and the card shows the wrong title, use Fix match…: type the name (plus the year when you know it), Search, pick the candidate, choose this season or the whole show, and Match. The match is stored on your machine and wins from then on. The folder list answers Up/Down/Home/End, and Enter opens the selected folder.
+
 Two switches exist and nothing else is honoured:
 
 ```powershell
@@ -34,7 +36,7 @@ Exit any running copy before `--selftest`: one instance runs at a time. You need
 
 ## What you get
 
-You get a Discord card that reads `Watching <title>` and is never blank: filenames are cleaned into real titles (codecs, tags, and release groups stripped, years parenthesized, `SxxEyy` parsed), series cards show the episode name with a teaser line, and movie cards show title, year, genres, and length.
+You get a Discord card that reads `Watching <title>` and is never blank: filenames are cleaned into real titles (codecs, tags, and release groups stripped, years parenthesized, `SxxEyy` parsed), series cards show the episode name with the episode tag, and movie cards show title, year, genres, and length.
 
 You get correct states without touching anything: a count-up timer while paused, Browsing and Idle when nothing plays.
 

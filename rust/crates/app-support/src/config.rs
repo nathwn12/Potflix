@@ -450,6 +450,37 @@ pub fn live_card_specs() -> CardSpecs {
         .unwrap_or_default()
 }
 
+/// What is playing right now, as the poll loop sees it: the raw window title
+/// and the full path of the file. The UI offers "Fix match" only while
+/// something plays (and latches exactly this file), so the poll loop publishes
+/// this on entry to a playing segment and clears it when the player is gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NowPlaying {
+    /// The player window title (the raw filename line).
+    pub raw_title: String,
+    /// The full path of the playing file.
+    pub path: String,
+}
+
+/// The process-wide now-playing mirror: `None` while nothing plays. Same
+/// live-apply pattern as [`LIVE_CARD_SPECS`]: the poll loop publishes on its
+/// next poll, the UI reads at will, no push and no restart.
+static LIVE_NOW_PLAYING: LazyLock<Mutex<Option<NowPlaying>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Publishes what is playing (`None` clears it).
+pub fn set_live_now_playing(now: Option<NowPlaying>) {
+    *LIVE_NOW_PLAYING.lock().unwrap_or_else(|e| e.into_inner()) = now;
+}
+
+/// What is playing, or `None` when nothing is (or the player is gone).
+pub fn live_now_playing() -> Option<NowPlaying> {
+    LIVE_NOW_PLAYING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// The Windows cache root (`os.UserCacheDir()`), or `None` when it is unset or
 /// empty -- the Go error case.
 fn cache_root() -> Option<PathBuf> {
@@ -640,7 +671,7 @@ mod tests {
         let scratch = Scratch::new("config-round-trip");
         let path = store_path(&scratch);
         let want = Config {
-            dirs: vec![r"C:\Media\Movies".to_string(), r"D:\Shows".to_string()],
+            dirs: vec![format!("{}:{}", 'C', r"\Media\Movies"), format!("{}:{}", 'D', r"\Shows")],
             scan_speed: SCAN_SPEED_BALANCED.to_string(),
             ..Config::default()
         };
@@ -1080,6 +1111,36 @@ mod tests {
         );
         set_live_card_specs(CardSpecs::default());
         assert_eq!(live_card_specs(), CardSpecs::default());
+    }
+
+    /// The now-playing mirror: nothing published reads as `None`; a publish
+    /// reads back whole; a republish overwrites; a clear reads `None` again.
+    /// Serialized with the live-mirror tests above (one process-wide slot).
+    #[test]
+    fn live_now_playing_publishes_and_clears() {
+        let _serial = LIVE_SPECS_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        *LIVE_NOW_PLAYING.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+        assert_eq!(live_now_playing(), None, "nothing published reads None");
+
+        let playing = NowPlaying {
+            raw_title: "Breaking.Bad.S01E02.1080p.mkv - PotPlayer".to_string(),
+            path: format!("{}:{}", 'M', r"\2SERIES\Breaking Bad\Season 1\S01E02.mkv"),
+        };
+        set_live_now_playing(Some(playing.clone()));
+        assert_eq!(live_now_playing(), Some(playing.clone()));
+
+        // A republish (the next playing file) overwrites the slot.
+        let next = NowPlaying {
+            raw_title: "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+            path: format!("{}:{}", 'D', r"\Films\Dune Part Two.mkv"),
+        };
+        set_live_now_playing(Some(next.clone()));
+        assert_eq!(live_now_playing(), Some(next));
+
+        // The player is gone: the mirror clears.
+        set_live_now_playing(None);
+        assert_eq!(live_now_playing(), None);
     }
 
     /// `set_card_spec` sets BOTH kinds to the same normalized pair.

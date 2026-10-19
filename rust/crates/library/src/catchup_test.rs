@@ -1,13 +1,14 @@
 //! `catchup_test` -- mirrors `go\internal\library\catchup_test.go`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::catchup::{
-    CATCH_UP_CONCURRENCY, CatchUpConfig, REPAIR_COOLDOWN, start_catch_up, stop_catch_up,
-    write_inventory,
+    CATCH_UP_CONCURRENCY, CatchUpConfig, REPAIR_COOLDOWN, set_overrides_path_for_test,
+    start_catch_up, stop_catch_up, write_inventory,
 };
 use crate::index::{
     FileRecord, Index, IndexInner, MAX_REPAIR_ATTEMPTS, STATE_NEEDS_REPAIR, STATE_PENDING,
@@ -207,6 +208,238 @@ fn catch_up_writes_inventory_report() {
     assert!(!e.last_error.is_empty());
     assert_eq!(e.reason, repair::report::REASON_NO_METADATA);
     write_inventory(&index, "test").unwrap();
+}
+
+/// Parser-classified extras are not metadata gaps: a needs-repair row under an
+/// extras leaf must not be looked up and must be counted under `extras`, never
+/// listed in the entries. The mixed fixture holds one normal record that IS
+/// looked up (the lookup count is exactly 1) and one extras row whose cooldown
+/// is already expired, so only the extras rule keeps it out of the pass.
+#[test]
+fn catch_up_skips_extras_and_partitions_the_report() {
+    let rx = ResolverScope::new();
+    let root = temp_dir("extrascs");
+    let normal = path_join(&[&root.path, "Missing.S01E01.mkv"]);
+    let extras = path_join(&[&root.path, "Featurettes", "Deleted Scenes", "scenes1.mkv"]);
+    std::fs::write(&normal, "x").unwrap();
+    std::fs::create_dir_all(std::path::Path::new(&extras).parent().unwrap()).unwrap();
+    std::fs::write(&extras, "x").unwrap();
+    let cache = meta_cache_dir();
+    let idxdir = crate::library_test::temp_dir("idxs");
+    let index = crate::library_test::index_path_in(&idxdir);
+
+    let miss = Arc::new(MissSource::new());
+    let m = Arc::clone(&miss);
+    rx.set(move |dir| resolver_with(m.clone(), dir));
+    scan_with_options(
+        &Cancel::background(),
+        index_scan_opts(&[root.path.clone()], &cache.path, &index, false),
+    )
+    .unwrap();
+
+    // A stale row: a parser from before the extras rule parked an extras leaf as
+    // needs-repair, with its cooldown already expired. Only `is_extra` can keep
+    // it out of this pass.
+    let ix = Arc::clone(&crate::scanindex::load_scan_index(&index).ix);
+    ix.put_file(FileRecord {
+        path: extras.clone(),
+        name: "scenes1.mkv".into(),
+        kind: crate::index::FILE_KIND_UNKNOWN.into(),
+        title: "Scenes".into(),
+        meta_key: "series|scenes|0|1".into(),
+        state: STATE_NEEDS_REPAIR.into(),
+        attempts: MAX_REPAIR_ATTEMPTS,
+        last_error: "no metadata found".into(),
+        next_try: crate::index::now_unix_nanos() - 60_000_000_000,
+        ..FileRecord::default()
+    });
+    ix.commit().unwrap();
+
+    let c = start_catch_up(
+        CatchUpConfig {
+            dirs: vec![root.path.clone()],
+            cache_dir: cache.path.clone(),
+            index_path: index.clone(),
+            app_version: "test".into(),
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    c.wait();
+
+    // Exactly one lookup: the normal record's. The extras row was never fetched.
+    assert_eq!(miss.calls.load(Ordering::SeqCst), 1, "lookups");
+    assert_eq!(c.stats().lookups, 1);
+
+    let report_path = path_join(&[
+        &crate::pathutil::dir(&index),
+        "inventory",
+        "needs-repair.json",
+    ]);
+    let r = repair::report::read_report(&report_path).unwrap();
+    assert!(
+        r.entries.iter().all(|e| !e.path.contains("Featurettes")),
+        "extras row listed in the entries: {:?}",
+        r.entries
+    );
+    assert!(r.entries.is_empty(), "entries: {:?}", r.entries);
+    assert_eq!(
+        (
+            r.totals.resolved,
+            r.totals.needs_repair,
+            r.totals.extras,
+            r.totals.pinned,
+            r.totals.pending
+        ),
+        (0, 0, 1, 0, 1),
+        "extras were not counted separately: {:?}",
+        r.totals
+    );
+    assert_eq!(r.totals.files, r.totals.indexed, "files != indexed");
+    assert_eq!(
+        r.totals.indexed,
+        r.totals.resolved
+            + r.totals.needs_repair
+            + r.totals.extras
+            + r.totals.pinned
+            + r.totals.pending,
+        "the partition does not hold: {:?}",
+        r.totals
+    );
+    write_inventory(&index, "test").unwrap();
+}
+
+/// Restores the previous override-store fixture path on drop. The module's
+/// shared test lock is held for each test's whole span, so a fixture never
+/// leaks into a concurrent test.
+struct OverridesFixture(Option<PathBuf>);
+
+impl OverridesFixture {
+    fn install(path: PathBuf) -> OverridesFixture {
+        OverridesFixture(set_overrides_path_for_test(Some(path)))
+    }
+}
+
+impl Drop for OverridesFixture {
+    fn drop(&mut self) {
+        set_overrides_path_for_test(self.0.take());
+    }
+}
+
+/// The manual latch wins before any metadata work: a record parked as
+/// needs-repair is resolved from the override store itself -- zero lookups, no
+/// attempt, no error -- and the regenerated report counts it as `pinned`, never
+/// as needs-repair. The positive control proves the parked row really is looked
+/// up when no latch exists.
+#[test]
+fn catch_up_resolves_a_latched_record_without_any_lookup() {
+    let rx = ResolverScope::new();
+    let (root, _names) = catch_up_corpus(1);
+    let cache = meta_cache_dir();
+    let idxdir = crate::library_test::temp_dir("idxs");
+    let index = crate::library_test::index_path_in(&idxdir);
+    let miss = Arc::new(MissSource::new());
+    let m = Arc::clone(&miss);
+    rx.set(move |dir| resolver_with(m.clone(), dir));
+    let path = path_join(&[&root.path, "ShowA.S01E01.mkv"]);
+    scan_with_options(
+        &Cancel::background(),
+        index_scan_opts(&[root.path.clone()], &cache.path, &index, false),
+    )
+    .unwrap();
+    let cfg = CatchUpConfig {
+        dirs: vec![root.path.clone()],
+        cache_dir: cache.path.clone(),
+        index_path: index.clone(),
+        app_version: "test".into(),
+        ..Default::default()
+    };
+
+    // Park the one record as needs_repair with its cooldown already expired.
+    let ix = Arc::clone(&crate::scanindex::load_scan_index(&index).ix);
+    let mut rec = ix.file(&path).unwrap();
+    rec.state = STATE_NEEDS_REPAIR.into();
+    rec.attempts = MAX_REPAIR_ATTEMPTS;
+    rec.last_error = "no metadata found".into();
+    rec.next_try = crate::index::now_unix_nanos() - 60_000_000_000;
+    ix.put_file(rec);
+    ix.commit().unwrap();
+
+    // Positive control: with no latch, that parked, expired row IS looked up
+    // exactly once.
+    start_catch_up(cfg.clone(), None).unwrap().wait();
+    assert_eq!(
+        miss.calls.load(Ordering::SeqCst),
+        1,
+        "positive control: the parked, expired row must be looked up"
+    );
+
+    // Latch the show folder in a fixture store (the test default is a
+    // non-existent path, so the owner's real store is never read).
+    let store_dir = temp_dir("latchcs");
+    let store_path = PathBuf::from(&store_dir.path).join("overrides.json");
+    let mut store = metadata::overrides::Store::empty_at(store_path.clone());
+    store
+        .put(metadata::overrides::Override {
+            scope: metadata::overrides::Scope::Series,
+            key: root.path.clone(),
+            title: "Show A".into(),
+            year: 2020,
+            provider: "tvmaze".into(),
+            provider_id: "1".into(),
+            poster: String::new(),
+            media: None,
+            episodes: Vec::new(),
+            created_at_ms: 1,
+        })
+        .expect("latch the show folder");
+    let _fixture = OverridesFixture::install(store_path);
+
+    // A source that would answer every query: if the pass looked anything up,
+    // its call count would move.
+    let fake = Arc::new(FakeSource::new("V1"));
+    let f = Arc::clone(&fake);
+    rx.set(move |dir| resolver_with(f.clone(), dir));
+    start_catch_up(cfg.clone(), None).unwrap().wait();
+
+    // Zero lookups: the latch resolved the record from the store alone.
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0, "latched lookup");
+    let after = crate::scanindex::load_scan_index(&index)
+        .ix
+        .file(&path)
+        .unwrap();
+    assert_eq!(after.state, STATE_RESOLVED);
+    assert_eq!(after.attempts, 0);
+    assert!(
+        after.last_error.is_empty(),
+        "last_error: {:?}",
+        after.last_error
+    );
+    assert_eq!(after.next_try, 0);
+
+    // The report the pass regenerated counts the record once, as pinned, and
+    // the file partition still adds up.
+    let report_path = path_join(&[
+        &crate::pathutil::dir(&index),
+        "inventory",
+        "needs-repair.json",
+    ]);
+    let r = repair::report::read_report(&report_path).unwrap();
+    assert_eq!(r.totals.pinned, 1, "pinned count: {:?}", r.totals);
+    assert_eq!(r.totals.needs_repair, 0, "needs-repair count: {:?}", r.totals);
+    assert!(r.entries.is_empty(), "entries: {:?}", r.entries);
+    assert_eq!(r.totals.files, r.totals.indexed, "files != indexed");
+    assert_eq!(
+        r.totals.indexed,
+        r.totals.resolved
+            + r.totals.needs_repair
+            + r.totals.extras
+            + r.totals.pinned
+            + r.totals.pending,
+        "the partition does not hold: {:?}",
+        r.totals
+    );
 }
 
 #[test]

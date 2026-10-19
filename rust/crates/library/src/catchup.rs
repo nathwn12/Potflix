@@ -6,13 +6,14 @@
 //! writes the needs-repair inventory report.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cancel_link::CancelLink;
 use crate::index::{
-    Index, MAX_REPAIR_ATTEMPTS, STATE_NEEDS_REPAIR, STATE_PENDING, STATE_RESOLVED,
+    FileRecord, Index, MAX_REPAIR_ATTEMPTS, STATE_NEEDS_REPAIR, STATE_PENDING, STATE_RESOLVED,
     index_store_path, now_unix_nanos, shared_index,
 };
 use crate::pathutil::{dir as path_dir, join as path_join, normalize_scan_dir};
@@ -181,6 +182,7 @@ impl CatchUp {
             );
         }
         let resolver = new_resolver(&cfg.cache_dir);
+        let overrides = load_overrides();
         let now = now_unix_nanos();
 
         let mut live: HashMap<String, bool> = HashMap::new();
@@ -215,6 +217,24 @@ impl CatchUp {
                     }
                     continue;
                 }
+            }
+            // The manual latch wins before anything is fetched: a latched
+            // record is resolved from the override store itself -- no provider
+            // lookup, no attempt increment, no error, no cooldown -- so a
+            // latched folder never returns to the repair list.
+            if overrides
+                .resolve_for(&rec.path, rec.query().kind == metadata::Kind::MOVIE)
+                .is_some()
+            {
+                apply_latch_verdict(&idx, rec, now);
+                continue;
+            }
+            // Parser-classified extras are not metadata gaps: the live path
+            // never fetches them (UNKNOWN kinds, extras-folder leaves), so the
+            // repair path never looks them up again. `write_inventory` counts
+            // them separately and keeps them out of the needs-repair list.
+            if is_extra(rec) {
+                continue;
             }
             let agg = aggs.entry(rec.meta_key.clone()).or_insert_with(|| KeyAgg {
                 query: rec.query(),
@@ -251,7 +271,7 @@ impl CatchUp {
             });
         }
         if groups.is_empty() {
-            self.finish_pass(&idx, &cfg, &t);
+            self.finish_pass(&idx, &cfg, &t, &overrides);
             return;
         }
 
@@ -357,10 +377,16 @@ impl CatchUp {
             }
             return;
         }
-        self.finish_pass(&idx, &cfg, &t);
+        self.finish_pass(&idx, &cfg, &t, &overrides);
     }
 
-    fn finish_pass(&self, idx: &Index, cfg: &CatchUpConfig, t: &PassTally) {
+    fn finish_pass(
+        &self,
+        idx: &Index,
+        cfg: &CatchUpConfig,
+        t: &PassTally,
+        overrides: &metadata::overrides::Store,
+    ) {
         let state = idx.state();
         if let Err(e) = idx.commit() {
             eprintln!("library: catch-up commit: {e}");
@@ -381,7 +407,7 @@ impl CatchUp {
         if state.files == 0 {
             return;
         }
-        if let Err(e) = idx.write_inventory(&cfg.index_path, &cfg.app_version) {
+        if let Err(e) = idx.write_inventory(&cfg.index_path, &cfg.app_version, overrides) {
             eprintln!("library: inventory report: {e}");
         }
     }
@@ -412,6 +438,17 @@ pub fn stop_catch_up(index_path: &str) {
         }
         c.wait();
     }
+}
+
+/// Whether the parser classifies a file as an extra rather than a metadata
+/// gap: its path sits under an extras leaf ("Featurettes", "Deleted Scenes",
+/// ...) or its rebuilt query is UNKNOWN (themes, filename-level extras, bare
+/// names with no usable folder context). The live poll path never fetches
+/// UNKNOWN kinds (`app\src\main.rs`), and providers will never answer for an
+/// extras leaf, so the repair path must not park either as needs-repair.
+pub(crate) fn is_extra(rec: &FileRecord) -> bool {
+    metadata_core::context::under_extras_folder(&rec.path)
+        || rec.query().kind == metadata::Kind::UNKNOWN
 }
 
 /// One metadata key's files for a pass.
@@ -458,36 +495,69 @@ impl PassTally {
 impl Index {
     /// Writes the needs-repair report for this index into
     /// `<dir of indexPath>\inventory` and returns both report paths.
+    ///
+    /// The file partition is exact and needs no scan: `files = indexed =
+    /// resolved + needs_repair + extras + pinned + pending`. `extras` are the
+    /// rows the parser classifies as extras (`is_extra`): they never become
+    /// needs-repair. `pinned` is counted from `overrides` HERE, at inventory
+    /// time, so a latched file is counted once as pinned -- whatever else its
+    /// record says -- and never listed as needs-repair. `pending` is every
+    /// remaining file (still awaiting a verdict), and `needs_repair` equals
+    /// `entries.len()`.
     pub(crate) fn write_inventory(
         &self,
         index_path: &str,
         app_version: &str,
+        overrides: &metadata::overrides::Store,
     ) -> Result<(String, String), Error> {
         let mut r = repair::report::Report {
             generated_at: repair::time::Time::now(),
             app_version: app_version.to_string(),
             ..Default::default()
         };
-        for rec in self.files_snapshot() {
-            if rec.state != STATE_NEEDS_REPAIR {
+        let records = self.files_snapshot();
+        let mut resolved = 0i64;
+        let mut pinned = 0i64;
+        let mut extras = 0i64;
+        let mut pending = 0i64;
+        for rec in &records {
+            // The manual latch wins over every other bucket: a latched file is
+            // counted once, as pinned, never as needs-repair -- even when its
+            // record still says so.
+            if overrides
+                .resolve_for(&rec.path, rec.query().kind == metadata::Kind::MOVIE)
+                .is_some()
+            {
+                pinned += 1;
                 continue;
             }
-            r.entries.push(repair::report::Entry {
-                path: rec.path.clone(),
-                name: rec.name.clone(),
-                kind: rec.kind.clone(),
-                reason: repair::report::REASON_NO_METADATA.to_string(),
-                attempts: rec.attempts,
-                last_error: rec.last_error.clone(),
-                last_try: nanos_to_time(rec.last_try),
-            });
+            if is_extra(rec) {
+                extras += 1;
+                continue;
+            }
+            match rec.state.as_str() {
+                STATE_RESOLVED => resolved += 1,
+                STATE_NEEDS_REPAIR => r.entries.push(repair::report::Entry {
+                    path: rec.path.clone(),
+                    name: rec.name.clone(),
+                    kind: rec.kind.clone(),
+                    reason: repair::report::REASON_NO_METADATA.to_string(),
+                    attempts: rec.attempts,
+                    last_error: rec.last_error.clone(),
+                    last_try: nanos_to_time(rec.last_try),
+                }),
+                _ => pending += 1,
+            }
         }
-        let state = self.state();
+        let files = records.len() as i64;
         r.totals = repair::report::Totals {
-            files: state.files,
-            indexed: state.files,
-            resolved: state.keys_resolved,
+            files,
+            indexed: files,
+            resolved,
             needs_repair: r.entries.len() as i64,
+            extras,
+            pinned,
+            pending,
         };
         let dir = path_join(&[&path_dir(index_path), "inventory"]);
         let (json, txt) = repair::report::write_report(&dir, &r)
@@ -558,7 +628,81 @@ pub fn write_inventory(index_path: &str, app_version: &str) -> Result<(String, S
             return Err(err);
         }
     };
-    idx.write_inventory(index_path, app_version)
+    let overrides = load_overrides();
+    idx.write_inventory(index_path, app_version, &overrides)
+}
+
+/// Loads the latch store a pass (and its report) honours: the launcher's
+/// `%LOCALAPPDATA%\Potflix\overrides.json` ([`metadata::overrides::load`]).
+/// A malformed store is reported and treated as empty -- the caller carries on
+/// -- exactly as the store documents; the file is never rewritten here.
+fn load_overrides() -> metadata::overrides::Store {
+    let path = override_store_path();
+    match metadata::overrides::load_from(&path) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!(
+                "library: catch-up overrides {}: {err} (latch ignored until the store changes)",
+                path.display()
+            );
+            metadata::overrides::Store::empty_at(path)
+        }
+    }
+}
+
+/// The store path [`load_overrides`] reads. Production honours the store's own
+/// default location; a test reads its fixture path, or -- with no fixture -- a
+/// path that never exists, so no test ever reads the owner's store.
+fn override_store_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        OVERRIDES_PATH_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("potflix-test-overrides-absent.json"))
+    }
+    #[cfg(not(test))]
+    {
+        metadata::overrides::default_path()
+    }
+}
+
+#[cfg(test)]
+static OVERRIDES_PATH_TEST: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Installs (or clears) the fixture store path the next pass reads; returns
+/// the previous fixture. Module tests hold the shared test lock, so a fixture
+/// never leaks into a concurrent test.
+#[cfg(test)]
+pub(crate) fn set_overrides_path_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
+    std::mem::replace(
+        &mut *OVERRIDES_PATH_TEST
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        path,
+    )
+}
+
+/// Applies the latch's verdict to one record, resolved from the store alone:
+/// `resolved`, never an attempt, no error, no cooldown. Returns whether the
+/// record changed; an already-clean resolved record is left untouched.
+fn apply_latch_verdict(idx: &Index, rec: &FileRecord, now: i64) -> bool {
+    if rec.state == STATE_RESOLVED
+        && rec.attempts == 0
+        && rec.last_error.is_empty()
+        && rec.next_try == 0
+    {
+        return false;
+    }
+    let mut next = rec.clone();
+    next.state = STATE_RESOLVED.to_string();
+    next.attempts = 0;
+    next.last_error = String::new();
+    next.next_try = 0;
+    next.last_try = now;
+    idx.put_file(next);
+    true
 }
 
 fn is_cancelled_err(e: &metadata::Error) -> bool {

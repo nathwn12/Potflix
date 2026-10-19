@@ -945,15 +945,47 @@ fn artwork_unusable(artwork: &str) -> bool {
 /// `Season == q.Season` when `q.Season > 0`) answers. It never returns a
 /// different episode via a positional index -- a wrong title is worse than no
 /// title (AniList 21355 serves Numbers 51-66 for an episode-1 query).
+///
+/// Season-aware absolute fallback: a provider that numbers a multi-season
+/// show's later episodes by their TOTAL number (S2E1 == 26) or flattens the
+/// seasons it does carry into `season = 0` is still matchable. When no
+/// season-exact episode exists, the wanted episode's total number is
+/// `q.Episode + the count of episodes the SAME table reports for strictly
+/// earlier seasons`, and the episode carrying that number answers. A table
+/// carrying only one season (or only the wanted season) never establishes
+/// such a total, so a wrong-season absolute list cannot fabricate a match.
+///
+/// A season-0 row never answers a wanted season above 0 when the table
+/// already carries that season: a special numbered `earlier + q.Episode`
+/// must not bind as the genuinely absent S3E1. The flattened case (no rows
+/// at all for the wanted season) still answers through its season-0 row.
 pub(crate) fn match_episode(eps: &[Episode], q: &Query) -> Option<Episode> {
     if eps.is_empty() || q.episode <= 0 {
         return None;
     }
     if q.season > 0 {
-        return eps
+        if let Some(ep) = eps
             .iter()
             .find(|e| i64::from(e.season) == q.season && e.number == q.episode)
-            .cloned();
+        {
+            return Some(ep.clone());
+        }
+        let earlier = eps
+            .iter()
+            .filter(|e| e.season > 0 && i64::from(e.season) < q.season)
+            .count();
+        if earlier == 0 {
+            return None;
+        }
+        let total = i32::try_from(earlier).unwrap_or(i32::MAX) + q.episode;
+        let found = eps
+            .iter()
+            .find(|e| e.number == total && i64::from(e.season) <= q.season)
+            .cloned()?;
+        if found.season == 0 && eps.iter().any(|e| i64::from(e.season) == q.season) {
+            return None;
+        }
+        return Some(found);
     }
     eps.iter().find(|e| e.number == q.episode).cloned()
 }

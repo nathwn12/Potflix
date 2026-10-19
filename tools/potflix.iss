@@ -5,7 +5,7 @@
 ; ArchitecturesInstallIn64BitMode unset: minimal and version-proof.
 
 #define MyAppName "Potflix"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "nathwn12"
 #define MyAppExeName "potflix.exe"
 
