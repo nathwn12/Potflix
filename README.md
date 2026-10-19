@@ -1,6 +1,8 @@
-# Potflix
-
-**Mirror whatever plays in PotPlayer onto your Discord card.**
+<p align="center">
+  <img src="assets/icon.ico" width="120" height="120" alt="Potflix icon" />
+</p>
+<h1 align="center">Potflix</h1>
+<p align="center"><strong>Mirror whatever plays in PotPlayer onto your Discord card.</strong></p>
 
 ## Install
 
@@ -49,3 +51,11 @@ You need Windows, PotPlayer, the Discord desktop app (the web client has no loca
 - [Changelog](CHANGELOG.md)
 - [Rust port notes](RUST-PORT.md)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
+
+<!-- nathwn12 house footer: identical in every repo. Do not edit. -->
+<p align="center">
+  <a href="https://github.com/nathwn12"><img src="assets/signature.svg" width="96" alt="nathwn12" /></a>
+</p>
+<p align="center">
+  <sub>Built by <a href="https://github.com/nathwn12">nathwn12</a> · <a href="https://github.com/nathwn12?tab=repositories">All projects</a></sub>
+</p>
