@@ -301,17 +301,19 @@ fn card_spec_unknown_falls_back() {
     }
 }
 
-/// Proves the offered preset sets stay small, fixed, and default-first
-/// (presets, not a template language). T5-B: the Details row offers only
-/// Default and Episode -- the `title`/`series` presets repeated the activity
-/// header, so they are retired (stored ids migrate; see
-/// `retired_details_ids_migrate_to_default`). States are unchanged.
+/// Proves the stored preset sets stay small, fixed, and default-first
+/// (presets, not a template language). The stored Details value is Default
+/// only -- the `title`/`series` presets repeated the activity header (T5-B)
+/// and `episode` rendered byte-identical to Default for both kinds, so all
+/// three are retired (stored ids migrate; see
+/// `retired_details_ids_migrate_to_default`) and the Card view offers no
+/// Details row at all. States are unchanged.
 #[test]
 fn card_presets_small() {
     let (d, s) = card_presets();
     assert!(
-        d.len() == 2 && s.len() == 4,
-        "presets = {} details + {} states, want 2+4",
+        d.len() == 1 && s.len() == 4,
+        "presets = {} details + {} states, want 1+4",
         d.len(),
         s.len()
     );
@@ -329,22 +331,23 @@ fn card_presets_small() {
     }
 }
 
-/// T5-B (red first): the repeating Details presets are gone from the offered
-/// list. TV and movie both offer only Default (the per-kind default line:
-/// episode title for TV, synopsis for movies) and Episode; `title`/`series`
-/// would repeat the activity header. States keep all four presets.
+/// The retired Details presets are gone from the stored set: it carries only
+/// Default (the per-kind default line: episode title for TV, synopsis for
+/// movies); `title`/`series` would repeat the activity header and `episode`
+/// rendered byte-identical to Default. The Card view offers no Details row.
+/// States keep all four presets.
 #[test]
-fn card_presets_drop_repeating_title_and_series() {
+fn card_presets_drop_repeating_title_series_and_episode() {
     let (dets, states) = card_presets();
     assert_eq!(
         dets.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-        [CARD_DETAILS_DEFAULT, CARD_DETAILS_EPISODE],
-        "offered details presets"
+        [CARD_DETAILS_DEFAULT],
+        "stored details presets"
     );
     assert!(
-        dets
-            .iter()
-            .all(|p| p.id != CARD_DETAILS_TITLE && p.id != CARD_DETAILS_SERIES),
+        dets.iter().all(|p| p.id != CARD_DETAILS_TITLE
+            && p.id != CARD_DETAILS_SERIES
+            && p.id != CARD_DETAILS_EPISODE),
         "a retired id is still offered: {dets:?}"
     );
     assert_eq!(
@@ -602,12 +605,16 @@ fn card_spec_kind_adapt() {
     }
 }
 
-/// Pins the fill-ladder contract: no preset but `none` blanks a slot (the
-/// details line never blanks: per-kind fallbacks keep the base line, and the
-/// state ladder ends on the clean filename title). `none` always hides, even
-/// with content and even when paused. The paused marker path is preserved:
-/// paused-with-content keeps the suffix, paused with nothing still reads
-/// "Paused" - except none, which hides even when paused.
+/// Pins the fill-ladder contract: a series state line blanks under `none`
+/// (Minimal) or when its final rung would repeat the header (the clean-title
+/// fallback equal to the header blanks to a deliberate one-line card,
+/// `"Paused"` when paused); a details line stays empty only when no rung may
+/// carry anything (series: no episode title and no filename episode name;
+/// movie: no synopsis/year/genres/length) -- never by repeating the header.
+/// `none` always hides, even with content and even when paused. The paused
+/// marker path is preserved: paused-with-content keeps the suffix, paused
+/// with nothing still reads "Paused" - except none, which hides even when
+/// paused.
 #[test]
 fn card_spec_empty_hide() {
     let run = Action {
@@ -680,22 +687,22 @@ fn card_spec_empty_hide() {
             want_s: "S1 E2",
         },
         Case {
-            name: "series tag falls to clean title with no tag",
+            name: "series tag blanks the header-equal clean fallback",
             raw: m_raw,
             act: run.clone(),
             res: Resolved::default(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_TAG),
-            want_d: "Movie",
-            want_s: "Movie",
+            want_d: "",
+            want_s: "",
         },
         Case {
-            name: "synopsis falls to clean title with no synopsis",
+            name: "synopsis preset blanks the header-equal clean fallback",
             raw: m_raw,
             act: run.clone(),
             res: Resolved::default(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_SYNOPSIS),
-            want_d: "Movie",
-            want_s: "Movie",
+            want_d: "",
+            want_s: "",
         },
         Case {
             name: "none hides with content",
@@ -749,13 +756,18 @@ fn card_spec_empty_hide() {
             c.want_s
         );
     }
-    // Details never blanks on series lines: every preset over every corpus
-    // input yields a non-empty details line (fallbacks keep the base line). A
-    // movie default-following line (default/episode, or series with no
-    // canonical title) may stay empty by design (T5-A: never repeat the
-    // title), so movies are exempt.
+    // Details never blanks when episode facts exist: every preset over every
+    // corpus input with a canonical episode title or a filename episode name
+    // yields a non-empty details line. Exempt only when BOTH are empty -- a
+    // series details line with no episode title anywhere stays empty by
+    // design (never the show header) -- and a movie default-following line,
+    // which may stay empty by design (T5-A: never repeat the title).
     let (dets, states) = card_presets();
     for c in card_spec_cases() {
+        // The filename's own episode name straight from the composer -- never
+        // a parallel clean/suffix derivation in the test.
+        let file_ep = crate::file_episode_name(&c.raw);
+        let has_episode = !c.res.episode_name.is_empty() || !file_ep.is_empty();
         for d in &dets {
             for st in &states {
                 let (gd, _) = CardSpec {
@@ -764,7 +776,7 @@ fn card_spec_empty_hide() {
                 }
                 .render(&c.raw, c.act.as_ref(), &c.res);
                 assert!(
-                    !gd.is_empty() || c.res.is_movie,
+                    !gd.is_empty() || c.res.is_movie || !has_episode,
                     "{} {}/{}: details blank, want fallback to base",
                     c.name,
                     d.id,
@@ -1371,6 +1383,25 @@ fn slot_completeness_gate() {
                                     "{ctx}: paused bare movie state = {:?}, want Paused",
                                     card.state
                                 );
+                            } else if kind.is_movie
+                                && (spreset == CARD_STATE_TAG || spreset == CARD_STATE_SYNOPSIS)
+                                && card.state.is_empty()
+                                && res.synopsis.is_empty()
+                                && res.year <= 0
+                                && res.genres.is_empty()
+                                && res.length.is_empty()
+                            {
+                                // Header-equal blank: an unresolved movie's
+                                // tag/synopsis ladder falls through to the
+                                // clean title, which equals the header and
+                                // blanks to the deliberate one-line shape
+                                // (paused still reads "Paused", so an empty
+                                // state here is always the playing card).
+                                assert!(
+                                    playing,
+                                    "{ctx}: paused header-equal movie state = {:?}, want Paused",
+                                    card.state
+                                );
                             } else {
                                 assert!(
                                     !card.state.is_empty(),
@@ -1616,10 +1647,12 @@ fn assert_gate_signal(slot: &str, line: &str, synopsis: &str, ctx: &str) {
     );
 }
 
-/// T5-B (red first): a stored retired Details id migrates to the default line
-/// without touching anything else. `title`/`series` details become `default`;
-/// kept ids, unknown ids and every state line survive byte-for-byte, so the
-/// migration can never lose an unrelated spec.
+/// T5-B (red first), extended to the retired Episode preset: a stored retired
+/// Details id migrates to the default line without touching anything else.
+/// `title`/`series` details become `default` (they repeated the header);
+/// `episode` becomes `default` (it rendered byte-identical to it for both
+/// kinds); kept ids, unknown ids and every state line survive byte-for-byte,
+/// so the migration can never lose an unrelated spec.
 #[test]
 fn retired_details_ids_migrate_to_default() {
     let migrated = |details: &str, state: &str| {
@@ -1640,14 +1673,9 @@ fn retired_details_ids_migrate_to_default() {
         def(CARD_STATE_SYNOPSIS),
         "a retired details id migrates even beside a kept state"
     );
-    // Kept ids are untouched.
-    assert_eq!(
-        migrated("episode", "tag"),
-        CardSpec {
-            details: CARD_DETAILS_EPISODE.to_string(),
-            state: CARD_STATE_TAG.to_string(),
-        }
-    );
+    // The retired Episode preset migrates too: it rendered byte-identical to
+    // the default for both kinds.
+    assert_eq!(migrated("episode", "tag"), def(CARD_STATE_TAG));
     assert_eq!(migrated("default", "default"), default_card_spec());
     // Unknown ids are NOT migration input: they stay stored (the renderer
     // still falls back per line), so a future preset id is never destroyed.

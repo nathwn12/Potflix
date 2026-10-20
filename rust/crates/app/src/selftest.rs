@@ -977,8 +977,12 @@ pub fn run_self_test(log: &Logger) -> ! {
 
     // (13) push-attempt recorder positive control: force one gate decision
     // through the real event writer, then read the line back from the log.
+    // The card comes from the shipped composer (`compose_card` with the
+    // default spec, via `build_activity_resolved`) -- not the legacy
+    // filename-only `build_activity` mapping -- so the control exercises the
+    // same lines the send path ships.
     let mut gate = presence::gate::Gate::new();
-    let card = presence::build_activity(
+    let card = presence::build_activity_resolved(
         "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
         Some(&presence::Action {
             running: true,
@@ -987,6 +991,7 @@ pub fn run_self_test(log: &Logger) -> ! {
             ct: 1000,
             ..Default::default()
         }),
+        &presence::Resolved::default(),
     );
     gate.force_next();
     let (out_card, verdict) = gate.decide(card, 1000, 60000, 900000, false, false);

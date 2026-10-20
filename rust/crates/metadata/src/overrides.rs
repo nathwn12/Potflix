@@ -516,11 +516,13 @@ impl Store {
 
     /// Records an explicit user correction for `path` and clears the latch of
     /// the other scope that would otherwise keep winning for that file, in a
-    /// single atomic save: a [`Scope::Movie`] correction removes the
-    /// season/series keys derived from `path`
-    /// ([`season_key_for`]/[`series_key_for`]), while a [`Scope::Season`] or
-    /// [`Scope::Series`] correction removes the movie key
-    /// ([`movie_key`]`(path)`). Only keys derived from `path` are touched;
+    /// single atomic save: a [`Scope::Movie`] correction removes the season
+    /// latch (with its episode pins) for the file's own season folder
+    /// ([`season_key_for`]) -- and never the show-wide series latch
+    /// ([`series_key_for`]), which survives with its cover and episode pins
+    /// and keeps serving every other episode under the show folder -- while
+    /// a [`Scope::Season`] or [`Scope::Series`] correction removes the movie
+    /// key ([`movie_key`]`(path)`). Only keys derived from `path` are touched;
     /// latches on other paths/shows are left alone. A failed save rolls every
     /// in-memory change back, so memory still matches the last successful
     /// save.
@@ -541,9 +543,6 @@ impl Store {
             Scope::Movie => {
                 if let Some(key) = season_key_for(path) {
                     conflicting.push((Scope::Season, key));
-                }
-                if let Some(key) = series_key_for(path) {
-                    conflicting.push((Scope::Series, key));
                 }
             }
             Scope::Season | Scope::Series => {
@@ -615,13 +614,12 @@ impl Store {
     /// The latch that wins for `path`, or `None` when the automatic ladder
     /// keeps the job, in precedence order: the exact-file movie latch, then
     /// the season latch for the file's own season folder ([`season_key_for`]),
-    /// then the nearest show-folder series latch on an ancestor.
-    /// `file_is_movie_hint` is the caller's own classification of the file; it
-    /// no longer vetoes a latch. An explicit series/season correction wins
-    /// over a movie-classified filename, while an exact-file movie latch
-    /// still wins over everything for that file.
-    pub fn resolve_for(&self, path: &str, file_is_movie_hint: bool) -> Option<&Override> {
-        let _ = file_is_movie_hint;
+    /// then the nearest show-folder series latch on an ancestor. It takes no
+    /// filename-classification hint (the old `file_is_movie_hint` parameter
+    /// is gone): the filename never vetoes a latch. An explicit
+    /// series/season correction wins over a movie-classified filename, while
+    /// an exact-file movie latch still wins over everything for that file.
+    pub fn resolve_for(&self, path: &str) -> Option<&Override> {
         if let Some(off) = self.lookup_movie(path) {
             return Some(off);
         }
@@ -1071,7 +1069,7 @@ mod tests {
         ] {
             assert!(store.lookup_series(odd).is_none(), "series lookup {odd:?}");
             assert!(store.lookup_movie(odd).is_none(), "movie lookup {odd:?}");
-            assert!(store.resolve_for(odd, false).is_none(), "resolve {odd:?}");
+            assert!(store.resolve_for(odd).is_none(), "resolve {odd:?}");
         }
     }
 
@@ -1140,19 +1138,17 @@ mod tests {
             .put(movie_override(&win('D', r"\Shows\Show\Special.mkv")))
             .expect("movie latch");
 
-        let resolved = store
-            .resolve_for(&win('d', "/shows/show/SPECIAL.mkv"), false)
-            .expect("a latch wins");
+        let resolved = store.resolve_for(&win('d', "/shows/show/SPECIAL.mkv")).expect("a latch wins");
         assert_eq!(resolved.scope, Scope::Movie, "the exact-file movie latch");
         let hinted = store
-            .resolve_for(&win('D', r"\Shows\Show\Special.mkv"), true)
+            .resolve_for(&win('D', r"\Shows\Show\Special.mkv"))
             .expect("movie latch");
         assert_eq!(hinted.scope, Scope::Movie);
         // A movie-classified file still takes an explicit show-folder latch:
         // the filename classification never vetoes a correction.
         assert_eq!(
             store
-                .resolve_for(&win('D', r"\Shows\Show\other.mkv"), true)
+                .resolve_for(&win('D', r"\Shows\Show\other.mkv"))
                 .expect("series latch")
                 .scope,
             Scope::Series
@@ -1160,7 +1156,7 @@ mod tests {
         // ...while an episode-classified file falls through to it.
         assert_eq!(
             store
-                .resolve_for(&win('D', r"\Shows\Show\Season 1\ep.mkv"), false)
+                .resolve_for(&win('D', r"\Shows\Show\Season 1\ep.mkv"))
                 .expect("series latch")
                 .scope,
             Scope::Series
@@ -1228,7 +1224,7 @@ mod tests {
         assert!(off.episodes.is_empty(), "a v1 entry has no episode pins");
         assert_eq!(
             store
-                .resolve_for(&win('M', r"\2SERIES\Zentaro\Season 1\01.mkv"), false)
+                .resolve_for(&win('M', r"\2SERIES\Zentaro\Season 1\01.mkv"))
                 .expect("resolve honours the v1 latch")
                 .scope,
             Scope::Series
@@ -1272,7 +1268,7 @@ mod tests {
             .expect("show latch");
 
         let season_file = win('M', r"\2SERIES\Attack on Titan\Season 2\S02E01.mkv");
-        let resolved = store.resolve_for(&season_file, false).expect("season latch");
+        let resolved = store.resolve_for(&season_file).expect("season latch");
         assert_eq!(
             resolved.scope,
             Scope::Season,
@@ -1285,7 +1281,7 @@ mod tests {
 
         // A season with no latch of its own falls through to the show latch.
         let other_file = win('M', r"\2SERIES\Attack on Titan\Season 3\S03E01.mkv");
-        let show = store.resolve_for(&other_file, false).expect("show latch");
+        let show = store.resolve_for(&other_file).expect("show latch");
         assert_eq!(show.scope, Scope::Series);
         assert_eq!(show.key, normalize_key(&win('M', r"\2SERIES\Attack on Titan")));
 
@@ -1294,25 +1290,22 @@ mod tests {
         // the exact-file movie latch (pinned below) still beats both.
         assert_eq!(
             store
-                .resolve_for(&season_file, true)
+                .resolve_for(&season_file)
                 .expect("season latch")
                 .scope,
             Scope::Season,
-            "hint=true keeps the season latch"
+            "a movie-classified filename keeps the season latch"
         );
 
-        // The exact-file movie latch beats both, hinted or not.
+        // The exact-file movie latch beats both.
         store.put(movie_override(&season_file)).expect("movie latch");
-        for hint in [false, true] {
-            assert_eq!(
-                store
-                    .resolve_for(&season_file, hint)
-                    .expect("movie latch")
-                    .scope,
-                Scope::Movie,
-                "hint={hint}"
-            );
-        }
+        assert_eq!(
+            store
+                .resolve_for(&season_file)
+                .expect("movie latch")
+                .scope,
+            Scope::Movie
+        );
     }
 
     /// A season pin keys the folder that DIRECTLY holds the episode: the
@@ -1450,7 +1443,7 @@ mod tests {
         // Movie-classified, yet the series latch still wins: the filename
         // classification never vetoes an explicit correction.
         let resolved = store
-            .resolve_for(&win('D', r"\Shows\Show\other.mkv"), true)
+            .resolve_for(&win('D', r"\Shows\Show\other.mkv"))
             .expect("series latch wins over the movie hint");
         assert_eq!(resolved.scope, Scope::Series);
         // A season latch wins the same way for its own season.
@@ -1458,12 +1451,12 @@ mod tests {
             .put(season_override(&win('D', r"\Shows\Show\Season 2")))
             .expect("season latch");
         let resolved = store
-            .resolve_for(&win('D', r"\Shows\Show\Season 2\S02E01.mkv"), true)
+            .resolve_for(&win('D', r"\Shows\Show\Season 2\S02E01.mkv"))
             .expect("season latch wins over the movie hint");
         assert_eq!(resolved.scope, Scope::Season);
     }
 
-    /// T1: a movie override still wins when present, hinted or not.
+    /// T1: a movie override still wins when present.
     #[test]
     fn movie_latch_still_wins_when_present() {
         let dir = TempDir::new();
@@ -1473,13 +1466,10 @@ mod tests {
             .expect("series latch");
         let file = win('D', r"\Shows\Show\Special.mkv");
         store.put(movie_override(&file)).expect("movie latch");
-        for hint in [false, true] {
-            assert_eq!(
-                store.resolve_for(&file, hint).expect("movie latch").scope,
-                Scope::Movie,
-                "hint={hint}"
-            );
-        }
+        assert_eq!(
+            store.resolve_for(&file).expect("movie latch").scope,
+            Scope::Movie
+        );
     }
 
     /// T2-C: correcting a movie-latched file to a series clears the movie
@@ -1491,7 +1481,7 @@ mod tests {
         let file = win('D', r"\Shows\Show\Special.mkv");
         store.put(movie_override(&file)).expect("movie latch");
         assert_eq!(
-            store.resolve_for(&file, true).expect("movie latch").scope,
+            store.resolve_for(&file).expect("movie latch").scope,
             Scope::Movie
         );
 
@@ -1503,30 +1493,32 @@ mod tests {
             store.lookup_movie(&file).is_none(),
             "the old movie latch is gone"
         );
-        let resolved = store.resolve_for(&file, false).expect("series latch");
+        let resolved = store.resolve_for(&file).expect("series latch");
         assert_eq!(resolved.scope, Scope::Series);
         // Downstream a series scope never renders as a movie, even when the
         // file name classifies as one.
-        let hinted = store.resolve_for(&file, true).expect("series latch");
+        let hinted = store.resolve_for(&file).expect("series latch");
         assert_eq!(hinted.scope, Scope::Series);
         assert_ne!(hinted.scope, Scope::Movie, "is_movie is false downstream");
     }
 
-    /// T2-C: correcting a series-latched file to a movie clears the
-    /// series/season latches for that path, so the movie wins.
+    /// A single-file movie correction inside a latched show removes only the
+    /// season latch for that file's own season folder: the show-wide series
+    /// latch -- cover and episode pins -- survives, keeps serving every other
+    /// episode, and the corrected file resolves movie.
     #[test]
-    fn put_correction_movie_clears_the_series_and_season_latches_for_that_file() {
+    fn put_correction_movie_keeps_the_show_latch_and_its_pins() {
         let dir = TempDir::new();
         let mut store = Store::empty_at(PathBuf::from(dir.child(STORE_FILE_NAME)));
-        store
-            .put(series_override(&win('D', r"\Shows\Show")))
-            .expect("series latch");
+        let show_key = win('D', r"\Shows\Show");
+        store.put(series_override(&show_key)).expect("series latch");
         store
             .put(season_override(&win('D', r"\Shows\Show\Season 1")))
             .expect("season latch");
         let file = win('D', r"\Shows\Show\Season 1\S01E01.mkv");
+        let sibling = win('D', r"\Shows\Show\Season 1\S01E02.mkv");
         assert_eq!(
-            store.resolve_for(&file, false).expect("season latch").scope,
+            store.resolve_for(&file).expect("season latch").scope,
             Scope::Season
         );
 
@@ -1537,17 +1529,23 @@ mod tests {
             store.lookup_season(&file).is_none(),
             "the season latch for that path is gone"
         );
-        assert!(
-            store.lookup_series(&file).is_none(),
-            "the series latch for that path is gone"
+        // The show-wide latch survives with its cover and episode pins: a
+        // one-file correction must not orphan the whole show.
+        let show = store.lookup_series(&file).expect("show latch survives");
+        assert_eq!(show.scope, Scope::Series);
+        assert_eq!(show.poster, SHOW_POSTER, "the show cover survives");
+        assert_eq!(show.episodes.len(), 1, "the episode pins survive");
+        assert_eq!(show.episodes[0].title, "Breakage");
+        assert_eq!(
+            store.resolve_for(&file).expect("movie latch").scope,
+            Scope::Movie,
+            "the corrected file resolves movie"
         );
-        for hint in [false, true] {
-            assert_eq!(
-                store.resolve_for(&file, hint).expect("movie latch").scope,
-                Scope::Movie,
-                "hint={hint}"
-            );
-        }
+        assert_eq!(
+            store.resolve_for(&sibling).expect("series latch").scope,
+            Scope::Series,
+            "a sibling episode still resolves through the surviving show latch"
+        );
     }
 
     /// T2-C: a correction touches only its own path; another show/file keeps
@@ -1570,12 +1568,12 @@ mod tests {
             "the first path keeps its movie latch"
         );
         assert_eq!(
-            store.resolve_for(&file_a, false).expect("movie latch A").scope,
+            store.resolve_for(&file_a).expect("movie latch A").scope,
             Scope::Movie
         );
         assert!(store.lookup_movie(&file_b).is_none());
         assert_eq!(
-            store.resolve_for(&file_b, false).expect("series latch B").scope,
+            store.resolve_for(&file_b).expect("series latch B").scope,
             Scope::Series
         );
     }
@@ -1618,7 +1616,7 @@ mod tests {
         assert!(store.lookup_movie(&file).is_some());
         assert!(store.lookup_series(&file).is_none());
         assert_eq!(
-            store.resolve_for(&file, false).expect("movie latch").scope,
+            store.resolve_for(&file).expect("movie latch").scope,
             Scope::Movie
         );
 
@@ -1630,7 +1628,7 @@ mod tests {
             .expect("save after clearing");
         assert!(store.lookup_movie(&file).is_none());
         assert_eq!(
-            store.resolve_for(&file, false).expect("series latch").scope,
+            store.resolve_for(&file).expect("series latch").scope,
             Scope::Series
         );
     }

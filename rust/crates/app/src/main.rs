@@ -184,17 +184,13 @@ static LATCH_STORE: LazyLock<Mutex<Option<LatchStore>>> = LazyLock::new(|| Mutex
 
 /// The latch that wins for one playing file, resolved from the store alone, or
 /// `None` when the ladder keeps the job.
-fn latch_resolved(
-    path: &str,
-    file_is_movie_hint: bool,
-    query: &metadata::Query,
-) -> Option<presence::Resolved> {
+fn latch_resolved(path: &str, query: &metadata::Query) -> Option<presence::Resolved> {
     let mut guard = LATCH_STORE.lock().unwrap_or_else(|e| e.into_inner());
     let store = guard.get_or_insert_with(|| LatchStore::new(override_store_path()));
     store.refresh();
     store
         .store
-        .resolve_for(path, file_is_movie_hint)
+        .resolve_for(path)
         .map(|off| resolved_from_latch(off, query))
 }
 
@@ -357,7 +353,6 @@ fn push_activity(
     // and so no network.
     if let Some(latched) = latch_resolved(
         &playing_file_path(raw_title),
-        query.kind == metadata::Kind::MOVIE,
         &query,
     ) {
         res = latched;
@@ -448,7 +443,8 @@ fn push_activity(
     }
 }
 
-/// Whether `generation` still owes a clear: a clear is only proven for the/// connection generation it went out on, so a changed generation (a reconnect)
+/// Whether `generation` still owes a clear: a clear is only proven for the
+/// connection generation it went out on, so a changed generation (a reconnect)
 /// must re-assert it. The old boolean latch stayed true across a reconnect and
 /// nothing ever re-sent the clear, which left the card stuck on the last movie.
 fn clear_due(generation: i64, cleared_gen: i64) -> bool {
@@ -2286,14 +2282,19 @@ mod tests {
         assert_eq!(dm1, edm1);
         assert_eq!(sm1.as_deref().unwrap_or(""), esm1);
 
-        // A Card-view save publishes a different MOVIE spec (state `tag`: the
-        // unresolved movie default is now ("",""), so `none` would be
-        // gate-identical and send nothing -- `tag` falls through to the clean
-        // title here and really changes the payload); the NEXT poll with the
-        // SAME title, the same ct/total/action and `event = false` must still
-        // send the new movie lines by itself.
+        // A published MOVIE spec change must also send by itself. An unresolved
+        // movie has no synopsis/year/genres/length, so every kept state preset
+        // blanks (the clean-title fallback equals the header and blanks to the
+        // deliberate one-line shape): the baseline default is ("","") and
+        // `tag`/`synopsis`/`none` are gate-identical to it. The reachable
+        // payload-changing movie spec under no metadata is the retired Details
+        // `title` id, which the composer still renders (header) for old
+        // in-flight specs -- the regression here is that the published mirror
+        // reaches the next poll, not which preset the Card view offers. The
+        // NEXT poll with the SAME title, the same ct/total/action and
+        // `event = false` must still send the new movie lines by itself.
         let mut specs_c = specs_b.clone();
-        assert!(specs_c.set_line(config::CardKind::Movie, config::CardLine::State, "tag"));
+        assert!(specs_c.set_line(config::CardKind::Movie, config::CardLine::Details, "title"));
         config::set_live_card_specs(specs_c.clone());
         push_activity(
             &log,
@@ -2322,8 +2323,8 @@ mod tests {
             "the wire must carry the new movie lines"
         );
         assert!(
-            s3.as_deref().is_some_and(|s| !s.is_empty()),
-            "movie state 'tag' must reach the wire, got {s3:?}"
+            !d3.is_empty(),
+            "movie details 'title' must reach the wire, got {d3:?}"
         );
 
         config::set_live_card_specs(config::CardSpecs::default());
@@ -3526,8 +3527,9 @@ mod tests {
         assert!(!res.is_movie, "absolute series latch is never a movie");
         assert_eq!(res.absolute, 7, "absolute from the query");
         assert_eq!((res.season, res.number), (0, 0), "no fabricated season");
-        // The provisional card composes: the show title (the code never
-        // reaches details), never a panic.
+        // The provisional card composes: details stay empty (never the show
+        // header -- the header already carries it) while the state carries
+        // the episode code; never a panic.
         let card = presence::compose_card(
             "Latch.Show.07.1080p.mkv - PotPlayer",
             None,
@@ -3535,7 +3537,8 @@ mod tests {
             res.is_movie,
             &presence::cardspec::default_card_spec(),
         );
-        assert_eq!(card.details, "Latch Show", "provisional details");
+        assert_eq!(card.details, "", "provisional details stay empty");
+        assert_eq!(card.state, "E7", "provisional state carries the tag");
     }
 
     /// T1: an explicit series latch beats a movie-classified file on the
@@ -3574,7 +3577,7 @@ mod tests {
             year: 2019,
             ..metadata::Query::default()
         };
-        let latched = latch_resolved(&file.to_string_lossy(), true, &query)
+        let latched = latch_resolved(&file.to_string_lossy(), &query)
             .expect("the series latch wins over the movie hint");
         assert!(
             !latched.is_movie,

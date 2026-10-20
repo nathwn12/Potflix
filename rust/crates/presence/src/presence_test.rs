@@ -886,7 +886,9 @@ fn build_activity_resolved_overrides() {
         "Resolved::default() card"
     );
 
-    // series override changes name, details and large_text
+    // series override changes name and large_text; details keeps the
+    // filename's episode name (never the show header -- the header already
+    // carries it).
     let base = build_activity(TV_RAW, Some(&act));
     let got = build_activity_resolved(
         TV_RAW,
@@ -905,10 +907,10 @@ fn build_activity_resolved_overrides() {
     );
     assert_eq!(
         got.details,
-        trunc("Canonical Show", 128),
+        trunc("Pilot", 128),
         "details = {:?}, want {:?}",
         got.details,
-        trunc("Canonical Show", 128)
+        trunc("Pilot", 128)
     );
     assert_eq!(
         got.large_text,
@@ -923,7 +925,7 @@ fn build_activity_resolved_overrides() {
     base.large_text = got.large_text.clone();
     assert_eq!(
         got, base,
-        "only name, details and large_text should change: got {got:?}, want {base:?}"
+        "only name and large_text should change: got {got:?}, want {base:?}"
     );
 
     // episode name override changes details; the default state falls to the
@@ -1436,7 +1438,8 @@ fn build_activity_resolved_movie() {
         ..Action::default()
     };
 
-    // T5-A: no synopsis falls back to the year, never the title.
+    // T5-A: no synopsis falls back to the year, never the title; the state
+    // stays empty beside a year-showing details line instead of repeating it.
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -1448,7 +1451,7 @@ fn build_activity_resolved_movie() {
         },
     );
     assert_eq!(got.details, "2024", "details");
-    assert_eq!(got.state, "2024", "state");
+    assert_eq!(got.state, "", "state");
     assert_eq!(got.large_text, "", "large_text");
     assert_eq!(got.name, trunc("Dune: Part Two", 128), "name");
 
@@ -2278,9 +2281,13 @@ fn unreplaced_signed_artwork_degrades_to_logo() {
 }
 
 /// T1: the one `SxxExx` formatter. Season+number renders `S01E02`; an
-/// absolute-only episode renders `E02` and never fabricates a season; a tag
-/// already matching `SxxExx` passes through; a missing number/season omits
-/// the code; a provider-supplied season-0 special renders `S00Exx`.
+/// absolute-only episode renders `E02` and never fabricates a season -- and a
+/// season-0 number never grows one either: the AniList absolute shape
+/// `(season 0, number = absolute)` renders `E05`, not `S00E05`. When the two
+/// numbers disagree (`season 0, number != absolute`) the absolute number wins
+/// (`E05` for `(0, 7, 5)`). A tag
+/// already matching `SxxExx` passes through; a missing number omits
+/// the code.
 #[test]
 fn episode_code_formatter() {
     use crate::episode_code;
@@ -2326,7 +2333,33 @@ fn episode_code_formatter() {
         "",
         "non-code tag is no code"
     );
-    assert_eq!(episode_code(0, 3, 0, ""), "S00E03", "provider special");
+    // The real AniList absolute production shape: season 0 with the number
+    // set to the absolute episode. No season is fabricated -- there is no
+    // distinct signal for a real S00 special in this shape, so it renders
+    // the bare absolute number the same way.
+    assert_eq!(
+        episode_code(0, 5, 5, ""),
+        "E05",
+        "absolute production shape (season 0, number = absolute)"
+    );
+    assert!(
+        !episode_code(0, 5, 5, "").contains('S'),
+        "season 0 must never fabricate S00"
+    );
+    assert_eq!(
+        episode_code(0, 3, 0, ""),
+        "E03",
+        "season-0 number renders bare, never S00"
+    );
+    assert_eq!(
+        episode_code(0, 7, 5, ""),
+        "E05",
+        "season 0 with disagreeing numbers: the absolute number wins"
+    );
+    assert!(
+        !episode_code(0, 7, 5, "").contains('S'),
+        "disagreeing season-0 numbers must never fabricate S00"
+    );
     assert_eq!(
         episode_code(0, 0, 0, ""),
         "",
@@ -2383,8 +2416,9 @@ fn series_default_details_show_plus_code() {
     );
 }
 
-/// T4: series default details fall back through episode title, show title,
-/// clean title, raw -- and truncate at 128. The code never appears here.
+/// T4: series default details fall back through episode title, filename
+/// episode name, then empty -- never the show title -- and truncate at 128.
+/// The code never appears here.
 #[test]
 fn series_default_details_fallbacks_and_truncation() {
     const TV_RAW: &str = "Show.S01E02.Confrontation.1080p.mkv - PotPlayer";
@@ -2413,7 +2447,9 @@ fn series_default_details_fallbacks_and_truncation() {
         "code must not leak into details: {:?}",
         got.details
     );
-    // Show title alone when the episode title is missing (the code stays out).
+    // No canonical episode title: the filename's own episode name stands in
+    // (never the show title -- the header already carries it -- and the code
+    // stays out).
     let got = build_activity_resolved(
         TV_RAW,
         Some(&run_act),
@@ -2424,7 +2460,7 @@ fn series_default_details_fallbacks_and_truncation() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.details, "Show", "show title fallback");
+    assert_eq!(got.details, "Confrontation", "filename episode-name fallback");
     assert!(
         !got.details.contains("S01E02"),
         "code must not leak into details: {:?}",
@@ -2440,9 +2476,9 @@ fn series_default_details_fallbacks_and_truncation() {
         },
     );
     assert_eq!(got.details, "Confrontation", "episode title fallback");
-    // Clean title when nothing resolved.
+    // Filename episode name when nothing resolved.
     let got = build_activity_resolved(TV_RAW, Some(&run_act), &Resolved::default());
-    assert_eq!(got.details, "Confrontation", "clean title fallback");
+    assert_eq!(got.details, "Confrontation", "filename episode-name fallback");
     // Long episode title truncates at 128, never silently.
     let long = "D".repeat(200);
     let got = build_activity_resolved(
@@ -2475,8 +2511,9 @@ fn series_default_details_fallbacks_and_truncation() {
 }
 
 /// T1 regression (T4 shape): unresolved `Show.S01E02.1080p.mkv` (no
-/// series/episode title, spaced tag `S1 E2`) must fall back to the clean
-/// title, never the tag. Ladder: episode title → show → clean title → raw.
+/// series/episode title, spaced tag `S1 E2`) leaves details empty -- never the
+/// show header, never the clean title, never the tag. Ladder: episode title
+/// (canonical, then filename) → empty; the state line still carries the tag.
 #[test]
 fn series_default_details_skips_spaced_tag() {
     const RAW: &str = "Show.S01E02.1080p.mkv - PotPlayer";
@@ -2497,14 +2534,15 @@ fn series_default_details_skips_spaced_tag() {
     assert_eq!(parsed.title, "Show", "fixture clean title");
     let got = build_activity_resolved(RAW, Some(&run_act), &Resolved::default());
     assert_eq!(
-        got.details, "Show",
-        "unresolved defaults to the clean title"
+        got.details, "",
+        "no episode title leaves details empty instead of repeating the header"
     );
     assert!(
         !got.details.contains("S1 E2"),
         "default must not leak the spaced tag: {:?}",
         got.details
     );
+    assert_eq!(got.state, "S1 E2", "state still carries the tag");
     // The episode preset keeps the episode title alone: no code prefix.
     let ep_spec = CardSpec {
         details: crate::cardspec::CARD_DETAILS_EPISODE.to_string(),
@@ -2584,8 +2622,9 @@ fn series_default_state_prefers_episode_title() {
     );
 }
 
-/// T4: the episode preset is the episode title alone -- the `S01E02 · Title`
-/// code prefix is gone. Without a title it keeps the default line.
+/// The retired `episode` preset still renders the episode title alone for old
+/// in-flight specs (it is byte-identical to the default) -- the `S01E02 · Title`
+/// code prefix is gone. Without a canonical title it keeps the default line.
 #[test]
 fn episode_preset_is_title_only() {
     const TV_RAW: &str = "Show.S01E02.Confrontation.1080p.mkv - PotPlayer";
@@ -2617,7 +2656,8 @@ fn episode_preset_is_title_only() {
         card.details, "Confrontation",
         "episode title alone, never the code"
     );
-    // No episode title: the default line, as today.
+    // No canonical episode title: the default line, as today (the filename's
+    // own episode name -- never the show header).
     let card = compose_card(
         TV_RAW,
         Some(&run_act),
@@ -2630,7 +2670,7 @@ fn episode_preset_is_title_only() {
         false,
         &ep_spec,
     );
-    assert_eq!(card.details, "Show", "fallback keeps the default line");
+    assert_eq!(card.details, "Confrontation", "fallback keeps the default line");
 }
 
 /// T1: absolute-only renders `E02`, a number-less special omits the code, and
@@ -2664,7 +2704,8 @@ fn absolute_special_and_movie_code_shapes() {
         "absolute must never render a code in details: {:?}",
         got.details
     );
-    // Special with no number: the code is omitted, the show stands alone.
+    // Special with no number: the code is omitted and no header repeats --
+    // details keeps the filename's episode name, never the show title.
     let got = build_activity_resolved(
         TV_RAW,
         Some(&run_act),
@@ -2675,7 +2716,10 @@ fn absolute_special_and_movie_code_shapes() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.details, "Show", "number-less special omits the code");
+    assert_eq!(
+        got.details, "Confrontation",
+        "number-less special omits the code without repeating the header"
+    );
     // Movie branches ignore episode-code data (T5-A shapes: year fallback on
     // details, year/genres/runtime join on state, empty tooltip).
     let got = build_activity_resolved(
@@ -2694,8 +2738,8 @@ fn absolute_special_and_movie_code_shapes() {
     );
     assert_eq!(got.details, "2024", "movie details ignore the code");
     assert_eq!(
-        got.state, "2024 \u{b7} Sci-Fi \u{b7} 2h 46m",
-        "movie state ignores the code"
+        got.state, "Sci-Fi \u{b7} 2h 46m",
+        "movie state ignores the code and never repeats the year-showing details"
     );
     assert_eq!(got.large_text, "", "movie tooltip stays omitted");
 }
@@ -2787,7 +2831,9 @@ fn series_default_state_carries_code_plus_title() {
         },
     );
     assert_eq!(got.state, "S1 E3", "no synopsis falls back to the tag");
-    // Code plus synopsis without an episode title.
+    // Code plus synopsis without an episode title: details stays empty (never
+    // the show header -- the header already carries it) while the state
+    // carries the code plus the synopsis.
     let got = build_activity_resolved(
         "Show.S01E03.1080p.mkv - PotPlayer",
         Some(&run_act),
@@ -2800,8 +2846,8 @@ fn series_default_state_carries_code_plus_title() {
         },
     );
     assert_eq!(
-        got.details, "Show",
-        "no episode title falls back to the show"
+        got.details, "",
+        "no episode title leaves details empty instead of repeating the header"
     );
     assert_eq!(
         got.state,
@@ -2828,6 +2874,31 @@ fn series_default_state_carries_code_plus_title() {
     assert!(
         !got.state.contains("S01") && !got.state.contains("S00"),
         "absolute must never fabricate a season: {:?}",
+        got.state
+    );
+    // The real AniList absolute production shape (season 0, number set to the
+    // absolute episode): still `E05`, never `S00E05`.
+    let got = build_activity_resolved(
+        TV_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Show".to_string(),
+            episode_name: "Title".to_string(),
+            synopsis: syn.to_string(),
+            season: 0,
+            number: 5,
+            absolute: 5,
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(
+        got.state,
+        format!("E05 - {syn}"),
+        "absolute production shape renders bare, never S00"
+    );
+    assert!(
+        !got.state.contains("S00"),
+        "season 0 must never fabricate a season: {:?}",
         got.state
     );
     // One-season shows keep S01.
@@ -2913,7 +2984,8 @@ fn series_default_state_carries_code_plus_title() {
         got.state
     );
     // T5-A movie default ignores episode-code data: no synopsis here, so
-    // details fall back to the year and state joins year/genres/runtime.
+    // details fall back to the year and state is genres/length without
+    // repeating it.
     let got = build_activity_resolved(
         "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
         Some(&run_act),
@@ -2931,8 +3003,8 @@ fn series_default_state_carries_code_plus_title() {
     );
     assert_eq!(got.details, "2024", "movie details ignore the code");
     assert_eq!(
-        got.state, "2024 \u{b7} Sci-Fi \u{b7} 2h 46m",
-        "movie default ignores the code"
+        got.state, "Sci-Fi \u{b7} 2h 46m",
+        "movie default ignores the code and never repeats the year"
     );
     // Custom presets are unchanged.
     for (preset, want) in [
@@ -3128,7 +3200,9 @@ fn movie_t5a_details_fallbacks_skip_missing_never_title() {
         "bare details must never be the title: {:?}",
         got.details
     );
-    // State skips missing parts.
+    // State skips missing parts -- and never repeats the details line: with no
+    // synopsis the details line already shows the genres/length pair, so the
+    // state stays empty.
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -3139,7 +3213,11 @@ fn movie_t5a_details_fallbacks_skip_missing_never_title() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "2h 19m", "state skips missing year/genres");
+    assert_eq!(got.details, "2h 19m", "details carries genres/length");
+    assert_eq!(
+        got.state, "",
+        "state stays empty beside a genres/length details line"
+    );
     let got = build_activity_resolved(
         MOVIE_RAW,
         Some(&run_act),
@@ -3150,7 +3228,11 @@ fn movie_t5a_details_fallbacks_skip_missing_never_title() {
             ..Resolved::default()
         },
     );
-    assert_eq!(got.state, "2024", "state with year only");
+    assert_eq!(got.details, "2024", "details carries the year");
+    assert_eq!(
+        got.state, "",
+        "state stays empty beside a year details line"
+    );
     // State with nothing: empty, never the title.
     let got = build_activity_resolved(
         "Movie.mkv - PotPlayer",
@@ -3166,6 +3248,86 @@ fn movie_t5a_details_fallbacks_skip_missing_never_title() {
         !got.state.contains("Dune"),
         "bare state must never be the title: {:?}",
         got.state
+    );
+}
+
+/// The movie default never puts the same text on both lines: with a synopsis
+/// the details carry it and the state joins year/genres/runtime; without one
+/// the details carry the year (then the state is genres/length, never
+/// repeating the year) or genres/length (then the state stays empty).
+/// Both lines are asserted together: a details-only assertion cannot catch a
+/// state duplication.
+#[test]
+fn movie_default_details_and_state_never_repeat() {
+    const MOVIE_RAW: &str = "Dune.Part.Two.2024.1080p.mkv - PotPlayer";
+    const MID: &str = " \u{b7} ";
+    let run_act = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    // Synopsis: details the synopsis, state year · genres · runtime.
+    let got = build_activity_resolved(
+        MOVIE_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Dune: Part Two".to_string(),
+            year: 2024,
+            is_movie: true,
+            genres: "Sci-Fi".to_string(),
+            length: "2h 46m".to_string(),
+            synopsis: "Paul unites the Fremen".to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(got.details, "Paul unites the Fremen", "synopsis details");
+    assert_eq!(
+        got.state,
+        format!("2024{MID}Sci-Fi{MID}2h 46m"),
+        "synopsis state joins year, genres and runtime"
+    );
+    // No synopsis with a year: details the year, state genres/length without
+    // repeating the year.
+    let got = build_activity_resolved(
+        MOVIE_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Dune: Part Two".to_string(),
+            year: 2024,
+            is_movie: true,
+            genres: "Sci-Fi".to_string(),
+            length: "2h 46m".to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(got.details, "2024", "year details");
+    assert_eq!(
+        got.state,
+        format!("Sci-Fi{MID}2h 46m"),
+        "state beside a year never repeats it"
+    );
+    // No synopsis, no year: details genres/length, state empty.
+    let got = build_activity_resolved(
+        MOVIE_RAW,
+        Some(&run_act),
+        &Resolved {
+            series: "Dune: Part Two".to_string(),
+            is_movie: true,
+            genres: "Sci-Fi".to_string(),
+            length: "2h 46m".to_string(),
+            ..Resolved::default()
+        },
+    );
+    assert_eq!(
+        got.details,
+        format!("Sci-Fi{MID}2h 46m"),
+        "genres/length details"
+    );
+    assert_eq!(
+        got.state, "",
+        "state stays empty beside a genres/length details line"
     );
 }
 
