@@ -164,7 +164,10 @@ impl JustWatchSource {
             "query": JUSTWATCH_QUERY,
         });
         let url = format!("{}/graphql", self.base_url());
-        let response = self.client.post_json(cancel, &url, &payload)?;
+        // Read-only GraphQL search: side-effect-free, so the idempotent POST
+        // retry (backoff + jitter, honoring Retry-After) applies. A mutating
+        // POST would use `post_json` and never retry.
+        let response = self.client.post_json_idempotent(cancel, &url, &payload)?;
         if response.status() == StatusCode::NOT_FOUND {
             drain_and_close(response);
             return Ok(None);

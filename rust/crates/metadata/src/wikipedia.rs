@@ -30,8 +30,9 @@
 //! `wikipedia_test.go` asserts `Potflix` case-sensitively, while
 //! `metadata-http::HttpClient` sends the shared `potflix-metadata/1.0`. This
 //! module therefore owns [`WikiClient`], which mirrors `http.go`'s
-//! `fetchWithRetry` exactly -- same limiter, same single 429 retry, same
-//! `Retry-After` bound, same `decode_capped` -- and differs only in the header.
+//! `fetchWithRetry` exactly -- same limiter, same bounded 429 retries with
+//! backoff and jitter, same `Retry-After` bound, same `decode_capped` -- and
+//! differs only in the header.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -40,8 +41,8 @@ use std::time::{Duration, SystemTime};
 use metadata_core::types::{Kind, Media, Query, normalize_url};
 use metadata_http::cancel::Cancel;
 use metadata_http::{
-    ACCEPT_JSON, DEFAULT_HTTP_TIMEOUT, MAX_RETRY_WAIT, decode_capped, drain_and_close,
-    parse_retry_after, wait_for_host,
+    ACCEPT_JSON, DEFAULT_HTTP_TIMEOUT, MAX_429_RETRIES, decode_capped, drain_and_close,
+    parse_retry_after, retry_wait_for_attempt, wait_for_host,
 };
 use serde::Deserialize;
 use ureq::Body;
@@ -92,25 +93,34 @@ impl WikiClient {
         }
     }
 
-    /// `wikiGet`: a GET with the Wikimedia `User-Agent` and one bounded 429
-    /// retry. The URL is never logged; errors carry the status only.
+    /// `wikiGet`: a GET with the Wikimedia `User-Agent` and the shared
+    /// bounded 429 retries (backoff + jitter, honoring `Retry-After`). GET is
+    /// idempotent, so it retries; the URL is never logged and errors carry
+    /// the status only.
     pub fn get(&self, cancel: &Cancel, url: &str) -> Result<Response<Body>, Error> {
         let uri: Uri = url.parse().map_err(|err: ureq::http::uri::InvalidUri| {
             Error::other(format!("metadata: invalid request URL: {err}"))
         })?;
-        let response = self.attempt(cancel, &uri)?;
-        if response.status().as_u16() != StatusCode::TOO_MANY_REQUESTS.as_u16() {
-            return Ok(response);
+        let mut attempt: u32 = 0;
+        loop {
+            let response = self.attempt(cancel, &uri)?;
+            if response.status().as_u16() != StatusCode::TOO_MANY_REQUESTS.as_u16() {
+                return Ok(response);
+            }
+            if attempt >= MAX_429_RETRIES {
+                return Ok(response);
+            }
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let server_wait = parse_retry_after(retry_after, SystemTime::now());
+            let wait = retry_wait_for_attempt(server_wait, attempt);
+            drain_and_close(response);
+            cancel.wait(wait).map_err(Error::Cancelled)?;
+            attempt += 1;
         }
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        let wait = parse_retry_after(retry_after, SystemTime::now()).min(MAX_RETRY_WAIT);
-        drain_and_close(response);
-        cancel.wait(wait).map_err(Error::Cancelled)?;
-        self.attempt(cancel, &uri)
     }
 
     fn attempt(&self, cancel: &Cancel, uri: &Uri) -> Result<Response<Body>, Error> {

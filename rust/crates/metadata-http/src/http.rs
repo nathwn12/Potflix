@@ -1,7 +1,7 @@
 //! `metadata::http` -- mirrors `go\internal\metadata\http.go`.
 //!
 //! The shared HTTP client and fetch helpers: one wire contract for every
-//! provider, one bounded retry, and a capped decoder.
+//! provider, bounded 429 retries with backoff and jitter, and a capped decoder.
 //!
 //! In Rust this is `ureq` with the `native-tls` provider (SChannel on
 //! Windows) -- OS-native TLS, no C toolchain -- rooted in the platform
@@ -48,6 +48,18 @@ pub const CONTENT_TYPE_JSON: &str = "application/json";
 pub const MAX_BODY_BYTES: u64 = 4 << 20;
 /// Upper bound on an honored `Retry-After` (http.go:18).
 pub const MAX_RETRY_WAIT: Duration = Duration::from_secs(10);
+/// Maximum 429 retries after the initial attempt: 1 initial + up to 3
+/// retries = 4 requests worst case. Small and bounded: a persistently
+/// rate-limited host hands its last 429 back instead of looping.
+pub const MAX_429_RETRIES: u32 = 3;
+/// Base for the exponential backoff when no usable `Retry-After` arrives:
+/// 200 ms, doubling per retry (200/400/800 ms), capped by
+/// [`MAX_RETRY_WAIT`].
+pub const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+/// Upper bound on the retry jitter. Every 429 wait adds 0..=100 ms of
+/// std-only jitter so concurrent lookups spread instead of retrying in
+/// lockstep.
+pub const RETRY_JITTER_CAP: Duration = Duration::from_millis(100);
 /// Post-decode drain cap that returns a connection to the pool (http.go:22).
 pub const DRAIN_BODY_CAP: u64 = 512 << 10;
 /// Pre-close drain cap (http.go:75, :133, :144).
@@ -139,10 +151,10 @@ impl HttpClient {
         }
     }
 
-    /// `fetchGet`: a GET with the shared `User-Agent`/`Accept` and one bounded
-    /// 429 retry (http.go:99).
+    /// `fetchGet`: a GET with the shared `User-Agent`/`Accept` and bounded
+    /// 429 retries (http.go:99). GET is idempotent, so it retries.
     pub fn get(&self, cancel: &Cancel, url: &str) -> Result<Response<Body>, Error> {
-        self.fetch(cancel, url, None, "")
+        self.fetch(cancel, url, None, "", true)
     }
 
     /// `fetchGet` with a per-request `Accept` override (empty means the shared
@@ -156,12 +168,16 @@ impl HttpClient {
         url: &str,
         accept: &str,
     ) -> Result<Response<Body>, Error> {
-        self.fetch(cancel, url, None, accept)
+        self.fetch(cancel, url, None, accept, true)
     }
 
-    /// `fetchPostJSON`: a JSON POST with the shared `User-Agent`/`Accept`, a
-    /// `Content-Type: application/json` and one bounded 429 retry
-    /// (http.go:112).
+    /// `fetchPostJSON`: a JSON POST with the shared `User-Agent`/`Accept` and
+    /// `Content-Type: application/json` (http.go:112).
+    ///
+    /// NEVER retried: POST is not idempotent in general, so a 429 (or any
+    /// other status) is handed straight back. Read-only GraphQL search callers
+    /// that can safely retry use [`HttpClient::post_json_idempotent`] instead,
+    /// which documents the opt-in at the call site.
     pub fn post_json<T: Serialize>(
         &self,
         cancel: &Cancel,
@@ -169,38 +185,71 @@ impl HttpClient {
         payload: &T,
     ) -> Result<Response<Body>, Error> {
         let body = serde_json::to_vec(payload).map_err(Error::Encode)?;
-        self.fetch(cancel, url, Some(body), "")
+        self.fetch(cancel, url, Some(body), "", false)
     }
 
-    /// `fetchWithRetry`: runs the request once, and on HTTP 429 retries
-    /// exactly once, honoring `Retry-After` bounded by [`MAX_RETRY_WAIT`].
-    /// Every attempt is spaced by the per-host limiter (unknown hosts go
-    /// ungated) (http.go:56).
+    /// A JSON POST for read-only search queries (AniList / JustWatch GraphQL
+    /// `search`): same wire shape as [`HttpClient::post_json`], but the
+    /// caller asserts the payload is a side-effect-free search, so 429s retry
+    /// with the shared backoff+jitter policy exactly like GET. Any future
+    /// mutating POST must keep using [`HttpClient::post_json`] (no retry).
+    pub fn post_json_idempotent<T: Serialize>(
+        &self,
+        cancel: &Cancel,
+        url: &str,
+        payload: &T,
+    ) -> Result<Response<Body>, Error> {
+        let body = serde_json::to_vec(payload).map_err(Error::Encode)?;
+        self.fetch(cancel, url, Some(body), "", true)
+    }
+
+    /// `fetchWithRetry`: runs the request once, and on HTTP 429 retries an
+    /// idempotent request up to [`MAX_429_RETRIES`] times (http.go:56).
+    /// Non-idempotent calls never retry.
+    ///
+    /// Each retry waits for the server's `Retry-After` when present and
+    /// usable (bounded by [`MAX_RETRY_WAIT`]), else the exponential
+    /// [`RETRY_BASE_DELAY`] backoff, plus 0..=[`RETRY_JITTER_CAP`] of jitter
+    /// so concurrent lookups do not retry in lockstep. Every attempt is spaced
+    /// by the per-host limiter (unknown hosts go ungated) (http.go:56). A
+    /// persistently rate-limited host hands its last 429 back for
+    /// `decode_capped` to report; 429 is a response, never a transport error.
     fn fetch(
         &self,
         cancel: &Cancel,
         url: &str,
         payload: Option<Vec<u8>>,
         accept: &str,
+        idempotent: bool,
     ) -> Result<Response<Body>, Error> {
         let uri: Uri = url
             .parse()
             .map_err(|err: ureq::http::uri::InvalidUri| Error::Url(err.to_string()))?;
-        let response = self.attempt(cancel, &uri, payload.as_deref(), accept)?;
-        if response.status().as_u16() != StatusCode::TOO_MANY_REQUESTS.as_u16() {
-            return Ok(response);
+        let mut attempt: u32 = 0;
+        loop {
+            let response = self.attempt(cancel, &uri, payload.as_deref(), accept)?;
+            if response.status().as_u16() != StatusCode::TOO_MANY_REQUESTS.as_u16() {
+                return Ok(response);
+            }
+            // Non-idempotent calls and an exhausted budget hand the last 429
+            // back instead of sleeping: the caller still owns the body.
+            if !idempotent || attempt >= MAX_429_RETRIES {
+                return Ok(response);
+            }
+            let retry_after = response
+                .headers()
+                .get("Retry-After")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            let server_wait = parse_retry_after(retry_after, SystemTime::now());
+            let wait = retry_wait_for_attempt(server_wait, attempt);
+            drain_and_close(response);
+            // Go bounds the wait, then a zero wait still checks `ctx.Err()` -
+            // which is exactly what `wait` does here; the backoff floor means
+            // this wait is never zero for a live scope.
+            cancel.wait(wait).map_err(Error::Cancelled)?;
+            attempt += 1;
         }
-        let retry_after = response
-            .headers()
-            .get("Retry-After")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        let wait = parse_retry_after(retry_after, SystemTime::now()).min(MAX_RETRY_WAIT);
-        drain_and_close(response);
-        // Go bounds the wait, then a zero wait still checks `ctx.Err()` - which
-        // is exactly what a zero-length `wait` does here.
-        cancel.wait(wait).map_err(Error::Cancelled)?;
-        self.attempt(cancel, &uri, payload.as_deref(), accept)
     }
 
     fn attempt(
@@ -237,6 +286,53 @@ impl HttpClient {
         };
         result.map_err(Error::Transport)
     }
+}
+
+/// Exponential backoff for retry `attempt` (0-based) when the server sent no
+/// usable `Retry-After`: [`RETRY_BASE_DELAY`] doubling per retry
+/// (200/400/800 ms for attempts 0/1/2), capped by [`MAX_RETRY_WAIT`].
+pub fn backoff_for_attempt(attempt: u32) -> Duration {
+    let shift = attempt.min(6);
+    RETRY_BASE_DELAY
+        .saturating_mul(1 << shift)
+        .min(MAX_RETRY_WAIT)
+}
+
+/// Std-only jitter for retry `attempt`: 0..=[`RETRY_JITTER_CAP`], mixed from
+/// the wall clock and the attempt number so concurrent lookups spread instead
+/// of retrying in lockstep. No third-party RNG: the workspace pins exact
+/// versions and `--locked` is the build norm, so randomness here is
+/// deliberately `std`-only. Bounds are exact; the value within them is not.
+fn jitter_for_attempt(attempt: u32) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0x9E37_79B9, |elapsed| elapsed.subsec_nanos());
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B1)
+        .wrapping_add(attempt.wrapping_mul(0x85EB_CA6B));
+    Duration::from_nanos((mixed % (RETRY_JITTER_CAP.as_nanos() as u32 + 1)) as u64)
+}
+
+/// The 429 wait for retry `attempt`: the server's `Retry-After` when present
+/// and positive (bounded by [`MAX_RETRY_WAIT`]), else
+/// [`backoff_for_attempt`], plus `jitter`. The total never exceeds
+/// `MAX_RETRY_WAIT + RETRY_JITTER_CAP`. Pure for tests: production callers
+/// pass [`jitter_for_attempt`] via [`retry_wait_for_attempt`].
+pub fn compute_retry_wait(server_wait: Duration, attempt: u32, jitter: Duration) -> Duration {
+    let jitter = jitter.min(RETRY_JITTER_CAP);
+    let base = if server_wait.is_zero() {
+        backoff_for_attempt(attempt)
+    } else {
+        server_wait.min(MAX_RETRY_WAIT)
+    };
+    (base + jitter).min(MAX_RETRY_WAIT + RETRY_JITTER_CAP)
+}
+
+/// [`compute_retry_wait`] with internally sampled [`jitter_for_attempt`]:
+/// the single policy every idempotent 429 retry uses, here and in
+/// `metadata::wikipedia`'s header-divergent client.
+pub fn retry_wait_for_attempt(server_wait: Duration, attempt: u32) -> Duration {
+    compute_retry_wait(server_wait, attempt, jitter_for_attempt(attempt))
 }
 
 /// `parseRetryAfter`: seconds, or an HTTP-date, or zero when the value is
@@ -441,6 +537,74 @@ mod tests {
                 at - Duration::from_secs(30)
             ),
             Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn backoff_doubles_per_attempt_and_caps() {
+        assert_eq!(backoff_for_attempt(0), Duration::from_millis(200));
+        assert_eq!(backoff_for_attempt(1), Duration::from_millis(400));
+        assert_eq!(backoff_for_attempt(2), Duration::from_millis(800));
+        assert_eq!(backoff_for_attempt(3), Duration::from_millis(1600));
+        // Far-future attempts never exceed the retry-wait cap.
+        assert_eq!(backoff_for_attempt(100), MAX_RETRY_WAIT);
+    }
+
+    #[test]
+    fn compute_retry_wait_honors_retry_after_and_caps() {
+        let jitter = Duration::from_millis(50);
+        // No server hint: pure backoff plus jitter.
+        assert_eq!(
+            compute_retry_wait(Duration::ZERO, 0, jitter),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            compute_retry_wait(Duration::ZERO, 1, jitter),
+            Duration::from_millis(450)
+        );
+        // A usable Retry-After wins over backoff.
+        assert_eq!(
+            compute_retry_wait(Duration::from_secs(2), 0, jitter),
+            Duration::from_millis(2050)
+        );
+        // ... but never past the cap plus jitter.
+        assert_eq!(
+            compute_retry_wait(Duration::from_secs(3600), 0, jitter),
+            MAX_RETRY_WAIT + jitter
+        );
+        assert_eq!(
+            compute_retry_wait(Duration::ZERO, 100, jitter),
+            MAX_RETRY_WAIT + jitter
+        );
+        // Jitter itself is capped.
+        assert_eq!(
+            compute_retry_wait(Duration::ZERO, 0, Duration::from_secs(60)),
+            RETRY_BASE_DELAY + RETRY_JITTER_CAP
+        );
+    }
+
+    #[test]
+    fn retry_wait_for_attempt_stays_in_bounds() {
+        // The jittered policy is non-deterministic by design (wall-clock
+        // mixed); assert the bounds, never an exact value. This check CAN go
+        // red: a missing jitter term or an uncapped wait fails it.
+        for attempt in 0..=MAX_429_RETRIES {
+            let wait = retry_wait_for_attempt(Duration::ZERO, attempt);
+            let base = backoff_for_attempt(attempt);
+            assert!(
+                wait >= base,
+                "attempt {attempt}: {wait:?} must carry the {base:?} backoff floor"
+            );
+            assert!(
+                wait <= base + RETRY_JITTER_CAP,
+                "attempt {attempt}: {wait:?} must not exceed backoff + jitter"
+            );
+        }
+        let honoring = retry_wait_for_attempt(Duration::from_secs(3), 0);
+        assert!(
+            honoring >= Duration::from_secs(3)
+                && honoring <= Duration::from_secs(3) + RETRY_JITTER_CAP,
+            "a 3 s Retry-After must be honored plus jitter, got {honoring:?}"
         );
     }
 }

@@ -392,7 +392,10 @@ impl crate::resolver::Source for AnilistSource {
             "query": ANILIST_QUERY,
             "variables": {"search": q.title},
         });
-        let response = self.client.post_json(cancel, self.base_url(), &payload)?;
+        // Read-only GraphQL search: side-effect-free, so the idempotent POST
+        // retry (backoff + jitter, honoring Retry-After) applies. A mutating
+        // POST would use `post_json` and never retry.
+        let response = self.client.post_json_idempotent(cancel, self.base_url(), &payload)?;
         let parsed: AnilistResp = decode_capped(response)?;
         let items = parsed.data.and_then(|data| data.page).map(|page| page.media).unwrap_or_default();
         // Title identity check: no candidates is a definitive miss (a film
