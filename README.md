@@ -52,6 +52,8 @@ You need Windows, PotPlayer, the Discord desktop app (the web client has no loca
 - [Changelog](CHANGELOG.md)
 - [Rust port notes](RUST-PORT.md)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
+- [Issues](https://github.com/nathwn12/Potflix/issues)
+- [Releases](https://github.com/nathwn12/Potflix/releases)
 - [License](LICENSE) (MIT)
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
