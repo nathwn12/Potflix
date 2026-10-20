@@ -5,6 +5,7 @@
 # on the cargo steps (the workspace manifest lives in `rust/`).
 name: ci
 on:
+  pull_request:
   workflow_dispatch:
 jobs:
   build:
