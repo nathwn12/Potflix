@@ -25,17 +25,12 @@ use metadata::{Candidate, Override, Scope};
 /// `key` is the caller-selected target key (movie file, season folder, show
 /// folder) and passes through byte-for-byte: this helper never normalises and
 /// never derives -- [`metadata::overrides::Store::put`] normalises on write.
-/// `path` is the file the correction is for, threaded through for the
-/// [`metadata::overrides::Store::put_correction`] call the UI lane makes next
-/// (which derives the conflicting-scope keys from it); no key is invented
-/// from it here.
 ///
 /// No network, no fetch, no store write: the caller persists the record
 /// (usually [`metadata::overrides::Store::put_correction`]) and the full pin
 /// or refresh later replaces it with the fetched media and episode pins.
 #[must_use]
-pub fn provisional_override(cand: &Candidate, scope: Scope, key: String, path: &str) -> Override {
-    let _ = path;
+pub fn provisional_override(cand: &Candidate, scope: Scope, key: String) -> Override {
     Override {
         scope,
         key,
@@ -89,12 +84,7 @@ mod tests {
     #[test]
     fn series_candidate_yields_provisional_series_override_without_network() {
         let cand = series_candidate();
-        let over = provisional_override(
-            &cand,
-            Scope::Series,
-            "M:\\2SERIES\\Show".to_string(),
-            "M:\\2SERIES\\Show\\Season 1\\s01e01.mkv",
-        );
+        let over = provisional_override(&cand, Scope::Series, "M:\\2SERIES\\Show".to_string());
         assert_eq!(over.scope, Scope::Series);
         assert_eq!(over.key, "M:\\2SERIES\\Show");
         assert_eq!(over.title, "Show");
@@ -114,7 +104,6 @@ mod tests {
             &cand,
             Scope::Movie,
             "D:\\Films\\Dune Part Two.mkv".to_string(),
-            "D:\\Films\\Dune Part Two.mkv",
         );
         assert_eq!(over.scope, Scope::Movie);
         assert_eq!(over.title, "Dune: Part Two");
@@ -131,62 +120,52 @@ mod tests {
     }
 
     #[test]
-    fn key_and_scope_pass_through_exactly_and_path_invents_no_key() {
+    fn key_and_scope_pass_through_exactly() {
         let cand = series_candidate();
         // Mixed case plus `/` separators: the helper must NOT normalise --
         // [`metadata::overrides::Store::put`] normalises on write.
         let key = "M:/2SERIES/Show".to_string();
-        let first = provisional_override(
-            &cand,
-            Scope::Season,
-            key.clone(),
-            "M:\\2SERIES\\Show\\Season 1\\s01e01.mkv",
-        );
-        assert_eq!(first.scope, Scope::Season);
-        assert_eq!(first.key, key, "key passes through byte-for-byte");
+        let over = provisional_override(&cand, Scope::Season, key.clone());
+        assert_eq!(over.scope, Scope::Season);
+        assert_eq!(over.key, key, "key passes through byte-for-byte");
         // A season scope is not a movie scope, so the candidate cover rides.
-        assert_eq!(first.poster, "https://art/show-picked.jpg");
-        // A different path must not change the record: the key is supplied,
-        // never derived.
-        let second = provisional_override(
-            &cand,
-            Scope::Season,
-            key.clone(),
-            "M:\\2SERIES\\Show\\Season 2\\s02e01.mkv",
-        );
-        assert_eq!(second.key, first.key);
-        assert_eq!(second.title, first.title);
-        assert_eq!(second.provider, first.provider);
-        assert_eq!(second.provider_id, first.provider_id);
-        assert_eq!(second.poster, first.poster);
-        assert!(second.created_at_ms > 0);
+        assert_eq!(over.poster, "https://art/show-picked.jpg");
+        assert!(over.media.is_none(), "provisional: no fetched record");
+        assert!(over.episodes.is_empty(), "provisional: no episode table");
+        assert!(over.created_at_ms > 0);
     }
 
     #[test]
-    fn provisional_override_touches_no_store_file() {
-        let store_path = metadata::overrides::default_path();
-        let before_bytes = std::fs::read(&store_path).ok();
-        let before_meta = std::fs::metadata(&store_path)
-            .ok()
-            .map(|m| (m.len(), m.modified().ok()));
-        let cand = series_candidate();
-        for _ in 0..3 {
-            let over = provisional_override(
-                &cand,
-                Scope::Series,
-                "M:\\2SERIES\\Show".to_string(),
-                "M:\\2SERIES\\Show\\Season 1\\s01e01.mkv",
+    fn provisional_override_persists_through_the_caller_store_write() {
+        // The helper itself takes no store handle (pure builder); the
+        // documented contract is that the CALLER persists the record. This
+        // drives that reachable path: build, save through `put_correction`,
+        // reload, resolve -- proving the built record is persistable, not
+        // merely that a pure function writes nothing.
+        crate::test_env::EnvGuard::with_scratch("search-persist", |dir| {
+            let store_path = metadata::overrides::default_path();
+            assert!(
+                store_path.starts_with(dir),
+                "the store resolves under scratch: {}",
+                store_path.display()
             );
-            assert!(over.media.is_none());
-        }
-        let after_bytes = std::fs::read(&store_path).ok();
-        let after_meta = std::fs::metadata(&store_path)
-            .ok()
-            .map(|m| (m.len(), m.modified().ok()));
-        assert_eq!(
-            before_bytes, after_bytes,
-            "the helper must not create, modify or delete the store file"
-        );
-        assert_eq!(before_meta, after_meta);
+            let path = crate::window::fix_series_path();
+            let key = metadata::overrides::series_key_for(&path).expect("series key");
+            let cand = series_candidate();
+            let over = provisional_override(&cand, Scope::Series, key.clone());
+            assert_eq!(over.key, key);
+            assert!(over.media.is_none(), "provisional: no fetched record");
+            assert!(over.episodes.is_empty(), "provisional: no episode table");
+            let mut store = metadata::overrides::load()
+                .unwrap_or_else(|_| metadata::overrides::Store::empty());
+            store.put_correction(&path, over.clone()).expect("caller save");
+            let reloaded = metadata::overrides::load().expect("reload");
+            let got = reloaded.resolve_for(&path).expect("persisted latch");
+            assert_eq!(got.title, "Show");
+            assert_eq!(got.provider_id, "169");
+            assert_eq!(got.poster, "https://art/show-picked.jpg");
+            assert!(got.media.is_none());
+            assert!(got.episodes.is_empty());
+        });
     }
 }

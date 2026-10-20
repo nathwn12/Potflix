@@ -13,12 +13,20 @@
 //! ladder, so the series default is the episode title over the code-plus-
 //! synopsis line and the movie default is the synopsis over the
 //! year/genres/runtime line (either movie line may stay empty rather than
-//! repeat the title); the synopsis stays
+//! repeat the title, and the movie state never repeats what the movie details
+//! line already shows); any state rung whose final text would repeat the
+//! activity header blanks instead (`Paused` when paused), so no body line
+//! from a kept preset ever repeats the header (the retired Details ids
+//! below still render the header for old in-flight specs -- see
+//! [`CardSpec::migrated`] -- so the guarantee covers kept presets and
+//! migrated stored specs, not a retired id composed mid-flight). The synopsis stays
 //! available as the explicit [`CARD_STATE_SYNOPSIS`] preset and whole in the
-//! series tooltip. The default falls back to the clean filename title, and only as
-//! the very last resort to the synopsis, so the series line is never blank. The
-//! paused " - Paused" marker path is preserved on every rung, and only
-//! [`CARD_STATE_NONE`] may empty the series line.
+//! series tooltip. Series details fall back to the filename's own episode
+//! name, then to empty -- never the show title, which is the activity
+//! header -- so a series card with no episode title anywhere is a deliberate
+//! one-line card, as is a header-equal state blank and a
+//! [`CARD_STATE_NONE`] (`Minimal`) card. The
+//! paused " - Paused" marker path is preserved on every rung.
 
 use player::window::{APP_NAME, SUFFIX};
 use serde::{Deserialize, Serialize};
@@ -35,7 +43,13 @@ pub const CARD_DETAILS_DEFAULT: &str = "default";
 /// specs, and [`CardSpec::normalized`] still accepts it.
 pub const CARD_DETAILS_TITLE: &str = "title";
 
-/// Details-line preset id: the episode label.
+/// Details-line preset id: the episode label. RETIRED: it renders
+/// byte-identical to [`CARD_DETAILS_DEFAULT`] for both kinds (the default
+/// already is the episode title for series and the synopsis-led line for
+/// movies), so it is no longer offered ([`card_presets`]) and stored specs
+/// carrying it migrate to [`CARD_DETAILS_DEFAULT`] (see
+/// [`CardSpec::migrated`]). The composer still renders it for old in-flight
+/// specs, and [`CardSpec::normalized`] still accepts it.
 pub const CARD_DETAILS_EPISODE: &str = "episode";
 
 /// Details-line preset id: the series name. RETIRED (T5-B): same as
@@ -106,9 +120,11 @@ impl CardSpec {
         out
     }
 
-    /// T5-B migration for stored specs: the retired Details presets
-    /// ([`CARD_DETAILS_TITLE`]/[`CARD_DETAILS_SERIES`], which repeat the
-    /// activity header) reset to the default line. Kept ids, unknown ids and
+    /// T5-B migration for stored specs, extended to the retired Episode
+    /// preset: the retired Details presets ([`CARD_DETAILS_TITLE`]/
+    /// [`CARD_DETAILS_SERIES`], which repeat the activity header, and
+    /// [`CARD_DETAILS_EPISODE`], which renders byte-identical to the default
+    /// for both kinds) reset to the default line. Kept ids, unknown ids and
     /// every state line survive byte-for-byte, so the migration can never lose
     /// an unrelated spec. The store applies this on load and on save; the
     /// renderer keeps composing retired ids for old in-flight specs, so only
@@ -116,7 +132,7 @@ impl CardSpec {
     pub fn migrated(&self) -> CardSpec {
         let mut out = self.clone();
         match out.details.as_str() {
-            CARD_DETAILS_TITLE | CARD_DETAILS_SERIES => {
+            CARD_DETAILS_TITLE | CARD_DETAILS_SERIES | CARD_DETAILS_EPISODE => {
                 out.details = CARD_DETAILS_DEFAULT.to_string();
             }
             _ => {}
@@ -136,10 +152,13 @@ impl CardSpec {
     /// exactly (both delegate to the same fill ladder); the series default is
     /// the episode title over the code-plus-synopsis line, the movie default
     /// is the synopsis over the year/genres/runtime line (either movie line
-    /// may stay empty rather than repeat the title), falling back to the
-    /// clean filename title and only as the very last resort to the synopsis
-    /// on series lines, so a series line is never blank. Only [`CARD_STATE_NONE`]
-    /// empties the series line. The idle card keeps its shipped lines under any spec.
+    /// may stay empty rather than repeat the title, and the movie state never
+    /// repeats what the movie details line shows), falling back to the
+    /// filename's own episode name and then to empty on series details -- never
+    /// the show title -- while the series state ladder ends on the clean
+    /// filename title unless it repeats the header (then empty, `Paused` when
+    /// paused). [`CARD_STATE_NONE`] and a header-equal state rung empty the
+    /// series state line. The idle card keeps its shipped lines under any spec.
     pub fn render(&self, raw_title: &str, a: Option<&Action>, r: &Resolved) -> (String, String) {
         self.render_kind(raw_title, a, r, r.is_movie)
     }
@@ -166,20 +185,19 @@ impl CardSpec {
     }
 }
 
-/// The small named set per line (`cardspec.go:83`): 2 Details choices and 4
-/// State choices. Details offers only Default (the per-kind default line:
-/// episode title for TV, synopsis for movies) and Episode -- the Title and
-/// Series presets repeated the activity header (T5-B). Labels stay short so
-/// the owner-drawn preset buttons ellipsize cleanly at any DPI.
+/// The small named set per line (`cardspec.go:83`): 1 stored Details value
+/// and 4 State choices. Details keeps only Default (the per-kind default
+/// line: episode title for TV, synopsis for movies); the stored value stays
+/// for compatibility but the Card view offers no Details row. Episode
+/// rendered byte-identical to Default for both kinds, so it is retired
+/// alongside Title and Series (which repeated the activity header, T5-B).
+/// Labels stay short so the owner-drawn preset buttons ellipsize cleanly at
+/// any DPI.
 pub fn card_presets() -> (Vec<CardPreset>, Vec<CardPreset>) {
     let details = vec![
         CardPreset {
             id: CARD_DETAILS_DEFAULT.to_string(),
             label: "Default".to_string(),
-        },
-        CardPreset {
-            id: CARD_DETAILS_EPISODE.to_string(),
-            label: "Episode".to_string(),
         },
     ];
     let states = vec![

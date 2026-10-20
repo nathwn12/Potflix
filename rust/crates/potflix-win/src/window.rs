@@ -78,9 +78,6 @@ pub const BTN_BACK: i32 = 7;
 pub const BTN_CARD: i32 = 8;
 /// Card view "Back".
 pub const BTN_CARD_BACK: i32 = 9;
-/// Card view Details presets, `+0..1` in `CardPresets` order (Default,
-/// Episode). The retired Title/Series ids (32/33) map to nothing.
-pub const BTN_CARD_DETAILS_AT: i32 = 30;
 /// Card view State presets, `+0..3` in `CardPresets` order.
 pub const BTN_CARD_STATE_AT: i32 = 40;
 /// Settings LIBRARY "Clear metadata".
@@ -1183,12 +1180,6 @@ pub fn settings_focus_order() -> Vec<i32> {
     ]
 }
 
-/// `cardDetailsButton` (`go\window.go:1455`).
-#[must_use]
-pub fn card_details_button(i: i32) -> i32 {
-    BTN_CARD_DETAILS_AT + i
-}
-
 /// `cardStateButton` (`go\window.go:1459`).
 #[must_use]
 pub fn card_state_button(i: i32) -> i32 {
@@ -1196,18 +1187,15 @@ pub fn card_state_button(i: i32) -> i32 {
 }
 
 /// `cardFocusOrder` (`go\window.go:1256`), in visual order: the strip, the way
-/// back, then the two preset rows, then the picker. The Details row follows
-/// the offered presets (Default, Episode) and the State row its four, so the
-/// order tracks [`presence::cardspec::card_presets`] instead of a hardcoded
+/// back, then the State preset row, then the picker. Line 1 is fixed by the
+/// shipped mapping, so the State row is the only preset row and the order
+/// tracks [`presence::cardspec::card_presets`] states instead of a hardcoded
 /// count. The preview follows the live card's kind; there is no manual kind
 /// toggle.
 #[must_use]
 pub fn card_focus_order() -> Vec<i32> {
-    let (dets, states) = presence::cardspec::card_presets();
+    let (_, states) = presence::cardspec::card_presets();
     let mut order = vec![BTN_CARD, BTN_SETTINGS, BTN_CARD_BACK];
-    for i in 0..dets.len() as i32 {
-        order.push(card_details_button(i));
-    }
     for i in 0..states.len() as i32 {
         order.push(card_state_button(i));
     }
@@ -1257,14 +1245,14 @@ pub fn main_focus_rect(l: &UiLayout, id: i32) -> Option<Rect> {
 // Card view (`go\window.go:1453-1731`).
 // ---------------------------------------------------------------------------
 
-/// `cardPresetForButton` (`go\window.go:1463`).
+/// `cardPresetForButton` (`go\window.go:1463`). Only the State row offers
+/// presets: the Details row is removed (line 1 is fixed by the shipped
+/// mapping and keeps its stored `Default` value for compatibility), so the
+/// retired Details ids (30..33) map to nothing, as do the retired
+/// kind-toggle ids (50/51).
 #[must_use]
 pub fn card_preset_for_button(id: i32) -> Option<(i32, String)> {
-    let (dets, states) = presence::cardspec::card_presets();
-    let i = id - BTN_CARD_DETAILS_AT;
-    if i >= 0 && (i as usize) < dets.len() {
-        return Some((0, dets[i as usize].id.clone()));
-    }
+    let (_, states) = presence::cardspec::card_presets();
     let i = id - BTN_CARD_STATE_AT;
     if i >= 0 && (i as usize) < states.len() {
         return Some((1, states[i as usize].id.clone()));
@@ -1274,11 +1262,13 @@ pub fn card_preset_for_button(id: i32) -> Option<(i32, String)> {
 
 /// `cardPresetStyle` (`go\window.go:1476`): the active preset is a LIT segment,
 /// not an accent fill. Each view has exactly one primary control, and a preset
-/// selection is not an action.
+/// selection is not an action. Only the State row (line 1) offers presets --
+/// the Details row is removed, so there is no line-0 control and no line-0
+/// branch: any other line reads unlit.
 #[must_use]
 pub fn card_preset_style(line: i32, id: &str, spec: &CardSpec) -> i32 {
     let spec = spec.normalized();
-    if (line == 0 && id == spec.details) || (line == 1 && id == spec.state) {
+    if line == 1 && id == spec.state {
         return BTN_TAB_SEL;
     }
     BTN_TAB
@@ -1304,22 +1294,23 @@ pub fn compute_card_layout(
     let mut l = CardLayout::default();
 
     // Same stack, same grid: header band, tab strip, then the preview panel
-    // and the two preset rows, each under its own micro-label. The panel
+    // and the single State preset row under its micro-label. The panel
     // reserves five rows plus the tooltip slot the layout pitch defines,
     // with room to spare. The removed kind-toggle band's budget (its label,
-    // row, and gaps) belongs to the preview now: the panel grows by exactly
-    // that band, so the Details/State rows, the hint, and the
-    // bottom-anchored footer keep their exact positions and no gap opens
-    // above the footer at any DPI.
+    // row, and gaps) belongs to the preview now, as does the removed Details
+    // row's band: the panel grows by exactly both bands, so the State row,
+    // the hint, and the bottom-anchored footer keep their exact positions
+    // and no gap opens above the footer at any DPI.
     let label_top = sc(TAB_TOP_L) + sc(TAB_H_L) + sc(SP_3);
     let label_h = sc(SECTION_H_L);
     let after_label = label_h + sc(SP_2);
 
     let prev_top = label_top + after_label;
-    // Unchanged base panel 176px plus exactly the freed kind-toggle band
-    // (its label, row, and gaps), in scaled px so everything below lands
-    // pixel-identical to the pre-toggle layout at every DPI.
-    let prev_h = sc(176) + after_label + sc(BTN_H) + sc(SP_4);
+    // Unchanged base panel 176px plus exactly the two freed bands (the
+    // kind-toggle band, then the Details row band: each its label, row, and
+    // gaps), in scaled px so everything below lands pixel-identical to the
+    // pre-toggle layout at every DPI.
+    let prev_h = sc(176) + 2 * (after_label + sc(BTN_H) + sc(SP_4));
     let prev_pad = sc(SP_3);
     let (row_h, row_pitch) = (sc(20), sc(22));
     l.preview = Rect {
@@ -1338,9 +1329,7 @@ pub fn compute_card_layout(
         });
     }
 
-    let det_label = prev_top + prev_h + sc(SP_4);
-    let det_row = det_label + after_label;
-    let state_label = det_row + sc(BTN_H) + sc(SP_4);
+    let state_label = prev_top + prev_h + sc(SP_4);
     let state_row = state_label + after_label;
     let hint_top = state_row + sc(BTN_H) + sc(SP_2);
     l.labels = vec![
@@ -1351,15 +1340,6 @@ pub fn compute_card_layout(
                 top: label_top,
                 right: margin + content_w,
                 bottom: label_top + label_h,
-            },
-        },
-        NamedTextRect {
-            id: "card.line1".into(),
-            rc: Rect {
-                left: margin,
-                top: det_label,
-                right: margin + content_w,
-                bottom: det_label + label_h,
             },
         },
         NamedTextRect {
@@ -1379,26 +1359,22 @@ pub fn compute_card_layout(
         bottom: hint_top + sc(SP_4),
     };
 
-    // The preset rows are a segmented control per line: mutually exclusive
-    // choices, one row of equal cells, so they carry the segment anatomy rather
-    // than the accent fill (which belongs to the view's single primary action).
+    // The State row is a segmented control: mutually exclusive choices, one
+    // row of equal cells, so it carries the segment anatomy rather than the
+    // accent fill (which belongs to the view's single primary action).
     let seg_gap = sc(SP_2);
-    let seg = |top: i32, line: i32, presets: &[CardPreset]| -> Vec<UiButton> {
+    let seg = |top: i32, presets: &[CardPreset]| -> Vec<UiButton> {
         let n = presets.len() as i32;
         let w = (content_w - seg_gap * (n - 1)) / n;
         let mut out = Vec::with_capacity(presets.len());
         for (i, p) in presets.iter().enumerate() {
             let i = i as i32;
             let left = margin + i * (w + seg_gap);
-            let id = if line == 0 {
-                card_details_button(i)
-            } else {
-                card_state_button(i)
-            };
+            let id = card_state_button(i);
             out.push(UiButton {
                 id,
                 label: p.label.clone(),
-                style: card_preset_style(line, &p.id, &spec),
+                style: card_preset_style(1, &p.id, &spec),
                 rc: Rect {
                     left,
                     top,
@@ -1413,10 +1389,9 @@ pub fn compute_card_layout(
         }
         out
     };
-    let (dets, states) = presence::cardspec::card_presets();
+    let (_, states) = presence::cardspec::card_presets();
     l.btns = tab_strip_buttons(cw, dpi);
-    l.btns.extend(seg(det_row, 0, &dets));
-    l.btns.extend(seg(state_row, 1, &states));
+    l.btns.extend(seg(state_row, &states));
 
     let status_h = sc(STATUS_H_L);
     let status_top = ch - sc(BOTTOM_L) - status_h;
@@ -3746,11 +3721,19 @@ fn fix_match_save_provisional(
     key: &str,
     path: &str,
 ) -> Result<Override, metadata::Error> {
-    let over = crate::search::provisional_override(cand, scope, key.to_string(), path);
+    let over = crate::search::provisional_override(cand, scope, key.to_string());
     let mut store =
         metadata::overrides::load().unwrap_or_else(|_| metadata::overrides::Store::empty());
     store.put_correction(path, over.clone())?;
     Ok(over)
+}
+
+/// Test-only shared fixture: the canonical Fix-match series file path. The
+/// `search` test lane derives its fixture path from here instead of carrying
+/// a parallel hand-built literal, so the two lanes can never drift apart.
+#[cfg(test)]
+pub(crate) fn fix_series_path() -> String {
+    format!("{}:{}", 'M', r"\2SERIES\Show\Season 1\s01e01.mkv")
 }
 
 /// The latch worker's failure outcome for one picked title: a failed full pin
@@ -4056,7 +4039,7 @@ impl FixMatchState {
         let choices = fix_match_scope_choices(&now.path, is_movie);
         let matched = metadata::overrides::load()
             .ok()
-            .and_then(|store| store.resolve_for(&now.path, is_movie).cloned());
+            .and_then(|store| store.resolve_for(&now.path).cloned());
         let screen = if matched.is_some() {
             FixScreen::Matched
         } else {
@@ -6557,7 +6540,8 @@ impl UiState {
         if id == BTN_CARD_BACK {
             self.close_card();
         } else if let Some((line, preset)) = card_preset_for_button(id) {
-            self.on_select_card_preset(line, &preset);
+            debug_assert_eq!(line, 1, "only the State row offers presets");
+            self.on_select_card_preset(&preset);
         }
         None
     }
@@ -6761,18 +6745,15 @@ impl UiState {
         }
     }
 
-    /// `onSelectCardPreset` (`go\window.go:1679`): writes to the DISPLAYED
-    /// kind — the live-recorded kind, Series while nothing live has been
-    /// recorded — details when `line == 0`, state otherwise.
-    pub fn on_select_card_preset(&mut self, line: i32, preset: &str) {
+    /// `onSelectCardPreset` (`go\window.go:1679`): writes the State preset to
+    /// the DISPLAYED kind — the live-recorded kind, Series while nothing live
+    /// has been recorded. The Card view offers no Details button (line 1 is
+    /// fixed by the shipped mapping; stored retired ids migrate at the config
+    /// seam via `migrated()`), so this is the State-only write path.
+    pub fn on_select_card_preset(&mut self, preset: &str) {
         let kind = self.displayed_card_kind();
-        let cl = if line == 0 {
-            CardLine::Details
-        } else {
-            CardLine::State
-        };
         let mut cfg = app_support::config::load_config();
-        if !cfg.set_card_line(kind, cl, preset) {
+        if !cfg.set_card_line(kind, CardLine::State, preset) {
             self.card_specs_state = cfg.effective_card_specs();
             self.invalidate();
             return;
@@ -6788,24 +6769,15 @@ impl UiState {
         // nothing: the mirror keeps the last good specs.
         app_support::config::set_live_card_specs(self.card_specs_state.clone());
         let cur = self.card_specs_state.for_kind(kind);
-        let (dets, states) = presence::cardspec::card_presets();
+        let (_, states) = presence::cardspec::card_presets();
         let mut name = preset.to_string();
-        if line == 0 {
-            for p in &dets {
-                if p.id == cur.details {
-                    name = p.label.clone();
-                }
+        for p in &states {
+            if p.id == cur.state {
+                name = p.label.clone();
             }
-            self.set_status_text(format!("Line 1: {name}"));
-        } else {
-            for p in &states {
-                if p.id == cur.state {
-                    name = p.label.clone();
-                }
-            }
-            self.set_status_text(format!("Line 2: {name}"));
         }
-        app_logf(&format!("card: line {} -> {preset}", line + 1));
+        self.set_status_text(format!("Line 2: {name}"));
+        app_logf(&format!("card: line 2 -> {preset}"));
     }
 
     /// `onSelectScanSpeed` (`go\settings_sections.go:177`). Persistence and
@@ -8642,7 +8614,6 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     for lab in &l.labels {
         let text = match lab.id.as_str() {
             "card.preview-label" => "Preview - the card Discord receives",
-            "card.line1" => "Line 1 - details",
             _ => "Line 2 - state",
         };
         paint_section_label(hdc, lab.rc, dpi, text, 0);
@@ -9190,12 +9161,6 @@ mod tests {
     }
 
     const NULL: HWND = std::ptr::null_mut();
-
-    /// Serializes the tests that drive the process-wide live card-spec mirror
-    /// or the real store behind `on_select_card_preset`: a concurrent publish
-    /// would leak into another test's read, and a concurrent store reader
-    /// would observe mid-flight bytes.
-    static LIVE_MIRROR_SERIAL: Mutex<()> = Mutex::new(());
 
     // -- window_test.go -----------------------------------------------------
 
@@ -9756,7 +9721,7 @@ mod tests {
         for (order, want_len) in [
             (main_focus_order(), 8usize),
             (settings_focus_order(), 12),
-            (card_focus_order(), 10),
+            (card_focus_order(), 8),
         ] {
             assert_eq!(order.len(), want_len);
             let mut seen = std::collections::HashSet::new();
@@ -9766,7 +9731,7 @@ mod tests {
         }
         assert_eq!(focus_order_for_view(View::Main).len(), 8);
         assert_eq!(focus_order_for_view(View::Settings).len(), 12);
-        assert_eq!(focus_order_for_view(View::Card).len(), 10);
+        assert_eq!(focus_order_for_view(View::Card).len(), 8);
         for id in [
             BTN_ADD,
             BTN_REMOVE,
@@ -9779,14 +9744,11 @@ mod tests {
         ] {
             assert!(main_focus_order().contains(&id), "missing {id}");
         }
-        // The Card view's preset rows are six focus stops in visual order:
-        // Details (Default, Episode) then State, right after Back.
+        // The Card view offers a single preset row: State (Default, Tag,
+        // Synopsis, Minimal), right after Back. Line 1 is fixed by the
+        // shipped mapping, so there is no Details focus stop.
         assert_eq!(
-            &card_focus_order()[3..5],
-            &[card_details_button(0), card_details_button(1),]
-        );
-        assert_eq!(
-            &card_focus_order()[5..9],
+            &card_focus_order()[3..7],
             &[
                 card_state_button(0),
                 card_state_button(1),
@@ -11673,7 +11635,7 @@ mod tests {
             (
                 CardSpecs {
                     series: CardSpec {
-                        details: "episode".into(),
+                        details: "default".into(),
                         state: "synopsis".into(),
                     },
                     movie: CardSpec::default(),
@@ -11683,13 +11645,11 @@ mod tests {
         ];
         for (specs, kind) in &cases {
             let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, specs, *kind);
-            // Tab strip (2) plus Details (2), State (4), Back and Fix match.
-            assert_eq!(l.btns.len(), 10);
+            // Tab strip (2) plus State (4), Back and Fix match.
+            assert_eq!(l.btns.len(), 8);
             for id in [
                 BTN_CARD_BACK,
                 BTN_FIX_MATCH,
-                card_details_button(0),
-                card_details_button(1),
                 card_state_button(0),
                 card_state_button(1),
                 card_state_button(2),
@@ -11721,25 +11681,26 @@ mod tests {
                         && r.bottom <= l.preview.bottom
                 );
             }
-            // The Details row sits directly under the preview: no kind row,
-            // no kind label — the preview absorbed that band.
-            let det_rc = l.card_btn(card_details_button(0)).unwrap();
-            assert!(
-                det_rc.top >= l.preview.bottom,
-                "details row above the preview"
-            );
+            // No Details row exists: the State row sits directly under the
+            // preview (the preview absorbed the kind-toggle and Details
+            // bands), with its micro-label in the freed Details-label slot.
             assert!(
                 l.labels.iter().all(|x| x.id != "card.kind"),
                 "retired kind label still laid out"
             );
-            assert_eq!(l.labels.len(), 3);
-            let det_label = l
+            assert!(
+                l.labels.iter().all(|x| x.id != "card.line1"),
+                "retired Details label still laid out"
+            );
+            assert_eq!(l.labels.len(), 2);
+            let state_label = l
                 .labels
                 .iter()
-                .find(|x| x.id == "card.line1")
-                .expect("card.line1 label missing");
-            assert_eq!(det_label.rc.top, l.preview.bottom + scale_px(96, SP_4));
-            assert!(det_label.rc.bottom <= det_rc.top);
+                .find(|x| x.id == "card.line2")
+                .expect("card.line2 label missing");
+            assert_eq!(state_label.rc.top, l.preview.bottom + scale_px(96, SP_4));
+            let st_rc = l.card_btn(card_state_button(0)).unwrap();
+            assert!(state_label.rc.bottom <= st_rc.top);
         }
         let a = compute_card_layout(
             MAIN_CLIENT_W,
@@ -11754,7 +11715,7 @@ mod tests {
             96,
             &CardSpecs {
                 series: CardSpec {
-                    details: "episode".into(),
+                    details: "default".into(),
                     state: "none".into(),
                 },
                 movie: CardSpec::default(),
@@ -11776,7 +11737,7 @@ mod tests {
                 (
                     CardSpecs {
                         series: CardSpec {
-                            details: "episode".into(),
+                            details: "default".into(),
                             state: "tag".into(),
                         },
                         movie: CardSpec::default(),
@@ -11837,11 +11798,11 @@ mod tests {
     #[test]
     fn card_preset_mapping() {
         let (dets, states) = presence::cardspec::card_presets();
-        for (i, p) in dets.iter().enumerate() {
-            assert_eq!(
-                card_preset_for_button(card_details_button(i as i32)),
-                Some((0, p.id.clone()))
-            );
+        // Line 1 is fixed by the shipped mapping: no Details button exists,
+        // so the whole Details id band maps to nothing.
+        assert_eq!(dets.len(), 1, "one stored Details value, zero buttons");
+        for id in [30, 31, 32, 33] {
+            assert!(card_preset_for_button(id).is_none(), "id {id} mapped");
         }
         for (i, p) in states.iter().enumerate() {
             assert_eq!(
@@ -11849,22 +11810,19 @@ mod tests {
                 Some((1, p.id.clone()))
             );
         }
-        // The retired Details ids (32/33) map to nothing, as do the retired
-        // kind-toggle ids (50/51).
-        for id in [0, 1, 2, 7, 10, 29, 32, 33, 34, 39, 44, 50, 51, 99] {
+        // The retired Details ids map to nothing (no Details row is offered),
+        // as do the retired kind-toggle ids (50/51).
+        for id in [0, 1, 2, 7, 10, 29, 30, 31, 32, 33, 34, 39, 44, 50, 51, 99] {
             assert!(card_preset_for_button(id).is_none(), "id {id} mapped");
         }
         let spec = CardSpec {
-            details: "episode".into(),
+            details: "default".into(),
             state: "none".into(),
         };
+        // No line-0 branch: the Details row is removed, so even the stored
+        // `Default` value never lights a (nonexistent) line-0 control.
         for p in &dets {
-            let want = if p.id == "episode" {
-                BTN_TAB_SEL
-            } else {
-                BTN_TAB
-            };
-            assert_eq!(card_preset_style(0, &p.id, &spec), want);
+            assert_eq!(card_preset_style(0, &p.id, &spec), BTN_TAB);
         }
         for p in &states {
             let want = if p.id == "none" { BTN_TAB_SEL } else { BTN_TAB };
@@ -12139,20 +12097,13 @@ mod tests {
             "the two kinds must preview different recorded items"
         );
 
-        // The lit preset segments follow the displayed kind's spec.
+        // The lit preset segments follow the displayed kind's spec (State row
+        // only: line 1 is fixed by the shipped mapping).
         for kind in [CardKind::Series, CardKind::Movie] {
             let l =
                 compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &st.card_specs_state, kind);
             let spec = st.card_specs_state.for_kind(kind);
-            let (dets, states) = presence::cardspec::card_presets();
-            for p in &dets {
-                let want = if p.id == spec.details {
-                    BTN_TAB_SEL
-                } else {
-                    BTN_TAB
-                };
-                assert_eq!(card_preset_style(0, &p.id, &spec), want);
-            }
+            let (_, states) = presence::cardspec::card_presets();
             for p in &states {
                 assert_eq!(
                     card_preset_style(1, &p.id, &spec),
@@ -12164,11 +12115,9 @@ mod tests {
                 );
             }
             // The layout's own preset buttons carry the same lit rule.
-            let (ndets, nstates) = presence::cardspec::card_presets();
-            let (nd, ns) = (ndets.len() as i32, nstates.len() as i32);
+            let ns = states.len() as i32;
             for b in l.btns.iter().filter(|b| {
-                (BTN_CARD_DETAILS_AT..BTN_CARD_DETAILS_AT + nd).contains(&b.id)
-                    || (BTN_CARD_STATE_AT..BTN_CARD_STATE_AT + ns).contains(&b.id)
+                (BTN_CARD_STATE_AT..BTN_CARD_STATE_AT + ns).contains(&b.id)
             }) {
                 if let Some((line, id)) = card_preset_for_button(b.id) {
                     assert_eq!(b.style, card_preset_style(line, &id, &spec));
@@ -12180,27 +12129,34 @@ mod tests {
     /// Probe-compat for the removed manual toggle: `set_card_kind` drives the
     /// derived kind directly (the app-crate preview probes still sweep both
     /// slots through it) and never touches the stored config.
+    ///
+    /// NOTE: the no-persist proof below is the weaker one -- it compares the
+    /// loaded effective specs before and after, so a save that round-trips
+    /// byte-identical would pass unseen. It proves the shim performs no
+    /// observable persist through the config paths the view owns, not that it
+    /// performs no write at all.
     #[test]
     fn card_kind_probe_shim_is_view_only() {
-        // Shares the real store with the save tests below; the serial keeps a
-        // mid-flight save from landing between the two reads.
-        let _serial = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let before = app_support::config::load_config().effective_card_specs();
-        let mut st = UiState::default();
-        let specs_before = st.card_specs_state.clone();
-        st.set_card_kind(CardKind::Movie);
-        assert_eq!(st.displayed_card_kind(), CardKind::Movie);
-        assert_eq!(st.card_specs_state, specs_before);
-        st.set_card_kind(CardKind::Series);
-        assert_eq!(st.displayed_card_kind(), CardKind::Series);
-        assert_eq!(st.card_specs_state, specs_before);
-        assert_eq!(
-            app_support::config::load_config().effective_card_specs(),
-            before,
-            "toggling the kind must not persist anything"
-        );
+        // Runs under a scratch root -- never the owner's real config -- with
+        // the shared env/config/mirror serial held for both reads, so a
+        // mid-flight scratch repoint from another lane cannot land between
+        // them.
+        crate::test_env::EnvGuard::with_scratch("card-kind-probe", |_dir| {
+            let before = app_support::config::load_config().effective_card_specs();
+            let mut st = UiState::default();
+            let specs_before = st.card_specs_state.clone();
+            st.set_card_kind(CardKind::Movie);
+            assert_eq!(st.displayed_card_kind(), CardKind::Movie);
+            assert_eq!(st.card_specs_state, specs_before);
+            st.set_card_kind(CardKind::Series);
+            assert_eq!(st.displayed_card_kind(), CardKind::Series);
+            assert_eq!(st.card_specs_state, specs_before);
+            assert_eq!(
+                app_support::config::load_config().effective_card_specs(),
+                before,
+                "toggling the kind must not persist anything"
+            );
+        });
     }
 
     /// Before the first live push there is no preview: `have == false` with
@@ -12245,18 +12201,71 @@ mod tests {
     }
 
     /// The retired kind-toggle ids (50/51) dispatch to nothing through the
-    /// real card action and map to no preset.
+    /// real card action and map to no preset. The reachable control (a State
+    /// preset still maps) proves the ids are inert because they are retired,
+    /// not because the whole action is a no-op.
     #[test]
     fn card_freed_kind_ids_are_inert() {
         let mut st = UiState::default();
         let before = st.displayed_card_kind();
+        let before_specs = st.card_specs_state.clone();
+        let before_status = st.status_text.clone();
         for id in [50, 51] {
-            assert!(st.do_card_action(NULL, id).is_none());
-            assert_eq!(st.displayed_card_kind(), before);
+            let _ = st.do_card_action(NULL, id);
+            assert_eq!(st.displayed_card_kind(), before, "id {id} changed kind");
+            assert_eq!(st.card_specs_state, before_specs, "id {id} changed specs");
+            assert_eq!(st.status_text, before_status, "id {id} changed status");
         }
         assert!(card_preset_for_button(50).is_none());
         assert!(card_preset_for_button(51).is_none());
+        assert!(
+            card_preset_for_button(card_state_button(0)).is_some(),
+            "the State row must still map: the retired ids are inert, the action is not"
+        );
         assert!(!st.preview_activity().1);
+    }
+
+    /// The retired Details ids (30..33) dispatch to nothing through the real
+    /// card action: no Details button is laid out, focused, or hit-tested, so
+    /// no no-op control remains on the Card view. The reachable control (a
+    /// State preset still maps and is still laid out) proves the ids are
+    /// inert because the Details row is gone, not because the whole action is
+    /// a no-op.
+    #[test]
+    fn card_retired_details_ids_are_inert() {
+        let mut st = UiState::default();
+        let before_specs = st.card_specs_state.clone();
+        let before_status = st.status_text.clone();
+        for id in [30, 31, 32, 33] {
+            // The mapping itself is pinned by `card_preset_mapping` above; here
+            // only the real action's inertness matters.
+            let _ = st.do_card_action(NULL, id);
+        }
+        assert_eq!(st.card_specs_state, before_specs, "specs untouched");
+        assert_eq!(st.status_text, before_status, "status untouched");
+        assert!(
+            card_preset_for_button(card_state_button(0)).is_some(),
+            "the State row must still map: the Details ids are inert, the action is not"
+        );
+        let l = compute_card_layout(
+            MAIN_CLIENT_W,
+            MAIN_CLIENT_H,
+            96,
+            &CardSpecs::default(),
+            CardKind::Series,
+        );
+        assert!(
+            l.btns.iter().all(|b| !(30..34).contains(&b.id)),
+            "a Details button is still laid out"
+        );
+        assert!(
+            l.btns.iter().any(|b| b.id == card_state_button(0)),
+            "the reachable State button must still be laid out"
+        );
+        assert!(
+            !card_focus_order().iter().any(|id| (30..34).contains(id)),
+            "a Details id is still a focus stop"
+        );
     }
 
     #[test]
@@ -12929,87 +12938,73 @@ mod tests {
         }
     }
 
-    /// Driving `on_select_card_preset` through a real save publishes the new
+    /// Driving a State preset through the real UI path publishes the new
     /// effective specs to the live mirror: the regression test for the
-    /// Card-view-preset-needs-restart defect. The real store is snapshotted
-    /// and restored byte-exact (panic-safe via `Drop`), as is the mirror.
+    /// Card-view-preset-needs-restart defect. It runs under a scratch config
+    /// root -- never the owner's real config -- with the shared env/mirror/
+    /// config serial held throughout; the guard restores the root and the
+    /// mirror on drop, panic-safe.
     #[test]
     fn card_preset_save_publishes_live_specs() {
-        let _serial = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        struct Restore {
-            path: std::path::PathBuf,
-            bytes: Option<Vec<u8>>,
-            mirror: CardSpecs,
-        }
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                if let Some(bytes) = self.bytes.take() {
-                    let _ = std::fs::write(&self.path, bytes);
-                } else {
-                    let _ = std::fs::remove_file(&self.path);
-                }
-                app_support::config::set_live_card_specs(self.mirror.clone());
-            }
-        }
-        let path = app_support::config::config_path();
-        let _restore = Restore {
-            bytes: std::fs::read(&path).ok(),
-            mirror: app_support::config::live_card_specs(),
-            path: path.clone(),
-        };
-        // Two valid presets in a row: whatever the store held, the second save
-        // always changes it, so the publish path is always exercised.
-        let mut st = UiState::default();
-        st.on_select_card_preset(0, "episode");
-        st.on_select_card_preset(0, "default");
-        let live = app_support::config::live_card_specs();
-        assert_eq!(live.series.details, "default");
-        assert_eq!(
-            live,
-            app_support::config::load_config().effective_card_specs(),
-            "the mirror must carry the saved effective specs"
-        );
+        crate::test_env::EnvGuard::with_scratch("card-save-publish", |_dir| {
+            // Two valid presets in a row: whatever the scratch store held,
+            // the second save always changes it, so the publish path is
+            // always exercised.
+            let mut st = UiState::default();
+            let _ = st.do_card_action(NULL, card_state_button(1));
+            let _ = st.do_card_action(NULL, card_state_button(2));
+            let live = app_support::config::live_card_specs();
+            assert_eq!(live.series.state, "synopsis");
+            assert_eq!(
+                live,
+                app_support::config::load_config().effective_card_specs(),
+                "the mirror must carry the saved effective specs"
+            );
+        });
     }
 
     /// A failed Card-view preset save publishes nothing: the mirror keeps the
-    /// last good specs.
+    /// last good specs. The save is driven through the real UI path with a
+    /// reachable State preset; the retired Details id migrates at the config
+    /// seam instead, asserted separately below.
     #[test]
     fn card_preset_failed_save_publishes_nothing() {
-        let _serial = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mirror_before = app_support::config::live_card_specs();
+        // The guard holds the shared env/mirror/config serial for the whole
+        // test: the mirror snapshot, the sentinel publish, the scratch
+        // repoint, the driven save, and the mirror read all happen under it,
+        // and the guard restores both root and mirror on drop, panic-safe.
+        // (Declared before the sentinel guard shape matters: a Drop guard
+        // declared after the EnvGuard would drop first, still under the
+        // serial. Here the shared guard itself carries the mirror, so one
+        // guard covers both.)
+        let mut env = crate::test_env::EnvGuard::scratch("card-save-fail");
         let mut sentinel = CardSpecs::default();
-        assert!(sentinel.set_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(sentinel.set_line(CardKind::Series, CardLine::State, "tag"));
         app_support::config::set_live_card_specs(sentinel.clone());
         // Break the store without touching the real file: point the cache root
         // at a regular file, so the load yields the zero config and the atomic
         // save's `create_dir_all` fails.
-        let scratch = Scratch::new("card-save-fail");
-        let blocker = scratch.write("blocker", "x");
-        let prev = std::env::var_os(app_support::config::LOCAL_APP_DATA_ENV);
-        // SAFETY: the serial above excludes every other test that reads this
-        // variable or the store; the previous value is restored below.
-        unsafe {
-            std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, &blocker);
-        }
+        let blocker = env.dir().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        env.repoint(&blocker);
         let mut st = UiState::default();
-        st.on_select_card_preset(0, "title");
+        let _ = st.do_card_action(NULL, card_state_button(3));
         let live = app_support::config::live_card_specs();
         let status = st.status_text.clone();
-        match prev {
-            Some(value) => unsafe {
-                std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(app_support::config::LOCAL_APP_DATA_ENV);
-            },
-        }
-        app_support::config::set_live_card_specs(mirror_before);
         assert_eq!(live, sentinel, "a failed save must publish nothing");
         assert_eq!(status, "Save failed.");
+        // The retired `"title"` Details id never reaches the UI path: stored
+        // specs carrying it migrate to `default` on load and on save.
+        assert_eq!(
+            CardSpec {
+                details: "title".into(),
+                state: "tag".into(),
+            }
+            .migrated()
+            .details,
+            "default",
+            "retired Details ids migrate at the config seam"
+        );
     }
 
     // -- Fix match picker (pure half) ----------------------------------------
@@ -13206,32 +13201,9 @@ mod tests {
 
     // -- Fix match provisional correction (T2-A2) --------------------------
 
-    /// Serializes the provisional-correction tests: they repoint
-    /// `LOCALAPPDATA` at a scratch dir, which every other store/env reader
-    /// would otherwise observe mid-flight.
-    static FIX_MATCH_STORE_SERIAL: Mutex<()> = Mutex::new(());
-
-    /// Point `LOCALAPPDATA` at `dir` for the closure, restoring the previous
-    /// value after: the scratch analogue of the card-save-fail breaker above,
-    /// so no test touches the real overrides file.
-    fn with_scratch_local_app_data<T>(dir: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let prev = std::env::var_os(app_support::config::LOCAL_APP_DATA_ENV);
-        // SAFETY: the serial above excludes every other test that reads this
-        // variable or the store; the previous value is restored below.
-        unsafe {
-            std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, dir);
-        }
-        let out = f();
-        match prev {
-            Some(value) => unsafe {
-                std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(app_support::config::LOCAL_APP_DATA_ENV);
-            },
-        }
-        out
-    }
+    // Every test below that touches the store or `LOCALAPPDATA` runs under
+    // the crate-shared [`crate::test_env::EnvGuard`] serial: one lock for the
+    // `window` and `search` lanes, panic-safe restore via `Drop`.
 
     fn fix_series_candidate() -> Candidate {
         Candidate {
@@ -13255,10 +13227,6 @@ mod tests {
             poster: "https://art/dune-search.jpg".to_string(),
             episode_count: 0,
         }
-    }
-
-    fn fix_series_path() -> String {
-        format!("{}:{}", 'M', r"\2SERIES\Show\Season 1\s01e01.mkv")
     }
 
     fn fix_movie_path() -> String {
@@ -13326,17 +13294,7 @@ mod tests {
 
     #[test]
     fn fix_match_provisional_saves_before_any_network() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-provisional");
-        with_scratch_local_app_data(scratch.path(), || {
+        crate::test_env::EnvGuard::with_scratch("fix-provisional", |_dir| {
             let path = fix_series_path();
             let key = metadata::overrides::series_key_for(&path).unwrap();
             let cand = fix_series_candidate();
@@ -13351,7 +13309,7 @@ mod tests {
             // The card resolves the corrected series (show + provider code)
             // without any episode table.
             let store = metadata::overrides::load().expect("reload");
-            let got = store.resolve_for(&path, false).expect("corrected latch");
+            let got = store.resolve_for(&path).expect("corrected latch");
             assert_eq!(got.scope, Scope::Series);
             assert_eq!(got.title, "Show");
             assert_eq!(got.provider_id, "169");
@@ -13362,17 +13320,7 @@ mod tests {
 
     #[test]
     fn fix_match_full_fetch_replaces_provisional_without_duplicates() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-full-replaces");
-        with_scratch_local_app_data(scratch.path(), || {
+        crate::test_env::EnvGuard::with_scratch("fix-full-replaces", |_dir| {
             let path = fix_series_path();
             let key = metadata::overrides::series_key_for(&path).unwrap();
             fix_match_save_provisional(&fix_series_candidate(), Scope::Series, &key, &path)
@@ -13381,7 +13329,7 @@ mod tests {
             // poster; it must REPLACE the provisional, not sit beside it.
             fix_match_put(&path, &fix_full_series_override(&key)).expect("full save");
             let store = metadata::overrides::load().expect("reload");
-            let got = store.resolve_for(&path, false).expect("full latch");
+            let got = store.resolve_for(&path).expect("full latch");
             assert_eq!(got.episodes.len(), 2);
             assert_eq!(got.episodes[0].title, "episode 1");
             assert_eq!(got.poster, "https://art/show-full.jpg");
@@ -13395,17 +13343,7 @@ mod tests {
 
     #[test]
     fn fix_match_movie_to_series_clears_the_movie_latch() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-movie-to-series");
-        with_scratch_local_app_data(scratch.path(), || {
+        crate::test_env::EnvGuard::with_scratch("fix-movie-to-series", |_dir| {
             // A legacy movie latch for a file the filename query called a
             // movie but that is really a series episode: the correction scope
             // comes from the SELECTED series candidate through the real
@@ -13429,7 +13367,7 @@ mod tests {
                     created_at_ms: 0,
                 })
                 .expect("seed movie latch");
-            assert!(store.resolve_for(&path, true).is_some());
+            assert!(store.resolve_for(&path).is_some());
             // Movie-classified file plus a series pick: the candidate
             // overrides the filename, offering the series table and a
             // series-kind target (the old filename-only scope would be Movie).
@@ -13457,9 +13395,7 @@ mod tests {
                 store.lookup_movie(&path).is_none(),
                 "the corrected series must clear the old movie latch"
             );
-            let got = store
-                .resolve_for(&path, st.effective_is_movie())
-                .expect("series latch");
+            let got = store.resolve_for(&path).expect("series latch");
             assert_eq!(got.scope, Scope::Series);
             assert_eq!(got.title, "Show");
             assert!(
@@ -13470,23 +13406,13 @@ mod tests {
     }
 
     #[test]
-    fn fix_match_series_to_movie_clears_series_and_season_latches() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-series-to-movie");
-        with_scratch_local_app_data(scratch.path(), || {
+    fn fix_match_series_to_movie_keeps_the_show_latch() {
+        crate::test_env::EnvGuard::with_scratch("fix-series-to-movie", |_dir| {
             // A file mis-latched as a series episode that is really a movie:
-            // the same path carries the old series/season latches and the new
-            // movie correction, so C's correction save clears exactly those
-            // conflicting keys derived from it. The scope comes from the
-            // SELECTED movie candidate through the real `FixMatchState`.
+            // the same path carries the old season latch and the new movie
+            // correction, so C's correction save clears the season key derived
+            // from it while the show-wide series latch stands. The scope comes
+            // from the SELECTED movie candidate through the real `FixMatchState`.
             let path = fix_series_path();
             let show_key = metadata::overrides::series_key_for(&path).unwrap();
             let season_key = metadata::overrides::season_key_for(&path).unwrap();
@@ -13524,28 +13450,44 @@ mod tests {
             );
             let (scope, key) = st.selected_target().expect("movie target");
             assert_eq!(scope, Scope::Movie, "series file + movie pick saves Movie");
-            // The movie correction removes the old series/season latches and
-            // the card becomes the movie (no poster: a movie renders from its
-            // media snapshot, per D).
+            // The movie correction removes the old season latch for the file's
+            // own season folder -- and never the show-wide series latch, which
+            // keeps serving every other episode -- and the card becomes the
+            // movie (no poster: a movie renders from its media snapshot).
             fix_match_save_provisional(&fix_movie_candidate(), scope, &key, &path)
                 .expect("movie correction");
             let store = metadata::overrides::load().expect("reload");
             assert!(
-                store.lookup_series(&path).is_none(),
-                "the corrected movie must clear the old series latch"
+                store.lookup_series(&path).is_some(),
+                "the corrected movie must keep the show-wide series latch"
             );
             assert!(
                 store.lookup_season(&path).is_none(),
                 "the corrected movie must clear the old season latch"
             );
-            let got = store
-                .resolve_for(&path, st.effective_is_movie())
-                .expect("movie latch");
+            let got = store.resolve_for(&path).expect("movie latch");
             assert_eq!(got.scope, Scope::Movie);
             assert_eq!(got.title, "Dune: Part Two");
             assert!(
                 got.poster.is_empty(),
                 "a movie provisional carries no poster"
+            );
+            // A sibling episode still resolves through the surviving show
+            // latch. It derives from the same fixture path helper, never a
+            // hand-built literal.
+            let sibling = std::path::Path::new(&path)
+                .parent()
+                .expect("the fixture lives in a season folder")
+                .join("s01e02.mkv")
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(
+                store
+                    .resolve_for(&sibling)
+                    .expect("series latch")
+                    .scope,
+                Scope::Series,
+                "the show latch still serves the other episodes"
             );
         });
     }
@@ -13701,17 +13643,7 @@ mod tests {
 
     #[test]
     fn fix_match_provisional_failure_saves_nothing() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-provisional-fail");
-        with_scratch_local_app_data(scratch.path(), || {
+        crate::test_env::EnvGuard::with_scratch("fix-provisional-fail", |_dir| {
             // An empty key cannot save: the worker must never spawn on this,
             // and no half-applied correction may reach the store.
             let path = fix_series_path();
@@ -13723,7 +13655,7 @@ mod tests {
             );
             let store = metadata::overrides::load().expect("reload");
             assert!(
-                store.resolve_for(&path, false).is_none(),
+                store.resolve_for(&path).is_none(),
                 "a failed provisional must leave no latch behind"
             );
         });
@@ -13731,17 +13663,7 @@ mod tests {
 
     #[test]
     fn fix_match_latch_failure_keeps_the_provisional_with_clear_status() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-fetch-fail");
-        with_scratch_local_app_data(scratch.path(), || {
+        crate::test_env::EnvGuard::with_scratch("fix-fetch-fail", |_dir| {
             let path = fix_series_path();
             let key = metadata::overrides::series_key_for(&path).unwrap();
             fix_match_save_provisional(&fix_series_candidate(), Scope::Series, &key, &path)
@@ -13767,7 +13689,7 @@ mod tests {
             ));
             // And the store still resolves the usable provisional.
             let store = metadata::overrides::load().expect("reload");
-            let got = store.resolve_for(&path, false).expect("provisional kept");
+            let got = store.resolve_for(&path).expect("provisional kept");
             assert_eq!(got.title, "Show");
             assert!(got.episodes.is_empty());
         });
@@ -13775,17 +13697,7 @@ mod tests {
 
     #[test]
     fn fix_match_put_replaces_through_the_correction_path() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = Scratch::new("fix-put-correction");
-        with_scratch_local_app_data(scratch.path(), || {
+        crate::test_env::EnvGuard::with_scratch("fix-put-correction", |_dir| {
             // A conflicting movie latch: a plain `put` of the series record
             // would leave it in place (movie-first precedence keeps winning).
             let path = fix_series_path();
@@ -13812,22 +13724,16 @@ mod tests {
             fix_match_put(&path, &fix_full_series_override(&key)).expect("full save");
             let store = metadata::overrides::load().expect("reload");
             assert!(store.lookup_movie(&path).is_none());
-            let got = store.resolve_for(&path, false).expect("series latch");
+            let got = store.resolve_for(&path).expect("series latch");
             assert_eq!(got.episodes.len(), 2);
         });
     }
 
     #[test]
     fn fix_match_provisional_kept_outcome_stays_open_with_clear_status() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // No store touch, but the shared serial keeps a mid-flight scratch
+        // repoint from landing under this lane.
+        let _env = crate::test_env::EnvGuard::hold();
         let mut st = fix_headless_state(fix_series_path(), false);
         st.busy = true;
         st.generation = 7;
@@ -13847,38 +13753,19 @@ mod tests {
 
     #[test]
     fn fix_match_provisional_save_failure_blocks_the_worker() {
-        let _serial = FIX_MATCH_STORE_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Also exclude the Card-view config tests: both lanes repoint
-        // `LOCALAPPDATA`, so parallel runs would otherwise observe each
-        // other's scratch dir mid-flight.
-        let _live = LIVE_MIRROR_SERIAL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Break the store without touching the real file: point the cache
         // root at a regular file, so the atomic save's `create_dir_all`
-        // fails and the provisional cannot save.
-        let scratch = Scratch::new("fix-latch-blocked");
-        let blocker = scratch.write("blocker", "x");
+        // fails and the provisional cannot save. The guard restores the root
+        // on drop.
+        let mut env = crate::test_env::EnvGuard::scratch("fix-latch-blocked");
+        let blocker = env.dir().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        env.repoint(&blocker);
         let path = fix_movie_path();
         let mut st = fix_headless_state(path.clone(), true);
         st.candidates = vec![fix_movie_candidate()];
-        let prev = std::env::var_os(app_support::config::LOCAL_APP_DATA_ENV);
-        // SAFETY: the serial above excludes every other test that reads this
-        // variable or the store; the previous value is restored below.
-        unsafe {
-            std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, &blocker);
-        }
         st.start_latch();
-        match prev {
-            Some(value) => unsafe {
-                std::env::set_var(app_support::config::LOCAL_APP_DATA_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(app_support::config::LOCAL_APP_DATA_ENV);
-            },
-        }
+        drop(env);
         assert!(
             st.status_error,
             "the dialog reports the save failure instead of spawning"
@@ -14226,8 +14113,9 @@ mod tests {
     fn card_preview_fits_all_six_rows() {
         // The tooltip is the sixth preview row: with the pad and gaps it must
         // sit fully inside the panel, never clipped against its bottom. The
-        // panel is the unchanged 176px base plus exactly the retired
-        // kind-toggle band, so every row below keeps its position.
+        // panel is the unchanged 176px base plus exactly the two retired
+        // bands (kind-toggle, then Details), so every row below keeps its
+        // position.
         for dpi in [96, 120, 144, 192] {
             let sc = |v: i32| scale_px(dpi, v);
             let l = compute_card_layout(
@@ -14245,16 +14133,16 @@ mod tests {
             );
             assert_eq!(
                 l.preview.bottom - l.preview.top,
-                sc(176) + (sc(SECTION_H_L) + sc(SP_2)) + sc(BTN_H) + sc(SP_4),
+                sc(176) + 2 * ((sc(SECTION_H_L) + sc(SP_2)) + sc(BTN_H) + sc(SP_4)),
                 "dpi {dpi}: preview height"
             );
-            // No gap, no overlap: the Details label starts exactly one gap
+            // No gap, no overlap: the State label starts exactly one gap
             // below the panel.
             let det = l
                 .labels
                 .iter()
-                .find(|x| x.id == "card.line1")
-                .expect("dpi {dpi}: card.line1 label missing");
+                .find(|x| x.id == "card.line2")
+                .expect("dpi {dpi}: card.line2 label missing");
             assert_eq!(det.rc.top, l.preview.bottom + sc(SP_4));
         }
     }

@@ -223,7 +223,7 @@ impl CatchUp {
             // lookup, no attempt increment, no error, no cooldown -- so a
             // latched folder never returns to the repair list.
             if overrides
-                .resolve_for(&rec.path, rec.query().kind == metadata::Kind::MOVIE)
+                .resolve_for(&rec.path)
                 .is_some()
             {
                 apply_latch_verdict(&idx, rec, now);
@@ -525,7 +525,7 @@ impl Index {
             // counted once, as pinned, never as needs-repair -- even when its
             // record still says so.
             if overrides
-                .resolve_for(&rec.path, rec.query().kind == metadata::Kind::MOVIE)
+                .resolve_for(&rec.path)
                 .is_some()
             {
                 pinned += 1;

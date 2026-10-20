@@ -305,23 +305,35 @@ further where the owner's live card proved the Go behaviour wrong:
     `not-found=` (`go\window.go:2749`): the per-file counter is honest but sampled
     before the async catch-up pass, so a nonzero value can coexist with a later
     successful fetch — Go's name reads as final at a moment that is not final.
-18. The card is always filled, per kind, with no synopsis on the card by
-    default. `rust\crates\presence\src\lib.rs`
+18. The card is per kind and never repeats itself. `rust\crates\presence\src\lib.rs`
     (`compose_card`, `compose_details_for`, `compose_state_for`,
     `synopsis_state`, `compose_large_text_inner`) builds each body line as a
-    fill ladder: the first non-empty rung wins and the last rung is identity
-    from the file itself, so a card is never blank; `rust\crates\presence\src\cardspec.rs`
-    (`CardSpec`, `render_kind`, `card_presets`, `CARD_STATE_NONE`) keeps every
-    preset as a re-head that never removes the fill, except the `Minimal`
-    state preset (stored `none`) — the only choice that may shorten the card
-    to a single body line. SERIES covers TV + anime, MOVIE is movies. Shipped
-    default: SERIES line 1 the episode name, line 2 the episode tag alone
-    (then the clean title, the synopsis only as the last resort before a
-    blank line); MOVIE line 1 `Title (Year)`, line 2 `genres · length`
-    (then year, clean title, synopsis last). The synopsis stays available as
-    the explicit `Synopsis` state preset and as the whole-note hover text of
-    the LARGE image slot — the cover when artwork resolved, the PotFlix `logo`
-    asset otherwise. Slot budgets in UTF-16 units
+    fill ladder whose last rung is identity from the file itself, except the
+    deliberate empties below; `rust\crates\presence\src\cardspec.rs`
+    (`CardSpec`, `render_kind`, `card_presets`, `CARD_STATE_NONE`) keeps the
+    presets as re-heads that never remove the fill, except the deliberate
+    one-line paths: the `Minimal` state preset (stored `none`), which empties
+    the state line, an empty default series details line (no episode
+    title and no filename episode name), and any state rung whose final text
+    would repeat the header (the clean-title fallback equal to the header
+    blanks, `Paused` when paused) -- Minimal is not the only one-line
+    path. SERIES covers TV + anime, MOVIE is movies. Shipped
+    default: SERIES line 1 the episode title (else the filename's own episode
+    name, else empty -- never the show title, which is the activity header,
+    and never the episode code, which lives on line 2), line 2 the `SxxExx`
+    code plus the synopsis (then the filename tag, then the clean title unless
+    it repeats the header -- then empty for a deliberate one-line card,
+    `Paused` when paused); MOVIE line 1 the synopsis (then the year,
+    then genres/length, then empty -- never the title, which is the
+    header/pill), line 2 the year/genres/runtime join with missing parts
+    skipped (then genres/length beside a year, then empty beside
+    genres/length -- the state never repeats what line 1 already shows).
+    A season-0/absent season never fabricates `S00`: an absolute episode
+    renders `E02` from its absolute number, and a season-0 shape whose numbers
+    disagree renders the absolute one. The movie tooltip is omitted, so
+    the synopsis is not repeated; the series hover text of the LARGE image
+    slot — the cover when artwork resolved, the PotFlix `logo` asset
+    otherwise — carries the whole stored note. Slot budgets in UTF-16 units
     held in one place (`NAME_BUDGET`,
     `DETAILS_BUDGET`, `STATE_BUDGET`, `STATE_SYNOPSIS_BUDGET`,
     `LARGE_TEXT_BUDGET`): header 128, line 1 128, line 2 128 plain / 72 with
@@ -335,20 +347,24 @@ further where the owner's live card proved the Go behaviour wrong:
     `"card":{"series":{"details":"…","state":"…"},"movie":{…}}`; the legacy
     flat `{"details":"…","state":"…"}` still loads as the series pair with the
     movie pair default and re-saves nested — a backward-compatible read, not a
-    byte-identical re-write; an all-default config still writes `"card":{}`. The S3 rule (the default state never
-    duplicates the tooltip synopsis) holds for both kinds by construction:
-    neither default state carries the synopsis — the series default is the
-    tag alone and the movie default is genres/length — and the full note
-    stays on hover.
+    byte-identical re-write; an all-default config still writes `"card":{}`.
+    Retired Details ids (`title`/`series`, which repeat the header, and
+    `episode`, byte-identical to the default) migrate to `default` on load and
+    on save. The non-repetition rules hold by construction: no body line
+    repeats the header title, and the movie state never repeats what the movie
+    details line already shows; the full note stays on hover (series) or on
+    line 1 (movies, whose tooltip is omitted).
 19. The Card-view preview is what Discord gets, row for row. The preview renders through the
     same composer the send path uses (`compose_card` via
     `CardSpec::render_kind`), so picking a line changes the preview
     immediately; it is exact for the rows it shows (Header / Details / State
     / Images / Buttons / Tooltip). The progress-bar end timestamp is
     projected by the send gate from the player clock, not by the composer,
-    so the preview shows no timestamps. The Card view's `Card lines for` row
-    (a Series/Movie toggle, `BTN_CARD_KIND_AT`) picks which kind the Details
-    and State preset rows edit — writes go to the SELECTED kind only. A preset save publishes the new specs to the running sender, in-process, through the
+    so the preview shows no timestamps. The preview follows the live card's
+    kind on its own — there is no Series/Movie toggle and no `Card lines for`
+    row: there is no Details row (line 1 is fixed by the shipped mapping; the
+    stored `Default` value stays for compatibility) and the State row offers
+    its four, and a preset save writes the DISPLAYED kind. A preset save publishes the new specs to the running sender, in-process, through the
     store's live mirror (`app_support::config::set_live_card_specs()` / `live_card_specs()`, backed by a process-wide lock) — the same live-apply shape as the
     scan-speed path (`metadata_http::set_rate_profile`); the poll loop (`push_activity` / `poll_loop` in `rust\crates\app\src\main.rs`, preset choice via
     `rust\crates\potflix-win\src\window.rs` `on_select_card_preset`) reads the published specs on every push, so the change reaches the live Discord card

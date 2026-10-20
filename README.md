@@ -36,9 +36,11 @@ Exit any running copy before `--selftest`: one instance runs at a time. You need
 
 ## What you get
 
-You get a Discord card that reads `Watching <title>` and is never blank: filenames are cleaned into real titles (codecs, tags, and release groups stripped, years parenthesized, `SxxEyy` parsed), series cards show the episode name with the episode tag, and movie cards show title, year, genres, and length.
+You get a Discord card whose header is the title and nothing else: filenames are cleaned into real titles (codecs, tags, and release groups stripped, years parenthesized, `SxxEyy` parsed), and no body line from a current preset ever repeats the header (a retired Title/Series line still in flight from an older build renders its stored line until it migrates to Default on load and save -- see the Card view note below). Series cards show the episode title on the first line (empty when no episode title is known -- never the show name) and `SxxExx - synopsis` on the second (the filename tag, then the clean title unless it repeats the header -- then the line stays empty for a deliberate one-line card, `Paused` when paused -- when there is no synopsis). Movie cards show the synopsis on the first line (the year when there is no synopsis and a year is known, else genres and length, else empty) and, when a synopsis is known, `Year · Genres · Runtime` on the second -- genres and length beside a year-showing first line, empty beside a genres/length first line, never the same text twice, and with no tooltip, since the synopsis already sits on the first line.
 
-You get correct states without touching anything: a count-up timer while paused, Browsing and Idle when nothing plays.
+You get correct states without touching anything: a count-up timer while paused, and a cleared card when nothing plays -- no `Browsing`/`Idle` activity, no `Watching PotFlix` header.
+
+The Card view previews exactly what Discord gets and follows the live card's kind on its own: there is no Series/Movie toggle, there is no Details row (line 1 is fixed by the shipped mapping), State offers Default, Tag, Synopsis, or Minimal, and a Title/Series/Episode choice saved by an older build quietly becomes Default.
 
 You get metadata with no keys and no accounts, cached on disk for 30 days; offline, the card falls back to the clean filename title. You can export and re-import that cache as one JSON bundle.
 

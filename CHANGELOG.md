@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The shipped card mapping: series line 1 is the episode title (then the
+  filename's own episode name, then empty -- never the show header, which is
+  the activity header, and never the episode code, which lives on line 2);
+  series line 2 is the `SxxExx` code plus the synopsis (then the filename
+  tag, then the clean title). Movie line 1 is the synopsis (then the year,
+  then genres/length, then empty -- never the title); movie line 2 is
+  `Year · Genres · Runtime` with missing parts skipped and never repeats
+  line 1 (no synopsis + year = details year, state genres/length; no
+  synopsis + no year = details genres/length, state empty); the movie tooltip
+  is omitted so the synopsis is not repeated. A season-0 or absent season
+  never fabricates `S00`: absolute episodes render `E02` from the absolute
+  number. An empty series line 1 is a deliberate one-line card -- as is a
+  header-equal state blank (`""`, `"Paused"` when paused) -- so `Minimal`
+  is not the only one-line path. Nothing playing clears the card: no
+  `Browsing`/`Idle` activity, no `Watching PotFlix`/`Watching PotPlayer`
+  header (`rust\crates\presence\src\lib.rs`, `rust\crates\app\src\main.rs`).
+- The Card view follows the live card's kind on its own: the Series/Movie
+  toggle (`Card lines for` row) is removed, the Details row is removed (line
+  1 is fixed by the mapping; the stored `Default` value stays for
+  compatibility, and only the State row offers presets), and the retired
+  Title/Series/Episode ids migrate to Default on load and on save
+  (`rust\crates\presence\src\cardspec.rs`,
+  `rust\crates\app-support\src\config.rs`,
+  `rust\crates\potflix-win\src\window.rs`).
+
+### Fixed
+
+- A single-file movie correction inside a latched show no longer deletes the
+  show-wide series latch: only the season-folder latch for the file's own
+  season is cleared, so the show cover, episode pins, and every other episode
+  keep resolving while the corrected file resolves movie
+  (`rust\crates\metadata\src\overrides.rs`, `Store::put_correction`).
+
 ## [1.1.0] - 2026-10-19
 
 ### Added

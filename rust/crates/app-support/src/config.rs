@@ -31,7 +31,8 @@
 //!   flat object `{"details": "...", "state": "..."}` still loads (as the
 //!   series spec, movie default). Go's `json:"card,omitempty"` is a no-op for a
 //!   struct, so the key is always written -- matched here. Retired Details ids
-//!   (`title`/`series`, which repeat the activity header) migrate to `default`
+//!   (`title`/`series`, which repeat the activity header, and `episode`,
+//!   which renders byte-identical to `default`) migrate to `default`
 //!   on load AND on save, so a stored repeating line resets without losing the
 //!   unrelated lines.
 //!
@@ -104,9 +105,8 @@ pub const SCAN_SPEED_GENTLE: &str = "gentle";
 /// on every line, so a store written before this field existed needs no
 /// migration.
 pub use presence::cardspec::{
-    CARD_DETAILS_DEFAULT, CARD_DETAILS_EPISODE, CARD_DETAILS_SERIES, CARD_DETAILS_TITLE,
-    CARD_STATE_DEFAULT, CARD_STATE_NONE, CARD_STATE_SYNOPSIS, CARD_STATE_TAG, CardSpec,
-    default_card_spec,
+    CARD_DETAILS_DEFAULT, CARD_DETAILS_SERIES, CARD_DETAILS_TITLE, CARD_STATE_DEFAULT,
+    CARD_STATE_NONE, CARD_STATE_SYNOPSIS, CARD_STATE_TAG, CardSpec, default_card_spec,
 };
 
 /// Store-local convenience on the presence-owned [`CardSpec`]: only the store
@@ -293,7 +293,8 @@ mod de {
     /// shipped default). Absent is handled by serde's `default`; here `null`,
     /// `{}`, and unknown-only objects all load as the all-default
     /// [`CardSpecs`]. A wrong (non-object) type errors, as before. Retired
-    /// Details ids (`title`/`series`, T5-B) migrate to the default per kind so
+    /// Details ids (`title`/`series`, which repeat the header, and `episode`,
+    /// byte-identical to the default) migrate to the default per kind so
     /// a saved repeating line can never reach the card again; every other
     /// stored id (kept or unknown) survives the load untouched.
     pub fn card<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CardSpecs, D::Error> {
@@ -567,7 +568,8 @@ pub fn save_config(config: &Config) -> io::Result<()> {
 pub fn save_config_to(path: &Path, config: &Config) -> io::Result<()> {
     let mut out = config.clone();
     out.scan_speed = normalize_scan_speed(&out.scan_speed).to_string();
-    // T5-B: a retired Details id (`title`/`series`) never persists again: the
+    // T5-B, extended to the retired `episode` preset: a retired Details id
+    // (`title`/`series`/`episode`) never persists again: the
     // store migrates it to the default line on save, as on load.
     out.card.series = out.card.series.migrated();
     out.card.movie = out.card.movie.migrated();
@@ -808,9 +810,9 @@ mod tests {
             scan_speed: SCAN_SPEED_TURBO.to_string(),
             ..Config::default()
         };
-        assert!(want.set_card_spec("episode", "tag"), "first set");
+        assert!(want.set_card_spec("default", "tag"), "first set");
         assert!(
-            !want.set_card_spec("episode", "tag"),
+            !want.set_card_spec("default", "tag"),
             "same value is unchanged"
         );
 
@@ -820,7 +822,7 @@ mod tests {
         let effective = got.effective_card_spec();
         assert_eq!(
             (effective.details.as_str(), effective.state.as_str()),
-            ("episode", "tag")
+            ("default", "tag")
         );
 
         // Zero value: no migration needed.
@@ -844,12 +846,13 @@ mod tests {
         let scratch = Scratch::new("config-card-wire");
         let path = store_path(&scratch);
 
-        // Details set, state empty: the state key is omitted (series only;
-        // movie stays default and is omitted as a kind).
+        // Details default, state empty: the kind normalises to the shipped
+        // default and is omitted as a kind (only one Details preset exists,
+        // so an explicit default carries no information).
         let details_only = Config {
             card: CardSpecs {
                 series: CardSpec {
-                    details: CARD_DETAILS_EPISODE.to_string(),
+                    details: CARD_DETAILS_DEFAULT.to_string(),
                     state: String::new(),
                 },
                 movie: CardSpec::default(),
@@ -860,7 +863,7 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{}}"#
         );
 
         // State set, details empty: the details key is omitted, and the line
@@ -923,24 +926,24 @@ mod tests {
 
         // (b) Series-only set: the movie object (default) is omitted.
         let mut series_only = Config::default();
-        assert!(series_only.set_card_line(CardKind::Series, CardLine::Details, "episode"));
+        assert!(series_only.set_card_line(CardKind::Series, CardLine::Details, "default"));
         assert!(series_only.set_card_line(CardKind::Series, CardLine::State, "tag"));
         save_config_to(&path, &series_only).expect("saveConfigTo");
         assert_eq!(
             read_wire(&path),
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"tag"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"default","state":"tag"}}}"#
         );
 
         // (c) Both kinds set.
         let mut both = Config::default();
-        assert!(both.set_card_line(CardKind::Series, CardLine::Details, "episode"));
+        assert!(both.set_card_line(CardKind::Series, CardLine::Details, "default"));
         assert!(both.set_card_line(CardKind::Series, CardLine::State, "tag"));
-        assert!(both.set_card_line(CardKind::Movie, CardLine::Details, "episode"));
+        assert!(both.set_card_line(CardKind::Movie, CardLine::Details, "default"));
         assert!(both.set_card_line(CardKind::Movie, CardLine::State, "synopsis"));
         save_config_to(&path, &both).expect("saveConfigTo");
         assert_eq!(
             read_wire(&path),
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"tag"},"movie":{"details":"episode","state":"synopsis"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"default","state":"tag"},"movie":{"details":"default","state":"synopsis"}}}"#
         );
     }
 
@@ -955,9 +958,9 @@ mod tests {
             scan_speed: SCAN_SPEED_TURBO.to_string(),
             ..Config::default()
         };
-        assert!(want.set_card_line(CardKind::Series, CardLine::Details, "episode"));
+        assert!(want.set_card_line(CardKind::Series, CardLine::Details, "default"));
         assert!(want.set_card_line(CardKind::Series, CardLine::State, "tag"));
-        assert!(want.set_card_line(CardKind::Movie, CardLine::Details, "episode"));
+        assert!(want.set_card_line(CardKind::Movie, CardLine::Details, "default"));
         assert!(want.set_card_line(CardKind::Movie, CardLine::State, "synopsis"));
 
         save_config_to(&path, &want).expect("saveConfigTo");
@@ -966,14 +969,14 @@ mod tests {
         assert_eq!(
             got.card.for_kind(CardKind::Series),
             CardSpec {
-                details: CARD_DETAILS_EPISODE.to_string(),
+                details: CARD_DETAILS_DEFAULT.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
         assert_eq!(
             got.card.for_kind(CardKind::Movie),
             CardSpec {
-                details: "episode".to_string(),
+                details: "default".to_string(),
                 state: "synopsis".to_string(),
             }
         );
@@ -985,8 +988,8 @@ mod tests {
 
     /// The legacy flat object every shipped config holds loads as series =
     /// that normalized pair and movie = the shipped default, and re-saves as
-    /// the nested series-only shape. A retired Details id in the flat object
-    /// migrates to the default (T5-B).
+    /// the nested series-only shape. A retired Details id (`title`/`series`/
+    /// `episode`) in the flat object migrates to the default.
     #[test]
     fn card_legacy_flat_read() {
         let scratch = Scratch::new("config-card-legacy");
@@ -998,7 +1001,7 @@ mod tests {
         assert_eq!(
             got.card.series,
             CardSpec {
-                details: CARD_DETAILS_EPISODE.to_string(),
+                details: CARD_DETAILS_DEFAULT.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
@@ -1006,7 +1009,7 @@ mod tests {
         assert_eq!(
             got.effective_card_spec(),
             CardSpec {
-                details: CARD_DETAILS_EPISODE.to_string(),
+                details: CARD_DETAILS_DEFAULT.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
@@ -1021,7 +1024,7 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"tag"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"default","state":"tag"}}}"#
         );
     }
 
@@ -1301,12 +1304,12 @@ mod tests {
         // A card with both lines set writes both kinds (set_card_spec sets
         // BOTH kinds to the same pair).
         let mut with_card = Config::default();
-        with_card.set_card_spec("episode", "synopsis");
+        with_card.set_card_spec("default", "synopsis");
         save_config_to(&path, &with_card).expect("saveConfigTo");
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"synopsis"},"movie":{"details":"episode","state":"synopsis"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"default","state":"synopsis"},"movie":{"details":"default","state":"synopsis"}}}"#
         );
 
         // start_with_windows is a real stored field.
