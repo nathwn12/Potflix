@@ -200,8 +200,11 @@ fn latch_resolved(
 
 /// One latch as the card's resolved inputs. A movie latch renders its `media`
 /// snapshot, with the latch poster as the artwork fallback; a season/show
-/// latch renders the playing episode's pin -- its title and synopsis -- under
-/// the latch's own series name, poster and year.
+/// latch renders the playing episode's pin -- its title, synopsis and episode
+/// code -- under the latch's own series name, poster and year. With no pin
+/// for the playing episode the show title/poster still resolve and the code
+/// rides from the query (the provisional path), so the latch is never a
+/// forced movie: `is_movie` follows the latch scope, not the filename.
 fn resolved_from_latch(off: &overrides::Override, query: &metadata::Query) -> presence::Resolved {
     match off.scope {
         overrides::Scope::Movie => {
@@ -233,6 +236,7 @@ fn resolved_from_latch(off: &overrides::Override, query: &metadata::Query) -> pr
                 series: off.title.clone(),
                 artwork: off.poster.clone(),
                 year: off.year,
+                is_movie: false,
                 ..presence::Resolved::default()
             };
             let pin = if query.absolute {
@@ -245,6 +249,14 @@ fn resolved_from_latch(off: &overrides::Override, query: &metadata::Query) -> pr
             if let Some(pin) = pin {
                 res.episode_name = pin.title.clone();
                 res.synopsis = pin.synopsis.clone();
+                res.season = i64::from(pin.season);
+                res.number = pin.number;
+                res.absolute = pin.absolute;
+            } else if query.absolute {
+                res.absolute = query.episode;
+            } else {
+                res.season = query.season;
+                res.number = query.episode;
             }
             res
         }
@@ -300,6 +312,13 @@ fn set_overrides_path_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
 /// the cardview tests drive.
 ///
 /// The preview is recorded only AFTER a successful send (`main.go:391-392`).
+/// A rate-limited hold (`rate-limited`) sends nothing and records nothing;
+///
+/// the newest held card flushes on the first poll after the 5-per-20 s window.
+/// Returns true only on a successful real-media send (the preview was
+/// recorded); every other path -- idle clear, gate suppression, dormant
+/// clear, send error -- returns false so the caller can tell a card from a
+/// non-send.
 #[allow(clippy::too_many_arguments)]
 fn push_activity(
     log: &Logger,
@@ -319,7 +338,17 @@ fn push_activity(
     now: i64,
     event: bool,
     debounced: bool,
-) {
+) -> bool {
+    // T5-C: an idle title never becomes a card. The presence composer would
+    // render `Browsing`/`Idle` (and fall back to the app-name header) for
+    // exactly these inputs; clear instead, record no preview, and leave the
+    // gate untouched so the next real media sends fresh.
+    if is_no_media_title(raw_title) {
+        if let Err(err) = dc.clear_activity() {
+            selftest::event_send_error(log, &err);
+        }
+        return false;
+    }
     let query = meta_query_for(raw_title);
     let mut res = presence::Resolved::default();
     let mut found = false;
@@ -350,6 +379,9 @@ fn push_activity(
                     length: answer.length,
                     year: answer.year,
                     is_movie: answer.is_movie,
+                    season: answer.season,
+                    number: answer.number,
+                    absolute: if query.absolute { query.episode } else { 0 },
                     buttons: Vec::new(),
                 };
                 found = true;
@@ -375,7 +407,7 @@ fn push_activity(
     let (out, verdict) = gate.decide(card, ct, total, now, event, debounced);
     selftest::event_push_attempt(log, &out, &verdict);
     if !verdict.send {
-        return;
+        return false;
     }
     // A pause parks the paused card and keeps it; the gate never sets Clear now,
     // so this branch is dormant and retained for the null-activity path only.
@@ -383,7 +415,7 @@ fn push_activity(
         if let Err(err) = dc.clear_activity() {
             selftest::event_send_error(log, &err);
         }
-        return;
+        return false;
     }
     selftest::event_push(log, &out.details, &out.state, ct, total);
     let wire = discord::Activity {
@@ -400,22 +432,46 @@ fn push_activity(
         buttons: Vec::new(),
     };
     match dc.set_activity(wire) {
-        Ok(()) => record(
-            kind,
-            raw_title.to_string(),
-            action.cloned(),
-            res.clone(),
-        ),
-        Err(err) => selftest::event_send_error(log, &err),
+        Ok(()) => {
+            record(
+                kind,
+                raw_title.to_string(),
+                action.cloned(),
+                res.clone(),
+            );
+            true
+        }
+        Err(err) => {
+            selftest::event_send_error(log, &err);
+            false
+        }
     }
 }
 
-/// Whether `generation` still owes a clear: a clear is only proven for the
-/// connection generation it went out on, so a changed generation (a reconnect)
+/// Whether `generation` still owes a clear: a clear is only proven for the/// connection generation it went out on, so a changed generation (a reconnect)
 /// must re-assert it. The old boolean latch stayed true across a reconnect and
 /// nothing ever re-sent the clear, which left the card stuck on the last movie.
 fn clear_due(generation: i64, cleared_gen: i64) -> bool {
     generation != cleared_gen
+}
+
+/// T5-C: whether `raw_title` carries no media. The presence composer renders
+/// `Browsing`/`Idle` (with the app-name header fallback) for exactly these
+/// inputs, so the app lane clears instead of sending: empty/whitespace, the
+/// bare player app name (`PotPlayer`, or the renamed `PotFlix`), with either
+/// ` - PotPlayer` / ` - PotFlix` suffix stripped first. A real filename that
+/// merely mentions the player keeps its card.
+fn is_no_media_title(raw_title: &str) -> bool {
+    let mut raw = raw_title
+        .strip_suffix(player::window::SUFFIX)
+        .unwrap_or(raw_title);
+    // A renamed window keeps the same convention (`PotFlix` instead of
+    // `PotPlayer`); strip it too so the gate does not depend on the suffix.
+    if let Some(stripped) = raw.strip_suffix(" - PotFlix") {
+        raw = stripped;
+    }
+    let title = raw.trim();
+    title.is_empty() || title == player::window::APP_NAME || title == "PotFlix"
 }
 
 /// Advances the sustained-stop anchor: `since_ms` is the epoch-ms anchor where
@@ -622,6 +678,29 @@ fn poll_step<P: PlayerProbe>(
                 // The card is rebuilt from the current action every poll,
                 // including polls where the tracker emits nothing (`current`).
                 let cur = action.clone().or_else(|| seg.tracker.current());
+                let live = cur.as_ref().is_some_and(|a| a.running || a.paused);
+                // T5-C: no idle card, ever. An idle title (empty, the player
+                // app name) or a window with no current file is not media:
+                // clear (once per generation, like the no-player path),
+                // record no preview, and feed nothing to the gate -- so no
+                // `Browsing`/`Idle`, no app-name header, and no PotFlix /
+                // PotPlayer name ever reaches the wire. A live running/paused
+                // action still wins over an empty file read (a transient path
+                // query must not clear a real card); a stopped or silent
+                // window with no file clears immediately instead of parking.
+                let no_media = is_no_media_title(&title)
+                    || (!live && playing_file_path(&title).trim().is_empty());
+                if no_media {
+                    config::set_live_now_playing(None);
+                    state.stop_since = 0;
+                    if clear_due(dc.generation(), state.cleared_gen) {
+                        if let Err(err) = dc.clear_activity() {
+                            selftest::event_send_error(log, &err);
+                        }
+                        log.log("cleared (idle, no media)");
+                        state.cleared_gen = dc.generation();
+                    }
+                } else {
                 // The UI's "Fix match" latches the file that is playing: mirror
                 // the raw title and its path while a live action (running or
                 // paused) is on the card, so the UI reads exactly what the card
@@ -668,7 +747,7 @@ fn poll_step<P: PlayerProbe>(
                                           res: presence::Resolved| {
                             window::ui().record_preview(kind, raw, act, res);
                         };
-                        push_activity(
+                        let sent = push_activity(
                             log,
                             dc,
                             &mut seg.gate,
@@ -682,7 +761,20 @@ fn poll_step<P: PlayerProbe>(
                             action.is_some(),
                             debounced,
                         );
+                        // T5-E: a successful real-media send re-arms the
+                        // once-per-generation idle clear. Without this the
+                        // next idle/no-media transition on the same
+                        // generation is suppressed (`generation ==
+                        // cleared_gen`) and the media card stays parked
+                        // after the media is gone. A suppressed hold or a
+                        // failed send leaves the anchor alone, so idle
+                        // polls without an intervening card still clear
+                        // exactly once.
+                        if sent {
+                            state.cleared_gen = -1;
+                        }
                     }
+                }
                 }
             }
         }
@@ -1043,9 +1135,12 @@ mod tests {
             drive(P, 15250, IT_N + 2500); // 10 flap -> still running
             drive(P, 15250, IT_N + 2750); // 11 real pause -> parked paused card
             drive(P, 15250, IT_N + 3000); // 12 paused steady
-            drive(R, 15250, IT_N + 3250); // 13 resume -> sent
+            // T2-B: the resume waits past the 5-per-20 s window (drives 0-11
+            // already sent 5), so the burst never trips the rate guard here;
+            // the guard's own burst test lives in `gate_test`.
+            drive(R, 15250, IT_N + 21000); // 13 resume -> sent
             for i in 1..=120i64 {
-                drive(R, 15250 + 250 * i, IT_N + 3250 + 250 * i);
+                drive(R, 15250 + 250 * i, IT_N + 21000 + 250 * i);
             }
         }
 
@@ -1067,7 +1162,7 @@ mod tests {
                 cur.as_ref(),
                 15250 + 250 * 120,
                 IT_TOTAL,
-                IT_N + 3250 + 250 * 120,
+                IT_N + 21000 + 250 * 120,
                 false,
                 false,
             );
@@ -1122,14 +1217,14 @@ mod tests {
         const START1: i64 = IT_N - 1800;
         const START2: i64 = IT_N - 7500;
         const START3: i64 = IT_N - 13000;
-        const START4: i64 = IT_N - 12000;
+        const START4: i64 = IT_N + 5750;
         const PAUSE_START: i64 = IT_N + 2750;
         const END0: i64 = IT_N + (IT_TOTAL - 1000);
         const END1: i64 = IT_N + 1000 + (IT_TOTAL - 2800);
         const END2: i64 = IT_N + 1500 + (IT_TOTAL - 9000);
         const END3: i64 = IT_N + 2000 + (IT_TOTAL - 15000);
-        const END5: i64 = IT_N + 3250 + (IT_TOTAL - 15250);
-        const END6: i64 = IT_N + 33250 + (IT_TOTAL - 45250);
+        const END5: i64 = IT_N + 21000 + (IT_TOTAL - 15250);
+        const END6: i64 = IT_N + 51000 + (IT_TOTAL - 45250);
 
         let playing = |details: &str, state: &str, start: i64, end: i64| Sent {
             clear: false,
@@ -1202,7 +1297,7 @@ mod tests {
                 "frame {i} looks like a frozen-position paused card: {raw}"
             );
         }
-        const RESUME_NOW: i64 = IT_N + 3250;
+        const RESUME_NOW: i64 = IT_N + 21000;
         const RESUME_CT: i64 = 15250;
         assert_eq!(
             got[5].start,
@@ -1805,6 +1900,181 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// T2-B: a single correction sends immediately under the 5-per-20 s window
+    /// (it never waits for the 30 s heartbeat) and records the preview.
+    #[test]
+    fn rate_single_correction_sends_and_previews() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (dc, frx, reader, dir) = live_pipe_harness("rate-single");
+        let log = Logger::new(dir.join("rate-single.log"), 0, 1);
+        const TOTAL: i64 = 2_832_979;
+        const NOW: i64 = 1_000_000_000_000;
+        let mut gate = Gate::new();
+        let raw_a = "Rate.Show.S01E01.First.1080p.mkv - PotPlayer";
+        let raw_b = "Rate.Show.S01E02.Second.1080p.mkv - PotPlayer";
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: NOW - 1000,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        let previews = std::cell::Cell::new(0);
+        let mut record = |_: config::CardKind,
+                          _: String,
+                          _: Option<presence::Action>,
+                          _: presence::Resolved| {
+            previews.set(previews.get() + 1);
+        };
+        push_activity(&log, &dc, &mut gate, config::CardSpecs::default(), &mut record, raw_a, Some(&act), 1000, TOTAL, NOW, true, false);
+        let first = frx.recv_timeout(Duration::from_secs(2)).expect("first card");
+        let (d1, _) = wire_lines(&first);
+        // One poll later the corrected title sends at once, not at heartbeat.
+        let act2 = presence::Action {
+            running: true,
+            has_start: true,
+            start: NOW + 250 - 1250,
+            ct: 1250,
+            ..presence::Action::default()
+        };
+        push_activity(&log, &dc, &mut gate, config::CardSpecs::default(), &mut record, raw_b, Some(&act2), 1250, TOTAL, NOW + 250, true, false);
+        let second = frx.recv_timeout(Duration::from_secs(2)).expect("correction must send immediately");
+        let (d2, _) = wire_lines(&second);
+        assert_ne!(d1, d2, "the wire must carry the corrected lines");
+        assert_eq!(previews.get(), 2, "preview records after each successful send");
+        assert!(frx.recv_timeout(Duration::from_millis(250)).is_err(), "no duplicate frame");
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2-B: 6 line changes inside 20 s send 5 and coalesce the latest; the
+    /// newest flushes on the first poll after the window with no duplicate and
+    /// no preview for the held poll.
+    #[test]
+    fn rate_burst_coalesces_latest_through_push() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (dc, frx, reader, dir) = live_pipe_harness("rate-burst");
+        let log = Logger::new(dir.join("rate-burst.log"), 0, 1);
+        const TOTAL: i64 = 2_832_979;
+        const NOW: i64 = 1_000_000_000_000;
+        let mut gate = Gate::new();
+        let previews = std::cell::Cell::new(0);
+        let mut record = |_: config::CardKind,
+                          _: String,
+                          _: Option<presence::Action>,
+                          _: presence::Resolved| {
+            previews.set(previews.get() + 1);
+        };
+        let raws = [
+            "Rate.Burst.S01E01.A.1080p.mkv - PotPlayer",
+            "Rate.Burst.S01E02.B.1080p.mkv - PotPlayer",
+            "Rate.Burst.S01E03.C.1080p.mkv - PotPlayer",
+            "Rate.Burst.S01E04.D.1080p.mkv - PotPlayer",
+            "Rate.Burst.S01E05.E.1080p.mkv - PotPlayer",
+            "Rate.Burst.S01E06.F.1080p.mkv - PotPlayer",
+        ];
+        for (i, raw) in raws.iter().enumerate() {
+            let ct = 1000 + 250 * i as i64;
+            let now = NOW + 250 * i as i64;
+            let act = presence::Action {
+                running: true,
+                has_start: true,
+                start: now - ct,
+                ct,
+                ..presence::Action::default()
+            };
+            push_activity(&log, &dc, &mut gate, config::CardSpecs::default(), &mut record, raw, Some(&act), ct, TOTAL, now, true, false);
+        }
+        // 5 frames go out; the 6th change is held (coalesced, no preview).
+        let mut got_details = Vec::new();
+        for _ in 0..5 {
+            let frame = frx.recv_timeout(Duration::from_secs(2)).expect("burst frame");
+            got_details.push(wire_lines(&frame).0);
+        }
+        assert!(frx.recv_timeout(Duration::from_millis(250)).is_err(), "6th change must hold, not send a 6th frame");
+        assert_eq!(previews.get(), 5, "held poll records no preview");
+        // First poll after the window flushes the newest (F); intermediates
+        // never go out twice and no identical duplicate follows.
+        let flush_now = NOW + 20_000 + 250;
+        let flush_ct = 1000 + 250 * 5 + 20_000;
+        let flush_act = presence::Action {
+            running: true,
+            has_start: true,
+            start: flush_now - flush_ct,
+            ct: flush_ct,
+            ..presence::Action::default()
+        };
+        push_activity(&log, &dc, &mut gate, config::CardSpecs::default(), &mut record, raws[5], Some(&flush_act), flush_ct, TOTAL, flush_now, false, false);
+        let flushed = frx.recv_timeout(Duration::from_secs(2)).expect("newest must flush after the window");
+        let (fd, _) = wire_lines(&flushed);
+        let (want_d, _) = expect_lines(raws[5], &flush_act, &config::CardSpecs::default());
+        assert_eq!(fd, want_d, "flush carries the newest lines");
+        assert_eq!(previews.get(), 6, "flush records the preview");
+        assert!(!got_details.contains(&fd) || got_details.len() == 5, "flush is the coalesced newest");
+        assert!(frx.recv_timeout(Duration::from_millis(250)).is_err(), "no duplicate after flush");
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T2-B: stop grace still clears and the resume still sends through the
+    /// real poll body while the rate guard is active.
+    #[test]
+    fn rate_stop_resume_still_works() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (dc, frx, reader, dir) = live_pipe_harness("rate-stop");
+        let log = Logger::new(dir.join("rate-stop.log"), 0, 1);
+        const TOTAL: i64 = 2_832_979;
+        const NOW: i64 = 1_000_000_000_000;
+        const RAW: &str = "Rate.Stop.S01E02.Pilot.1080p.mkv - PotPlayer";
+        let mut tracker = Tracker::new();
+        let mut gate = Gate::new();
+        let mut stop_since = 0i64;
+        let mut cleared_gen = -1i64;
+        let previews = std::cell::Cell::new(0);
+        let mut drive = |status: PlayStatus, ct: i64, now: i64| {
+            let action = tracker.poll(RAW, status, ct, now);
+            let cur = action.clone().or_else(|| tracker.current());
+            let stopped = cur.as_ref().is_some_and(|a| !a.running && !a.paused);
+            let (since, due) = sustained_stop(now, stop_since, stopped);
+            stop_since = since;
+            if due {
+                if clear_due(dc.generation(), cleared_gen) {
+                    dc.clear_activity().expect("clear after the sustained stop");
+                    cleared_gen = dc.generation();
+                }
+                return;
+            }
+            if let Some(cur) = cur {
+                let mut record = |_: config::CardKind,
+                                  _: String,
+                                  _: Option<presence::Action>,
+                                  _: presence::Resolved| {
+                    previews.set(previews.get() + 1);
+                };
+                push_activity(&log, &dc, &mut gate, live_card_specs(), &mut record, RAW, Some(&cur), ct, TOTAL, now, action.is_some(), tracker.pending_debounce());
+            }
+        };
+        drive(PlayStatus::RUNNING, 1000, NOW);
+        drive(PlayStatus::RUNNING, 1250, NOW + 250);
+        drive(PlayStatus::STOPPED, 1250, NOW + 500);
+        drive(PlayStatus::STOPPED, 1250, NOW + 750);
+        let _ = frx.recv_timeout(Duration::from_secs(2)).expect("running card");
+        let _ = frx.recv_timeout(Duration::from_secs(2)).expect("stop card");
+        drive(PlayStatus::STOPPED, 1250, NOW + 16_000);
+        let cleared: serde_json::Value = serde_json::from_slice(&frx.recv_timeout(Duration::from_secs(2)).expect("clear")).expect("decode clear");
+        assert!(cleared["args"]["activity"].is_null(), "sustained stop clears");
+        drive(PlayStatus::RUNNING, 1300, NOW + 16_250);
+        let resume = frx.recv_timeout(Duration::from_secs(2)).expect("resume sends under the rate guard");
+        let resume: serde_json::Value = serde_json::from_slice(&resume).expect("decode resume");
+        assert_eq!(resume["args"]["activity"]["timestamps"]["start"].as_i64(), Some(NOW + 16_250 - 1300));
+        assert!(previews.get() >= 3, "running, stop and resume previews recorded, got {}", previews.get());
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The real push path over an in-process fake pipe: the caller drives
     /// `push_activity` and reads the exact SET_ACTIVITY frames. Returns the
     /// client, the frame channel, the reader thread, and the scratch dir the
@@ -2016,12 +2286,14 @@ mod tests {
         assert_eq!(dm1, edm1);
         assert_eq!(sm1.as_deref().unwrap_or(""), esm1);
 
-        // A Card-view save publishes a different MOVIE spec (state `none`, so
-        // the state field is omitted); the NEXT poll with the SAME title, the
-        // same ct/total/action and `event = false` must still send the new
-        // movie lines by itself.
+        // A Card-view save publishes a different MOVIE spec (state `tag`: the
+        // unresolved movie default is now ("",""), so `none` would be
+        // gate-identical and send nothing -- `tag` falls through to the clean
+        // title here and really changes the payload); the NEXT poll with the
+        // SAME title, the same ct/total/action and `event = false` must still
+        // send the new movie lines by itself.
         let mut specs_c = specs_b.clone();
-        assert!(specs_c.set_line(config::CardKind::Movie, config::CardLine::State, "none"));
+        assert!(specs_c.set_line(config::CardKind::Movie, config::CardLine::State, "tag"));
         config::set_live_card_specs(specs_c.clone());
         push_activity(
             &log,
@@ -2049,7 +2321,10 @@ mod tests {
             (d3.clone(), s3.clone()),
             "the wire must carry the new movie lines"
         );
-        assert!(s3.is_none(), "movie state 'none' must omit the state line");
+        assert!(
+            s3.as_deref().is_some_and(|s| !s.is_empty()),
+            "movie state 'tag' must reach the wire, got {s3:?}"
+        );
 
         config::set_live_card_specs(config::CardSpecs::default());
         let _ = dc.close();
@@ -2378,6 +2653,8 @@ mod tests {
 
     /// A latched series file renders FROM THE LATCH: the episode name and
     /// synopsis are the stored pin's and the artwork is the latch poster.
+    /// Details keeps the pin's episode title alone (the show lives in the
+    /// header); the state is the pin's episode code plus the pin's synopsis.
     /// META_RESOLVER is only ever set by `run_ui`, never in a test binary, so
     /// the latch branch is the ONLY possible source of these values -- the
     /// exclusivity is structural.
@@ -2468,7 +2745,12 @@ mod tests {
         assert_eq!(
             a["details"].as_str().unwrap_or(""),
             "The Pin Episode",
-            "the pin's episode name: {v}"
+            "the pin's episode title leads the card: {v}"
+        );
+        assert_eq!(
+            a["state"].as_str().unwrap_or(""),
+            "S02E05 - A synopsis from the pin.",
+            "the pin's episode code plus synopsis is the state: {v}"
         );
         assert_eq!(
             a["assets"]["large_text"].as_str().unwrap_or(""),
@@ -2573,18 +2855,18 @@ mod tests {
         assert_eq!(a["name"].as_str().unwrap_or(""), "Latch Movie", "{v}");
         assert_eq!(
             a["details"].as_str().unwrap_or(""),
-            "Latch Movie (2019)",
-            "the media snapshot's title and year: {v}"
+            "The media snapshot's synopsis.",
+            "T5-A movie shape: the snapshot's synopsis leads the card: {v}"
         );
         assert_eq!(
             a["state"].as_str().unwrap_or(""),
-            "Action \u{b7} 1h 40m",
-            "the snapshot's genres and length: {v}"
+            "2019 \u{b7} Action \u{b7} 1h 40m",
+            "T5-A movie shape: year, genres and runtime: {v}"
         );
         assert_eq!(
             a["assets"]["large_text"].as_str().unwrap_or(""),
-            "The media snapshot's synopsis.",
-            "{v}"
+            "",
+            "T5-A movie shape: no tooltip, the synopsis is not repeated: {v}"
         );
         assert_eq!(
             a["assets"]["large_image"].as_str().unwrap_or(""),
@@ -2814,7 +3096,9 @@ mod tests {
         config::set_live_card_specs(config::CardSpecs::default());
         const RAW: &str = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
         const NOW: i64 = 1_000_000_000_000;
-        let query = seed_playing_file(RAW, "");
+        // T5-C: real media carries a current file; the no-file case clears on
+        // its own path (t5c_poll_window_with_no_file_clears).
+        let query = seed_playing_file(RAW, r"Q:\Media\Dune.Part.Two.2024.1080p.BluRay.x264.mkv");
         assert_eq!(query.kind, metadata::Kind::MOVIE, "movie fixture kind");
 
         let srv = discord::FakeServer::new(0);
@@ -2901,7 +3185,8 @@ mod tests {
         config::set_live_card_specs(config::CardSpecs::default());
         const RAW: &str = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
         const NOW: i64 = 1_000_000_000_000;
-        let query = seed_playing_file(RAW, "");
+        // T5-C: real media carries a current file (see above).
+        let query = seed_playing_file(RAW, r"Q:\Media\Dune.Part.Two.2024.1080p.BluRay.x264.mkv");
         assert_eq!(query.kind, metadata::Kind::MOVIE, "movie fixture kind");
 
         let srv = discord::FakeServer::new(0);
@@ -3020,7 +3305,9 @@ mod tests {
 
         // Case 1: a still-Stopped window clears after the grace, exactly once.
         {
-            let query = seed_playing_file(RAW, "");
+            // T5-C: real media carries a current file, so the grace (not the
+            // no-file path) decides this clear.
+            let query = seed_playing_file(RAW, r"Q:\Media\Dune.Part.Two.2024.1080p.BluRay.x264.mkv");
             assert_eq!(query.kind, metadata::Kind::MOVIE, "movie fixture kind");
             let srv = discord::FakeServer::new(0);
             let dc = poll_test_client(srv.base.clone());
@@ -3111,7 +3398,8 @@ mod tests {
         // across a 20 s span (past the grace): the live polls reset the stop
         // anchor, so no clear ever fires.
         {
-            let query = seed_playing_file(RAW, "");
+            // T5-C: real media carries a current file (see case 1).
+            let query = seed_playing_file(RAW, r"Q:\Media\Dune.Part.Two.2024.1080p.BluRay.x264.mkv");
             assert_eq!(query.kind, metadata::Kind::MOVIE, "movie fixture kind");
             let srv = discord::FakeServer::new(0);
             let dc = poll_test_client(srv.base.clone());
@@ -3190,5 +3478,489 @@ mod tests {
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// T1: a series latch with no episode pin still resolves the show
+    /// title/poster and the episode code from the query (the
+    /// provisional/text-only path): no panic, no forced movie.
+    #[test]
+    fn series_latch_without_pin_resolves_show_and_code() {
+        let latch = overrides::Override {
+            scope: overrides::Scope::Series,
+            key: "show".to_string(),
+            title: "Latch Show".to_string(),
+            year: 2011,
+            provider: "tvmaze".to_string(),
+            provider_id: "7".to_string(),
+            poster: "https://example.com/latch-series.jpg".to_string(),
+            media: None,
+            episodes: Vec::new(),
+            created_at_ms: 1_700_000_000_000,
+        };
+        // Season/episode query: the code comes from the query.
+        let query = metadata::Query {
+            kind: metadata::Kind::SERIES,
+            title: "Latch Show".to_string(),
+            season: 1,
+            episode: 2,
+            ..metadata::Query::default()
+        };
+        let res = resolved_from_latch(&latch, &query);
+        assert_eq!(res.series, "Latch Show", "show title");
+        assert_eq!(
+            res.artwork, "https://example.com/latch-series.jpg",
+            "poster"
+        );
+        assert!(!res.is_movie, "a series latch is never a movie");
+        assert_eq!((res.season, res.number), (1, 2), "code from the query");
+        assert!(res.episode_name.is_empty(), "no pin means no episode title");
+        // Absolute query: the absolute number rides along, no season fabricated.
+        let absolute = metadata::Query {
+            kind: metadata::Kind::SERIES,
+            title: "Latch Show".to_string(),
+            episode: 7,
+            absolute: true,
+            ..metadata::Query::default()
+        };
+        let res = resolved_from_latch(&latch, &absolute);
+        assert!(!res.is_movie, "absolute series latch is never a movie");
+        assert_eq!(res.absolute, 7, "absolute from the query");
+        assert_eq!((res.season, res.number), (0, 0), "no fabricated season");
+        // The provisional card composes: the show title (the code never
+        // reaches details), never a panic.
+        let card = presence::compose_card(
+            "Latch.Show.07.1080p.mkv - PotPlayer",
+            None,
+            &res,
+            res.is_movie,
+            &presence::cardspec::default_card_spec(),
+        );
+        assert_eq!(card.details, "Latch Show", "provisional details");
+    }
+
+    /// T1: an explicit series latch beats a movie-classified file on the
+    /// latch path, so `push_activity`'s `is_movie` yields a series card.
+    #[test]
+    fn explicit_series_latch_beats_movie_classified_file() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_dir("latch-beats-movie");
+        let show_dir = root.join("Latch Show");
+        std::fs::create_dir_all(&show_dir).expect("media dirs");
+        let file = show_dir.join("Latch.Movie.2019.1080p.mkv");
+        std::fs::write(&file, "x").expect("media file");
+
+        let store_path = root.join("overrides.json");
+        let mut store = metadata::overrides::Store::empty_at(store_path.clone());
+        store
+            .put(overrides::Override {
+                scope: overrides::Scope::Series,
+                key: show_dir.to_string_lossy().into_owned(),
+                title: "Latch Show".to_string(),
+                year: 2011,
+                provider: "tvmaze".to_string(),
+                provider_id: "7".to_string(),
+                poster: String::new(),
+                media: None,
+                episodes: Vec::new(),
+                created_at_ms: 1_700_000_000_000,
+            })
+            .expect("latch the show folder");
+        let _fixture = OverridesFixture::install(store_path);
+
+        // The filename classifies as a movie, yet the series latch wins.
+        let query = metadata::Query {
+            kind: metadata::Kind::MOVIE,
+            title: "Latch Movie".to_string(),
+            year: 2019,
+            ..metadata::Query::default()
+        };
+        let latched = latch_resolved(&file.to_string_lossy(), true, &query)
+            .expect("the series latch wins over the movie hint");
+        assert!(
+            !latched.is_movie,
+            "is_movie follows the latch, not the filename"
+        );
+        assert_eq!(latched.series, "Latch Show", "the latch's series name");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // T5-C (red first): no idle `Browsing`/`Idle` card, no `Watching
+    // PotFlix`/`Watching PotPlayer`. An idle title (empty/whitespace, the
+    // player app name) or a window with no current file must never send the
+    // idle card: clear instead, record no preview, and keep real media
+    // sending with the stop grace intact.
+    // -----------------------------------------------------------------------
+
+    /// T5-C: the idle-title predicate covers the app names and the empty
+    /// cases (suffix-stripped, trimmed).
+    #[test]
+    fn t5c_idle_title_predicate() {
+        for raw in [
+            "",
+            "   ",
+            "\t\n ",
+            "PotPlayer",
+            "PotFlix",
+            " - PotPlayer",
+            "PotPlayer - PotPlayer",
+            "PotFlix - PotPlayer",
+            "  PotPlayer  ",
+        ] {
+            assert!(
+                is_no_media_title(raw),
+                "idle title {raw:?} must gate, got live"
+            );
+        }
+        for raw in [
+            "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer",
+            "Show.S01E02.Pilot.1080p.mkv - PotPlayer",
+            "Some Movie - PotPlayer",
+        ] {
+            assert!(
+                !is_no_media_title(raw),
+                "real media {raw:?} must not gate, got idle"
+            );
+        }
+    }
+
+    /// T5-C: `push_activity` with an idle raw title sends no card, records no
+    /// preview, and never puts `Browsing`/`Idle` (or the app name) on the
+    /// wire. Any frame it emits must be the null clear.
+    #[test]
+    fn t5c_push_idle_title_sends_no_card() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        for raw in ["PotPlayer", "PotFlix", "", "   "] {
+            let (dc, frx, reader, dir) = live_pipe_harness("t5c-idle-push");
+            let log = Logger::new(dir.join("t5c-idle-push.log"), 0, 1);
+            let mut gate = Gate::new();
+            let previews = std::cell::Cell::new(0);
+            let mut record = |_: config::CardKind,
+                              _: String,
+                              _: Option<presence::Action>,
+                              _: presence::Resolved| {
+                previews.set(previews.get() + 1);
+            };
+            let act = presence::Action {
+                running: true,
+                has_start: true,
+                start: 1_000_000_000_000 - 1000,
+                ct: 1000,
+                ..presence::Action::default()
+            };
+            push_activity(
+                &log,
+                &dc,
+                &mut gate,
+                config::CardSpecs::default(),
+                &mut record,
+                raw,
+                Some(&act),
+                1000,
+                2_832_979,
+                1_000_000_000_000,
+                true,
+                false,
+            );
+            std::thread::sleep(Duration::from_millis(150));
+            let mut frames = Vec::new();
+            while let Ok(payload) = frx.try_recv() {
+                frames.push(payload);
+            }
+            for payload in &frames {
+                let v: serde_json::Value =
+                    serde_json::from_slice(payload).expect("decode frame");
+                assert_eq!(v["cmd"], "SET_ACTIVITY", "raw {raw:?}: {v}");
+                let activity = &v["args"]["activity"];
+                if activity.is_null() {
+                    continue;
+                }
+                let details = activity["details"].as_str().unwrap_or("");
+                let state = activity.get("state").and_then(|s| s.as_str()).unwrap_or("");
+                let name = activity["name"].as_str().unwrap_or("");
+                let text = format!("{name} {details} {state} {v}");
+                assert!(
+                    !text.contains("Browsing")
+                        && !text.contains("Idle")
+                        && !text.contains("PotPlayer")
+                        && !text.contains("PotFlix"),
+                    "raw {raw:?}: idle payload reached the wire: {v}"
+                );
+                panic!("raw {raw:?}: idle title sent a card, want no card (clear only): {v}");
+            }
+            assert_eq!(
+                previews.get(),
+                0,
+                "raw {raw:?}: idle push recorded a preview"
+            );
+            let _ = dc.close();
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// T5-C: real media still sends through the same path (positive control)
+    /// with a preview and no idle lines.
+    #[test]
+    fn t5c_push_real_media_still_sends() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let (dc, frx, reader, dir) = live_pipe_harness("t5c-real-push");
+        let log = Logger::new(dir.join("t5c-real-push.log"), 0, 1);
+        let mut gate = Gate::new();
+        let previews = std::cell::Cell::new(0);
+        let mut record = |_: config::CardKind,
+                          _: String,
+                          _: Option<presence::Action>,
+                          _: presence::Resolved| {
+            previews.set(previews.get() + 1);
+        };
+        const RAW: &str = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: 1_000_000_000_000 - 1000,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            config::CardSpecs::default(),
+            &mut record,
+            RAW,
+            Some(&act),
+            1000,
+            2_832_979,
+            1_000_000_000_000,
+            true,
+            false,
+        );
+        let frame = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("real media must send a card");
+        let v: serde_json::Value = serde_json::from_slice(&frame).expect("decode frame");
+        assert!(
+            !v["args"]["activity"].is_null(),
+            "real media must send a card, got a clear: {v}"
+        );
+        assert_eq!(previews.get(), 1, "real media must record the preview");
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T5-C: a live window titled `PotPlayer` (no media) clears on the real
+    /// poll path with no card and no idle lines.
+    #[test]
+    fn t5c_poll_idle_title_clears_no_card() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        config::set_live_card_specs(config::CardSpecs::default());
+        const NOW: i64 = 1_000_000_000_000;
+        let srv = discord::FakeServer::new(0);
+        let dc = poll_test_client(srv.base.clone());
+        dc.start();
+        let sc = accept_ready(&srv, &dc, 1);
+        let (ftx, frx) = mpsc::channel::<PeerFrame>();
+        let reader = spawn_frame_reader(sc, 1, true, ftx);
+        let dir = unique_dir("t5c-poll-idle");
+        let log = Logger::new(dir.join("t5c-poll-idle.log"), 0, 1);
+        let now_clock = std::cell::Cell::new(NOW);
+        let clock = || now_clock.get();
+        let sleep = |_: Duration| {};
+        let player = ScriptedPlayer::new("PotPlayer");
+        let mut state = PollState::new();
+        player.set(|w| {
+            w.present = true;
+            w.alive = true;
+            w.title = "PotPlayer".to_string();
+            w.status = PlayStatus::RUNNING;
+            w.ct = 1000;
+        });
+        poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        let frames = drain_frames(&frx);
+        assert!(
+            !frames.is_empty(),
+            "idle window must clear (no frames at all)"
+        );
+        for f in &frames {
+            let v: serde_json::Value =
+                serde_json::from_slice(&f.raw).expect("decode frame");
+            if v["args"]["activity"].is_null() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&f.raw).into_owned();
+            assert!(
+                !text.contains("Browsing") && !text.contains("Idle"),
+                "idle window sent a card: {text}"
+            );
+            panic!("idle window sent a card, want clear only: {text}");
+        }
+        assert!(
+            frames.iter().any(|f| f.clear),
+            "idle window must emit the null clear, got {} card frame(s)",
+            frames.len()
+        );
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T5-C: a window with a real-looking title but no current file clears
+    /// instead of parking a card (stopped, so the stop grace is not the path).
+    #[test]
+    fn t5c_poll_window_with_no_file_clears() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        config::set_live_card_specs(config::CardSpecs::default());
+        const RAW: &str = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
+        const NOW: i64 = 1_000_000_000_000;
+        let query = seed_playing_file(RAW, "");
+        assert_eq!(query.kind, metadata::Kind::MOVIE, "movie fixture kind");
+        let srv = discord::FakeServer::new(0);
+        let dc = poll_test_client(srv.base.clone());
+        dc.start();
+        let sc = accept_ready(&srv, &dc, 1);
+        let (ftx, frx) = mpsc::channel::<PeerFrame>();
+        let reader = spawn_frame_reader(sc, 1, true, ftx);
+        let dir = unique_dir("t5c-poll-nofile");
+        let log = Logger::new(dir.join("t5c-poll-nofile.log"), 0, 1);
+        let now_clock = std::cell::Cell::new(NOW);
+        let clock = || now_clock.get();
+        let sleep = |_: Duration| {};
+        let player = ScriptedPlayer::new(RAW);
+        let mut state = PollState::new();
+        player.set(|w| {
+            w.present = true;
+            w.alive = true;
+            w.status = PlayStatus::STOPPED;
+            w.ct = 1250;
+        });
+        poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        let frames = drain_frames(&frx);
+        assert!(
+            !frames.is_empty(),
+            "window with no file must clear (no frames at all)"
+        );
+        for f in &frames {
+            assert!(
+                f.clear,
+                "window with no file must send only the clear, got card: {}",
+                String::from_utf8_lossy(&f.raw)
+            );
+        }
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T5-E: one generation, idle -> clear -> real media -> idle clears
+    /// again. A successful media send re-arms the once-per-generation idle
+    /// clear; without the re-arm the second idle is suppressed and the media
+    /// card stays parked after the media is gone.
+    #[test]
+    fn t5e_idle_media_idle_clears_twice_on_one_generation() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        config::set_live_card_specs(config::CardSpecs::default());
+        const RAW: &str = "Dune.Part.Two.2024.1080p.BluRay.x264.mkv - PotPlayer";
+        const NOW: i64 = 1_000_000_000_000;
+        let query = seed_playing_file(RAW, r"Q:\Media\Dune.Part.Two.2024.1080p.BluRay.x264.mkv");
+        assert_eq!(query.kind, metadata::Kind::MOVIE, "movie fixture kind");
+
+        let srv = discord::FakeServer::new(0);
+        let dc = poll_test_client(srv.base.clone());
+        dc.start();
+        let sc = accept_ready(&srv, &dc, 1);
+        let (ftx, frx) = mpsc::channel::<PeerFrame>();
+        let reader = spawn_frame_reader(sc, 1, true, ftx);
+        let dir = unique_dir("t5e-rearm");
+        let log = Logger::new(dir.join("t5e-rearm.log"), 0, 1);
+        let now_clock = std::cell::Cell::new(NOW);
+        let clock = || now_clock.get();
+        let sleep = |_: Duration| {};
+        let player = ScriptedPlayer::new("PotPlayer");
+        let mut state = PollState::new();
+
+        // Phase 1: idle title on a live window. The first poll clears; the
+        // steady idle followers stay silent (once per generation).
+        player.set(|w| {
+            w.present = true;
+            w.alive = true;
+            w.title = "PotPlayer".to_string();
+            w.status = PlayStatus::RUNNING;
+            w.ct = 1000;
+        });
+        poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        let first = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("phase 1: the first idle must clear");
+        assert!(first.clear && first.conn == 1, "phase 1: want the null clear");
+        for i in 1..=2i64 {
+            now_clock.set(NOW + 250 * i);
+            poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        }
+        let silent = drain_frames(&frx);
+        assert!(
+            silent.is_empty(),
+            "phase 1: idle must clear once per generation, got {} extra frame(s)",
+            silent.len()
+        );
+
+        // Phase 2: real media in the SAME window on the SAME generation. The
+        // card must go out (and re-arm the clear); it must not be a clear and
+        // must not carry idle lines.
+        now_clock.set(NOW + 1000);
+        player.set(|w| {
+            w.title = RAW.to_string();
+            w.status = PlayStatus::RUNNING;
+            w.ct = 2000;
+        });
+        poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        let card = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("phase 2: real media must send a card");
+        assert!(!card.clear, "phase 2: real media must send a card, got a clear");
+        let v: serde_json::Value =
+            serde_json::from_slice(&card.raw).expect("decode the media card");
+        assert!(
+            !v["args"]["activity"].is_null(),
+            "phase 2: the card must be present: {v}"
+        );
+        let text = String::from_utf8_lossy(&card.raw).into_owned();
+        assert!(
+            !text.contains("Browsing") && !text.contains("Idle"),
+            "phase 2: media card carries idle lines: {text}"
+        );
+
+        // Phase 3: back to idle on the same generation. The re-armed clear
+        // must go out again; further idle polls stay silent.
+        now_clock.set(NOW + 1250);
+        player.set(|w| {
+            w.title = "PotPlayer".to_string();
+            w.status = PlayStatus::RUNNING;
+            w.ct = 2250;
+        });
+        poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        let second = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("phase 3: idle after media must clear again");
+        assert!(
+            second.clear && second.conn == 1,
+            "phase 3: want the second null clear on the same generation"
+        );
+        for i in 1..=2i64 {
+            now_clock.set(NOW + 1250 + 250 * i);
+            poll_steps(&log, &dc, &player, &clock, &mut state, &sleep, 1);
+        }
+        let tail = drain_frames(&frx);
+        assert!(
+            tail.is_empty(),
+            "phase 3: the second clear must fire once, got {} extra frame(s)",
+            tail.len()
+        );
+
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
