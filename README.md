@@ -49,10 +49,10 @@ You need Windows, PotPlayer, the Discord desktop app (the web client has no loca
 ## Links
 
 - [Repository](https://github.com/nathwn12/Potflix)
-- [License](LICENSE) (MIT)
 - [Changelog](CHANGELOG.md)
 - [Rust port notes](RUST-PORT.md)
 - [Third-party notices](THIRD-PARTY-NOTICES.md)
+- [License](LICENSE) (MIT)
 
 <!-- nathwn12 house footer: identical in every repo. Do not edit. -->
 <p align="center">
