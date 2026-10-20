@@ -9,7 +9,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{Reply, TestServer};
-use metadata_http::{decode_capped, Cancel, CancelError, Error, HttpClient};
+use metadata_http::{MAX_429_RETRIES, decode_capped, Cancel, CancelError, Error, HttpClient};
 
 #[derive(serde::Deserialize, Debug)]
 struct Meta {
@@ -112,8 +112,8 @@ fn post_json_sends_content_type_and_payload() {
 fn decode_capped_rejects_non_2xx_without_the_body() {
     let server = TestServer::start(vec![Reply::too_many_requests(None)]);
     let client = HttpClient::new(Duration::from_secs(8));
-    // The server answers 429 to every attempt, so the single retry also sees
-    // 429 and `get` hands the response back - exactly one retry, no more.
+    // The server answers 429 to every attempt, so every retry also sees 429
+    // and `get` hands the last response back - bounded, never a loop.
     let response = client
         .get(&Cancel::background(), &server.url("/meta"))
         .expect("429 is a response, not a transport error");
@@ -134,13 +134,30 @@ fn decode_capped_rejects_non_2xx_without_the_body() {
     );
     assert_eq!(
         server.hits(),
-        2,
-        "one initial attempt plus exactly one retry"
+        MAX_429_RETRIES as usize + 1,
+        "one initial attempt plus the bounded retries"
     );
 }
 
-/// Exactly ONE retry, and only on HTTP 429: a 429 followed by a 200 returns
-/// the 200 (http.go:53-96).
+/// A persistent 429 never loops: 1 initial attempt plus exactly
+/// MAX_429_RETRIES retries, then the last 429 is handed back.
+#[test]
+fn persistent_429_stops_after_the_bounded_retries() {
+    let server = TestServer::start(vec![Reply::too_many_requests(None)]);
+    let client = HttpClient::new(Duration::from_secs(8));
+    let response = client
+        .get(&Cancel::background(), &server.url("/meta"))
+        .expect("429 is a response, not a transport error");
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(
+        server.hits(),
+        MAX_429_RETRIES as usize + 1,
+        "retries must be capped"
+    );
+}
+
+/// A 429 followed by a 200 returns the 200: idempotent GETs retry with
+/// backoff and jitter (http.go:53-96).
 #[test]
 fn one_retry_on_429_returns_the_second_response() {
     let server = TestServer::start(vec![
@@ -158,6 +175,93 @@ fn one_retry_on_429_returns_the_second_response() {
         2,
         "one initial attempt plus exactly one retry"
     );
+}
+
+/// A plain POST is NEVER retried, even on 429: POST is not idempotent in
+/// general, so the first 429 is handed back untouched.
+#[test]
+fn post_json_is_never_retried_on_429() {
+    let server = TestServer::start(vec![
+        Reply::too_many_requests(Some("0")),
+        Reply::ok_json("{\"ok\":true}"),
+    ]);
+    let client = HttpClient::new(Duration::from_secs(8));
+    let response = client
+        .post_json(
+            &Cancel::background(),
+            &server.url("/graphql"),
+            &GraphQl { query: "query {Media}" },
+        )
+        .expect("429 is a response, not a transport error");
+    assert_eq!(response.status().as_u16(), 429);
+    assert_eq!(server.hits(), 1, "a non-idempotent POST must not retry");
+}
+
+/// A read-only search POST retries like a GET: the idempotent opt-in exists
+/// for the AniList / JustWatch GraphQL searches, which are side-effect-free.
+#[test]
+fn post_json_idempotent_retries_on_429() {
+    let server = TestServer::start(vec![
+        Reply::too_many_requests(Some("0")),
+        Reply::ok_json("{\"ok\":true}"),
+    ]);
+    let client = HttpClient::new(Duration::from_secs(8));
+    let response = client
+        .post_json_idempotent(
+            &Cancel::background(),
+            &server.url("/graphql"),
+            &GraphQl { query: "query {Media}" },
+        )
+        .expect("fetch");
+    let meta: Meta = decode_capped(response).expect("decode");
+    assert!(meta.ok);
+    assert_eq!(server.hits(), 2, "an idempotent POST retries like a GET");
+}
+
+/// Without `Retry-After` the retry waits for the backoff floor (200 ms plus
+/// up to 100 ms jitter): this check CAN go red, a missing backoff returns
+/// near-instantly.
+#[test]
+fn retry_without_retry_after_waits_for_backoff() {
+    let server = TestServer::start(vec![
+        Reply::too_many_requests(None),
+        Reply::ok_json("{\"ok\":true}"),
+    ]);
+    let client = HttpClient::new(Duration::from_secs(8));
+    let started = Instant::now();
+    let response = client
+        .get(&Cancel::background(), &server.url("/meta"))
+        .expect("fetch");
+    let meta: Meta = decode_capped(response).expect("decode");
+    assert!(meta.ok);
+    assert!(
+        started.elapsed() >= Duration::from_millis(150),
+        "the backoff floor was skipped: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(server.hits(), 2);
+}
+
+/// A 1 s `Retry-After` is honored before the retry succeeds.
+#[test]
+fn retry_after_delays_the_retry() {
+    let server = TestServer::start(vec![
+        Reply::too_many_requests(Some("1")),
+        Reply::ok_json("{\"ok\":true}"),
+    ]);
+    let client = HttpClient::new(Duration::from_secs(8));
+    let started = Instant::now();
+    let response = client
+        .get(&Cancel::background(), &server.url("/meta"))
+        .expect("fetch");
+    let meta: Meta = decode_capped(response).expect("decode");
+    assert!(meta.ok);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "the Retry-After was not honored: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(server.hits(), 2);
 }
 
 /// A 500 is NOT retried: only 429 is (http.go:68-70).
