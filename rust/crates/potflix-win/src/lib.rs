@@ -7,6 +7,7 @@
 //! `windows-sys` is the only FFI path -- no C toolchain.
 
 pub mod brand;
+pub mod search;
 pub mod settings;
 pub mod tray;
 pub mod win32;

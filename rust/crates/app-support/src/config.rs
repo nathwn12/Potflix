@@ -30,7 +30,10 @@
 //!   OMITTED, so an unset/default config still writes `"card": {}`. The legacy
 //!   flat object `{"details": "...", "state": "..."}` still loads (as the
 //!   series spec, movie default). Go's `json:"card,omitempty"` is a no-op for a
-//!   struct, so the key is always written -- matched here.
+//!   struct, so the key is always written -- matched here. Retired Details ids
+//!   (`title`/`series`, which repeat the activity header) migrate to `default`
+//!   on load AND on save, so a stored repeating line resets without losing the
+//!   unrelated lines.
 //!
 //! Go marshals a nil `Dirs` as `null`; this port always writes `[]`, and accepts
 //! `null` on read (Go's `json.Unmarshal` treats a JSON `null` for any non-pointer
@@ -289,7 +292,10 @@ mod de {
     /// shipped config holds (series = that normalized pair, movie = the
     /// shipped default). Absent is handled by serde's `default`; here `null`,
     /// `{}`, and unknown-only objects all load as the all-default
-    /// [`CardSpecs`]. A wrong (non-object) type errors, as before.
+    /// [`CardSpecs`]. A wrong (non-object) type errors, as before. Retired
+    /// Details ids (`title`/`series`, T5-B) migrate to the default per kind so
+    /// a saved repeating line can never reach the card again; every other
+    /// stored id (kept or unknown) survives the load untouched.
     pub fn card<'de, D: Deserializer<'de>>(deserializer: D) -> Result<CardSpecs, D::Error> {
         use serde::de::Error as _;
         let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
@@ -312,13 +318,16 @@ mod de {
                 .transpose()
                 .map_err(D::Error::custom)?
                 .unwrap_or_default();
-            return Ok(CardSpecs { series, movie });
+            return Ok(CardSpecs {
+                series: series.migrated(),
+                movie: movie.migrated(),
+            });
         }
         if map.contains_key("details") || map.contains_key("state") {
             let flat: CardSpec =
                 serde_json::from_value(value).map_err(D::Error::custom)?;
             return Ok(CardSpecs {
-                series: flat.normalized(),
+                series: flat.normalized().migrated(),
                 movie: default_card_spec(),
             });
         }
@@ -558,6 +567,10 @@ pub fn save_config(config: &Config) -> io::Result<()> {
 pub fn save_config_to(path: &Path, config: &Config) -> io::Result<()> {
     let mut out = config.clone();
     out.scan_speed = normalize_scan_speed(&out.scan_speed).to_string();
+    // T5-B: a retired Details id (`title`/`series`) never persists again: the
+    // store migrates it to the default line on save, as on load.
+    out.card.series = out.card.series.migrated();
+    out.card.movie = out.card.movie.migrated();
 
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -795,9 +808,9 @@ mod tests {
             scan_speed: SCAN_SPEED_TURBO.to_string(),
             ..Config::default()
         };
-        assert!(want.set_card_spec("title", "tag"), "first set");
+        assert!(want.set_card_spec("episode", "tag"), "first set");
         assert!(
-            !want.set_card_spec("title", "tag"),
+            !want.set_card_spec("episode", "tag"),
             "same value is unchanged"
         );
 
@@ -807,7 +820,7 @@ mod tests {
         let effective = got.effective_card_spec();
         assert_eq!(
             (effective.details.as_str(), effective.state.as_str()),
-            ("title", "tag")
+            ("episode", "tag")
         );
 
         // Zero value: no migration needed.
@@ -836,7 +849,7 @@ mod tests {
         let details_only = Config {
             card: CardSpecs {
                 series: CardSpec {
-                    details: CARD_DETAILS_TITLE.to_string(),
+                    details: CARD_DETAILS_EPISODE.to_string(),
                     state: String::new(),
                 },
                 movie: CardSpec::default(),
@@ -847,7 +860,7 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode"}}}"#
         );
 
         // State set, details empty: the details key is omitted, and the line
@@ -910,24 +923,24 @@ mod tests {
 
         // (b) Series-only set: the movie object (default) is omitted.
         let mut series_only = Config::default();
-        assert!(series_only.set_card_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(series_only.set_card_line(CardKind::Series, CardLine::Details, "episode"));
         assert!(series_only.set_card_line(CardKind::Series, CardLine::State, "tag"));
         save_config_to(&path, &series_only).expect("saveConfigTo");
         assert_eq!(
             read_wire(&path),
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title","state":"tag"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"tag"}}}"#
         );
 
         // (c) Both kinds set.
         let mut both = Config::default();
-        assert!(both.set_card_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(both.set_card_line(CardKind::Series, CardLine::Details, "episode"));
         assert!(both.set_card_line(CardKind::Series, CardLine::State, "tag"));
         assert!(both.set_card_line(CardKind::Movie, CardLine::Details, "episode"));
         assert!(both.set_card_line(CardKind::Movie, CardLine::State, "synopsis"));
         save_config_to(&path, &both).expect("saveConfigTo");
         assert_eq!(
             read_wire(&path),
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title","state":"tag"},"movie":{"details":"episode","state":"synopsis"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"tag"},"movie":{"details":"episode","state":"synopsis"}}}"#
         );
     }
 
@@ -942,7 +955,7 @@ mod tests {
             scan_speed: SCAN_SPEED_TURBO.to_string(),
             ..Config::default()
         };
-        assert!(want.set_card_line(CardKind::Series, CardLine::Details, "title"));
+        assert!(want.set_card_line(CardKind::Series, CardLine::Details, "episode"));
         assert!(want.set_card_line(CardKind::Series, CardLine::State, "tag"));
         assert!(want.set_card_line(CardKind::Movie, CardLine::Details, "episode"));
         assert!(want.set_card_line(CardKind::Movie, CardLine::State, "synopsis"));
@@ -953,7 +966,7 @@ mod tests {
         assert_eq!(
             got.card.for_kind(CardKind::Series),
             CardSpec {
-                details: CARD_DETAILS_TITLE.to_string(),
+                details: CARD_DETAILS_EPISODE.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
@@ -972,19 +985,20 @@ mod tests {
 
     /// The legacy flat object every shipped config holds loads as series =
     /// that normalized pair and movie = the shipped default, and re-saves as
-    /// the nested series-only shape.
+    /// the nested series-only shape. A retired Details id in the flat object
+    /// migrates to the default (T5-B).
     #[test]
     fn card_legacy_flat_read() {
         let scratch = Scratch::new("config-card-legacy");
         let legacy = scratch.write(
             "legacy-card.json",
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"details":"title","state":"tag"}}"#,
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"details":"episode","state":"tag"}}"#,
         );
         let got = load_config_from(&legacy).expect("load legacy flat card");
         assert_eq!(
             got.card.series,
             CardSpec {
-                details: CARD_DETAILS_TITLE.to_string(),
+                details: CARD_DETAILS_EPISODE.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
@@ -992,7 +1006,7 @@ mod tests {
         assert_eq!(
             got.effective_card_spec(),
             CardSpec {
-                details: CARD_DETAILS_TITLE.to_string(),
+                details: CARD_DETAILS_EPISODE.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
@@ -1007,7 +1021,7 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"title","state":"tag"}}}"#
+            r#"{"dirs":[],"start_with_windows":false,"scan_speed":"turbo","card":{"series":{"details":"episode","state":"tag"}}}"#
         );
     }
 
@@ -1141,6 +1155,60 @@ mod tests {
         // The player is gone: the mirror clears.
         set_live_now_playing(None);
         assert_eq!(live_now_playing(), None);
+    }
+
+    /// T5-B (red first): a stored retired Details id migrates to the default on
+    /// load (nested and legacy flat shapes) and on save, without losing the
+    /// unrelated lines. A save never persists a retired id again, and a reload
+    /// is stable.
+    #[test]
+    fn card_retired_details_ids_migrate_on_load_and_save() {
+        let scratch = Scratch::new("config-card-migrate");
+
+        // Nested shape with retired ids on both kinds; the states survive.
+        let retired = scratch.write(
+            "retired.json",
+            r#"{"dirs":[],"card":{"series":{"details":"title","state":"tag"},"movie":{"details":"series","state":"none"}}}"#,
+        );
+        let got = load_config_from(&retired).expect("load retired card");
+        assert_eq!(got.card.series.details, CARD_DETAILS_DEFAULT);
+        assert_eq!(got.card.series.state, CARD_STATE_TAG);
+        assert_eq!(got.card.movie.details, CARD_DETAILS_DEFAULT);
+        assert_eq!(got.card.movie.state, CARD_STATE_NONE);
+
+        // A save migrates too: the file no longer carries a retired id, and a
+        // reload is stable.
+        let path = store_path(&scratch);
+        let raw = Config {
+            card: CardSpecs {
+                series: CardSpec {
+                    details: "title".to_string(),
+                    state: CARD_STATE_TAG.to_string(),
+                },
+                movie: CardSpec::default(),
+            },
+            ..Config::default()
+        };
+        save_config_to(&path, &raw).expect("saveConfigTo");
+        let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
+        assert!(
+            !wire.contains("\"details\":\"title\"") && !wire.contains("\"details\":\"series\""),
+            "a retired id persisted: {wire}"
+        );
+        let reloaded = load_config_from(&path).expect("loadConfigFrom");
+        assert_eq!(reloaded.card.series.details, CARD_DETAILS_DEFAULT);
+        assert_eq!(reloaded.card.series.state, CARD_STATE_TAG);
+        assert!(reloaded.card.movie.is_default());
+
+        // Legacy flat shape migrates the same way (movie stays default).
+        let legacy = scratch.write(
+            "legacy-retired.json",
+            r#"{"dirs":[],"card":{"details":"series","state":"tag"}}"#,
+        );
+        let got = load_config_from(&legacy).expect("load legacy retired card");
+        assert_eq!(got.card.series.details, CARD_DETAILS_DEFAULT);
+        assert_eq!(got.card.series.state, CARD_STATE_TAG);
+        assert_eq!(got.card.movie, default_card_spec());
     }
 
     /// `set_card_spec` sets BOTH kinds to the same normalized pair.
@@ -1316,7 +1384,8 @@ mod tests {
     /// config shape (`go\config.go:22-30`, flat `card`) with SYNTHETIC values --
     /// parse, migrate, assert no key is lost and no default silently changes.
     /// The legacy flat card loads as the series spec (movie default) and
-    /// re-saves as the nested shape.
+    /// re-saves as the nested shape; its retired `title` details id migrates
+    /// to the default (T5-B) while the `tag` state survives.
     #[test]
     fn go_written_shape_round_trips_without_key_loss() {
         // Synthetic stand-in for a Go-written store: all four keys, non-default
@@ -1333,14 +1402,14 @@ mod tests {
         assert_eq!(
             parsed.effective_card_spec(),
             CardSpec {
-                details: CARD_DETAILS_TITLE.to_string(),
+                details: CARD_DETAILS_DEFAULT.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             }
         );
 
         // Round-trip through the atomic write: the legacy flat card migrates to
-        // the nested shape (series = the pair, movie default = omitted) while
-        // the top-level key set stays exactly the Go contract.
+        // the nested shape (series = the migrated pair, movie default =
+        // omitted) while the top-level key set stays exactly the Go contract.
         let scratch = Scratch::new("config-golden");
         let fixture_path = scratch.write("golden.json", fixture);
         let loaded = load_config_from(&fixture_path).expect("loadConfigFrom");
@@ -1349,7 +1418,7 @@ mod tests {
         let wire = String::from_utf8(std::fs::read(&path).expect("read store")).expect("utf-8");
         assert_eq!(
             wire,
-            r#"{"dirs":["/synth/movies","/synth/shows"],"start_with_windows":true,"scan_speed":"balanced","card":{"series":{"details":"title","state":"tag"}}}"#,
+            r#"{"dirs":["/synth/movies","/synth/shows"],"start_with_windows":true,"scan_speed":"balanced","card":{"series":{"details":"default","state":"tag"}}}"#,
             "legacy flat card must migrate to the nested series shape"
         );
         let wire_value: serde_json::Value = serde_json::from_str(&wire).expect("wire JSON");

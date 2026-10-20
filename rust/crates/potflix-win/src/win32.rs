@@ -42,7 +42,7 @@
 use core::mem::size_of;
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-pub use windows_sys::Win32::Graphics::Gdi as Gdi;
+pub use windows_sys::Win32::Graphics::Gdi;
 
 // ---------------------------------------------------------------------------
 // Binding table (`go\win32.go:8-36`).
@@ -157,8 +157,8 @@ pub fn dpi_awareness() -> i32 {
 // ---------------------------------------------------------------------------
 
 pub use windows_sys::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
-    DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_USE_IMMERSIVE_DARK_MODE,
+    DwmSetWindowAttribute,
 };
 
 /// `DwmSetWindowAttribute` for one 4-byte value, best-effort.
@@ -213,7 +213,7 @@ pub fn apply_dark_caption(hwnd: HWND, caption: u32, text: u32) {
 // ---------------------------------------------------------------------------
 
 pub use windows_sys::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT};
-pub use windows_sys::Win32::UI::WindowsAndMessaging::{SetMenuInfo, MENUINFO};
+pub use windows_sys::Win32::UI::WindowsAndMessaging::{MENUINFO, SetMenuInfo};
 
 /// `InsertMenuItemW` + `MENUITEMINFOW`: the documented owner-draw recipe is an
 /// `MFT_OWNERDRAW` item carrying `dwItemData`, measured in `WM_MEASUREITEM`
@@ -246,8 +246,16 @@ pub const MF_SEPARATOR: u32 = 0x0000_0800;
 pub const ODS_SELECTED: u32 = 0x0001;
 pub const ODS_DISABLED: u32 = 0x0004;
 pub const ODS_HOTLIGHT: u32 = 0x0040;
+/// `ODS_FOCUS` (`0x0010`): the item has the keyboard focus. The Fix match
+/// dialog's owner-drawn buttons read it for the focus ring.
+pub const ODS_FOCUS: u32 = 0x0010;
 /// `ODT_MENU`: the owner-draw request is a menu item.
 pub const ODT_MENU: u32 = 1;
+/// `ODT_LISTBOX` (`2`) / `ODT_BUTTON` (`4`) / `ODT_STATIC` (`5`): the
+/// owner-draw request kinds the Fix match dialog paints (`WM_DRAWITEM`).
+pub const ODT_LISTBOX: u32 = 2;
+pub const ODT_BUTTON: u32 = 4;
+pub const ODT_STATIC: u32 = 5;
 
 // ---------------------------------------------------------------------------
 // GDI+ (`gdiplus.dll`) -- antialiased rounded geometry.
@@ -373,6 +381,23 @@ pub const WS_TAB_STOP: u32 = 0x00010000;
 
 pub const LBS_NOTIFY: u32 = 0x0001;
 pub const BN_CLICKED: u32 = 0;
+/// `BS_OWNERDRAW` (`0x000B`): the Fix match dialog's push buttons paint
+/// themselves in `WM_DRAWITEM` with the main window's button anatomy.
+pub const BS_OWNERDRAW: u32 = 0x000B;
+/// `LBS_OWNERDRAWFIXED` (`0x0010`) / `LBS_HASSTRINGS` (`0x0040`): the Fix match
+/// results list is fixed-height owner-drawn but keeps its strings.
+pub const LBS_OWNERDRAWFIXED: u32 = 0x0010;
+pub const LBS_HASSTRINGS: u32 = 0x0040;
+/// `SS_OWNERDRAW` (`0x000D`): the Fix match empty panel / progress strip /
+/// header rule paint themselves in `WM_DRAWITEM`.
+pub const SS_OWNERDRAW: u32 = 0x000D;
+/// `EN_CHANGE` (`0x0300`): the edit-text-changed notification the Fix match
+/// dialog uses to re-arm Search.
+pub const EN_CHANGE: u32 = 0x0300;
+/// `EN_SETFOCUS` (`0x0100`) / `EN_KILLFOCUS` (`0x0200`): the edit focus
+/// notifications the Fix match dialog uses to repaint its field frames.
+pub const EN_SETFOCUS: u32 = 0x0100;
+pub const EN_KILLFOCUS: u32 = 0x0200;
 
 // List box messages used by the settings window (`go\win32.go:203-209`).
 pub const LB_ADD_STRING: u32 = 0x0180;
@@ -445,6 +470,10 @@ pub const DT_CENTER: u32 = 0x0001;
 pub const DT_RIGHT: u32 = 0x0002;
 pub const DT_V_CENTER: u32 = 0x0004;
 pub const DT_END_ELLIPSIS: u32 = 0x8000;
+/// `DT_EDITCONTROL` (`0x2000`): duplicate the last line's alignment for a
+/// multi-line control. The Fix match empty panel's centered wrap uses it so a
+/// two-line hint centers as one block under its title.
+pub const DT_EDITCONTROL: u32 = 0x2000;
 
 // Pen, blit, icon, cursor, and metrics constants (`go\win32.go:309-326`).
 pub const PS_SOLID: i32 = 0;
@@ -978,6 +1007,7 @@ mod tests {
         assert_eq!(DT_SINGLE_LINE, gdi::DT_SINGLELINE);
         assert_eq!(DT_NO_PREFIX, gdi::DT_NOPREFIX);
         assert_eq!(DT_END_ELLIPSIS, gdi::DT_END_ELLIPSIS);
+        assert_eq!(DT_EDITCONTROL, gdi::DT_EDITCONTROL);
         assert_eq!(PS_SOLID, gdi::PS_SOLID);
         assert_eq!(SRCCOPY, gdi::SRCCOPY);
         assert_eq!(DI_NORMAL, wam::DI_NORMAL);
@@ -997,6 +1027,26 @@ mod tests {
             OPEN_EXISTING,
             windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING
         );
+        // Fix match owner-draw values: the dialog's buttons, list and statics.
+        assert_eq!(ODS_SELECTED, windows_sys::Win32::UI::Controls::ODS_SELECTED);
+        assert_eq!(ODS_DISABLED, windows_sys::Win32::UI::Controls::ODS_DISABLED);
+        assert_eq!(ODS_HOTLIGHT, windows_sys::Win32::UI::Controls::ODS_HOTLIGHT);
+        assert_eq!(ODS_FOCUS, windows_sys::Win32::UI::Controls::ODS_FOCUS);
+        assert_eq!(ODT_MENU, windows_sys::Win32::UI::Controls::ODT_MENU);
+        assert_eq!(ODT_LISTBOX, windows_sys::Win32::UI::Controls::ODT_LISTBOX);
+        assert_eq!(ODT_BUTTON, windows_sys::Win32::UI::Controls::ODT_BUTTON);
+        assert_eq!(ODT_STATIC, windows_sys::Win32::UI::Controls::ODT_STATIC);
+        assert_eq!(LBS_OWNERDRAWFIXED as i32, wam::LBS_OWNERDRAWFIXED);
+        assert_eq!(LBS_HASSTRINGS as i32, wam::LBS_HASSTRINGS);
+        assert_eq!(BS_OWNERDRAW as i32, wam::BS_OWNERDRAW);
+        // `SS_OWNERDRAW` lives behind the `Win32_System_SystemServices`
+        // feature, which this crate does not enable; pin the stable value.
+        assert_eq!(SS_OWNERDRAW, 0x000D);
+        assert_eq!(EN_CHANGE, wam::EN_CHANGE);
+        assert_eq!(EN_SETFOCUS, wam::EN_SETFOCUS);
+        assert_eq!(EN_KILLFOCUS, wam::EN_KILLFOCUS);
+        assert_eq!(WM_DRAWITEM, wam::WM_DRAWITEM);
+        assert_eq!(WM_MEASUREITEM, wam::WM_MEASUREITEM);
     }
 
     #[test]

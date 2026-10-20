@@ -224,8 +224,9 @@ fn card_spec_default_golden_independent() {
         d == "Pilot" && s == "S1 E2",
         "series render = ({d:?}, {s:?}), want (\"Pilot\", \"S1 E2\")"
     );
-    // Movie with canonical override: details is "Title (Year)", state is
-    // genres/length joined (the synopsis lives in the tooltip now).
+    // Movie with canonical override (T5-A): details is the synopsis, state is
+    // year/genres/length joined (the title lives in the header, never on a
+    // body line).
     let (d, s) = def.render(
         "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
         run_action(12345, 1000).as_ref(),
@@ -240,7 +241,7 @@ fn card_spec_default_golden_independent() {
         },
     );
     assert!(
-        d == "Dune: Part Two (2024)" && s == "Sci-Fi \u{b7} 2h 46m",
+        d == "Paul unites the Fremen" && s == "2024 \u{b7} Sci-Fi \u{b7} 2h 46m",
         "movie render = ({d:?}, {s:?}), want goldens"
     );
     // Idle card keeps its shipped lines.
@@ -300,14 +301,17 @@ fn card_spec_unknown_falls_back() {
     }
 }
 
-/// Proves the preset sets stay small, fixed, and default-first (presets, not a
-/// template language).
+/// Proves the offered preset sets stay small, fixed, and default-first
+/// (presets, not a template language). T5-B: the Details row offers only
+/// Default and Episode -- the `title`/`series` presets repeated the activity
+/// header, so they are retired (stored ids migrate; see
+/// `retired_details_ids_migrate_to_default`). States are unchanged.
 #[test]
 fn card_presets_small() {
     let (d, s) = card_presets();
     assert!(
-        d.len() == 4 && s.len() == 4,
-        "presets = {} details + {} states, want 4+4",
+        d.len() == 2 && s.len() == 4,
+        "presets = {} details + {} states, want 2+4",
         d.len(),
         s.len()
     );
@@ -323,6 +327,36 @@ fn card_presets_small() {
             "preset {p:?} has an empty id or label"
         );
     }
+}
+
+/// T5-B (red first): the repeating Details presets are gone from the offered
+/// list. TV and movie both offer only Default (the per-kind default line:
+/// episode title for TV, synopsis for movies) and Episode; `title`/`series`
+/// would repeat the activity header. States keep all four presets.
+#[test]
+fn card_presets_drop_repeating_title_and_series() {
+    let (dets, states) = card_presets();
+    assert_eq!(
+        dets.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        [CARD_DETAILS_DEFAULT, CARD_DETAILS_EPISODE],
+        "offered details presets"
+    );
+    assert!(
+        dets
+            .iter()
+            .all(|p| p.id != CARD_DETAILS_TITLE && p.id != CARD_DETAILS_SERIES),
+        "a retired id is still offered: {dets:?}"
+    );
+    assert_eq!(
+        states.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+        [
+            CARD_STATE_DEFAULT,
+            CARD_STATE_TAG,
+            CARD_STATE_SYNOPSIS,
+            CARD_STATE_NONE
+        ],
+        "offered state presets"
+    );
 }
 
 /// Proves every preset line stays within the 128-unit Discord cap and the paused
@@ -417,6 +451,7 @@ fn card_spec_kind_adapt() {
         ..Resolved::default()
     };
     const MID: &str = " \u{b7} ";
+    const DASH: &str = " - ";
     struct Case {
         name: &'static str,
         raw: &'static str,
@@ -426,14 +461,15 @@ fn card_spec_kind_adapt() {
         want_s: String,
     }
     let mid = |a: &str, b: &str| format!("{a}{MID}{b}");
+    let dash = |a: &str, b: &str| format!("{a}{DASH}{b}");
     let cases = vec![
         Case {
             name: "movie default",
             raw: m_raw,
             res: movie.clone(),
             spec: default_card_spec(),
-            want_d: "Dune: Part Two (2024)",
-            want_s: mid("Sci-Fi", "2h 46m"),
+            want_d: "Paul unites the Fremen",
+            want_s: mid("2024", "Sci-Fi") + MID + "2h 46m",
         },
         Case {
             name: "movie episode keeps base",
@@ -443,8 +479,8 @@ fn card_spec_kind_adapt() {
                 details: CARD_DETAILS_EPISODE.to_string(),
                 state: CARD_STATE_DEFAULT.to_string(),
             },
-            want_d: "Dune: Part Two (2024)",
-            want_s: mid("Sci-Fi", "2h 46m"),
+            want_d: "Paul unites the Fremen",
+            want_s: mid("2024", "Sci-Fi") + MID + "2h 46m",
         },
         Case {
             name: "movie series appends year",
@@ -455,7 +491,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_DEFAULT.to_string(),
             },
             want_d: "Dune: Part Two (2024)",
-            want_s: mid("Sci-Fi", "2h 46m"),
+            want_s: mid("2024", "Sci-Fi") + MID + "2h 46m",
         },
         Case {
             name: "movie title drops year",
@@ -486,7 +522,7 @@ fn card_spec_kind_adapt() {
                 details: CARD_DETAILS_DEFAULT.to_string(),
                 state: CARD_STATE_SYNOPSIS.to_string(),
             },
-            want_d: "Dune: Part Two (2024)",
+            want_d: "Paul unites the Fremen",
             want_s: mid("Sci-Fi", "2h 46m") + MID + "Paul unites the Fremen",
         },
         Case {
@@ -495,8 +531,9 @@ fn card_spec_kind_adapt() {
             res: series.clone(),
             spec: default_card_spec(),
             want_d: "Canonical Episode",
-            // The series default is the tag alone: no synopsis teaser.
-            want_s: "S1 E2".to_string(),
+            // The series default is the code-plus-synopsis line: the episode
+            // title stays on the details line.
+            want_s: dash("S1 E2", "A brave synopsis"),
         },
         Case {
             name: "series episode",
@@ -506,6 +543,8 @@ fn card_spec_kind_adapt() {
                 details: CARD_DETAILS_EPISODE.to_string(),
                 state: CARD_STATE_TAG.to_string(),
             },
+            // No episode code: the title alone, as today; the tag preset keeps
+            // the tag.
             want_d: "Canonical Episode",
             want_s: "S1 E2".to_string(),
         },
@@ -518,7 +557,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_SYNOPSIS.to_string(),
             },
             want_d: "Canonical Series",
-            want_s: mid("S1 E2", "A brave synopsis"),
+            want_s: dash("S1 E2", "A brave synopsis"),
         },
         Case {
             name: "anime default is series branch",
@@ -526,7 +565,7 @@ fn card_spec_kind_adapt() {
             res: anime.clone(),
             spec: default_card_spec(),
             want_d: "The Hero's Rest",
-            want_s: "S1 E1".to_string(),
+            want_s: dash("S1 E1", "An elf mourns"),
         },
         Case {
             name: "anime series ignores year",
@@ -548,7 +587,7 @@ fn card_spec_kind_adapt() {
                 state: CARD_STATE_SYNOPSIS.to_string(),
             },
             want_d: "Frieren",
-            want_s: mid("S1 E1", "An elf mourns"),
+            want_s: dash("S1 E1", "An elf mourns"),
         },
     ];
     for c in &cases {
@@ -605,21 +644,21 @@ fn card_spec_empty_hide() {
     };
     let cases = vec![
         Case {
-            name: "movie tag falls to clean title",
+            name: "movie default details stays empty, tag falls to clean title",
             raw: m_raw,
             act: run.clone(),
             res: bare_movie.clone(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_TAG),
-            want_d: "Dune",
+            want_d: "",
             want_s: "Movie",
         },
         Case {
-            name: "movie synopsis falls to clean title",
+            name: "movie default details stays empty, synopsis falls to clean title",
             raw: m_raw,
             act: run.clone(),
             res: bare_movie.clone(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_SYNOPSIS),
-            want_d: "Dune",
+            want_d: "",
             want_s: "Movie",
         },
         Case {
@@ -628,7 +667,7 @@ fn card_spec_empty_hide() {
             act: run.clone(),
             res: bare_movie.clone(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_NONE),
-            want_d: "Dune",
+            want_d: "",
             want_s: "",
         },
         Case {
@@ -678,7 +717,7 @@ fn card_spec_empty_hide() {
             act: paused.clone(),
             res: bare_movie.clone(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_TAG),
-            want_d: "Dune",
+            want_d: "",
             want_s: "Movie - Paused",
         },
         Case {
@@ -687,7 +726,7 @@ fn card_spec_empty_hide() {
             act: paused.clone(),
             res: bare_movie.clone(),
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_SYNOPSIS),
-            want_d: "Dune",
+            want_d: "",
             want_s: "Movie - Paused",
         },
         Case {
@@ -696,7 +735,7 @@ fn card_spec_empty_hide() {
             act: paused,
             res: bare_movie,
             spec: spec(CARD_DETAILS_DEFAULT, CARD_STATE_NONE),
-            want_d: "Dune",
+            want_d: "",
             want_s: "",
         },
     ];
@@ -710,8 +749,11 @@ fn card_spec_empty_hide() {
             c.want_s
         );
     }
-    // Details never blanks: every preset over every corpus input yields a
-    // non-empty details line (fallbacks keep the base line).
+    // Details never blanks on series lines: every preset over every corpus
+    // input yields a non-empty details line (fallbacks keep the base line). A
+    // movie default-following line (default/episode, or series with no
+    // canonical title) may stay empty by design (T5-A: never repeat the
+    // title), so movies are exempt.
     let (dets, states) = card_presets();
     for c in card_spec_cases() {
         for d in &dets {
@@ -722,7 +764,7 @@ fn card_spec_empty_hide() {
                 }
                 .render(&c.raw, c.act.as_ref(), &c.res);
                 assert!(
-                    !gd.is_empty(),
+                    !gd.is_empty() || c.res.is_movie,
                     "{} {}/{}: details blank, want fallback to base",
                     c.name,
                     d.id,
@@ -804,15 +846,15 @@ fn card_spec_serde_matches_go_omitempty() {
     assert!(parsed.is_default(), "and normalizes to the default");
 }
 
-/// The default state carries no synopsis on either kind: the movie state is
-/// genres-plus-length and the series state is the episode tag alone, while the
-/// hover tooltip keeps the whole note. Drives the real builder for a movie and
+/// The default state carries the synopsis on a series (code plus synopsis)
+/// while the movie state is year/genres/length (T5-A) and the movie tooltip is
+/// omitted so the synopsis is not repeated; the series tooltip keeps the whole
+/// note. Drives the real builder for a movie and
 /// a series, and the default spec must agree byte-for-byte with the builder on
-/// both. Also pins the never-blank tail: a movie with no genres/length/year
-/// still renders a non-empty line (the clean title, preferred over the
-/// synopsis).
+/// both. Also pins the T5-A tail: a bare movie default stays empty on both
+/// lines rather than repeating the title.
 #[test]
-fn default_state_carries_no_synopsis() {
+fn default_state_carries_synopsis_for_series() {
     let run = Action {
         running: true,
         has_start: true,
@@ -834,15 +876,15 @@ fn default_state_carries_no_synopsis() {
         Some(&run),
         &movie,
     );
-    assert_eq!(got.state, "Sci-Fi \u{b7} 2h 46m", "movie state");
+    assert_eq!(got.state, "2024 \u{b7} Sci-Fi \u{b7} 2h 46m", "movie state");
     assert!(
         !got.state.contains("Paul unites the Fremen"),
         "movie state duplicates the synopsis: {:?}",
         got.state
     );
     assert_eq!(
-        got.large_text, "Paul unites the Fremen",
-        "movie tooltip must still carry the synopsis"
+        got.large_text, "",
+        "movie tooltip is omitted so the synopsis is not repeated"
     );
     let (d, s) = default_card_spec().render(
         "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
@@ -865,10 +907,14 @@ fn default_state_carries_no_synopsis() {
         Some(&run),
         &series,
     );
-    assert_eq!(got.state, "S1 E2", "series state");
+    assert_eq!(got.details, "Canonical Episode", "series details");
+    assert_eq!(
+        got.state, "S1 E2 - A brave synopsis",
+        "series state"
+    );
     assert!(
-        !got.state.contains("A brave synopsis"),
-        "series default state must not carry the synopsis: {:?}",
+        got.state.contains("A brave synopsis"),
+        "series default state must carry the synopsis: {:?}",
         got.state
     );
     assert_eq!(
@@ -885,22 +931,23 @@ fn default_state_carries_no_synopsis() {
         (got.details.as_str(), got.state.as_str()),
         "default spec must agree with the builder"
     );
-    // The never-blank tail: no genres, no length, no year still yields a
-    // non-empty state -- the clean filename title, preferred over the
-    // synopsis, which stays in the tooltip.
+    // The T5-A tail: a bare movie default stays empty rather than repeating
+    // the title -- the synopsis, when present, leads the details line, and
+    // the tooltip stays omitted.
     let bare_movie = Resolved {
         is_movie: true,
         synopsis: "Paul unites the Fremen".to_string(),
         ..Resolved::default()
     };
     let got = build_activity_resolved("Movie.mkv - PotPlayer", Some(&run), &bare_movie);
-    assert_eq!(got.state, "Movie", "bare movie state");
+    assert_eq!(got.details, "Paul unites the Fremen", "bare movie details");
+    assert_eq!(got.state, "", "bare movie state stays empty");
     assert!(
         !got.state.contains("Paul unites the Fremen"),
-        "bare movie state must prefer the clean title over the synopsis: {:?}",
+        "bare movie state must not duplicate the synopsis: {:?}",
         got.state
     );
-    assert_eq!(got.large_text, "Paul unites the Fremen", "bare movie tooltip");
+    assert_eq!(got.large_text, "", "bare movie tooltip stays omitted");
     let (d, s) = default_card_spec().render("Movie.mkv - PotPlayer", Some(&run), &bare_movie);
     assert_eq!(
         (d.as_str(), s.as_str()),
@@ -910,8 +957,8 @@ fn default_state_carries_no_synopsis() {
 }
 
 /// The explicitly chosen Synopsis preset still renders the synopsis inline --
-/// the default no longer does -- joined after the tag for a series, within the
-/// 72-unit [`STATE_SYNOPSIS_BUDGET`].
+/// and the series default now agrees with it -- joined after the tag for a
+/// series, within the 72-unit [`STATE_SYNOPSIS_BUDGET`].
 #[test]
 fn synopsis_preset_renders_inline() {
     let run = Action {
@@ -935,7 +982,7 @@ fn synopsis_preset_renders_inline() {
             ..Resolved::default()
         },
     );
-    assert_eq!(s, "S1 E2 \u{b7} A brave synopsis", "series preset state");
+    assert_eq!(s, "S1 E2 - A brave synopsis", "series preset state");
     let n = java_units(&s);
     assert!(
         n <= STATE_SYNOPSIS_BUDGET,
@@ -990,7 +1037,7 @@ fn synopsis_preset_keeps_old_line_shapes() {
     );
     assert_eq!(
         s,
-        "S2 E4 \u{b7} Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}",
+        "S2 E4 - Allsafe is controlled; the Dark Army is ready to meet Elliot\u{2026}",
         "semicolon-cut preset state"
     );
     // Long movie line ends on a whole word with the terminator.
@@ -1279,8 +1326,11 @@ fn slot_completeness_gate() {
                                 !card.name.is_empty(),
                                 "{ctx}: name blank"
                             );
+                            // T5-A: a bare movie default stays empty rather
+                            // than repeating the title, and the movie tooltip
+                            // is omitted so the synopsis is not repeated.
                             assert!(
-                                !card.details.is_empty(),
+                                !card.details.is_empty() || kind.is_movie,
                                 "{ctx}: details blank"
                             );
                             assert!(
@@ -1288,7 +1338,7 @@ fn slot_completeness_gate() {
                                 "{ctx}: large_image blank"
                             );
                             assert!(
-                                !card.large_text.is_empty(),
+                                !card.large_text.is_empty() || kind.is_movie,
                                 "{ctx}: large_text blank"
                             );
                             if poster {
@@ -1306,6 +1356,19 @@ fn slot_completeness_gate() {
                                 assert!(
                                     card.state.is_empty(),
                                     "{ctx}: none state = {:?}, want empty",
+                                    card.state
+                                );
+                            } else if kind.is_movie
+                                && spreset == CARD_STATE_DEFAULT
+                                && card.state.is_empty()
+                            {
+                                // T5-A: a movie default with no year, genres or
+                                // runtime stays empty (paused still reads
+                                // "Paused" through the composer, so an empty
+                                // state here is always the playing card).
+                                assert!(
+                                    playing,
+                                    "{ctx}: paused bare movie state = {:?}, want Paused",
                                     card.state
                                 );
                             } else {
@@ -1355,11 +1418,17 @@ fn slot_completeness_gate() {
                             if (vlabel == "nospace" || vlabel == "cjk")
                                 && spreset != CARD_STATE_NONE
                             {
-                                assert!(
-                                    card.large_text.ends_with('\u{2026}'),
-                                    "{ctx}: large_text = {:?}, want trailing ellipsis",
-                                    card.large_text
-                                );
+                                // T5-A: the movie tooltip is omitted, so only
+                                // series/anime tooltips pin the ellipsis here;
+                                // a synopsis-bearing movie state still pins it
+                                // below through `state_carries_synopsis`.
+                                if !kind.is_movie {
+                                    assert!(
+                                        card.large_text.ends_with('\u{2026}'),
+                                        "{ctx}: large_text = {:?}, want trailing ellipsis",
+                                        card.large_text
+                                    );
+                                }
                                 if state_carries_synopsis(&card.state, &res.synopsis) {
                                     if playing {
                                         assert!(
@@ -1379,7 +1448,12 @@ fn slot_completeness_gate() {
                             // Sentence-end pin: the tooltip cut lands on `.`
                             // followed by a space, so it keeps the complete
                             // sentence with its own terminator and no ellipsis.
-                            if vlabel == "sentence" && spreset != CARD_STATE_NONE {
+                            // Movies omit the tooltip (T5-A), so only
+                            // series/anime pin it.
+                            if vlabel == "sentence"
+                                && spreset != CARD_STATE_NONE
+                                && !kind.is_movie
+                            {
                                 let want = "x".repeat(120) + ".";
                                 assert_eq!(
                                     card.large_text, want,
@@ -1398,12 +1472,18 @@ fn slot_completeness_gate() {
                             // paused marker, or a sentence terminator with no
                             // ellipsis).
                             if !res.synopsis.is_empty() {
-                                assert_gate_signal(
-                                    "large_text",
-                                    &card.large_text,
-                                    &res.synopsis,
-                                    &ctx,
-                                );
+                                // T5-A: the movie tooltip is omitted, so only
+                                // series/anime tooltips signal against the
+                                // synopsis source; movie synopsis-bearing
+                                // states still signal below.
+                                if !kind.is_movie {
+                                    assert_gate_signal(
+                                        "large_text",
+                                        &card.large_text,
+                                        &res.synopsis,
+                                        &ctx,
+                                    );
+                                }
                                 if spreset != CARD_STATE_NONE
                                     && state_carries_synopsis(&card.state, &res.synopsis)
                                 {
@@ -1533,5 +1613,125 @@ fn assert_gate_signal(slot: &str, line: &str, synopsis: &str, ctx: &str) {
         (line.ends_with('.') || line.ends_with('!') || line.ends_with('?'))
             && !line.contains('\u{2026}'),
         "{ctx}: {slot} shorter than its source without a signal: {line:?}"
+    );
+}
+
+/// T5-B (red first): a stored retired Details id migrates to the default line
+/// without touching anything else. `title`/`series` details become `default`;
+/// kept ids, unknown ids and every state line survive byte-for-byte, so the
+/// migration can never lose an unrelated spec.
+#[test]
+fn retired_details_ids_migrate_to_default() {
+    let migrated = |details: &str, state: &str| {
+        CardSpec {
+            details: details.to_string(),
+            state: state.to_string(),
+        }
+        .migrated()
+    };
+    let def = |state: &str| CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: state.to_string(),
+    };
+    assert_eq!(migrated("title", "tag"), def(CARD_STATE_TAG));
+    assert_eq!(migrated("series", "none"), def(CARD_STATE_NONE));
+    assert_eq!(
+        migrated("title", "synopsis"),
+        def(CARD_STATE_SYNOPSIS),
+        "a retired details id migrates even beside a kept state"
+    );
+    // Kept ids are untouched.
+    assert_eq!(
+        migrated("episode", "tag"),
+        CardSpec {
+            details: CARD_DETAILS_EPISODE.to_string(),
+            state: CARD_STATE_TAG.to_string(),
+        }
+    );
+    assert_eq!(migrated("default", "default"), default_card_spec());
+    // Unknown ids are NOT migration input: they stay stored (the renderer
+    // still falls back per line), so a future preset id is never destroyed.
+    assert_eq!(
+        migrated("fancy-template", "tag"),
+        CardSpec {
+            details: "fancy-template".to_string(),
+            state: CARD_STATE_TAG.to_string(),
+        }
+    );
+    // Migration is idempotent.
+    assert_eq!(def(CARD_STATE_TAG).migrated(), def(CARD_STATE_TAG));
+}
+
+/// T5-B: the four kept line combos still compose through the real composer --
+/// the T4 TV shapes and the T5-A movie shapes. Series default, series
+/// episode+synopsis, movie default, movie synopsis state: no body line repeats
+/// the header title.
+#[test]
+fn kept_line_combos_compose_without_repeating_the_header() {
+    const SERIES_RAW: &str = "Show.S01E02.Pilot.1080p.mkv - PotPlayer";
+    const MOVIE_RAW: &str = "Dune.Part.Two.2024.1080p.mkv - PotPlayer";
+    let run = Action {
+        running: true,
+        has_start: true,
+        start: 12345,
+        ct: 1000,
+        ..Action::default()
+    };
+    let series = Resolved {
+        series: "Canonical Series".to_string(),
+        episode_name: "Canonical Episode".to_string(),
+        synopsis: "A brave synopsis".to_string(),
+        season: 1,
+        number: 2,
+        ..Resolved::default()
+    };
+    let movie = Resolved {
+        series: "Dune: Part Two".to_string(),
+        year: 2024,
+        is_movie: true,
+        genres: "Sci-Fi".to_string(),
+        length: "2h 46m".to_string(),
+        synopsis: "Paul unites the Fremen".to_string(),
+        ..Resolved::default()
+    };
+    // 1. Series default: episode title over the code-plus-synopsis line.
+    let card = compose_card(SERIES_RAW, Some(&run), &series, false, &default_card_spec());
+    assert_eq!(card.details, "Canonical Episode", "series default details");
+    assert_eq!(card.state, "S01E02 - A brave synopsis", "series default state");
+    // 2. Series episode+synopsis: the same kept lines, chosen explicitly.
+    let kept = CardSpec {
+        details: CARD_DETAILS_EPISODE.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
+    let card = compose_card(SERIES_RAW, Some(&run), &series, false, &kept);
+    assert_eq!(
+        (card.details.as_str(), card.state.as_str()),
+        ("Canonical Episode", "S01E02 - A brave synopsis"),
+        "series episode+synopsis"
+    );
+    // 3. Movie default (T5-A): synopsis over year/genres/runtime.
+    let card = compose_card(MOVIE_RAW, Some(&run), &movie, true, &default_card_spec());
+    assert_eq!(card.details, "Paul unites the Fremen", "movie default details");
+    assert_eq!(
+        card.state, "2024 \u{b7} Sci-Fi \u{b7} 2h 46m",
+        "movie default state"
+    );
+    assert_eq!(card.name, "Dune: Part Two", "the header keeps the title");
+    assert!(
+        !card.details.contains("Dune") && !card.state.contains("Dune"),
+        "movie default must not repeat the header: {:?}",
+        (&card.details, &card.state)
+    );
+    // 4. Movie synopsis state: the same default details under the kept
+    // synopsis line.
+    let kept = CardSpec {
+        details: CARD_DETAILS_DEFAULT.to_string(),
+        state: CARD_STATE_SYNOPSIS.to_string(),
+    };
+    let card = compose_card(MOVIE_RAW, Some(&run), &movie, true, &kept);
+    assert_eq!(
+        card.state,
+        "Sci-Fi \u{b7} 2h 46m \u{b7} Paul unites the Fremen",
+        "movie synopsis state"
     );
 }

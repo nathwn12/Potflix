@@ -591,6 +591,16 @@ pub struct Resolved {
     pub year: i32,
     /// True: movie card lines; false: series card lines.
     pub is_movie: bool,
+    /// Season number of the playing episode; <=0 = unknown. Filled from the
+    /// latch pin or query ([`crate::episode_code`]'s `Sxx` half) and from the
+    /// resolver answer; never fabricated from an absolute number.
+    pub season: i64,
+    /// Episode number within the season; <=0 = unknown. The `Exx` half.
+    pub number: i32,
+    /// Absolute/anime episode number; <=0 = absent. Renders `E02` only when
+    /// `season`/`number` carry no code, so an absolute episode never grows a
+    /// season it was never given.
+    pub absolute: i32,
     /// Ignored: the pristine card carries no links.
     pub buttons: Vec<Button>,
 }
@@ -920,9 +930,14 @@ fn compose_name_inner(raw_title: &str, r: &Resolved) -> String {
     }
 }
 
-/// The hover slot: the whole synopsis (word-aware, [`LARGE_TEXT_BUDGET`]), else
-/// the canonical series title, else "PotFlix".
-fn compose_large_text_inner(r: &Resolved) -> String {
+/// The hover slot: series carry the whole synopsis (word-aware,
+/// [`LARGE_TEXT_BUDGET`]), else the canonical series title, else "PotFlix".
+/// Movies omit the tooltip (`""`, dropped on the wire) so the synopsis is not
+/// repeated: it already lives on the details line.
+fn compose_large_text_inner(r: &Resolved, is_movie: bool) -> String {
+    if is_movie {
+        return String::new();
+    }
     let s = trim_word(&r.synopsis, LARGE_TEXT_BUDGET);
     if !s.is_empty() {
         return s;
@@ -1007,7 +1022,10 @@ fn rung_synopsis_alone(r: &Resolved, a: Option<&Action>) -> String {
     }
 }
 
-/// One state-ladder rung: the movie year, or "" when `year <= 0`.
+/// One state-ladder rung: the movie year, or "" when `year <= 0`. Retained for
+/// compatibility (the T5-A movie default joins year/genres/length inline); the
+/// `tag` preset path still documents the single-year shape.
+#[allow(dead_code)]
 fn rung_year(r: &Resolved, a: Option<&Action>) -> String {
     if r.year <= 0 {
         return String::new();
@@ -1043,12 +1061,69 @@ fn rung_clean_title(raw_title: &str, a: Option<&Action>) -> String {
     }
 }
 
-/// The details fill ladder (never blank outside idle). Series: the canonical
-/// episode name, else the filename episode line (name, else tag, else clean
-/// title). Movie: `Title (YYYY)` when `year > 0`, else the title, else the
-/// filename line. The `title` preset is the header identity; `episode` is the
-/// episode name else the ladder; `series` is the canonical series (`(YYYY)`
-/// appended for a movie) else the ladder; `default` is today's behavior.
+/// The one `SxxExx` formatter (T1): season+number renders `S01E02`
+/// (zero-padded to at least two digits, so `S12E34` and `S00E03` for a
+/// provider-supplied season-0 special); an absolute-only episode renders
+/// `E02` and never fabricates a season; a tag already matching `SxxExx`
+/// (compact, case-insensitive, no space) passes through normalized; anything
+/// with no usable number or season yields `""` and the caller falls back, so
+/// a missing number/season omits the code instead of inventing one.
+pub(crate) fn episode_code(season: i64, number: i32, absolute: i32, tag: &str) -> String {
+    if season > 0 && number > 0 {
+        return format!("S{season:02}E{number:02}");
+    }
+    if season == 0 && number > 0 {
+        return format!("S00E{number:02}");
+    }
+    if absolute > 0 {
+        return format!("E{absolute:02}");
+    }
+    passthrough_sxxexx(tag).unwrap_or_default()
+}
+
+/// A tag already shaped `SxxExx` passes through normalized (`s1e2` becomes
+/// `S01E02`); anything else -- the spaced `S1 E2` filename tag, an episode
+/// name, an empty tag -- is `None` and keeps the current tag behavior at the
+/// call site. Hand-rolled: the workspace forbids a regex crate here.
+fn passthrough_sxxexx(tag: &str) -> Option<String> {
+    let rest = tag
+        .trim()
+        .strip_prefix('S')
+        .or(tag.trim().strip_prefix('s'))?;
+    let (season_digits, rest) = split_digits(rest)?;
+    let rest = rest.strip_prefix('E').or(rest.strip_prefix('e'))?;
+    let (number_digits, rest) = split_digits(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let season: u32 = season_digits.parse().ok()?;
+    let number: u32 = number_digits.parse().ok()?;
+    Some(format!("S{season:02}E{number:02}"))
+}
+
+/// Splits leading ASCII digits off `s`; `None` when there are none.
+fn split_digits(s: &str) -> Option<(&str, &str)> {
+    let n = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if n == 0 {
+        return None;
+    }
+    Some(s.split_at(n))
+}
+
+/// The details fill ladder (never blank outside idle, except a bare movie with
+/// no synopsis/year/genres/length, which stays empty rather than repeating the
+/// title). Series `default` is
+/// the canonical episode title, falling back to the show title, the clean
+/// title, then the raw title in that order when a part is missing; the
+/// episode code never appears here (the show title lives in the header).
+/// Series `episode` is the episode title alone. `title`/`series` keep their
+/// current meanings and never add a second code. Movie `default` is the
+/// synopsis (word-aware, [`DETAILS_BUDGET`]), never the title and never
+/// `Title (Year)`; with no synopsis it falls back to the year when `year > 0`,
+/// else genres/length joined with [`JOINER`], else empty -- never the movie
+/// title (the title is the activity header/pill). Movie `title`/`series`
+/// branches keep their current meanings for compatibility, but the movie
+/// default never uses them. Movie branches never consult the episode code.
 pub(crate) fn compose_details_for(
     raw_title: &str,
     r: &Resolved,
@@ -1059,15 +1134,14 @@ pub(crate) fn compose_details_for(
     let c = clean(raw);
     let clean_title = trunc(&c.title, DETAILS_BUDGET);
     let file_ep = trunc(&c.episode_name, DETAILS_BUDGET);
-    let file_tag = trunc(&c.episode_tag, DETAILS_BUDGET);
-    let mut file_line = clean_title.clone();
+    // Series default skips the spaced filename tag: show → episode title →
+    // clean title → raw.
+    let mut series_file_line = clean_title.clone();
     if !file_ep.is_empty() {
-        file_line = file_ep;
-    } else if !file_tag.is_empty() {
-        file_line = file_tag;
+        series_file_line = file_ep;
     }
-    if file_line.is_empty() {
-        file_line = rp_text(raw.trim(), DETAILS_BUDGET);
+    if series_file_line.is_empty() {
+        series_file_line = rp_text(raw.trim(), DETAILS_BUDGET);
     }
     let canonical_ep = if r.episode_name.is_empty() {
         String::new()
@@ -1084,16 +1158,45 @@ pub(crate) fn compose_details_for(
     } else {
         canonical_series.clone()
     };
-    let default_line = if is_movie {
-        if !canonical_series.is_empty() {
-            canonical_series_year.clone()
+    // The episode code never reaches the details line; movies never consult
+    // it either.
+    // T5-A: the movie default is the synopsis, never the title. Fallback is
+    // the year, else genres/length, else empty -- never the title.
+    let movie_synopsis_default = trim_word(&r.synopsis, DETAILS_BUDGET);
+    let movie_genres_length_default = {
+        let g = rp_text(&r.genres, HUGE);
+        let l = rp_text(&r.length, HUGE);
+        let mut parts: Vec<&str> = Vec::new();
+        if !g.is_empty() {
+            parts.push(&g);
+        }
+        if !l.is_empty() {
+            parts.push(&l);
+        }
+        let joined = parts.join(JOINER);
+        if joined.is_empty() {
+            String::new()
         } else {
-            file_line.clone()
+            trim_word(&joined, DETAILS_BUDGET)
+        }
+    };
+    let movie_fallback_default = if r.year > 0 {
+        r.year.to_string()
+    } else {
+        movie_genres_length_default.clone()
+    };
+    let default_line = if is_movie {
+        if !movie_synopsis_default.is_empty() {
+            movie_synopsis_default.clone()
+        } else {
+            movie_fallback_default.clone()
         }
     } else if !canonical_ep.is_empty() {
         canonical_ep.clone()
+    } else if !canonical_series.is_empty() {
+        canonical_series.clone()
     } else {
-        file_line.clone()
+        series_file_line.clone()
     };
     match details_preset {
         cardspec::CARD_DETAILS_TITLE => {
@@ -1105,7 +1208,9 @@ pub(crate) fn compose_details_for(
             }
         }
         cardspec::CARD_DETAILS_EPISODE => {
-            if !canonical_ep.is_empty() {
+            if is_movie {
+                default_line
+            } else if !canonical_ep.is_empty() {
                 canonical_ep
             } else {
                 default_line
@@ -1123,15 +1228,19 @@ pub(crate) fn compose_details_for(
 }
 
 /// The state fill ladder (first non-empty rung wins; only `none` may empty the
-/// line). Series: `default` is the tag alone, else the clean title, else the
-/// synopsis only as the last resort so the line can never go empty; `tag` is
-/// tag, else synopsis, else clean; `synopsis` is tag-plus-synopsis, else tag,
-/// else clean. Movie: `default` is genres-plus-length, else the year, else the
-/// clean title, else the synopsis only as the last resort; `tag` is the
-/// filename tag, else genres-plus-length, else synopsis, else clean;
-/// `synopsis` is genres-length-plus-synopsis, else synopsis, else clean. Every
-/// rung carries the paused marker when paused; paused with nothing reads
-/// "Paused".
+/// line, plus a bare movie default with no year/genres/length, which stays
+/// empty rather than repeating the title). Series: `default` is the synopsis line -- the `SxxExx` code plus the
+/// synopsis (the raw tag when no code is available), capped word-aware at
+/// [`STATE_SYNOPSIS_BUDGET`] -- else the tag, else the clean title, so the
+/// line can never go blank; it never carries the episode title (that lives on
+/// the details line). `tag` is tag, else synopsis, else clean; `synopsis` is
+/// the same code-plus-synopsis line, else tag, else clean. Movie `default`
+/// is `<Year> · <Genres> · <Runtime>` (missing parts skipped, word-aware at
+/// [`STATE_BUDGET`]), never the title; with nothing known it stays empty.
+/// Movie `tag` is the filename tag, else
+/// genres-plus-length, else synopsis, else clean; `synopsis` is
+/// genres-length-plus-synopsis, else synopsis, else clean. Every rung carries
+/// the paused marker when paused; paused with nothing reads "Paused".
 pub(crate) fn compose_state_for(
     raw_title: &str,
     a: Option<&Action>,
@@ -1185,22 +1294,40 @@ pub(crate) fn compose_state_for(
                 }
             }
             _ => {
-                let gl = rung_genres_length(r, a);
-                if !gl.is_empty() {
-                    return gl;
+                // T5-A: the movie default joins year, genres and runtime with
+                // the middle-dot joiner, skipping missing parts, never the
+                // title. Bare movies (nothing known) stay empty.
+                let y_full = if r.year > 0 {
+                    r.year.to_string()
+                } else {
+                    String::new()
+                };
+                let g_full = rp_text(&r.genres, HUGE);
+                let l_full = rp_text(&r.length, HUGE);
+                let mut parts: Vec<&str> = Vec::new();
+                if !y_full.is_empty() {
+                    parts.push(&y_full);
                 }
-                let year = rung_year(r, a);
-                if !year.is_empty() {
-                    return year;
+                if !g_full.is_empty() {
+                    parts.push(&g_full);
                 }
-                if !clean.is_empty() {
-                    return clean;
+                if !l_full.is_empty() {
+                    parts.push(&l_full);
                 }
-                // Never blank: the synopsis is the very last resort, only
-                // reached when even the clean title yields nothing.
-                if !synopsis.is_empty() {
-                    return synopsis;
+                let joined = parts.join(JOINER);
+                if joined.is_empty() {
+                    if paused {
+                        return with_state_time("", PAUSED_MARKER);
+                    }
+                    return String::new();
                 }
+                if paused {
+                    return with_state_time(
+                        &trim_word(&joined, STATE_BUDGET - PAUSED_MARKER.len()),
+                        PAUSED_MARKER,
+                    );
+                }
+                return trim_word(&joined, STATE_BUDGET);
             }
         }
     } else {
@@ -1228,16 +1355,18 @@ pub(crate) fn compose_state_for(
                 }
             }
             _ => {
+                // T4: the default is the synopsis line (the `synopsis`
+                // preset's combined rung): the code plus the synopsis where
+                // known, else the tag, else the clean title. The episode
+                // title never appears here; it lives on the details line.
+                if !combined.is_empty() {
+                    return combined;
+                }
                 if !tag.is_empty() {
                     return tag;
                 }
                 if !clean.is_empty() {
                     return clean;
-                }
-                // Never blank: the synopsis is the very last resort, only
-                // reached when even the clean title yields nothing.
-                if !synopsis.is_empty() {
-                    return synopsis;
                 }
             }
         }
@@ -1249,8 +1378,9 @@ pub(crate) fn compose_state_for(
 }
 
 /// The single card composer the app's push path and the Card-view preview both
-/// call (`presence.go:662`): one always-filled card with a per-kind fill
-/// ladder, so a card never ships an empty body line. `is_movie` drives the
+/// call (`presence.go:662`): one card with a per-kind fill
+/// ladder (a bare movie default with no synopsis/year/genres/length stays
+/// empty rather than repeating the title). `is_movie` drives the
 /// kind branches; the idle card keeps its shipped lines under any spec.
 pub fn compose_card(
     raw_title: &str,
@@ -1277,7 +1407,7 @@ pub fn compose_card(
         details,
         state,
         large_image: compose_large_image_inner(r),
-        large_text: compose_large_text_inner(r),
+        large_text: compose_large_text_inner(r, is_movie),
         paused: a.is_some_and(|x| x.paused),
         ..Activity::default()
     };
@@ -1296,23 +1426,27 @@ pub fn compose_card(
 /// [`compose_card`] with the stored kind and the shipped default spec
 /// (`presence.go:662`).
 ///
-/// Movie (`r.is_movie`): details is the canonical title with " (YYYY)" when
-/// `year > 0`, else the filename line; state is genres-plus-length, else the
-/// year, else the clean title, else the synopsis only as the last resort, so
-/// the line is never blank. Series: details is the episode override when
-/// present (else the filename-derived line); state is the episode tag alone,
-/// else the clean title, else the synopsis only as the last resort. The hover
-/// tooltip carries the whole synopsis; the paused " - Paused" marker path is
-/// preserved on every rung.
+/// Movie (`r.is_movie`): details is the synopsis (word-aware at 128), else the
+/// year when `year > 0`, else genres/length, else empty -- never the title
+/// (the title is the header/pill); state is `<Year> · <Genres> · <Runtime>`
+/// with missing parts skipped, never the title; the tooltip is omitted (empty)
+/// so the synopsis is not repeated. Series: details is the episode title, else the
+/// show title, else the filename-derived line (never the episode code: the
+/// show title lives in the header); state is the `SxxExx` code plus the
+/// synopsis (the synopsis-preset line at [`STATE_SYNOPSIS_BUDGET`]), else the
+/// episode tag, else the clean title. The series hover tooltip carries the whole synopsis; the paused
+/// " - Paused" marker path is preserved on every rung.
 pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved) -> Activity {
     compose_card(raw_title, a, r, r.is_movie, &cardspec::default_card_spec())
 }
 
 /// The synopsis-bearing state line: a movie joins genres, length and the
-/// synopsis with " \u{b7} ", a series joins the episode tag and the synopsis
-/// the same way, both capped word-aware at [`STATE_SYNOPSIS_BUDGET`]. It backs
+/// synopsis with " \u{b7} "; a series joins the `SxxExx` episode code (the
+/// raw episode tag when no code is available) and the synopsis with a literal
+/// `" - "`, both capped word-aware at [`STATE_SYNOPSIS_BUDGET`]. It backs
 /// the combined rung of the [`compose_state_for`] ladder under the
-/// [`cardspec::CARD_STATE_SYNOPSIS`] preset; the default carries no synopsis.
+/// [`cardspec::CARD_STATE_SYNOPSIS`] preset and the series default; the movie
+/// default carries no synopsis.
 /// With no synopsis the slot hides (`""`, `"Paused"` when paused), so the
 /// preset honors the empty-hides contract (`cardspec_test::card_spec_empty_hide`).
 pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) -> String {
@@ -1364,7 +1498,14 @@ pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) 
         if !(raw.trim().is_empty() || raw == APP_NAME) {
             tag_raw = clean(raw).episode_tag;
         }
-        let tag_t = rp_text(&tag_raw, STATE_BUDGET);
+        // The `SxxExx` code prefixes the synopsis where available; otherwise
+        // the current raw-tag behavior stands.
+        let code = episode_code(r.season, r.number, r.absolute, &tag_raw);
+        let tag_t = if code.is_empty() {
+            rp_text(&tag_raw, STATE_BUDGET)
+        } else {
+            code
+        };
         if tag_t.is_empty() {
             if paused {
                 return with_state_time(
@@ -1376,7 +1517,7 @@ pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) 
         }
         if paused {
             let join_budget = STATE_SYNOPSIS_BUDGET - PAUSED_MARKER.len();
-            let sep = " \u{b7} ";
+            let sep = " - ";
             let prefix_units = utf16_units(&tag_t);
             let sep_units = utf16_units(sep);
             if prefix_units + sep_units >= join_budget {
@@ -1390,12 +1531,12 @@ pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) 
         }
         let join_budget = STATE_SYNOPSIS_BUDGET;
         let prefix_units = utf16_units(&tag_t);
-        let sep_units = utf16_units(" \u{b7} ");
+        let sep_units = utf16_units(" - ");
         if prefix_units + sep_units >= join_budget {
-            trim_word(&format!("{tag_t} \u{b7} {s_full}"), join_budget)
+            trim_word(&format!("{tag_t} - {s_full}"), join_budget)
         } else {
             let trimmed = smart_trim_synopsis(&s_full, join_budget - prefix_units - sep_units);
-            format!("{tag_t} \u{b7} {trimmed}")
+            format!("{tag_t} - {trimmed}")
         }
     }
 }

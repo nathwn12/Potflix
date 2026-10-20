@@ -5,8 +5,9 @@
 //! carries no timestamps; resume re-anchors.
 
 use crate::gate::{
-    DIVERGENCE_MS, DIVERGENCE_THROTTLE_MS, Gate, HEARTBEAT_MS, REASON_DEBOUNCE,
-    REASON_HEARTBEAT_NOT_DUE, REASON_PAUSED, REASON_UNCHANGED,
+    DIVERGENCE_MS, DIVERGENCE_THROTTLE_MS, Gate, HEARTBEAT_MS, RATE_MAX_SENDS, RATE_WINDOW_MS,
+    REASON_DEBOUNCE, REASON_HEARTBEAT_NOT_DUE, REASON_PAUSED, REASON_RATE_LIMITED,
+    REASON_UNCHANGED,
 };
 use crate::{Activity, Button};
 
@@ -698,4 +699,161 @@ fn gate_timing_constants() {
     assert_eq!(HEARTBEAT_MS, 30_000);
     assert_eq!(DIVERGENCE_MS, 2_000);
     assert_eq!(DIVERGENCE_THROTTLE_MS, 5_000);
+    assert_eq!(RATE_WINDOW_MS, 20_000);
+    assert_eq!(RATE_MAX_SENDS, 5);
+    assert_eq!(REASON_RATE_LIMITED, "rate-limited");
+}
+
+/// T2-B: a single correction sends immediately when the window permits -- it
+/// never waits for the 30 s heartbeat.
+#[test]
+fn gate_rate_single_correction_sends_immediately() {
+    let mut g = Gate::default();
+    let (_, v) = g.decide(running_card("Show", "S1 E1"), 1000, 60000, 100000, false, false);
+    assert!(v.send, "first card should send, got {v}");
+    // A changed card 250 ms later (one poll) sends at once under the limit.
+    let (_, v) = g.decide(
+        running_card("Other", "S1 E1"),
+        1250,
+        60000,
+        100250,
+        false,
+        false,
+    );
+    assert!(v.send, "single correction should send immediately, got {v}");
+}
+
+/// T2-B: 6 content changes inside 20 s send 5 and hold the latest; the hold
+/// flushes on the first poll after the window with the newest lines, and the
+/// intermediate card never goes out.
+#[test]
+fn gate_rate_burst_coalesces_to_latest() {
+    let mut g = Gate::default();
+    const NOW0: i64 = 1_000_000;
+    // 6 distinct cards, one poll (250 ms) apart: all inside one 20 s window.
+    let mut sends = 0;
+    let mut last_verdict = String::new();
+    for i in 0..6 {
+        let card = running_card(&format!("Show{i}"), "S1 E1");
+        // ct/now advance together so the anchor holds; only the content moves.
+        let (_, v) = g.decide(card, 1000 + 250 * i, 60000, NOW0 + 250 * i, false, false);
+        last_verdict = format!("{v}");
+        if v.send {
+            sends += 1;
+        }
+    }
+    assert_eq!(sends, 5, "6 rapid changes must send 5, got {sends}");
+    assert!(
+        last_verdict.contains(REASON_RATE_LIMITED),
+        "6th change must hold with {REASON_RATE_LIMITED}, got {last_verdict}"
+    );
+    // The held card is the newest (Show5), not an intermediate one: advancing
+    // past the window and polling steady with Show5 flushes it.
+    let (_, v) = g.decide(
+        running_card("Show5", "S1 E1"),
+        2250,
+        60000,
+        NOW0 + RATE_WINDOW_MS + 250,
+        false,
+        false,
+    );
+    assert!(v.send, "newest held card must flush after the window, got {v}");
+    // And it parked: a repeat stays quiet (never an identical duplicate).
+    let (_, v) = g.decide(
+        running_card("Show5", "S1 E1"),
+        2500,
+        60000,
+        NOW0 + RATE_WINDOW_MS + 500,
+        false,
+        false,
+    );
+    assert!(
+        !v.send,
+        "flushed card repeat must not duplicate, got {v}"
+    );
+}
+
+/// T2-B: an identical payload is never sent from the hold -- a revert to the
+/// last-sent card drops the hold instead of flushing it.
+#[test]
+fn gate_rate_revert_drops_hold_without_duplicate() {
+    let mut g = Gate::default();
+    const NOW0: i64 = 2_000_000;
+    let (_, v) = g.decide(running_card("Show", "S1 E1"), 1000, 60000, NOW0, false, false);
+    assert!(v.send);
+    // Fill the window with 4 more distinct cards (5 sends total).
+    for i in 1..5 {
+        let (_, v) = g.decide(
+            running_card(&format!("Show{i}"), "S1 E1"),
+            1000 + 250 * i,
+            60000,
+            NOW0 + 250 * i,
+            false,
+            false,
+        );
+        assert!(v.send, "fill {i} should send, got {v}");
+    }
+    // 6th change held.
+    let (_, v) = g.decide(
+        running_card("Held", "S1 E1"),
+        2250,
+        60000,
+        NOW0 + 1250,
+        false,
+        false,
+    );
+    assert_eq!(v.reason, REASON_RATE_LIMITED, "6th must hold, got {v}");
+    // Revert to the last-sent card (Show4) after the window: nothing goes out.
+    // ct keeps the anchor (now - ct == last start), so the payload is truly
+    // identical -- steady playback advances now and ct together.
+    let (_, v) = g.decide(
+        running_card("Show4", "S1 E1"),
+        22500,
+        60000,
+        NOW0 + RATE_WINDOW_MS + 1500,
+        false,
+        false,
+    );
+    assert!(
+        !v.send && v.reason != REASON_RATE_LIMITED,
+        "revert must drop the hold without sending, got {v}"
+    );
+}
+
+/// T2-B: a paused card held by the window still parks -- it flushes once after
+/// the window and then stays quiet.
+#[test]
+fn gate_rate_paused_flush_parks() {
+    let mut g = Gate::default();
+    const NOW0: i64 = 3_000_000;
+    let (_, v) = g.decide(running_card("Show", "S1 E1"), 1000, 60000, NOW0, false, false);
+    assert!(v.send);
+    for i in 1..5 {
+        let (_, v) = g.decide(
+            running_card(&format!("Show{i}"), "S1 E1"),
+            1000 + 250 * i,
+            60000,
+            NOW0 + 250 * i,
+            false,
+            false,
+        );
+        assert!(v.send);
+    }
+    // Pause transition while the window is full: held, not parked yet.
+    let paused = Activity {
+        type_: "PLAYING".to_string(),
+        details: "Show4".to_string(),
+        state: "S1 E1 - Paused".to_string(),
+        small_image: "pause".to_string(),
+        ..Activity::default()
+    };
+    let (_, v) = g.decide(paused.clone(), 2250, 60000, NOW0 + 1250, true, false);
+    assert_eq!(v.reason, REASON_RATE_LIMITED, "paused hold, got {v}");
+    // First poll after the window flushes the parked pause card.
+    let (out, v) = g.decide(paused.clone(), 2250, 60000, NOW0 + RATE_WINDOW_MS + 1500, false, false);
+    assert!(v.send, "paused flush must send, got {v}");
+    assert!(out.has_start && out.end == 0, "parked pause carries start only");
+    // Then it stays parked.
+    let (_, v) = g.decide(paused, 2250, 60000, NOW0 + RATE_WINDOW_MS + 1750, false, false);
+    assert_eq!(v.reason, REASON_PAUSED, "parked repeat, got {v}");
 }
