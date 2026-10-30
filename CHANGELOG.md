@@ -9,22 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- The shipped card mapping: series line 1 is the episode title (then the
-  filename's own episode name, then empty -- never the show header, which is
-  the activity header, and never the episode code, which lives on line 2);
-  series line 2 is the `SxxExx` code plus the synopsis (then the filename
-  tag, then the clean title). Movie line 1 is the synopsis (then the year,
-  then genres/length, then empty -- never the title); movie line 2 is
-  `Year · Genres · Runtime` with missing parts skipped and never repeats
-  line 1 (no synopsis + year = details year, state genres/length; no
-  synopsis + no year = details genres/length, state empty); the movie tooltip
-  is omitted so the synopsis is not repeated. A season-0 or absent season
-  never fabricates `S00`: absolute episodes render `E02` from the absolute
-  number. An empty series line 1 is a deliberate one-line card -- as is a
-  header-equal state blank (`""`, `"Paused"` when paused) -- so `Minimal`
+- The window is rebuilt around one object: the title PotPlayer is playing. The
+  object card (cover, title, year/kind, connection state) sits first, one
+  title+year field and one Search follow it, and every payload knob -- field
+  toggles, the line-2 state row and the kind override -- lives behind a single
+  `Advanced` disclosure. At rest at 463x703 the window shows zero payload
+  controls, one search verb and no repair affordance.
+- `Fix match…` is no longer a peer of the query field. Repair is one text row
+  inside the results list (`Not this one? Open advanced match…`), present only
+  while a row is selected; the dialog's criteria and wire behaviour are
+  unchanged.
+- The matched record's kind now sets the control: a series match is latched as
+  a series even when the previous search was seeded as a movie, and the kind
+  display is derived from the record rather than from user state.
+- The Discord previews no longer borrow the local account name: the member and
+  profile surfaces read `You`. This build exposes no connected Discord identity
+  to the window, so no handle is invented.
+
+- The card mapping, implemented in the working tree but not yet shipped: the
+  header is the media title -- `name` carries it, so the client draws
+  `Watching <media title>` (the movie title, or the series title for an
+  episode) and never `Watching Potflix`; series line 1
+  stays empty because the header already carries the show title, line 2 is
+  `SxxEyy · Episode` (the filename's own tag stands in for a missing code;
+  the episode title is the resolved title, else the filename's own episode
+  name), with `- Paused` when paused; movie line 1 is `Title (Year)` and
+  line 2 is `Genres · Runtime` with missing parts skipped (`- Paused` when
+  paused). The synopsis no longer takes a body line: it rides the artwork
+  hover text (`large_text`) as a snippet capped at 128 UTF-16 units that ends
+  with `…` whenever it is cut, while the complete stored note stays in the
+  Card view's `Synopsis` tooltip -- the movie tooltip is no longer omitted.
+  No status icon rides the card: the small slot is never populated. The
+  artwork slot holds the resolved poster URL or nothing -- the branded app
+  mark is never a missing-art fallback, and the Card view paints no `P` mark,
+  FILM/SERIES badge or play/pause glyph over or instead of the art
+  (`rust\crates\presence\src\lib.rs`, `rust\crates\discord\src\activity.rs`,
+  `rust\crates\potflix-win\src\window.rs`). A season-0 or absent season never fabricates `S00`:
+  absolute episodes render `E02` from the absolute number. An empty series
+  line 2 is a deliberate one-line card -- as is any state rung whose text
+  would repeat the header title (`""`, `"Paused"` when paused) -- so `Minimal`
   is not the only one-line path. Nothing playing clears the card: no
-  `Browsing`/`Idle` activity, no `Watching PotFlix`/`Watching PotPlayer`
-  header (`rust\crates\presence\src\lib.rs`, `rust\crates\app\src\main.rs`).
+  `Browsing`/`Idle` activity and no header left behind
+  (`rust\crates\app\src\main.rs`).
 - The Card view follows the live card's kind on its own: the Series/Movie
   toggle (`Card lines for` row) is removed, the Details row is removed (line
   1 is fixed by the mapping; the stored `Default` value stays for
@@ -288,8 +314,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   index and 19.1 ms -> 8.8 ms with it (-54%), the real-shape benchmark
   0.59 s/op on the reduced corpus while the full-scale baseline could not
   finish a single op in over 30 minutes, and a real-corpus read-only warm
-  walk (`metawarm -dry -offline` over `D:\1movies;D:\2animes;E:\2movies`)
-  covering 4,255 files / 3,776 unique in about 1.2 s.
+  walk (`metawarm -dry -offline` over the three configured media roots: two
+  movie libraries and one anime library) covering 4,255 files / 3,776 unique
+  in about 1.2 s.
 - Library window scan progress is phase-aware: a sweeping strip while
   walking, a determinate keys bar while resolving, with live counters,
   elapsed time, and an ETA only when a measured resolve-phase rate supports

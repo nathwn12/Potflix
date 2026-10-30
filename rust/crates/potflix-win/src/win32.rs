@@ -270,10 +270,14 @@ pub const ODT_STATIC: u32 = 5;
 // ---------------------------------------------------------------------------
 
 pub use windows_sys::Win32::Graphics::GdiPlus::{
-    FillModeAlternate, GdipAddPathArcI, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath,
-    GdipCreatePath2I, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics,
-    GdipDeletePath, GdipDeletePen, GdipDrawPath, GdipFillPath, GdipSetSmoothingMode,
-    GdiplusShutdown, GdiplusStartup, SmoothingModeAntiAlias, UnitPixel,
+    CombineModeReplace, FillModeAlternate, GdipAddPathArcI, GdipClosePathFigure,
+    GdipCreateBitmapFromFile, GdipCreateFromHDC, GdipCreatePath, GdipCreatePath2I,
+    GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath,
+    GdipDeletePen, GdipDisposeImage, GdipDrawImageRectI, GdipDrawPath, GdipFillPath,
+    GdipGetImageHeight, GdipGetImageWidth, GdipResetClip, GdipSetClipPath,
+    GdipSetInterpolationMode, GdipSetSmoothingMode,
+    GdiplusShutdown, GdiplusStartup, InterpolationModeHighQualityBicubic,
+    SmoothingModeAntiAlias, UnitPixel,
 };
 
 /// `GdiplusStartupInput` (version 1, no debug callback, background thread kept).

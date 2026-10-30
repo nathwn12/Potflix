@@ -100,9 +100,12 @@ These are load-bearing for the port and easy to break:
   widths, not the ABI size; Go rounds to the 8-byte alignment and reports 72,
   exactly like the Windows header. A 68-byte buffer is a stack overwrite by
   `BeginPaint`, so 72 is what the port asserts.
-- All UI geometry is integer `scalePx = (v*dpi + 48) / 96` from a 460x680
-  logical design, and font heights are negative. An `f32`/`f64` scale would
-  change hit-tests versus paint, so the port keeps `i32` everywhere.
+- All UI geometry is integer `scalePx = (v*dpi + 48) / 96`, and font heights
+  are negative. An `f32`/`f64` scale would change hit-tests versus paint, so
+  the port keeps `i32` everywhere. The design size is **463x703 (floor) and
+  1180x700 (ceiling)** per `DESIGN-UNLOCK.md` D6; the original 460x680 figure
+  is the shipped 1.1.0 window and no longer the acceptance size. The
+  integer-scaling rule itself is unchanged.
 - One OS thread owns the tray and main window procedures and the `GetMessageW`
   message loop; workers (poll, scan, report) never touch the UI — their payloads
   ride mutex-guarded snapshots and repaint only via `InvalidateRect` plus an
@@ -148,7 +151,7 @@ the choice it is.
 | Anime per-episode season is not available | No keyless source carries it: AniList episodes are numbered continuously and the port fixes their season to 0 (`rust\crates\metadata\src\anilist.rs:289-290`). |
 | The card shows series artwork, never an episode still | One card, one recognisable poster — stills never override (`rust\crates\metadata\src\resolver.rs:817-819`). |
 | A file with no episode or season tag is treated as a movie | Title-only classification is all a filename gives; an anime movie or a TV special therefore takes the movie chain, which still resolves it. |
-| Artwork falls back to the app logo when no source has a poster | A deliberate mark beats a broken image. |
+| A file with no poster on any source carries no image, not the app logo | The branded mark is never substituted for missing media artwork (owner decision 2026-10-28): no image is honest, a Potflix icon standing in for the poster is not. |
 | Bangumi answers only what a romaji query can title-validate: entries whose validated pick is the native-script `name` still match, but a native-only name no romaji query resembles is a miss, not a wrong card (`rust\crates\metadata\src\bangumi.rs:116-122,174-177`) | A wrong title is worse than no title — the pick returns a definitive miss rather than a wrong show. |
 | Year is a preference, never a veto: a query whose year matches nothing still returns the best title match (`rust\crates\metadata\src\bangumi.rs:188-191`, `rust\crates\metadata\src\yearpref.rs`) | A year mismatch is a filename quirk, not a wrong title — rejecting on it would drop a complete answer for a nice-to-have. |
 | Some providers are unofficial or undocumented (JustWatch's GraphQL, Episodate, LiveChart.me, ANN) and may change without notice (`rust\crates\metadata-http\src\ratelimit.rs:52-71`) | Keyless is the constraint: no keys, no registration — so the chain leans on whatever free endpoint answers, and an endpoint that moves breaks its leg until the code follows. |
@@ -268,10 +271,13 @@ further where the owner's live card proved the Go behaviour wrong:
     `decode_cache_entry`, no schema bump). Go stored the raw page title
     (`go\internal\metadata\wikipedia.go:504`).
 12. Truncated card lines are always signalled, never silent. `rust\crates\presence\src\lib.rs`
-    (`trim_word`, `smart_trim_synopsis`, the `large_text` build): a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…` — a whole-word end wherever the text has word boundaries, always a terminator otherwise, so a note with no spaces at all (a long token, CJK text) is cut on a character boundary and still ends with that `…`.
-    The tooltip now always carries its terminator, and a
-    spaceless note is cut on a character boundary with that terminator attached. Guarantee: never silently truncated. Go kept the
-    cut punctuation and hard-cut the tooltip
+    (`trim_word`, `smart_trim_synopsis`): a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…` — a whole-word end wherever the text has word boundaries, always a terminator otherwise, so a note with no spaces at all (a long token, CJK text) is cut on a character boundary and still ends with that `…`.
+    The `large_text` build is stricter (`synopsis_snippet`): a note that fits
+    rides whole with no terminator, and any cut ends with a single `…` even
+    when the cut lands on a sentence end (the sentence terminator is replaced,
+    never doubled). Guarantee: never silently truncated, and the stored note
+    is never lost — the whole note stays in the local Card-view tooltip. Go
+    kept the cut punctuation and hard-cut the tooltip
     (`go\internal\presence\presence.go:573-644,673-675`).
 13. Wikipedia artwork accepts the article's own file. `rust\crates\metadata\src\wikipedia.rs`
     (`wiki_pick_poster`) falls back to a file named exactly like the page
@@ -313,32 +319,44 @@ further where the owner's live card proved the Go behaviour wrong:
     (`CardSpec`, `render_kind`, `card_presets`, `CARD_STATE_NONE`) keeps the
     presets as re-heads that never remove the fill, except the deliberate
     one-line paths: the `Minimal` state preset (stored `none`), which empties
-    the state line, an empty default series details line (no episode
-    title and no filename episode name), and any state rung whose final text
-    would repeat the header (the clean-title fallback equal to the header
-    blanks, `Paused` when paused) -- Minimal is not the only one-line
-    path. SERIES covers TV + anime, MOVIE is movies. Shipped
-    default: SERIES line 1 the episode title (else the filename's own episode
-    name, else empty -- never the show title, which is the activity header,
-    and never the episode code, which lives on line 2), line 2 the `SxxExx`
-    code plus the synopsis (then the filename tag, then the clean title unless
-    it repeats the header -- then empty for a deliberate one-line card,
-    `Paused` when paused); MOVIE line 1 the synopsis (then the year,
-    then genres/length, then empty -- never the title, which is the
-    header/pill), line 2 the year/genres/runtime join with missing parts
-    skipped (then genres/length beside a year, then empty beside
-    genres/length -- the state never repeats what line 1 already shows).
+    the state line, an empty default episode state line (no code, no episode
+    title, no filename tag), and any state rung whose final text would repeat
+    the header title (the clean-title fallback equal to it blanks, `Paused`
+    when paused) -- Minimal is not the only one-line path. SERIES
+    covers TV + anime, MOVIE is movies. Implemented in this tree, not shipped
+    (the installed build is 1.1.0, built before this mapping): the wire header is
+    the media title -- `name` carries it and the client draws
+    `Watching <media title>` (the movie title, or the series title for an
+    episode), never `Watching Potflix`; `presence::header_line` is the one
+    definition the wire and the Card-view caption share. SERIES line 1 stays
+    empty (the header already carries the show title, and any rung equal to it
+    blanks), line 2 `SxxEyy · Episode` (the filename's own tag stands in for a
+    missing code; the episode title is the resolved title, else the filename's
+    own episode name; empty when neither side is known), plus the paused
+    marker; MOVIE line 1 `Title (Year)` (the clean filename title when the
+    lookup misses; the year is reserved out of the budget), line 2
+    `Genres · Runtime` with missing parts skipped, plus the paused marker.
     A season-0/absent season never fabricates `S00`: an absolute episode
     renders `E02` from its absolute number, and a season-0 shape whose numbers
-    disagree renders the absolute one. The movie tooltip is omitted, so
-    the synopsis is not repeated; the series hover text of the LARGE image
-    slot — the cover when artwork resolved, the PotFlix `logo` asset
-    otherwise — carries the whole stored note. Slot budgets in UTF-16 units
-    held in one place (`NAME_BUDGET`,
+    disagree renders the absolute one. The synopsis never takes a body line
+    under the default: `large_text` carries it as the LARGE image slot's hover
+    text for both kinds, as a synopsis snippet capped at 128 UTF-16
+    units that ends with a single `…` whenever the stored note is cut. The
+    complete stored note is not truncated: it lives in Potflix's own Card-view
+    `Synopsis` tooltip (hover or keyboard focus, pin-able with Enter), which
+    reads the stored record. `large_image` is the resolved provider poster URL
+    or EMPTY: the branded app mark is never a missing-art fallback (owner
+    decision 2026-10-28), so a file with no poster carries no image and, when
+    no asset field has a value, no `assets` key at all. The small slot is
+    never populated: no status icon rides the card, and the Card view paints
+    no `P` mark, FILM/SERIES badge or play/pause glyph over or instead of the
+    art. Slot budgets in UTF-16 units held in one place (`NAME_BUDGET`,
     `DETAILS_BUDGET`, `STATE_BUDGET`, `STATE_SYNOPSIS_BUDGET`,
-    `LARGE_TEXT_BUDGET`): header 128, line 1 128, line 2 128 plain / 72 with
-    a synopsis, hover 128; body lines join with `JOINER` (U+00B7 with single
-    spaces); cuts (`trim_word`, `smart_trim_synopsis`) are always signalled: a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…` —
+    `LARGE_TEXT_BUDGET`): header 128 (the title the fill ladders compare
+    against), line 1 128, line 2 128 (the
+    explicit `Synopsis` preset carries its synopsis at
+    `STATE_SYNOPSIS_BUDGET` = 72), hover 128; body lines join with `JOINER`
+    (U+00B7 with single spaces); cuts (`trim_word`, `smart_trim_synopsis`) are always signalled: a cut landing on a sentence end returns the complete sentence with its own `.`/`!`/`?` and no ellipsis, and every other cut ends with a single `…` —
     never silently truncated; a whole-word end wherever the text has word boundaries; always a terminator otherwise (a spaceless note — long token, CJK text — cut on a character boundary, still ending with that `…`). Every provider mapper caps the note at fetch time
     (`cap_synopsis`, `MAX_SYNOPSIS_UNITS` = 128 UTF-16 code units), so the
     stored note always fits the 128-unit hover whole. Per-kind choices persist in
@@ -348,29 +366,48 @@ further where the owner's live card proved the Go behaviour wrong:
     flat `{"details":"…","state":"…"}` still loads as the series pair with the
     movie pair default and re-saves nested — a backward-compatible read, not a
     byte-identical re-write; an all-default config still writes `"card":{}`.
-    Retired Details ids (`title`/`series`, which repeat the header, and
-    `episode`, byte-identical to the default) migrate to `default` on load and
-    on save. The non-repetition rules hold by construction: no body line
-    repeats the header title, and the movie state never repeats what the movie
-    details line already shows; the full note stays on hover (series) or on
-    line 1 (movies, whose tooltip is omitted).
+    Retired Details ids (`title`/`series`/`episode`, no longer offered)
+    migrate to `default` on load and on save. The non-repetition rules hold
+    by construction: no body line repeats the header text, the series title
+    rides only the header, a movie's bare title rides the header while
+    `Title (Year)` rides line 1, and under the default presets the synopsis
+    appears in `large_text` and the local tooltip (full note) only. In
+    `large_text` the stored note rides whole when it fits `LARGE_TEXT_BUDGET`
+    and otherwise as a shortened snippet. Two state presets can also carry
+    synopsis text. The explicit `Synopsis` preset places shortened synopsis
+    text on the state line at `STATE_SYNOPSIS_BUDGET` = 72
+    (`presence\src\lib.rs:1413`, rung at `:1058-1070`). The explicit `Tag`
+    preset calls the same shortened synopsis rung later in its ladder: for a
+    movie after the tag and the `Genres · Runtime` rungs
+    (`presence\src\lib.rs:1398-1407`), for a series after the tag rung
+    (`presence\src\lib.rs:1430-1435`), so the state line — not only
+    `large_text` — can carry a synopsis fragment under either preset. The full
+    note still stays in the local tooltip.
 19. The Card-view preview is what Discord gets, row for row. The preview renders through the
     same composer the send path uses (`compose_card` via
     `CardSpec::render_kind`), so picking a line changes the preview
-    immediately; it is exact for the rows it shows (Header / Details / State
-    / Images / Buttons / Tooltip). The progress-bar end timestamp is
+    immediately; its panel caption is the Discord header verbatim
+    (`Watching <media title>`, from `presence::header_line`), the title row is
+    the media title, and the rows below are the composed body lines and the
+    `large_text` snippet (`rust\crates\potflix-win\src\window.rs`,
+    `paint_card_view`). The progress-bar end timestamp is
     projected by the send gate from the player clock, not by the composer,
     so the preview shows no timestamps. The preview follows the live card's
     kind on its own — there is no Series/Movie toggle and no `Card lines for`
-    row: there is no Details row (line 1 is fixed by the shipped mapping; the
+    row: there is no Details row (line 1 is fixed by the in-tree mapping; the
     stored `Default` value stays for compatibility) and the State row offers
     its four, and a preset save writes the DISPLAYED kind. A preset save publishes the new specs to the running sender, in-process, through the
     store's live mirror (`app_support::config::set_live_card_specs()` / `live_card_specs()`, backed by a process-wide lock) — the same live-apply shape as the
     scan-speed path (`metadata_http::set_rate_profile`); the poll loop (`push_activity` / `poll_loop` in `rust\crates\app\src\main.rs`, preset choice via
     `rust\crates\potflix-win\src\window.rs` `on_select_card_preset`) reads the published specs on every push, so the change reaches the live Discord card
-    at the next poll tick: no restart, and no push from the click itself. The send gate compares name/details/state/paused/images/buttons/has_start against the last-sent card and sends when they differ (`rust\crates\presence\src\gate.rs:209-221`), so the changed lines go out by themselves — while paused too, where the card is re-parked when the compared content is unchanged — the header, the two body lines, the large image, the button list and the paused flag — and a change to any of those still goes out with a fresh pause anchor; a change confined to the hover text does not re-park on its own. That set mirrors the ported gate's paused comparison (`rust\crates\presence\src\gate.rs:170-193`), and no card preset changes the hover text alone.
-20. A wrong card is fixed by hand, not by re-scanning. While something plays,
-    `Fix match…` (`rust\crates\potflix-win\src\window.rs`, `FIX_MATCH_*` copy
+    at the next poll tick: no restart, and no push from the click itself. The send gate compares name/details/state/paused/images/buttons/has_start against the last-sent card and sends when they differ (`rust\crates\presence\src\gate.rs:209-221`), so the changed lines go out by themselves — while paused too, where the card is re-parked when the compared content is unchanged — the header, the two body lines, the large image, the small slot, the button list and the paused flag — and a change to any of those still goes out with a fresh pause anchor; a change confined to the hover text does not re-park on its own. That set mirrors the ported gate's paused comparison (`rust\crates\presence\src\gate.rs:170-193`), and no card preset changes the hover text alone.
+20. A wrong card is fixed by hand, not by re-scanning. **Superseded 2026-10-29
+    as a UI description by `DESIGN-UNLOCK.md` D1/D2:** `Fix match…` is no longer
+    a peer button of the query field. The same picker survives as the inline
+    text action inside the results list (`Not this one? Open advanced match…`),
+    reachable only while a row is selected, and its wire/parity behaviour is
+    unchanged. While something plays,
+    the picker (`rust\crates\potflix-win\src\window.rs`, `FIX_MATCH_*` copy
     through `fix_match_scope_choices`) pre-fills the name from the resolver's
     own parse, searches the provider chain on demand, and pins the pick as a
     latch in `%LOCALAPPDATA%\Potflix\overrides.json`
