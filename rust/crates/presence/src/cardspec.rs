@@ -8,30 +8,17 @@
 //! language. The zero value falls back to the default on every line, so no
 //! migration is needed for stored configs.
 //!
-//! [`default_card_spec`] reproduces [`build_activity_resolved`]'s lines
-//! exactly: both delegate to the [`compose_card`](crate::compose_card) fill
-//! ladder, so the series default is the episode title over the code-plus-
-//! synopsis line and the movie default is the synopsis over the
-//! year/genres/runtime line (either movie line may stay empty rather than
-//! repeat the title, and the movie state never repeats what the movie details
-//! line already shows); any state rung whose final text would repeat the
-//! activity header blanks instead (`Paused` when paused), so no body line
-//! from a kept preset ever repeats the header (the retired Details ids
-//! below still render the header for old in-flight specs -- see
-//! [`CardSpec::migrated`] -- so the guarantee covers kept presets and
-//! migrated stored specs, not a retired id composed mid-flight). The synopsis stays
-//! available as the explicit [`CARD_STATE_SYNOPSIS`] preset and whole in the
-//! series tooltip. Series details fall back to the filename's own episode
-//! name, then to empty -- never the show title, which is the activity
-//! header -- so a series card with no episode title anywhere is a deliberate
-//! one-line card, as is a header-equal state blank and a
-//! [`CARD_STATE_NONE`] (`Minimal`) card. The
-//! paused " - Paused" marker path is preserved on every rung.
+//! [`default_card_spec`] is the shipped per-kind mapping: movie details
+//! `Title (Year)` over a genre/runtime state; series details the series title
+//! over `SxxEyy / Episode`. The synopsis stays in the artwork tooltip as a
+//! <=128-unit snippet; both body lines are identity/playback only. Any state
+//! preset whose final text would repeat the series title blanks instead.
+//! The paused " - Paused" marker path is preserved on every rung.
 
 use player::window::{APP_NAME, SUFFIX};
 use serde::{Deserialize, Serialize};
 
-use crate::{Action, Resolved, compose_details_for, compose_state_for};
+use crate::{Action, Resolved, compose_details_for, compose_name_inner, compose_state_for};
 
 /// Details-line preset id: the shipped default.
 pub const CARD_DETAILS_DEFAULT: &str = "default";
@@ -147,18 +134,13 @@ impl CardSpec {
     }
 
     /// Returns the (details, state) body lines for the given inputs under this
-    /// spec (`cardspec.go:147`). The default spec returns
-    /// [`build_activity_resolved`](crate::build_activity_resolved)'s lines
-    /// exactly (both delegate to the same fill ladder); the series default is
-    /// the episode title over the code-plus-synopsis line, the movie default
-    /// is the synopsis over the year/genres/runtime line (either movie line
-    /// may stay empty rather than repeat the title, and the movie state never
-    /// repeats what the movie details line shows), falling back to the
-    /// filename's own episode name and then to empty on series details -- never
-    /// the show title -- while the series state ladder ends on the clean
-    /// filename title unless it repeats the header (then empty, `Paused` when
-    /// paused). [`CARD_STATE_NONE`] and a header-equal state rung empty the
-    /// series state line. The idle card keeps its shipped lines under any spec.
+    /// spec (`cardspec.go:147`). The default spec is the shipped per-kind
+    /// mapping: movie `Title (Year)` over genre/runtime, series title over
+    /// `SxxEyy / Episode`. No body line ever repeats the activity header: the
+    /// header carries the media title, so a line identical to it blanks. The
+    /// synopsis is never a body line under the default;
+    /// [`CARD_STATE_SYNOPSIS`] is an explicit legacy preset. The idle card
+    /// keeps its shipped lines under any spec.
     pub fn render(&self, raw_title: &str, a: Option<&Action>, r: &Resolved) -> (String, String) {
         self.render_kind(raw_title, a, r, r.is_movie)
     }
@@ -179,8 +161,16 @@ impl CardSpec {
             return ("Browsing".to_string(), "Idle".to_string());
         }
         let spec = self.normalized();
-        let details = compose_details_for(raw_title, r, is_movie, &spec.details);
+        let mut details = compose_details_for(raw_title, r, is_movie, &spec.details);
         let state = compose_state_for(raw_title, a, r, is_movie, &spec.state);
+        // One rule for both surfaces (wire and Card-view preview): no body line
+        // repeats the header. The header carries the media title, so a series'
+        // own title on line 1 blanks; the episode state still carries
+        // `SxxEyy · Episode`. A movie's line 1 keeps `Title (Year)`.
+        let header = compose_name_inner(raw_title, r);
+        if !details.is_empty() && details == header {
+            details.clear();
+        }
         (details, state)
     }
 }

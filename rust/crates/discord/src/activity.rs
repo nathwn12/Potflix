@@ -9,13 +9,18 @@
 //!  "args":{"pid":<std::process::id()>,
 //!          "activity":{"type":3,"name":...,"details":...,"state":...,
 //!                      "timestamps":{"start":...,"end":...},
-//!                      "assets":{"large_image":"logo","large_text":"PotFlix"}}},
+//!                      "assets":{"large_image":...,"large_text":...}}},
 //!  "nonce":"<unique>"}
 //! ```
 //!
-//! `name` overrides the header line ("Watching <title>"); when absent the header
-//! falls back to the app name. The body is two lines: details (episode name,
-//! else episode tag, else title) and state (episode tag, else empty).
+//! `name` is the media title the shipped composer sets, so the client renders
+//! `Watching <title>` -- the movie title, or the series title for an episode --
+//! never `Watching Potflix`. The body is two lines: details (movie
+//! `Title (Year)`; empty for a series, whose title the header carries) and
+//! state (movie genres/runtime, episode `SxxEyy · Episode`). The synopsis rides
+//! `large_text` as a <=128-unit, explicitly ellipsized snippet; the complete
+//! note stays in Potflix's own hover/focus tooltip. The small slot is never
+//! populated: no status icon is overlaid on the artwork.
 //!
 //! A clear is the same command with `"activity":null`. The activity type is
 //! Watching (3), not the Java reference's Playing (0): Discord documents the
@@ -28,7 +33,11 @@
 //! ("paused for M:SS"). The pristine card carries NO small_image/small_text (no
 //! play/pause/stop corner icon) and NO buttons: the caller-side fields are
 //! accepted for compatibility but never serialized. Deliberately NOT set:
-//! party, secrets, instance, application_id/name.
+//! party, secrets, instance, application_id.
+//!
+//! The artwork slot is the resolved poster URL or EMPTY; the branded app mark
+//! is never a missing-art fallback. When no asset field has a value the whole
+//! `assets` key is omitted.
 //!
 //! Empty-string fields are OMITTED, not sent as "". Discord rejects an activity
 //! whose assets carry a present-but-empty large_text/small_text (code 4000:
@@ -50,20 +59,19 @@ use serde::Serialize;
 /// and the fixed brand fields are added here.
 #[derive(Debug, Clone, Default)]
 pub struct Activity {
-    /// Overrides the header line ("Watching <Name>"); empty omits `name` and the
-    /// header falls back to the app name.
+    /// Overrides the header line ("Watching <Name>"): the shipped composer sets
+    /// the media title. Empty omits `name` (the idle card).
     pub name: String,
     pub details: String,
     pub state: String,
-    /// https artwork URL within Discord's 300-char limit; empty/invalid/over-budget falls back to "logo".
+    /// https artwork URL within Discord's 300-char limit; empty/invalid/over-budget
+    /// is omitted on the wire -- never replaced by the branded `logo`.
     pub large_image: String,
-    /// "PotFlix"; empty is omitted on the wire.
+    /// The synopsis snippet; empty is omitted on the wire.
     pub large_text: String,
-    /// Legacy: accepted so existing callers keep compiling, but never
-    /// serialized -- the card carries no status icon.
+    /// Caller-compat only: the shipped composer sets no status icon. Empty omitted.
     pub small_image: String,
-    /// Legacy: accepted so existing callers keep compiling, but never
-    /// serialized -- the card carries no status icon.
+    /// Caller-compat only: the shipped composer sets no status text. Empty omitted.
     pub small_text: String,
     pub has_start: bool,
     /// epoch ms, set while running and paused
@@ -89,14 +97,15 @@ pub struct ActivityButton {
 const ACTIVITY_TYPE_WATCHING: i32 = 3;
 
 /// Discord caps `large_image` at 300 chars (`code=4000` otherwise). An
-/// over-budget URL is omitted (fallback to `"logo"`), never truncated (a cut
-/// signed URL is a broken link). Local copy of the presence crate's cap: the
-/// crates share no edge, so the value is duplicated, not imported.
+/// over-budget URL is omitted whole (no branded fallback), never truncated (a
+/// cut signed URL is a broken link). Local copy of the presence crate's cap:
+/// the crates share no edge, so the value is duplicated, not imported.
 const LARGE_IMAGE_BUDGET: usize = 300;
 
 /// The wire activity object. Every empty string field is omitted so Discord
-/// never sees `"large_text":""`. The pristine card has no small image/text and
-/// no buttons, so those keys can never appear here.
+/// never sees `"large_text":""`. An activity with no image and no asset text
+/// carries no `assets` key at all (the card is clean, never branded art in a
+/// missing-art slot, and no corner icon).
 #[derive(Debug, Serialize)]
 pub(crate) struct ActivityPayload {
     #[serde(rename = "type")]
@@ -109,7 +118,8 @@ pub(crate) struct ActivityPayload {
     pub(crate) state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) timestamps: Option<Timestamps>,
-    pub(crate) assets: ActivityAssets,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assets: Option<ActivityAssets>,
 }
 
 /// Carries the elapsed anchor and, while playing, the projected end. A playing
@@ -135,6 +145,14 @@ pub(crate) struct ActivityAssets {
     pub(crate) large_text: String,
 }
 
+impl ActivityAssets {
+    /// Whether no asset field carries a value: the card then sends no `assets`
+    /// key at all.
+    fn is_empty(&self) -> bool {
+        self.large_image.is_empty() && self.large_text.is_empty()
+    }
+}
+
 /// The args object; a `None` activity marshals to `null`.
 #[derive(Debug, Serialize)]
 pub(crate) struct SetActivityArgs {
@@ -155,9 +173,11 @@ fn is_zero(v: &i64) -> bool {
 }
 
 /// Maps one card to the wire payload. `type` is Watching (3); `large_image` is
-/// the caller's `large_image` when it is an http(s) URL within
-/// [`LARGE_IMAGE_BUDGET`], else "logo" (never empty, never truncated, never
-/// over budget); empty text stays omitted; `name` carries the header override.
+/// the caller's resolved artwork when it is an http(s) URL within
+/// [`LARGE_IMAGE_BUDGET`], else EMPTY -- the branded app mark is never
+/// substituted for missing artwork. Empty text stays omitted, the `assets` key
+/// is omitted entirely when no asset field has a value, and `name` carries the
+/// media-title header override.
 pub(crate) fn new_activity(a: &Activity) -> ActivityPayload {
     let large_image = if (a.large_image.starts_with("http://")
         || a.large_image.starts_with("https://"))
@@ -165,18 +185,20 @@ pub(crate) fn new_activity(a: &Activity) -> ActivityPayload {
     {
         a.large_image.clone()
     } else {
-        "logo".to_string()
+        String::new()
     };
+    let assets = ActivityAssets {
+        large_image,
+        large_text: a.large_text.clone(),
+    };
+    let assets = if assets.is_empty() { None } else { Some(assets) };
     let mut p = ActivityPayload {
         activity_type: ACTIVITY_TYPE_WATCHING,
         name: a.name.clone(),
         details: a.details.clone(),
         state: a.state.clone(),
         timestamps: None,
-        assets: ActivityAssets {
-            large_image,
-            large_text: a.large_text.clone(),
-        },
+        assets,
     };
     if a.has_start {
         // Playing: start + end (when the duration is known) so the client renders

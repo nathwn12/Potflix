@@ -47,7 +47,7 @@ use crate::brand;
 use crate::win32::{Rect, utf16_z};
 
 use library::{Progress, Stats};
-use presence::{Action, Activity, CardPreset, CardSpec, Resolved};
+use presence::{Action, Activity, CardSpec, Resolved};
 
 use app_support::config::{CardKind, CardLine, CardSpecs};
 
@@ -104,6 +104,47 @@ pub const BTN_CLEAR_INDEX: i32 = 24;
 /// [`app_support::config::live_now_playing`] answers `Some`; dimmed and
 /// input-refused otherwise (see [`fix_match_blocked_reason`]).
 pub const BTN_FIX_MATCH: i32 = 10;
+/// The Card view's synopsis affordance: a focusable text control whose hover
+/// or keyboard focus reveals the full stored synopsis in the owner-drawn
+/// tooltip. Not a stored preset.
+pub const BTN_SYNOPSIS: i32 = 25;
+/// The narrow Card view's surface switcher: one segment per Discord preview.
+pub const BTN_SURFACE_MEMBER: i32 = 60;
+pub const BTN_SURFACE_PROFILE: i32 = 61;
+pub const BTN_SURFACE_ACTIVITY: i32 = 62;
+/// The designer's field toggles. Each flips one [`presence::DesignerSpec`]
+/// field and immediately publishes it to the live mirror the sender reads.
+pub const BTN_FIELD_ARTWORK: i32 = 70;
+pub const BTN_FIELD_DETAILS: i32 = 71;
+pub const BTN_FIELD_STATE: i32 = 72;
+pub const BTN_FIELD_SYNOPSIS: i32 = 73;
+pub const BTN_FIELD_TIMERS: i32 = 74;
+/// The Card workspace's title/year query field. It is the same single-field
+/// contract as the picker dialog: a title, or a title with a trailing year.
+pub const BTN_PICKER_FIELD: i32 = 80;
+/// The Advanced search-scope filter: `All types` (the default), `Movies`,
+/// `Series`. It shapes the SEARCH only; the record a row resolves owns the
+/// preview's kind.
+pub const BTN_PICKER_ALL: i32 = 85;
+pub const BTN_PICKER_MOVIE: i32 = 81;
+pub const BTN_PICKER_TV: i32 = 82;
+/// The one primary picker action: Search. It never changes label or job: a
+/// second verb (applying a match to the playing title) is its own inline
+/// control, [`BTN_PICKER_APPLY`].
+pub const BTN_PICKER_SEARCH: i32 = 83;
+/// Apply the selected result to the playing title (the latch). Inline with the
+/// results, and present only while a player exists and a row is selected.
+pub const BTN_PICKER_APPLY: i32 = 86;
+/// The result rows in the picker overlay, `+0..SEARCH_LIMIT-1` in candidate
+/// order. The rows are hit-tested but are not part of the static focus ring;
+/// the field owns text entry and Enter runs the primary action.
+pub const BTN_PICKER_RESULT_AT: i32 = 90;
+/// The overlay's dismiss control (Escape also closes it).
+pub const BTN_PICKER_CLOSE: i32 = 89;
+/// The one payload disclosure. Every field toggle, the kind override and the
+/// line-2 state row live behind it; at rest the window shows the object, one
+/// query field, one Search and this one control.
+pub const BTN_ADVANCED: i32 = 84;
 
 // ---------------------------------------------------------------------------
 // Worker -> UI messages (`go\window.go:74-93`).
@@ -116,6 +157,12 @@ pub const WM_APP_REPORT_DONE: u32 = crate::win32::WM_APP + 5;
 /// published its outcome into the dialog's slot and this message tells the
 /// dialog's own message loop to read it.
 pub const WM_APP_FIX_MATCH_DONE: u32 = crate::win32::WM_APP + 6;
+/// The Card workspace picker's worker wakeup: a search or latch finished and
+/// published into [`UiState`]'s picker slot.
+pub const WM_APP_PICKER_DONE: u32 = crate::win32::WM_APP + 7;
+/// A background artwork fetch finished; repaint so the cached cover appears
+/// without waiting for the next live poll.
+pub const WM_APP_ARTWORK_READY: u32 = crate::win32::WM_APP + 8;
 /// The Win32 timer message (`go\window.go:83`).
 pub const WM_TIMER: u32 = 0x0113;
 
@@ -309,6 +356,12 @@ pub const BTN_TAB: i32 = 5;
 /// the label -- never a second accent FILL, because each view has exactly one
 /// primary control (`Scan`) and selection is not a primary action.
 pub const BTN_TAB_SEL: i32 = 6;
+/// A field toggle, off: the segment anatomy with a hairline and muted text.
+pub const BTN_TOGGLE: i32 = 7;
+/// A field toggle, on: a quiet lit segment with a WHITE indicator. The
+/// designer can have several fields on at once, so this state deliberately
+/// avoids the red selection indicator (minimal dark workspace, white controls).
+pub const BTN_TOGGLE_ON: i32 = 8;
 
 // ---------------------------------------------------------------------------
 // Types.
@@ -395,13 +448,66 @@ impl SettingsLayout {
 #[derive(Clone, Debug, Default)]
 pub struct CardLayout {
     pub preview: Rect,
+    /// The chrome header band; zero-height in the compact composition.
+    pub header: Rect,
+    /// The tab strip's outer rect; the two segments are [`CardLayout::card_link`]
+    /// (Card) and [`CardLayout::settings`] (Settings).
+    pub tab_strip: Rect,
+    pub card_link: Rect,
+    pub settings: Rect,
+    /// The wide workspace's editor rail and preview stage. In the narrow
+    /// composition both are the full content column and the rail holds the
+    /// search/summary band above the preview.
+    pub rail: Rect,
+    pub stage: Rect,
+    /// The three Discord surfaces: member list, profile/expanded card, and
+    /// Activity tab. In the wide composition all three have distinct rects; in
+    /// the narrow composition each is the one preview rect (only the selected
+    /// surface paints).
+    pub surfaces: [Rect; 3],
+    /// The media rows of the profile surface: title, metadata, synopsis.
     pub rows: Vec<Rect>,
+    /// The brand art tile inside the profile surface.
+    pub art: Rect,
+    /// The media title (`Title (Year)` for a movie, the series for an episode).
+    pub title: Rect,
+    /// The playback line (genres/runtime or `SxxEyy / Episode`).
+    pub meta: Rect,
+    /// The full-row synopsis affordance (hover + keyboard focus).
+    pub synopsis: Rect,
+    /// The tooltip panel, clamped inside the client; empty while hidden.
+    pub tooltip: Rect,
+    /// The designer's wire summary block (field values as they reach Discord).
+    pub wire: Rect,
+    /// The title/year + Movie/TV + Search band. It is in the first viewport at
+    /// every size: above the previews in the wide split, above the one preview
+    /// in the narrow stack, and a single compact row in the short client.
+    pub picker_bar: Rect,
+    /// The picker's result overlay. It drops from the bar over the previews
+    /// while open; empty when no search result is shown.
+    pub picker_results: Rect,
+    /// The picker's one-line status readout (empty when the band is too narrow
+    /// for it).
+    pub picker_status: Rect,
+    /// The one object card: cover, title, year/kind and the connection/presence
+    /// status. It is the first thing under the tab strip in every composition.
+    pub object: Rect,
+    /// The object cover thumbnail inside [`CardLayout::object`].
+    pub obj_cover: Rect,
+    pub obj_title: Rect,
+    pub obj_meta: Rect,
+    pub obj_status: Rect,
+    /// The Advanced disclosure's panel; empty while closed.
+    pub advanced_panel: Rect,
+    /// Compact composition (no chrome header, no field rows).
+    pub compact: bool,
+    /// Wide composition (the split workspace: rail beside the three surfaces).
+    pub wide: bool,
     pub status: Rect,
     pub btns: Vec<UiButton>,
-    /// The section micro-labels, in paint order (the preview heading and the two
-    /// preset-row headings).
+    /// The section micro-labels, in paint order.
     pub labels: Vec<NamedTextRect>,
-    /// The explanatory line under the preset rows.
+    /// The explanatory line under the rows.
     pub hint: Rect,
 }
 
@@ -424,6 +530,22 @@ pub struct NamedTextRect {
 pub const MAIN_CLIENT_W: i32 = 460;
 pub const MAIN_CLIENT_H: i32 = 680;
 pub const MAIN_MARGIN: i32 = 20;
+
+/// The content column never grows past this logical width; wide windows centre
+/// it so the media card keeps a readable measure instead of stretching a 128px
+/// body line across 1440px.
+pub const CONTENT_MAX_W: i32 = 980;
+
+/// The Card view's supported minimum client size: the compact media row, the
+/// State preset row and the footer must all fit at 96 DPI.
+pub const CARD_MIN_W: i32 = 360;
+pub const CARD_MIN_H: i32 = 270;
+
+/// The Main and Settings views need their full vertical stack (folder list,
+/// action grid, status, the settings groups); they refuse to shrink below the
+/// shipped 460x680 composition's height.
+pub const APP_MIN_W: i32 = 420;
+pub const APP_MIN_H: i32 = 680;
 
 // --- The main view's vertical stack, logical px at 96 DPI. ------------------
 //
@@ -543,6 +665,18 @@ pub fn scrollbar_thumb(track: Rect, total: i32, capacity: i32, top: i32, min_thu
     }
 }
 
+/// The content column every view centres: the window minus its margins, capped
+/// at [`CONTENT_MAX_W`] and centred when the window is wider. At the default
+/// 460px client this is exactly the old 20px margin and 420px column, so the
+/// shipped geometry is unchanged.
+#[must_use]
+pub fn content_span(cw: i32, dpi: i32) -> (i32, i32) {
+    let margin = scale_px(dpi, MAIN_MARGIN);
+    let avail = (cw - margin * 2).max(scale_px(dpi, 100));
+    let width = avail.min(scale_px(dpi, CONTENT_MAX_W));
+    ((cw - width) / 2, width)
+}
+
 /// The tab strip's two segments as `(card, settings)`, in every view.
 ///
 /// One function owns the strip's geometry so the three views cannot drift: the
@@ -551,8 +685,7 @@ pub fn scrollbar_thumb(track: Rect, total: i32, capacity: i32, top: i32, min_thu
 #[must_use]
 pub fn tab_strip_rects(cw: i32, dpi: i32) -> (Rect, Rect) {
     let sc = |v: i32| scale_px(dpi, v);
-    let margin = sc(MAIN_MARGIN);
-    let content_w = (cw - margin * 2).max(sc(100));
+    let (left, content_w) = content_span(cw, dpi);
     let top = sc(TAB_TOP_L);
     let bottom = top + sc(TAB_H_L);
     // Equal segments with one gap: the same rule the action grid uses, so both
@@ -560,15 +693,15 @@ pub fn tab_strip_rects(cw: i32, dpi: i32) -> (Rect, Rect) {
     let seg_w = (content_w - sc(SP_2)) / 2;
     (
         Rect {
-            left: margin,
+            left,
             top,
-            right: margin + seg_w,
+            right: left + seg_w,
             bottom,
         },
         Rect {
-            left: margin + seg_w + sc(SP_2),
+            left: left + seg_w + sc(SP_2),
             top,
-            right: margin + seg_w + sc(SP_2) + seg_w,
+            right: left + seg_w + sc(SP_2) + seg_w,
             bottom,
         },
     )
@@ -608,8 +741,7 @@ pub fn compute_layout_from(dirs: &[String], cw: i32, ch: i32, dpi: i32, top: i32
 #[must_use]
 pub fn compute_layout_total(total: i32, cw: i32, ch: i32, dpi: i32, top: i32) -> UiLayout {
     let sc = |v: i32| scale_px(dpi, v);
-    let margin = sc(MAIN_MARGIN);
-    let content_w = (cw - margin * 2).max(sc(100));
+    let (margin, content_w) = content_span(cw, dpi);
 
     let mut l = UiLayout::default();
     // --- The vertical stack -------------------------------------------------
@@ -831,8 +963,7 @@ pub fn compute_settings_layout(
     scan_speed: &str,
 ) -> SettingsLayout {
     let sc = |v: i32| scale_px(dpi, v);
-    let margin = sc(MAIN_MARGIN);
-    let content_w = (cw - margin * 2).max(sc(100));
+    let (margin, content_w) = content_span(cw, dpi);
 
     let mut l = SettingsLayout::default();
 
@@ -1186,24 +1317,80 @@ pub fn card_state_button(i: i32) -> i32 {
     BTN_CARD_STATE_AT + i
 }
 
-/// `cardFocusOrder` (`go\window.go:1256`), in visual order: the strip, the way
-/// back, then the State preset row, then the picker. Line 1 is fixed by the
-/// shipped mapping, so the State row is the only preset row and the order
-/// tracks [`presence::cardspec::card_presets`] states instead of a hardcoded
-/// count. The preview follows the live card's kind; there is no manual kind
-/// toggle.
+/// `cardFocusOrder`, in visual order: the strip, the one query field, its one
+/// confirm, the disclosure, then Back. The payload knobs and the kind override
+/// are absent because they are absent from the screen; [`card_focus_order_with`]
+/// appends them the moment the disclosure opens.
 #[must_use]
 pub fn card_focus_order() -> Vec<i32> {
-    let (_, states) = presence::cardspec::card_presets();
-    let mut order = vec![BTN_CARD, BTN_SETTINGS, BTN_CARD_BACK];
-    for i in 0..states.len() as i32 {
-        order.push(card_state_button(i));
+    vec![
+        BTN_CARD,
+        BTN_SETTINGS,
+        BTN_PICKER_FIELD,
+        BTN_PICKER_SEARCH,
+        BTN_ADVANCED,
+        BTN_CARD_BACK,
+    ]
+}
+
+/// The Card focus order for the current disclosure state with no result row
+/// selected: the one shape every at-rest card has.
+#[must_use]
+pub fn card_focus_order_with(advanced: bool) -> Vec<i32> {
+    card_focus_order_for(advanced, false, false)
+}
+
+/// The Card focus order for the state actually on screen: the disclosure AND
+/// the picker's own two list actions.
+///
+/// Apply and "Not this one?" are laid out only inside the results list, above
+/// which nothing shows them; but they used to be Tab stops only while
+/// `Advanced` was open, so a visible action was unreachable from the keyboard in
+/// the state where it matters. Every id here is one the layout really draws, so
+/// Tab never lands on an absent control and never skips a present one:
+///   * `has_selection` -- a row is highlighted, so the repair action is drawn;
+///   * `can_apply` -- that row is a pick AND something plays, so Apply is drawn
+///     (`can_apply` implies `has_selection`).
+#[must_use]
+pub fn card_focus_order_for(advanced: bool, has_selection: bool, can_apply: bool) -> Vec<i32> {
+    let mut order = card_focus_order();
+    if advanced {
+        let (_, states) = presence::cardspec::card_presets();
+        let tail = vec![
+            BTN_PICKER_ALL,
+            BTN_PICKER_MOVIE,
+            BTN_PICKER_TV,
+            BTN_FIELD_ARTWORK,
+            BTN_FIELD_DETAILS,
+            BTN_FIELD_STATE,
+            BTN_FIELD_SYNOPSIS,
+            BTN_FIELD_TIMERS,
+        ];
+        let back = order.len() - 1;
+        for (i, id) in tail.into_iter().enumerate() {
+            order.insert(back + i, id);
+        }
+        let back = order.len() - 1;
+        for i in 0..states.len() as i32 {
+            order.insert(back + i as usize, card_state_button(i));
+        }
     }
-    order.push(BTN_FIX_MATCH);
+    if has_selection {
+        // The layout's own order: "Not this one?" sits above Apply, so the Tab
+        // path crosses them in the direction the eye does.
+        order.push(BTN_FIX_MATCH);
+        if can_apply {
+            order.push(BTN_PICKER_APPLY);
+        }
+    }
     order
 }
 
 /// `focusOrderForView` (`go\window.go:1268`).
+///
+/// The view's static order. The Card view's result actions come and go with the
+/// results list, so the window takes those from [`card_focus_order_for`] with
+/// the live layout state; this returns the at-rest shape.
 #[must_use]
 pub fn focus_order_for_view(v: View) -> Vec<i32> {
     match v {
@@ -1274,10 +1461,25 @@ pub fn card_preset_style(line: i32, id: &str, spec: &CardSpec) -> i32 {
     BTN_TAB
 }
 
-/// `computeCardLayout` (`go\window.go:1546`). The displayed kind's spec flips
-/// the preset styles. `kind` is the displayed kind — [`UiState::preview_kind`]
-/// while a live card has been recorded, Series before that — never a manual
-/// toggle: the preview follows the live card.
+/// `computeCardLayout`: the one-object composition.
+///
+/// The window shows exactly one object -- the title PotPlayer is playing -- and
+/// everything on screen is either that object, its presence preview, or a
+/// correction to it:
+///
+/// 1. the object card: cover, title, year/kind, and the plain connection state;
+/// 2. one query field (title, optional trailing year) and one **Search** -- the
+///    only search-like control at rest in the whole window;
+/// 3. one **Advanced** disclosure holding every payload knob (field toggles,
+///    line-2 modes, and the kind override that exists only for a wrong guess);
+/// 4. the presence surfaces: three at 1180x700, the object's own profile
+///    preview at 463x703;
+/// 5. the results list, which owns the only repair affordance and shows it only
+///    while a row is selected.
+///
+/// `advanced` opens the disclosure and `has_selection` adds the inline repair
+/// row. Both are model state, so crossing 1180x700 <-> 463x703 keeps the query,
+/// the result set, the selection and the disclosure exactly as they were.
 #[must_use]
 pub fn compute_card_layout(
     cw: i32,
@@ -1285,184 +1487,1292 @@ pub fn compute_card_layout(
     dpi: i32,
     specs: &CardSpecs,
     kind: CardKind,
+    surface: PreviewSurface,
 ) -> CardLayout {
-    let sc = |v: i32| scale_px(dpi, v);
-    let margin = sc(MAIN_MARGIN);
-    let content_w = (cw - margin * 2).max(sc(100));
+    compute_card_layout_with(cw, ch, dpi, specs, kind, surface, false, false)
+}
+
+/// The picker's model state the Card composition needs beyond the resolved
+/// kind: the payload disclosure, whether a result row is selected (the only
+/// state in which repair/apply exist), whether applying to the playing title is
+/// possible at all, and the explicit search scope.
+#[derive(Clone, Copy, Debug)]
+pub struct CardLayoutState {
+    pub advanced: bool,
+    pub has_selection: bool,
+    pub can_apply: bool,
+    pub filter: crate::search::KindFilter,
+}
+
+impl Default for CardLayoutState {
+    fn default() -> Self {
+        Self {
+            advanced: false,
+            has_selection: false,
+            can_apply: false,
+            filter: crate::search::KindFilter::All,
+        }
+    }
+}
+
+/// [`compute_card_layout`] plus the disclosure and selection flags. The apply
+/// control is never laid out here: this form is the "rest / no player" shape
+/// the pinned tests measure.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_card_layout_with(
+    cw: i32,
+    ch: i32,
+    dpi: i32,
+    specs: &CardSpecs,
+    kind: CardKind,
+    surface: PreviewSurface,
+    advanced: bool,
+    has_selection: bool,
+) -> CardLayout {
+    compute_card_layout_state(
+        cw,
+        ch,
+        dpi,
+        specs,
+        kind,
+        surface,
+        &CardLayoutState {
+            advanced,
+            has_selection,
+            can_apply: false,
+            filter: crate::search::KindFilter::All,
+        },
+    )
+}
+
+/// The full Card composition.
+#[must_use]
+pub fn compute_card_layout_state(
+    cw: i32,
+    ch: i32,
+    dpi: i32,
+    specs: &CardSpecs,
+    kind: CardKind,
+    surface: PreviewSurface,
+    state: &CardLayoutState,
+) -> CardLayout {
+    let advanced = state.advanced;
+    let has_selection = state.has_selection;    let sc = |v: i32| scale_px(dpi, v);
     let spec = specs.for_kind(kind);
+    let compact = ch < sc(480);
+    // Three simultaneous surfaces need a stage wide enough to read them; below
+    // this the object's own preview stands alone.
+    let wide = cw >= sc(1180) && ch >= sc(700);
+    let header_h = if compact { 0 } else { sc(HEADER_H_L) };
+    let tab_top = if compact { sc(SP_2) } else { sc(TAB_TOP_L) };
+    let tab_h = sc(TAB_H_L);
+    let tab_bottom = tab_top + tab_h;
+    let status_h = if compact { 0 } else { sc(STATUS_H_L) };
+    let status_top = ch - sc(BOTTOM_L) - status_h;
+    let (_, states) = presence::cardspec::card_presets();
+    let seg_gap = sc(SP_2);
+    let designer = presence::live_designer();
 
-    let mut l = CardLayout::default();
-
-    // Same stack, same grid: header band, tab strip, then the preview panel
-    // and the single State preset row under its micro-label. The panel
-    // reserves five rows plus the tooltip slot the layout pitch defines,
-    // with room to spare. The removed kind-toggle band's budget (its label,
-    // row, and gaps) belongs to the preview now, as does the removed Details
-    // row's band: the panel grows by exactly both bands, so the State row,
-    // the hint, and the bottom-anchored footer keep their exact positions
-    // and no gap opens above the footer at any DPI.
-    let label_top = sc(TAB_TOP_L) + sc(TAB_H_L) + sc(SP_3);
-    let label_h = sc(SECTION_H_L);
-    let after_label = label_h + sc(SP_2);
-
-    let prev_top = label_top + after_label;
-    // Unchanged base panel 176px plus exactly the two freed bands (the
-    // kind-toggle band, then the Details row band: each its label, row, and
-    // gaps), in scaled px so everything below lands pixel-identical to the
-    // pre-toggle layout at every DPI.
-    let prev_h = sc(176) + 2 * (after_label + sc(BTN_H) + sc(SP_4));
-    let prev_pad = sc(SP_3);
-    let (row_h, row_pitch) = (sc(20), sc(22));
-    l.preview = Rect {
-        left: margin,
-        top: prev_top,
-        right: margin + content_w,
-        bottom: prev_top + prev_h,
+    let mut l = CardLayout {
+        compact,
+        wide,
+        ..CardLayout::default()
     };
-    for i in 0..5 {
-        let top = prev_top + prev_pad + i * row_pitch;
-        l.rows.push(Rect {
-            left: margin + prev_pad,
-            top,
-            right: margin + content_w - prev_pad,
-            bottom: top + row_h,
-        });
+    l.header = Rect {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: header_h,
+    };
+    let (mut card_tab, mut settings_tab) = tab_strip_rects(cw, dpi);
+    for r in [&mut card_tab, &mut settings_tab] {
+        r.top = tab_top;
+        r.bottom = tab_bottom;
+    }
+    l.tab_strip = Rect {
+        left: card_tab.left,
+        top: card_tab.top,
+        right: settings_tab.right,
+        bottom: card_tab.bottom,
+    };
+    l.card_link = card_tab;
+    l.settings = settings_tab;
+
+    // One segmented row over `items`; the last cell lands exactly on `right`.
+    let segments = |left: i32,
+                    right: i32,
+                    top: i32,
+                    h: i32,
+                    items: &[(i32, String, i32)]|
+     -> Vec<UiButton> {
+        let n = items.len() as i32;
+        if n == 0 {
+            return Vec::new();
+        }
+        let w = ((right - left) - seg_gap * (n - 1)) / n;
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, (id, label, style))| {
+                let i = i as i32;
+                let x = left + i * (w + seg_gap);
+                UiButton {
+                    id: *id,
+                    label: label.clone(),
+                    style: *style,
+                    rc: Rect {
+                        left: x,
+                        top,
+                        right: if i == n - 1 { right } else { x + w },
+                        bottom: top + h,
+                    },
+                }
+            })
+            .collect()
+    };
+
+    let (margin, content_w) = content_span(cw, dpi);
+    let rail_w = if wide { sc(400).min(content_w / 2) } else { content_w };
+    let col_left = margin;
+    let col_right = col_left + rail_w;
+    let stage_left = if wide { col_right + sc(SP_6) } else { margin };
+    let stage_right = margin + content_w;
+
+    // --- 1. the object card ------------------------------------------------
+    let top = tab_bottom + sc(SP_3);
+    let obj_h = sc(if compact { 96 } else { 128 });
+    l.object = Rect {
+        left: col_left,
+        top,
+        right: col_right,
+        bottom: top + obj_h,
+    };
+    let opad = sc(SP_3);
+    let cover_w = sc(if compact { 48 } else { 68 });
+    l.obj_cover = Rect {
+        left: l.object.left + opad,
+        top: l.object.top + opad,
+        right: (l.object.left + opad + cover_w).min(l.object.right - opad),
+        bottom: l.object.bottom - opad,
+    };
+    let text_l = l.obj_cover.right + sc(SP_3);
+    let text_r = l.object.right - opad;
+    l.obj_title = Rect {
+        left: text_l,
+        top: l.object.top + opad,
+        right: text_r,
+        bottom: l.object.top + opad + sc(24),
+    };
+    l.obj_meta = Rect {
+        left: text_l,
+        top: l.obj_title.bottom + sc(SP_1),
+        right: text_r,
+        bottom: l.obj_title.bottom + sc(SP_1) + sc(18),
+    };
+    l.obj_status = Rect {
+        left: text_l,
+        top: l.obj_meta.bottom + sc(SP_2),
+        right: text_r,
+        bottom: l.obj_meta.bottom + sc(SP_2) + sc(18),
+    };
+
+    // --- 2. one field, one verb -------------------------------------------
+    let field_h = sc(BTN_H);
+    let search_top = l.object.bottom + sc(SP_3);
+    let search_w = sc(84);
+    let gap = sc(SP_2);
+    l.picker_bar = Rect {
+        left: col_left,
+        top: search_top,
+        right: col_right,
+        bottom: search_top + field_h,
+    };
+    let field_right = col_right - search_w - gap;
+    let field_rc = Rect {
+        left: col_left,
+        top: search_top,
+        right: field_right,
+        bottom: search_top + field_h,
+    };
+    let search_rc = Rect {
+        left: field_right + gap,
+        top: search_top,
+        right: col_right,
+        bottom: search_top + field_h,
+    };
+
+    // --- 3. one disclosure -------------------------------------------------
+    let adv_top = l.picker_bar.bottom + sc(SP_1);
+    let adv_h = sc(32);
+    let adv_w = sc(132);
+    let advanced_rc = Rect {
+        left: col_left,
+        top: adv_top,
+        right: col_left + adv_w,
+        bottom: adv_top + adv_h,
+    };
+    // The search's own readout shares the disclosure row: it never costs a line
+    // of its own, so the field can explain a failure without moving the list.
+    l.picker_status = Rect {
+        left: advanced_rc.right + gap,
+        top: adv_top + sc(SP_2),
+        right: col_right,
+        bottom: adv_top + adv_h,
+    };
+    let panel_top = adv_top + adv_h + sc(SP_2);
+    let panel_h = sc(130);
+    let footer_top = status_top - sc(SP_3) - sc(BTN_H);
+    // Very short clients have no footer row of their own: Back shares the
+    // disclosure row, and a disclosure with nowhere to open stays shut.
+    let share_row = footer_top < adv_top + adv_h + sc(SP_2) + sc(BTN_H);
+    let advanced = advanced && !share_row;
+    if advanced {
+        l.advanced_panel = Rect {
+            left: col_left,
+            top: panel_top,
+            right: col_right,
+            bottom: panel_top + panel_h,
+        };
     }
 
-    let state_label = prev_top + prev_h + sc(SP_4);
-    let state_row = state_label + after_label;
-    let hint_top = state_row + sc(BTN_H) + sc(SP_2);
-    l.labels = vec![
-        NamedTextRect {
-            id: "card.preview-label".into(),
-            rc: Rect {
-                left: margin,
-                top: label_top,
-                right: margin + content_w,
-                bottom: label_top + label_h,
-            },
+    let stage_top = if wide {
+        top
+    } else if advanced {
+        l.advanced_panel.bottom + sc(SP_3)
+    } else {
+        panel_top
+    };
+    let stage_bottom = if share_row {
+        ch - sc(SP_2)
+    } else {
+        footer_top - sc(SP_2)
+    };
+    let stage = Rect {
+        left: stage_left,
+        top: stage_top,
+        right: stage_right,
+        bottom: stage_bottom.max(stage_top + sc(60)).min(ch - sc(SP_1)).max(stage_top),
+    };
+    l.stage = stage;
+    l.tooltip = Rect::default();
+    // The results list occupies the stage: the two are painted exclusively, so
+    // one rect cannot be both a preview and a result set.
+    l.picker_results = stage;
+
+    // --- 4. the presence surfaces -----------------------------------------
+    if wide {
+        let stage_h = stage.bottom - stage.top;
+        let member_h = sc(140).min((stage_h - sc(SP_2)).max(sc(60)));
+        let member = Rect {
+            left: stage.left,
+            top: stage.top,
+            right: stage.right,
+            bottom: stage.top + member_h,
+        };
+        let lower_top = member.bottom + sc(SP_2);
+        let half = (stage.right - stage.left - sc(SP_4)) / 2;
+        let profile = Rect {
+            left: stage.left,
+            top: lower_top,
+            right: stage.left + half,
+            bottom: stage.bottom,
+        };
+        let activity = Rect {
+            left: profile.right + sc(SP_4),
+            top: lower_top,
+            right: stage.right,
+            bottom: stage.bottom,
+        };
+        l.surfaces = [member, profile, activity];
+        l.preview = profile;
+        let pad = sc(SP_4);
+        let banner_h = sc(30);
+        let avatar_h = sc(54);
+        let title_top = profile.top + banner_h + sc(18) + avatar_h + sc(SP_2);
+        l.title = Rect {
+            left: profile.left + pad,
+            top: title_top,
+            right: profile.right - pad,
+            bottom: title_top + sc(26),
+        };
+        l.meta = Rect {
+            left: l.title.left,
+            top: l.title.bottom + sc(SP_1),
+            right: l.title.right,
+            bottom: l.title.bottom + sc(SP_1) + sc(18),
+        };
+        let activity_top = l.meta.bottom + sc(SP_3);
+        let art_w = sc(72).min((profile.right - profile.left) / 3);
+        l.art = Rect {
+            left: l.title.left,
+            top: activity_top,
+            right: l.title.left + art_w,
+            bottom: (activity_top + sc(96)).min(profile.bottom - pad),
+        };
+        l.synopsis = Rect {
+            left: (l.art.right + sc(SP_3)).min(profile.right - pad),
+            top: activity_top + sc(72),
+            right: profile.right - pad,
+            bottom: (activity_top + sc(72) + sc(18)).min(profile.bottom - pad),
+        };
+    } else {
+        let stage_h = stage.bottom - stage.top;
+        l.preview = stage;
+        l.surfaces = [stage, stage, stage];
+        if stage_h >= sc(120) {
+            let pad = sc(SP_3);
+            let art_w = sc(64);
+            let art_h = sc(96);
+            let art_top = stage.top + pad;
+            l.art = Rect {
+                left: stage.left + pad,
+                top: art_top,
+                right: (stage.left + pad + art_w).min(stage.right - pad),
+                bottom: (art_top + art_h).min(stage.bottom - pad),
+            };
+            let text_l = l.art.right + sc(SP_3);
+            l.title = Rect {
+                left: text_l,
+                top: art_top,
+                right: stage.right - pad,
+                bottom: art_top + sc(24),
+            };
+            l.meta = Rect {
+                left: text_l,
+                top: l.title.bottom + sc(SP_1),
+                right: stage.right - pad,
+                bottom: l.title.bottom + sc(SP_1) + sc(18),
+            };
+            l.synopsis = Rect {
+                left: text_l,
+                top: l.meta.bottom + sc(SP_2),
+                right: stage.right - pad,
+                bottom: (l.meta.bottom + sc(SP_2) + sc(18)).min(stage.bottom - pad),
+            };
+        }
+    }
+    l.rows = vec![l.title, l.meta, l.synopsis];
+    // The rail is the whole column the object and its query live in; the stage
+    // is what is left over for the preview or the results.
+    l.rail = Rect {
+        left: col_left,
+        top: l.object.top,
+        right: col_right,
+        bottom: footer_top.max(l.object.bottom),
+    };
+    let _ = surface;
+
+    // --- the control table -------------------------------------------------
+    l.btns = vec![
+        UiButton {
+            id: BTN_CARD,
+            label: "Card".into(),
+            style: BTN_TAB,
+            rc: l.card_link,
         },
-        NamedTextRect {
-            id: "card.line2".into(),
-            rc: Rect {
-                left: margin,
-                top: state_label,
-                right: margin + content_w,
-                bottom: state_label + label_h,
-            },
+        UiButton {
+            id: BTN_SETTINGS,
+            label: "Settings".into(),
+            style: BTN_TAB,
+            rc: l.settings,
+        },
+        UiButton {
+            id: BTN_PICKER_FIELD,
+            label: String::new(),
+            style: BTN_OUTLINE,
+            rc: field_rc,
+        },
+        UiButton {
+            id: BTN_PICKER_SEARCH,
+            label: "Search".into(),
+            style: BTN_ACCENT,
+            rc: search_rc,
+        },
+        UiButton {
+            id: BTN_ADVANCED,
+            label: if advanced { "Advanced \u{25be}" } else { "Advanced \u{25b8}" }.into(),
+            style: BTN_TEXT,
+            rc: advanced_rc,
         },
     ];
-    l.hint = Rect {
-        left: margin,
-        top: hint_top,
-        right: margin + content_w,
-        bottom: hint_top + sc(SP_4),
-    };
-
-    // The State row is a segmented control: mutually exclusive choices, one
-    // row of equal cells, so it carries the segment anatomy rather than the
-    // accent fill (which belongs to the view's single primary action).
-    let seg_gap = sc(SP_2);
-    let seg = |top: i32, presets: &[CardPreset]| -> Vec<UiButton> {
-        let n = presets.len() as i32;
-        let w = (content_w - seg_gap * (n - 1)) / n;
-        let mut out = Vec::with_capacity(presets.len());
-        for (i, p) in presets.iter().enumerate() {
-            let i = i as i32;
-            let left = margin + i * (w + seg_gap);
-            let id = card_state_button(i);
-            out.push(UiButton {
-                id,
-                label: p.label.clone(),
-                style: card_preset_style(1, &p.id, &spec),
+    if advanced {
+        // Search scope: `All types` by default. This shapes the SEARCH only --
+        // the record a row resolves owns the preview's kind, so this row can
+        // never relabel a series as a movie. It is never on screen at rest.
+        let filter_items = vec![
+            (
+                BTN_PICKER_ALL,
+                crate::search::KindFilter::All.label().to_string(),
+                if state.filter == crate::search::KindFilter::All { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+            (
+                BTN_PICKER_MOVIE,
+                crate::search::KindFilter::Movies.label().to_string(),
+                if state.filter == crate::search::KindFilter::Movies { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+            (
+                BTN_PICKER_TV,
+                crate::search::KindFilter::Series.label().to_string(),
+                if state.filter == crate::search::KindFilter::Series { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+        ];
+        l.btns.extend(segments(
+            l.advanced_panel.left,
+            l.advanced_panel.right,
+            l.advanced_panel.top,
+            sc(32),
+            &filter_items,
+        ));
+        let field_items: Vec<(i32, String, i32)> = vec![
+            (
+                BTN_FIELD_ARTWORK,
+                "Artwork".to_string(),
+                if designer.artwork { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+            (
+                BTN_FIELD_DETAILS,
+                "Details".to_string(),
+                if designer.details { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+            (
+                BTN_FIELD_STATE,
+                "State".to_string(),
+                if designer.state { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+            (
+                BTN_FIELD_SYNOPSIS,
+                "Synopsis".to_string(),
+                if designer.synopsis { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+            (
+                BTN_FIELD_TIMERS,
+                "Timers".to_string(),
+                if designer.timers { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+            ),
+        ];
+        l.btns.extend(segments(
+            l.advanced_panel.left,
+            l.advanced_panel.right,
+            l.advanced_panel.top + sc(32) + sc(SP_2),
+            sc(32),
+            &field_items,
+        ));
+        let si: Vec<(i32, String, i32)> = states
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    card_state_button(i as i32),
+                    p.label.clone(),
+                    card_preset_style(1, &p.id, &spec),
+                )
+            })
+            .collect();
+        l.labels.push(NamedTextRect {
+            id: "card.line2".into(),
+            rc: Rect {
+                left: l.advanced_panel.left,
+                top: l.advanced_panel.top + sc(32) + sc(SP_2) + sc(32) + sc(SP_2),
+                right: l.advanced_panel.right,
+                bottom: l.advanced_panel.top + sc(32) + sc(SP_2) + sc(32) + sc(SP_2) + sc(18),
+            },
+        });
+        l.btns.extend(segments(
+            l.advanced_panel.left,
+            l.advanced_panel.right,
+            l.advanced_panel.top + sc(32) + sc(SP_2) + sc(32) + sc(SP_2) + sc(18),
+            sc(32),
+            &si,
+        ));
+    }
+    l.btns.push(UiButton {
+        id: BTN_CARD_BACK,
+        label: "Back".into(),
+        style: BTN_OUTLINE,
+        rc: if share_row {
+            Rect {
+                left: (col_right - sc(84)).max(l.picker_status.left),
+                top: adv_top,
+                right: col_right,
+                bottom: adv_top + adv_h,
+            }
+        } else {
+            Rect {
+                left: col_left,
+                top: footer_top,
+                right: col_left + if wide { rail_w } else { content_w },
+                bottom: footer_top + sc(BTN_H),
+            }
+        },
+    });
+    // The list's own actions. Both exist ONLY with a selection and only inside
+    // the results list -- never as a peer of the field, never at rest.
+    if has_selection {
+        let row_h = sc(32);
+        let gap = sc(SP_1);
+        let mut bottom = l.picker_results.bottom - sc(SP_2);
+        if state.can_apply {
+            // Applying a match changes what the CURRENTLY PLAYING title is;
+            // with nothing playing there is nothing to apply it to, so the
+            // control is absent rather than disabled-and-lying.
+            l.btns.push(UiButton {
+                id: BTN_PICKER_APPLY,
+                label: "Apply to playing title".into(),
+                style: BTN_ACCENT,
                 rc: Rect {
-                    left,
-                    top,
-                    right: if i == n - 1 {
-                        margin + content_w
-                    } else {
-                        left + w
-                    },
-                    bottom: top + sc(BTN_H),
+                    left: l.picker_results.left + sc(SP_2),
+                    top: (bottom - row_h).max(l.picker_results.top),
+                    right: l.picker_results.right - sc(SP_2),
+                    bottom,
                 },
             });
+            bottom -= row_h + gap;
         }
-        out
-    };
-    let (_, states) = presence::cardspec::card_presets();
-    l.btns = tab_strip_buttons(cw, dpi);
-    l.btns.extend(seg(state_row, &states));
-
-    let status_h = sc(STATUS_H_L);
-    let status_top = ch - sc(BOTTOM_L) - status_h;
-    let footer_top = status_top - sc(SP_3) - sc(BTN_H);
+        l.btns.push(UiButton {
+            id: BTN_FIX_MATCH,
+            label: "Not this one? Open advanced match\u{2026}".into(),
+            style: BTN_TEXT,
+            rc: Rect {
+                left: l.picker_results.left + sc(SP_2),
+                top: (bottom - row_h).max(l.picker_results.top),
+                right: l.picker_results.right - sc(SP_2),
+                bottom,
+            },
+        });
+    }
     l.status = Rect {
         left: margin,
         top: status_top,
         right: margin + content_w,
         bottom: status_top + status_h,
     };
-    let col_w = (content_w - sc(BTN_GAP_L)) / 2;
-    l.btns.push(UiButton {
-        id: BTN_CARD_BACK,
-        label: "Back".into(),
-        style: BTN_OUTLINE,
-        rc: Rect {
+    l.wire = Rect::default();
+    let _ = tab_h;
+    l
+}
+/// The **superseded** composition (`v1`): the designer split workspace with the
+/// Movie/TV choice in the primary band, `Fix match…` as a peer footer button and
+/// twenty interactive controls at rest. It is no longer painted or hit-tested.
+///
+/// It survives only as the pinned "before" arm of the two red-capable delta
+/// tests (`card_kind_never_renders_movie_for_a_series_match` and
+/// `advanced_disclosure_keeps_the_rest_state_at_three_controls`, both in this
+/// file's test module): a threshold test that cannot show the pre-fix numbers
+/// going red proves nothing. Nothing outside those tests calls it.
+#[allow(dead_code)]
+pub fn compute_card_layout_shipped_v1(
+    cw: i32,
+    ch: i32,
+    dpi: i32,
+    specs: &CardSpecs,
+    kind: CardKind,
+    surface: PreviewSurface,
+) -> CardLayout {
+    let sc = |v: i32| scale_px(dpi, v);
+    let spec = specs.for_kind(kind);
+    let compact = ch < sc(480);
+    // The split workspace needs a readable stage for three surfaces; below
+    // this width (or height) the narrow stack shows one surface at full width.
+    let wide = cw >= sc(1180) && ch >= sc(700);
+    let header_h = if compact { 0 } else { sc(HEADER_H_L) };
+    let tab_top = if compact { sc(SP_2) } else { sc(TAB_TOP_L) };
+    let tab_h = sc(TAB_H_L);
+    let tab_bottom = tab_top + tab_h;
+    let label_h = sc(SECTION_H_L);
+    let status_h = if compact { 0 } else { sc(STATUS_H_L) };
+    let status_top = ch - sc(BOTTOM_L) - status_h;
+    let (_, states) = presence::cardspec::card_presets();
+    let seg_gap = sc(SP_2);
+    let designer = presence::live_designer();
+
+    let mut l = CardLayout {
+        compact,
+        wide,
+        ..CardLayout::default()
+    };
+    l.header = Rect {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: header_h,
+    };
+    let (mut card_tab, mut settings_tab) = tab_strip_rects(cw, dpi);
+    for r in [&mut card_tab, &mut settings_tab] {
+        r.top = tab_top;
+        r.bottom = tab_bottom;
+    }
+    l.tab_strip = Rect {
+        left: card_tab.left,
+        top: card_tab.top,
+        right: settings_tab.right,
+        bottom: card_tab.bottom,
+    };
+    l.card_link = card_tab;
+    l.settings = settings_tab;
+
+    // One segmented row over `items`; the last cell lands exactly on `right`.
+    let segments = |left: i32,
+                    right: i32,
+                    top: i32,
+                    h: i32,
+                    items: &[(i32, String, i32)]|
+     -> Vec<UiButton> {
+        let n = items.len() as i32;
+        if n == 0 {
+            return Vec::new();
+        }
+        let w = ((right - left) - seg_gap * (n - 1)) / n;
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, (id, label, style))| {
+                let i = i as i32;
+                let x = left + i * (w + seg_gap);
+                UiButton {
+                    id: *id,
+                    label: label.clone(),
+                    style: *style,
+                    rc: Rect {
+                        left: x,
+                        top,
+                        right: if i == n - 1 { right } else { x + w },
+                        bottom: top + h,
+                    },
+                }
+            })
+            .collect()
+    };
+    let surface_items = |sel: PreviewSurface| -> Vec<(i32, String, i32)> {
+        [
+            (BTN_SURFACE_MEMBER, "Members", PreviewSurface::Member),
+            (BTN_SURFACE_PROFILE, "Profile", PreviewSurface::Profile),
+            (BTN_SURFACE_ACTIVITY, "Activity", PreviewSurface::Activity),
+        ]
+        .into_iter()
+        .map(|(id, label, s)| {
+            (
+                id,
+                label.to_string(),
+                if s == sel { BTN_TAB_SEL } else { BTN_TAB },
+            )
+        })
+        .collect()
+    };
+    // The picker band is one row in every composition: the query field, the
+    // explicit Movie/TV choice, the primary Search/Match action, and (when the
+    // width allows) a status readout. The field keeps the same trailing-year
+    // contract as the Fix match dialog; no second Year control exists.
+    let picker_items = |left: i32, right: i32, top: i32| -> (Rect, Rect, Rect, Rect, Rect) {
+        let gap = sc(6);
+        let wide_enough = right - left >= sc(520);
+        let search_w = sc(if wide_enough { 76 } else { 58 });
+        let kind_w = sc(if wide_enough { 60 } else { 46 });
+        let status_w = if wide_enough { sc(110) } else { 0 };
+        let field_w = (right - left - search_w - 2 * kind_w - status_w - 4 * gap).max(sc(80));
+        let h = sc(32);
+        let field = Rect {
+            left,
+            top: top + sc(4),
+            right: left + field_w,
+            bottom: top + sc(4) + h,
+        };
+        let movie = Rect {
+            left: field.right + gap,
+            top: field.top,
+            right: field.right + gap + kind_w,
+            bottom: field.bottom,
+        };
+        let tv = Rect {
+            left: movie.right + gap,
+            top: field.top,
+            right: movie.right + gap + kind_w,
+            bottom: field.bottom,
+        };
+        let search = Rect {
+            left: tv.right + gap,
+            top: field.top,
+            right: tv.right + gap + search_w,
+            bottom: field.bottom,
+        };
+        let status = Rect {
+            left: search.right + gap,
+            top: field.top,
+            right: if status_w > 0 { right } else { search.right },
+            bottom: field.bottom,
+        };
+        (field, movie, tv, search, status)
+    };
+    let field_items = |short: bool| -> Vec<(i32, String, i32)> {
+        let name = |on: bool, long: &str, brief: &str| {
+            (
+                if on { BTN_TOGGLE_ON } else { BTN_TOGGLE },
+                if short { brief } else { long }.to_string(),
+            )
+        };
+        let (s_art, art) = name(designer.artwork, "Artwork", "Art");
+        let (s_det, det) = name(designer.details, "Details", "Details");
+        let (s_sta, sta) = name(designer.state, "State", "State");
+        let (s_syn, syn) = name(designer.synopsis, "Synopsis", "Synopsis");
+        let (s_tim, tim) = name(designer.timers, "Timers", "Time");
+        vec![
+            (BTN_FIELD_ARTWORK, art, s_art),
+            (BTN_FIELD_DETAILS, det, s_det),
+            (BTN_FIELD_STATE, sta, s_sta),
+            (BTN_FIELD_SYNOPSIS, syn, s_syn),
+            (BTN_FIELD_TIMERS, tim, s_tim),
+        ]
+    };
+
+    if wide {
+        // Split workspace: the editor rail on the left, the three live Discord
+        // surfaces on the right, all visible at once.
+        let m = sc(32);
+        let content_w = (cw - 2 * m).max(sc(600));
+        let content_top = tab_bottom + sc(SP_4);
+        let content_bottom = (status_top - sc(SP_3)).max(content_top + sc(320));
+        let rail_w = sc(400).min(content_w / 2);
+        l.rail = Rect {
+            left: m,
+            top: content_top,
+            right: m + rail_w,
+            bottom: content_bottom,
+        };
+        let stage_left = l.rail.right + sc(SP_6);
+        l.picker_bar = Rect {
+            left: stage_left,
+            top: content_top,
+            right: m + content_w,
+            bottom: content_top + sc(40),
+        };
+        l.stage = Rect {
+            left: stage_left,
+            top: l.picker_bar.bottom + sc(SP_2),
+            right: m + content_w,
+            bottom: content_bottom,
+        };
+        l.picker_results = Rect {
+            left: l.stage.left,
+            top: l.stage.top,
+            right: l.stage.right,
+            bottom: (l.stage.top + sc(250)).min(l.stage.bottom),
+        };
+        let stage_w = l.stage.right - l.stage.left;
+        let stage_h = l.stage.bottom - l.stage.top;
+        // At the 1180x700 workspace the profile surface needs the lower band
+        // to keep its 132px cover and the timer labels inside the panel; at
+        // taller clients the member list takes its full 180px.
+        let member_h = if stage_h < sc(520) {
+            sc(140)
+        } else {
+            sc(180).min(stage_h / 3)
+        };
+        let member = Rect {
+            left: l.stage.left,
+            top: l.stage.top,
+            right: l.stage.right,
+            bottom: l.stage.top + member_h,
+        };
+        let lower_top = member.bottom + sc(SP_2);
+        let half = (stage_w - sc(SP_4)) / 2;
+        let profile = Rect {
+            left: l.stage.left,
+            top: lower_top,
+            right: l.stage.left + half,
+            bottom: l.stage.bottom,
+        };
+        let activity = Rect {
+            left: profile.right + sc(SP_4),
+            top: lower_top,
+            right: l.stage.right,
+            bottom: l.stage.bottom,
+        };
+        l.surfaces = [member, profile, activity];
+        l.preview = profile;
+
+        // The profile surface's media rows.
+        let pad = sc(SP_4);
+        let banner_h = sc(30);
+        let avatar_h = sc(54);
+        let title_top = profile.top + banner_h + sc(18) + avatar_h + sc(SP_2);
+        l.title = Rect {
+            left: profile.left + pad,
+            top: title_top,
+            right: profile.right - pad,
+            bottom: title_top + sc(28),
+        };
+        l.meta = Rect {
+            left: l.title.left,
+            top: l.title.bottom + sc(SP_1),
+            right: l.title.right,
+            bottom: l.title.bottom + sc(SP_1) + sc(18),
+        };
+        let activity_top = l.meta.bottom + sc(SP_3);
+        let art_w = sc(96).min((profile.right - profile.left) / 3);
+        let art_h = sc(132);
+        l.art = Rect {
+            left: l.title.left,
+            top: activity_top,
+            right: l.title.left + art_w,
+            bottom: (activity_top + art_h).min(profile.bottom - pad),
+        };
+        let text_left = l.art.right + sc(SP_3);
+        l.synopsis = Rect {
+            left: text_left,
+            top: activity_top + sc(96),
+            right: profile.right - pad,
+            bottom: (activity_top + sc(96) + sc(20)).min(profile.bottom - pad),
+        };
+        l.rows = vec![l.title, l.meta, l.synopsis];
+        l.tooltip = Rect::default();
+
+        // The rail's stack: heading, context, preview switch, fields, state
+        // presets, wire summary, footer actions.
+        l.labels = vec![
+            NamedTextRect {
+                id: "card.designer".into(),
+                rc: Rect {
+                    left: l.rail.left + sc(SP_4),
+                    top: l.rail.top,
+                    right: l.rail.right - sc(SP_4),
+                    bottom: l.rail.top + label_h,
+                },
+            },
+            NamedTextRect {
+                id: "card.context".into(),
+                rc: Rect {
+                    left: l.rail.left + sc(SP_4),
+                    top: l.rail.top + label_h,
+                    right: l.rail.right - sc(SP_4),
+                    bottom: l.rail.top + label_h + sc(18),
+                },
+            },
+            NamedTextRect {
+                id: "card.fields".into(),
+                rc: Rect {
+                    left: l.rail.left + sc(SP_4),
+                    top: l.rail.top + sc(120),
+                    right: l.rail.right - sc(SP_4),
+                    bottom: l.rail.top + sc(120) + label_h,
+                },
+            },
+            NamedTextRect {
+                id: "card.line2".into(),
+                rc: Rect {
+                    left: l.rail.left + sc(SP_4),
+                    top: l.rail.top + sc(230),
+                    right: l.rail.right - sc(SP_4),
+                    bottom: l.rail.top + sc(230) + label_h,
+                },
+            },
+            NamedTextRect {
+                id: "card.wire".into(),
+                rc: Rect {
+                    left: l.rail.left + sc(SP_4),
+                    top: l.rail.top + sc(350),
+                    right: l.rail.right - sc(SP_4),
+                    bottom: l.rail.top + sc(350) + label_h,
+                },
+            },
+        ];
+        l.wire = Rect {
+            left: l.rail.left + sc(SP_4),
+            top: l.rail.top + sc(350) + label_h + sc(SP_1),
+            right: l.rail.right - sc(SP_4),
+            bottom: l.rail.top + sc(350) + label_h + sc(SP_1) + sc(46),
+        };
+        let rail_inner_l = l.rail.left + sc(SP_4);
+        let rail_inner_r = l.rail.right - sc(SP_4);
+        let footer_top = l.rail.bottom - sc(BTN_H);
+        l.btns = vec![
+            UiButton {
+                id: BTN_CARD,
+                label: "Card".into(),
+                style: BTN_TAB,
+                rc: l.card_link,
+            },
+            UiButton {
+                id: BTN_SETTINGS,
+                label: "Settings".into(),
+                style: BTN_TAB,
+                rc: l.settings,
+            },
+        ];
+        // The picker band: one query field, the explicit Movie/TV choice, and
+        // the one primary action. The field is the same single-input contract
+        // as the dialog; the layout carries no second year control.
+        let (pf, pm, pt, ps, pstat) = picker_items(
+            l.picker_bar.left,
+            l.picker_bar.right,
+            l.picker_bar.top,
+        );
+        l.picker_status = pstat;
+        l.btns.push(UiButton {
+            id: BTN_PICKER_FIELD,
+            label: String::new(),
+            style: BTN_OUTLINE,
+            rc: pf,
+        });
+        l.btns.push(UiButton {
+            id: BTN_PICKER_MOVIE,
+            label: "Movie".into(),
+            style: BTN_TOGGLE,
+            rc: pm,
+        });
+        l.btns.push(UiButton {
+            id: BTN_PICKER_TV,
+            label: "TV".into(),
+            style: BTN_TOGGLE,
+            rc: pt,
+        });
+        l.btns.push(UiButton {
+            id: BTN_PICKER_SEARCH,
+            label: "Search".into(),
+            style: BTN_ACCENT,
+            rc: ps,
+        });
+        // Preview switch row (all three already visible; the choice marks the
+        // focused surface and keeps the keyboard path identical to narrow).
+        l.btns.extend(segments(
+            rail_inner_l,
+            rail_inner_r,
+            l.rail.top + sc(56),
+            sc(30),
+            &surface_items(surface),
+        ));
+        // Fields: 3 + 2 rows.
+        let fi = field_items(false);
+        l.btns.extend(segments(
+            rail_inner_l,
+            rail_inner_r,
+            l.rail.top + sc(120) + label_h + sc(SP_1),
+            sc(34),
+            &fi[..3],
+        ));
+        l.btns.extend(segments(
+            rail_inner_l,
+            rail_inner_r,
+            l.rail.top + sc(120) + label_h + sc(SP_1) + sc(42),
+            sc(34),
+            &fi[3..],
+        ));
+        // State presets: 2 + 2 rows.
+        let mut si: Vec<(i32, String, i32)> = states
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                (
+                    card_state_button(i as i32),
+                    p.label.clone(),
+                    card_preset_style(1, &p.id, &spec),
+                )
+            })
+            .collect();
+        let si2 = si.split_off(2);
+        l.btns.extend(segments(
+            rail_inner_l,
+            rail_inner_r,
+            l.rail.top + sc(230) + label_h + sc(SP_1),
+            sc(BTN_H),
+            &si,
+        ));
+        l.btns.extend(segments(
+            rail_inner_l,
+            rail_inner_r,
+            l.rail.top + sc(230) + label_h + sc(SP_1) + sc(44),
+            sc(BTN_H),
+            &si2,
+        ));
+        let col_w = (rail_inner_r - rail_inner_l - sc(BTN_GAP_L)) / 2;
+        l.btns.push(UiButton {
+            id: BTN_CARD_BACK,
+            label: "Back".into(),
+            style: BTN_OUTLINE,
+            rc: Rect {
+                left: rail_inner_l,
+                top: footer_top,
+                right: rail_inner_l + col_w,
+                bottom: footer_top + sc(BTN_H),
+            },
+        });
+        l.btns.push(UiButton {
+            id: BTN_FIX_MATCH,
+            label: FIX_MATCH_LABEL.into(),
+            style: BTN_OUTLINE,
+            rc: Rect {
+                left: rail_inner_l + col_w + sc(BTN_GAP_L),
+                top: footer_top,
+                right: rail_inner_r,
+                bottom: footer_top + sc(BTN_H),
+            },
+        });
+        l.status = Rect {
+            left: m,
+            top: status_top,
+            right: m + content_w,
+            bottom: status_top + status_h,
+        };
+        l.hint = Rect {
+            left: rail_inner_l,
+            top: l.wire.bottom + sc(SP_1),
+            right: rail_inner_r,
+            bottom: (l.wire.bottom + sc(SP_1) + sc(16)).min(footer_top - sc(SP_1)),
+        };
+    } else {
+        // Narrow stack: preview, then the field rows, the footer and status.
+        let (margin, content_w) = content_span(cw, dpi);
+        l.rail = Rect {
             left: margin,
-            top: footer_top,
-            right: margin + col_w,
-            bottom: footer_top + sc(BTN_H),
-        },
-    });
-    // The card view's action area, second column: the manual latch picker.
-    // `paint_button`/`do_card_action` gate it on the live now-playing state.
-    l.btns.push(UiButton {
-        id: BTN_FIX_MATCH,
-        label: FIX_MATCH_LABEL.into(),
-        style: BTN_OUTLINE,
-        rc: Rect {
-            left: margin + col_w + sc(BTN_GAP_L),
-            top: footer_top,
+            top: tab_bottom + sc(SP_2),
             right: margin + content_w,
-            bottom: footer_top + sc(BTN_H),
-        },
-    });
+            bottom: status_top,
+        };
+        l.picker_bar = Rect {
+            left: margin,
+            top: tab_bottom + sc(SP_2),
+            right: margin + content_w,
+            bottom: tab_bottom + sc(SP_2) + sc(40),
+        };
+        let label_top = l.picker_bar.bottom + sc(SP_2);
+        let label_band_h = if compact { 0 } else { sc(24) };
+        let preview_top = label_top + label_band_h + sc(SP_2);
+        let footer_top = status_top - sc(SP_3) - sc(BTN_H);
+        let hint_h = sc(16);
+        let hint_top = footer_top - sc(SP_2) - hint_h;
+        let state_row_top = hint_top - sc(SP_2) - sc(BTN_H);
+        let state_label_top = state_row_top - sc(SP_1) - label_h;
+        let field_h = sc(32);
+        let fields_row_top = state_label_top - sc(SP_3) - field_h;
+        let fields_label_top = fields_row_top - sc(SP_1) - label_h;
+        let preview_bottom = if compact {
+            footer_top - sc(SP_2)
+        } else {
+            fields_label_top - sc(SP_4)
+        };
+        let preview = Rect {
+            left: margin,
+            top: preview_top,
+            right: margin + content_w,
+            bottom: preview_bottom.max(preview_top + sc(80)),
+        };
+        l.preview = preview;
+        l.surfaces = [preview, preview, preview];
+        l.stage = preview;
+        l.picker_results = Rect {
+            left: preview.left,
+            top: l.picker_bar.bottom + sc(SP_1),
+            right: preview.right,
+            bottom: preview.bottom.max(l.picker_bar.bottom + sc(120)),
+        };
+        let pad = sc(if compact { SP_2 } else { SP_3 });
+        let art_w = if compact { sc(48) } else { sc(72) };
+        let art_h = if compact { sc(64) } else { sc(112) };
+        // Centre the media block in the panel: the narrow stack gives the
+        // preview the leftover height, so a top-aligned block would float.
+        let art_top = preview.top
+            + ((preview.bottom - preview.top - art_h).max(0) / 2).max(pad);
+        l.art = Rect {
+            left: preview.left + pad,
+            top: art_top,
+            right: (preview.left + pad + art_w).min(preview.right - pad),
+            bottom: (art_top + art_h).min(preview.bottom - pad),
+        };
+        let text_left = l.art.right + sc(SP_3);
+        let title_h = if compact { sc(20) } else { sc(26) };
+        l.title = Rect {
+            left: text_left,
+            top: art_top,
+            right: preview.right - pad,
+            bottom: art_top + title_h,
+        };
+        l.meta = Rect {
+            left: text_left,
+            top: l.title.bottom + sc(SP_1),
+            right: preview.right - pad,
+            bottom: l.title.bottom + sc(SP_1) + sc(18),
+        };
+        l.synopsis = Rect {
+            left: text_left,
+            top: l.meta.bottom + sc(SP_2),
+            right: preview.right - pad,
+            bottom: (l.meta.bottom + sc(SP_2) + sc(20)).min(preview.bottom - pad),
+        };
+        l.rows = vec![l.title, l.meta, l.synopsis];
+        l.tooltip = Rect::default();
+
+        l.labels = Vec::new();
+        if !compact {
+            l.labels.push(NamedTextRect {
+                id: "card.preview-label".into(),
+                rc: Rect {
+                    left: margin,
+                    top: label_top,
+                    right: margin + content_w / 3,
+                    bottom: label_top + label_band_h,
+                },
+            });
+            l.labels.push(NamedTextRect {
+                id: "card.fields".into(),
+                rc: Rect {
+                    left: margin,
+                    top: fields_label_top,
+                    right: margin + content_w,
+                    bottom: fields_label_top + label_h,
+                },
+            });
+            l.labels.push(NamedTextRect {
+                id: "card.line2".into(),
+                rc: Rect {
+                    left: margin,
+                    top: state_label_top,
+                    right: margin + content_w,
+                    bottom: state_label_top + label_h,
+                },
+            });
+            l.hint = Rect {
+                left: margin,
+                top: hint_top,
+                right: margin + content_w,
+                bottom: hint_top + hint_h,
+            };
+        }
+
+        l.btns = vec![
+            UiButton {
+                id: BTN_CARD,
+                label: "Card".into(),
+                style: BTN_TAB,
+                rc: l.card_link,
+            },
+            UiButton {
+                id: BTN_SETTINGS,
+                label: "Settings".into(),
+                style: BTN_TAB,
+                rc: l.settings,
+            },
+        ];
+        let (pf, pm, pt, ps, pstat) = picker_items(
+            l.picker_bar.left,
+            l.picker_bar.right,
+            l.picker_bar.top,
+        );
+        l.picker_status = pstat;
+        l.btns.push(UiButton {
+            id: BTN_PICKER_FIELD,
+            label: String::new(),
+            style: BTN_OUTLINE,
+            rc: pf,
+        });
+        l.btns.push(UiButton {
+            id: BTN_PICKER_MOVIE,
+            label: "Movie".into(),
+            style: BTN_TOGGLE,
+            rc: pm,
+        });
+        l.btns.push(UiButton {
+            id: BTN_PICKER_TV,
+            label: "TV".into(),
+            style: BTN_TOGGLE,
+            rc: pt,
+        });
+        l.btns.push(UiButton {
+            id: BTN_PICKER_SEARCH,
+            label: "Search".into(),
+            style: BTN_ACCENT,
+            rc: ps,
+        });
+        if !compact {
+            let sw_left = margin + content_w / 3;
+            l.btns.extend(segments(
+                sw_left,
+                margin + content_w,
+                label_top,
+                label_band_h,
+                &surface_items(surface),
+            ));
+            l.btns.extend(segments(
+                margin,
+                margin + content_w,
+                fields_row_top,
+                field_h,
+                &field_items(true),
+            ));
+            let si: Vec<(i32, String, i32)> = states
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    (
+                        card_state_button(i as i32),
+                        p.label.clone(),
+                        card_preset_style(1, &p.id, &spec),
+                    )
+                })
+                .collect();
+            l.btns.extend(segments(
+                margin,
+                margin + content_w,
+                state_row_top,
+                sc(BTN_H),
+                &si,
+            ));
+        }
+        let col_w = (content_w - sc(BTN_GAP_L)) / 2;
+        l.btns.push(UiButton {
+            id: BTN_CARD_BACK,
+            label: "Back".into(),
+            style: BTN_OUTLINE,
+            rc: Rect {
+                left: margin,
+                top: footer_top,
+                right: margin + col_w,
+                bottom: footer_top + sc(BTN_H),
+            },
+        });
+        l.btns.push(UiButton {
+            id: BTN_FIX_MATCH,
+            label: FIX_MATCH_LABEL.into(),
+            style: BTN_OUTLINE,
+            rc: Rect {
+                left: margin + col_w + sc(BTN_GAP_L),
+                top: footer_top,
+                right: margin + content_w,
+                bottom: footer_top + sc(BTN_H),
+            },
+        });
+        l.status = Rect {
+            left: margin,
+            top: status_top,
+            right: margin + content_w,
+            bottom: status_top + status_h,
+        };
+    }
     l
 }
 
-/// `cardTextRects` (`go\window.go:1606`).
+/// `cardTextRects` (`go\window.go:1606`). One audit table for the media rows,
+/// the labels, the tooltip panel, the controls and the status line.
 #[must_use]
 pub fn card_text_rects(cw: i32, ch: i32, dpi: i32, l: &CardLayout) -> Vec<NamedTextRect> {
-    let sc = |v: i32| scale_px(dpi, v);
-    let margin = sc(MAIN_MARGIN);
-    let content_w = (cw - margin * 2).max(sc(100));
+    let _ = (cw, dpi);
     let mut out = l.labels.clone();
-    for (i, r) in l.rows.iter().enumerate() {
-        out.push(NamedTextRect {
-            id: format!("card.row-{i}"),
-            rc: *r,
-        });
-    }
-    {
-        // The tooltip line is the sixth preview row: the panel reserves five
-        // rows, and `paint_preview_rows` draws the tooltip into the sixth slot
-        // the layout's pitch defines.
-        let (prev_pad, row_h, row_pitch) = (sc(SP_3), sc(20), sc(22));
-        let tip_top = l.preview.top + prev_pad + 5 * row_pitch;
-        out.push(NamedTextRect {
-            id: "card.row-5".into(),
-            rc: Rect {
-                left: l.preview.left + prev_pad,
-                top: tip_top,
-                right: l.preview.right - prev_pad,
-                bottom: tip_top + row_h,
-            },
-        });
-    }
     out.push(NamedTextRect {
-        id: "card.hint".into(),
-        rc: l.hint,
+        id: "card.title".into(),
+        rc: l.title,
     });
+    out.push(NamedTextRect {
+        id: "card.meta".into(),
+        rc: l.meta,
+    });
+    out.push(NamedTextRect {
+        id: "card.art".into(),
+        rc: l.art,
+    });
+    if l.hint.bottom > l.hint.top {
+        out.push(NamedTextRect {
+            id: "card.hint".into(),
+            rc: l.hint,
+        });
+    }
     for b in &l.btns {
         out.push(NamedTextRect {
             id: format!("card.btn-{}", b.id),
@@ -1473,8 +2783,26 @@ pub fn card_text_rects(cw: i32, ch: i32, dpi: i32, l: &CardLayout) -> Vec<NamedT
         id: "card.status".into(),
         rc: l.status,
     });
-    let _ = (ch, content_w);
+    let _ = ch;
     out
+}
+
+/// The object card's one status sentence for a local, unsent preview. It is
+/// true whatever PotPlayer is doing, so it can sit beside the preview surfaces
+/// without contradicting them.
+pub const LOCAL_PREVIEW_STATUS: &str = "Local preview \u{b7} not sent to Discord";
+
+/// What a preview surface says when there is no object to preview at all
+/// (cold start, nothing recorded, nothing selected). The synopsis boilerplate
+/// belongs to a title, so it is never painted with this line.
+pub const PREVIEW_EMPTY_TEXT: &str = "Nothing to preview";
+
+/// Whether the preview surfaces have nothing to show: no recorded push and no
+/// local selection, or a record that resolved to no title. The three surfaces
+/// read this one predicate, so none of them can paint a title-less body.
+#[must_use]
+pub fn preview_is_empty(have: bool, p: &SurfacePreview) -> bool {
+    !have || p.header.trim().is_empty()
 }
 
 /// `previewRows` (`go\window.go:1490`): the recorded payload verbatim.
@@ -1493,10 +2821,10 @@ pub fn preview_rows(act: &Activity, have: bool) -> [String; 5] {
     if header.is_empty() {
         header = "(Discord app name)".into();
     }
-    let mut images = act.large_image.clone();
-    if !act.small_image.is_empty() {
-        images = format!("{images} + {}", act.small_image);
-    }
+    // The small slot is never populated: the wire carries no `small_image`
+    // (the composer clears it and the serializer drops it), so the preview
+    // reports the cover alone and never paints a corner icon.
+    let images = act.large_image.clone();
     let mut buttons = "none".to_string();
     if !act.buttons.is_empty() {
         let parts: Vec<String> = act
@@ -1522,6 +2850,247 @@ pub fn preview_tooltip(act: &Activity, have: bool) -> String {
         return "Tooltip: -".into();
     }
     format!("Tooltip: {}", act.large_text)
+}
+
+// ---------------------------------------------------------------------------
+// RPC designer: one preview model for the three Discord surfaces.
+// ---------------------------------------------------------------------------
+
+/// Which Discord surface the narrow Card view shows. The wide workspace shows
+/// all three at once; the narrow composition keeps one at a time so no panel
+/// is clipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PreviewSurface {
+    Member,
+    #[default]
+    Profile,
+    Activity,
+}
+
+impl PreviewSurface {
+    /// Parses `/0/1/2`; any other value falls back to the profile.
+    #[must_use]
+    pub fn of_button(id: i32) -> Option<Self> {
+        match id {
+            BTN_SURFACE_MEMBER => Some(Self::Member),
+            BTN_SURFACE_PROFILE => Some(Self::Profile),
+            BTN_SURFACE_ACTIVITY => Some(Self::Activity),
+            _ => None,
+        }
+    }
+}
+
+/// Which designer field a toggle button edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesignerField {
+    Artwork,
+    Details,
+    State,
+    Synopsis,
+    Timers,
+}
+
+/// The field a designer toggle button id names, or `None`.
+#[must_use]
+pub fn designer_field_for_button(id: i32) -> Option<DesignerField> {
+    match id {
+        BTN_FIELD_ARTWORK => Some(DesignerField::Artwork),
+        BTN_FIELD_DETAILS => Some(DesignerField::Details),
+        BTN_FIELD_STATE => Some(DesignerField::State),
+        BTN_FIELD_SYNOPSIS => Some(DesignerField::Synopsis),
+        BTN_FIELD_TIMERS => Some(DesignerField::Timers),
+        _ => None,
+    }
+}
+
+/// The toggle's short status label.
+#[must_use]
+pub fn designer_field_label(field: DesignerField) -> &'static str {
+    match field {
+        DesignerField::Artwork => "Artwork",
+        DesignerField::Details => "Details",
+        DesignerField::State => "State",
+        DesignerField::Synopsis => "Synopsis",
+        DesignerField::Timers => "Time bar",
+    }
+}
+
+/// The time strip one preview shows. `timer` is false when the designer's
+/// timer field is off or the card carries no start anchor; the fraction is
+/// clamped to 0..=1 and drives the bar fill.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PreviewClock {
+    pub timer: bool,
+    pub paused: bool,
+    pub fraction: f64,
+    pub left: String,
+    pub right: String,
+}
+
+/// One preview projection of the composed (and designer-filtered) activity.
+/// Every surface renders from THIS struct, so the member list, the profile
+/// card and the Activity tab can never disagree about the header, the two
+/// body lines, the cover, the local synopsis or the time strip.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SurfacePreview {
+    /// `Watching <media title>`, from the one presence definition.
+    pub header: String,
+    pub details: String,
+    pub state: String,
+    /// The complete local synopsis (the Activity tab body). Empty when the
+    /// designer's synopsis field is off; never sent as a Discord field.
+    pub synopsis: String,
+    /// Whether a real cover is shown. The designer's artwork toggle AND a
+    /// decoded local image must both be true; a missing/not-yet-fetched URL
+    /// collapses the slot instead of painting a blank "poster" tile.
+    pub art: bool,
+    /// The resolved https cover URL when the wire carries one. Empty when the
+    /// card has no artwork.
+    pub art_url: String,
+    pub clock: PreviewClock,
+}
+
+/// Parses a resolved runtime string into milliseconds. The providers emit
+/// `166 min`, `2h 19m`, `2h`, `45 min` and the iTunes `2h 19m`; a `H:MM` or
+/// `H:MM:SS` shape is accepted too. Anything unparseable is `0` (the preview
+/// then shows elapsed time with no projected end).
+#[must_use]
+pub fn parse_length_ms(length: &str) -> i64 {
+    let s = length.trim().to_lowercase();
+    if s.is_empty() {
+        return 0;
+    }
+    // Providers spell the units with a space (`166 min`); fold that one space
+    // so the token pass below sees `166min`.
+    let s = s.replace(" min", "min").replace(" h", "h").replace(" m", "m");
+    if s.contains(':') {
+        let parts: Vec<&str> = s.split(':').collect();
+        let mut nums = Vec::new();
+        for part in &parts {
+            let Ok(n) = part.trim().parse::<i64>() else {
+                return 0;
+            };
+            if n < 0 {
+                return 0;
+            }
+            nums.push(n);
+        }
+        let (h, m, sec) = match nums.as_slice() {
+            [h, m, sec] => (*h, *m, *sec),
+            [h, m] => (*h, *m, 0),
+            _ => return 0,
+        };
+        return (h * 3600 + m * 60 + sec) * 1_000;
+    }
+    let mut ms: i64 = 0;
+    let mut any = false;
+    for token in s.split_whitespace() {
+        let token = token.trim();
+        let (num, unit_ms) = if let Some(h) = token.strip_suffix('h') {
+            (h, 3_600_000)
+        } else if let Some(m) = token.strip_suffix("min") {
+            (m, 60_000)
+        } else if let Some(m) = token.strip_suffix('m') {
+            (m, 60_000)
+        } else {
+            continue;
+        };
+        if let Ok(n) = num.trim().parse::<i64>() {
+            ms += n.max(0) * unit_ms;
+            any = true;
+        }
+    }
+    if any { ms } else { 0 }
+}
+
+/// The preview time strip from the payload's own anchor: while playing the bar
+/// fills toward the resolved runtime and the right label counts down; paused
+/// cards hold the bar and count the pause up (the same start anchor the client
+/// uses). No anchor, or a zero runtime, still shows elapsed time when running.
+#[must_use]
+pub fn preview_clock(act: &Activity, now_ms: i64, duration_ms: i64) -> PreviewClock {
+    if !act.has_start || act.start <= 0 {
+        return PreviewClock::default();
+    }
+    let elapsed = (now_ms - act.start).max(0);
+    if act.paused {
+        return PreviewClock {
+            timer: true,
+            paused: true,
+            fraction: 0.0,
+            left: "Paused".to_string(),
+            right: presence::fmt_ms(elapsed),
+        };
+    }
+    let mut clock = PreviewClock {
+        timer: true,
+        paused: false,
+        fraction: 0.0,
+        left: presence::fmt_ms(elapsed),
+        right: String::new(),
+    };
+    if duration_ms > 0 {
+        let used = elapsed.min(duration_ms);
+        clock.fraction = used as f64 / duration_ms as f64;
+        clock.left = presence::fmt_ms(used);
+        clock.right = format!("-{}", presence::fmt_ms(duration_ms - used));
+    }
+    clock
+}
+
+/// Projects one composed card into the shared preview model. `synopsis` is the
+/// complete local note (already gated by the designer's synopsis toggle by the
+/// caller); `now_ms`/`duration_ms` drive the time strip.
+#[must_use]
+pub fn surface_preview(
+    act: &Activity,
+    have: bool,
+    synopsis: &str,
+    now_ms: i64,
+    duration_ms: i64,
+    art_on: bool,
+) -> SurfacePreview {
+    if !have {
+        return SurfacePreview::default();
+    }
+    let art_url = if art_on && !act.large_image.is_empty() {
+        act.large_image.clone()
+    } else {
+        String::new()
+    };
+    SurfacePreview {
+        header: presence::header_line(act),
+        details: act.details.clone(),
+        state: act.state.clone(),
+        synopsis: synopsis.to_string(),
+        art: !art_url.is_empty(),
+        art_url,
+        clock: preview_clock(act, now_ms, duration_ms),
+    }
+}
+
+/// The non-empty lines one surface draws, in order. The three surfaces share
+/// the header, details and state verbatim; the profile and Activity tab add
+/// the time strip, and only the Activity tab carries the local synopsis body.
+#[must_use]
+pub fn surface_lines(p: &SurfacePreview, surface: PreviewSurface) -> Vec<String> {
+    let mut out: Vec<String> = vec![p.header.clone()];
+    for line in [&p.details, &p.state] {
+        if !line.is_empty() {
+            out.push(line.clone());
+        }
+    }
+    if surface != PreviewSurface::Member && p.clock.timer {
+        out.push(p.clock.left.clone());
+        if !p.clock.right.is_empty() {
+            out.push(p.clock.right.clone());
+        }
+    }
+    if surface == PreviewSurface::Activity && !p.synopsis.is_empty() {
+        out.push(p.synopsis.clone());
+    }
+    out.retain(|s| !s.is_empty());
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2455,6 +4024,33 @@ struct CardPreviewInput {
     resolved: Resolved,
 }
 
+/// The provider-search seam: one query, one explicit scope, the merged rows or
+/// a failure. The default runs the real provider pass for every leg the scope
+/// asks for; tests inject a fixture so no test touches the network.
+pub type PickerSearch = Arc<
+    dyn Fn(&str, i32, crate::search::KindFilter) -> Result<Vec<Candidate>, String> + Send + Sync,
+>;
+
+/// The real search pass. `All types` is two kind-scoped provider passes merged
+/// into one list (the providers cannot answer both kinds at once); a single
+/// kind is one pass. A cancelled/deadlined pass stops rather than reporting a
+/// misleading "no matches".
+fn default_picker_search(
+    title: &str,
+    year: i32,
+    filter: crate::search::KindFilter,
+) -> Result<Vec<Candidate>, String> {
+    let cancel = metadata_http::cancel::Cancel::with_deadline(FIX_MATCH_DEADLINE);
+    let mut passes: Vec<Vec<Candidate>> = Vec::new();
+    for kind in filter.kinds() {
+        if cancel.err().is_some() {
+            return Err("search cancelled".to_string());
+        }
+        passes.push(metadata::search(&cancel, title, year, *kind));
+    }
+    Ok(crate::search::merge_candidates(title, passes))
+}
+
 /// The scanner the UI seam owns. Every mutable value the Go root package held as
 /// a process global lives here, so Rust tests construct an isolated instance
 /// instead of racing a global.
@@ -2491,14 +4087,42 @@ pub struct UiState {
     pub startup_state: bool,
     pub scan_speed_state: String,
     pub card_specs_state: CardSpecs,
+    /// The narrow Card view's selected preview surface (the wide workspace
+    /// shows all three at once). Defaults to the profile card.
+    pub preview_surface: PreviewSurface,
+    /// The designer's field choices. The UI owns them; every toggle publishes
+    /// the same value to the live mirror the sender reads.
+    pub designer: presence::DesignerSpec,
+    /// The Card workspace's single search model: one title/year field, one
+    /// explicit Movie/TV choice, one result set. The Fix match dialog seeds
+    /// from and writes back to this model, so the main surface is canonical.
+    pub picker: crate::search::MediaPicker,
+    /// The playing file the picker's latch targets.
+    pub picker_path: String,
+    /// The picker worker's outcome slot and generation handshake.
+    picker_slot: Arc<Mutex<Option<(u64, FixOutcome)>>>,
+    /// The provider-search seam (see [`PickerSearch`]).
+    pub picker_search: PickerSearch,
     /// The live card's kind, derived from the last [`UiState::record_preview`]
     /// push — never a manual toggle. `None` until the first successful send
     /// records one; the view falls back to Series meanwhile.
     preview_kind: Option<CardKind>,
+    /// The local, unsent preview of a selected search result: the record the
+    /// user picked, composed through the same composer the send path uses. It
+    /// is shown only while no live preview exists, and it never sends Discord
+    /// activity — the object card says so in words.
+    local_preview: Option<(CardKind, CardPreviewInput)>,
     pub dead_cache_count: i32,
 
     preview_series: Option<CardPreviewInput>,
     preview_movie: Option<CardPreviewInput>,
+    /// True while the Card view's synopsis tooltip is pinned open by Enter or
+    /// a click; hover and keyboard focus show it without pinning.
+    pub synopsis_pinned: bool,
+    /// Whether the one payload disclosure (`Advanced`) is open. At rest the
+    /// window shows the object, one field, one Search and this disclosure; every
+    /// field toggle, line-2 mode and the kind override live behind it.
+    pub advanced_open: bool,
     pub ui_icon: usize,
     pub main_hwnd: usize,
     pub ui_centered: bool,
@@ -2551,6 +4175,7 @@ impl Default for UiState {
             scan_progress: Progress::default(),
             scan_stats: Stats::default(),
             scan_err: None,
+            advanced_open: false,
             scan_start: Instant::now(),
             scan_last_paint: Instant::now(),
             scan_resolve_start: None,
@@ -2559,10 +4184,18 @@ impl Default for UiState {
             startup_state: false,
             scan_speed_state: app_support::config::SCAN_SPEED_TURBO.to_string(),
             card_specs_state: CardSpecs::default(),
+            preview_surface: PreviewSurface::default(),
+            designer: presence::DesignerSpec::default(),
+            picker: crate::search::MediaPicker::default(),
+            picker_path: String::new(),
+            picker_slot: Arc::new(Mutex::new(None)),
+            picker_search: Arc::new(default_picker_search),
             preview_kind: None,
+            local_preview: None,
             dead_cache_count: 0,
             preview_series: None,
             preview_movie: None,
+            synopsis_pinned: false,
             ui_icon: 0,
             main_hwnd: 0,
             ui_centered: false,
@@ -2717,8 +4350,15 @@ pub const FIX_MATCH_IDLE_REASON: &str = "Nothing is playing - start a video to f
 /// The scope section's label. Frozen copy.
 pub const FIX_MATCH_SCOPE_LABEL: &str = "Apply to";
 /// The name field's label. Frozen copy (two spaces before the parenthetical).
-pub const FIX_MATCH_NAME_LABEL: &str = "Name";
-pub const FIX_MATCH_YEAR_LABEL: &str = "Year  (optional)";
+/// The one query field's label: a title, or a title and year in the same
+/// field. There is no separate Year control (owner direction 2026-10-29).
+pub const FIX_MATCH_NAME_LABEL: &str = "Title  (or title + year)";
+/// The picker's explicit kind choice (owner direction 2026-10-29): the choice
+/// drives the provider search and the latch scope, instead of deriving the
+/// kind from the filename or the selected candidate.
+pub const FIX_MATCH_KIND_LABEL: &str = "Kind";
+pub const FIX_MATCH_KIND_MOVIE: &str = "Movie";
+pub const FIX_MATCH_KIND_TV: &str = "TV";
 /// The buttons. Frozen copy.
 pub const FIX_MATCH_SEARCH_LABEL: &str = "Search";
 pub const FIX_MATCH_MATCH_LABEL: &str = "Match";
@@ -2996,6 +4636,43 @@ pub fn fix_match_static_color(id: i32, status_error: bool) -> u32 {
 #[must_use]
 pub fn fix_match_search_allowed(name_empty: bool, busy: bool) -> bool {
     !name_empty && !busy
+}
+
+/// Parses the one query field into `(title, year)`: a trailing `19xx`/`20xx`
+/// token is the year and the text before it is the title; a bare year is a
+/// year-only query (`""` title); anything else is the title alone. The rules
+/// match the approved prototype: `Dune 2021` -> `("Dune", 2021)`,
+/// `Blade Runner 2049` -> `("Blade Runner", 2049)`, `1984` -> `("", 1984)`.
+/// Only the trailing token is considered, so a year-looking word inside a
+/// title survives when another word follows it.
+#[must_use]
+pub fn parse_title_year(input: &str) -> (String, i32) {
+    let text = input.trim();
+    if text.is_empty() {
+        return (String::new(), 0);
+    }
+    let is_year = |s: &str| {
+        s.len() == 4
+            && (s.starts_with("19") || s.starts_with("20"))
+            && s.bytes().all(|b| b.is_ascii_digit())
+    };
+    let mut parts = text.rsplitn(2, char::is_whitespace);
+    let last = parts.next().unwrap_or("");
+    if !is_year(last) {
+        return (text.to_string(), 0);
+    }
+    let head = parts.next().unwrap_or("").trim_end();
+    let year = last.parse::<i32>().unwrap_or(0);
+    (head.to_string(), year)
+}
+
+/// Whether the one query field may run Search: a title or a bare year is
+/// enough (a bare year is a valid filter), a blank is not, and a running job
+/// freezes the button.
+#[must_use]
+pub fn search_query_allowed(input: &str, busy: bool) -> bool {
+    let (title, year) = parse_title_year(input);
+    !busy && (!title.is_empty() || year > 0)
 }
 
 /// Whether `Match` may run: a candidate is selected, a latch target exists,
@@ -3286,8 +4963,11 @@ const FM_ID_TITLE: i32 = 200;
 const FM_ID_SUB: i32 = 201;
 const FM_ID_NAME_LABEL: i32 = 202;
 const FM_ID_NAME: i32 = 203;
-const FM_ID_YEAR_LABEL: i32 = 204;
-const FM_ID_YEAR: i32 = 205;
+/// The kind row's label (the retired Year label's slot).
+const FM_ID_KIND_LABEL: i32 = 204;
+/// The explicit Movie/TV radios (the retired Year edit's slot).
+const FM_ID_KIND_MOVIE: i32 = 205;
+const FM_ID_KIND_TV: i32 = 226;
 const FM_ID_SEARCH: i32 = 206;
 const FM_ID_LIST: i32 = 207;
 const FM_ID_SEARCHING: i32 = 208;
@@ -3313,8 +4993,6 @@ const FM_ID_RULE: i32 = 223;
 /// The Name field's owner-drawn frame: a rounded `COL_BORDER` field behind
 /// the borderless edit, lit `COL_ACCENT` while the edit has focus.
 const FM_ID_NAME_FRAME: i32 = 224;
-/// The Year field's owner-drawn frame, same anatomy as the Name frame.
-const FM_ID_YEAR_FRAME: i32 = 225;
 
 /// `SetTimer` id for the Fix match indeterminate strip. Distinct from the
 /// main window's `SCAN_TIMER_ID` (a different window, but one id space per
@@ -3355,10 +5033,9 @@ pub struct FixMatchLayout {
     pub name_edit: Rect,
     /// The Name field's owner-drawn frame (the edit sits 2px inside it).
     pub name_frame: Rect,
-    pub year_label: Rect,
-    pub year_edit: Rect,
-    /// The Year field's owner-drawn frame (the edit sits 2px inside it).
-    pub year_frame: Rect,
+    /// The explicit Movie/TV choice: its label and the two radio rects.
+    pub kind_label: Rect,
+    pub kind_radios: Vec<Rect>,
     pub search: Rect,
     pub list: Rect,
     pub searching: Rect,
@@ -3436,24 +5113,26 @@ pub fn fix_match_layout(dpi: i32, screen: FixScreen, radios: usize) -> FixMatchL
                 right,
                 bottom: sc(126),
             };
-            l.year_label = Rect {
+            l.kind_label = Rect {
                 left: m,
                 top: sc(136),
                 right,
                 bottom: sc(154),
             };
-            l.year_edit = Rect {
-                left: m,
-                top: sc(156),
-                right: m + sc(72),
-                bottom: sc(184),
-            };
-            l.year_frame = Rect {
-                left: m - pad,
-                top: sc(156) - pad,
-                right: m + sc(72) + pad,
-                bottom: sc(184) + pad,
-            };
+            l.kind_radios = vec![
+                Rect {
+                    left: m,
+                    top: sc(156),
+                    right: m + sc(120),
+                    bottom: sc(184),
+                },
+                Rect {
+                    left: m + sc(132),
+                    top: sc(156),
+                    right: m + sc(252),
+                    bottom: sc(184),
+                },
+            ];
             l.progress = Rect {
                 left: m,
                 top: sc(190),
@@ -3756,13 +5435,10 @@ struct FixMatchState {
     dpi: i32,
     raw_title: String,
     path: String,
+    /// The explicit Movie/TV choice. Seeded from the filename query at `open`;
+    /// the kind radios are its only later writer, and it drives the provider
+    /// search and the latch scope (owner direction 2026-10-29).
     is_movie: bool,
-    /// Immutable filename classification from `open` (the original
-    /// `resolve_query` kind): the no-candidate fallback. Never mutated by
-    /// [`Self::sync_scope_to_selection`], so an empty search after a
-    /// cross-kind pick restores the filename scope instead of retaining the
-    /// previous candidate's kind.
-    filename_is_movie: bool,
     /// The latch already resolving for `path`, if any: selects the matched
     /// screen (`None` = the search screen).
     matched: Option<Override>,
@@ -3855,21 +5531,17 @@ impl FixMatchState {
             .and_then(|i| self.candidates.get(i).cloned())
     }
 
-    /// The effective movie flag: the selected candidate's kind when a
-    /// candidate is selected, otherwise the immutable filename baseline from
-    /// [`FixMatchState::open`]. The candidate overrides the original
-    /// classification both ways (a movie file plus a series pick is a series;
-    /// a series file plus a movie pick is a movie); with no candidate the
-    /// filename owns the scope, never the mutated current flag.
+    /// The effective movie flag: the user's explicit Movie/TV choice. The
+    /// choice is seeded from the filename query when the dialog opens and from
+    /// then on owns the search kind and the latch scope; the selected
+    /// candidate no longer overrides it (owner direction 2026-10-29).
     fn effective_is_movie(&self) -> bool {
-        self.selected_candidate()
-            .as_ref()
-            .map_or(self.filename_is_movie, fix_candidate_is_movie)
+        self.is_movie
     }
 
-    /// The effective scope table: recomputed from the candidate-derived flag,
-    /// so a series pick offers Series/Season even for a movie-classified file
-    /// and a movie pick offers the single movie target for a series file.
+    /// The effective scope table: recomputed from the user's kind choice, so a
+    /// TV choice always offers Series/Season even for a movie-classified file
+    /// and a Movie choice always offers the single movie target.
     fn effective_choices(&self) -> Vec<ScopeChoice> {
         fix_match_scope_choices(&self.path, self.effective_is_movie())
     }
@@ -3902,13 +5574,14 @@ impl FixMatchState {
     /// user pick survives. With no candidate selected the stored flag/table
     /// resets to the immutable filename baseline, so an empty search clears
     /// a stale cross-kind pick before `Use my text`/actions run.
+    /// Recompute the scope table from the user's kind choice. The kind itself
+    /// never changes here: the explicit Movie/TV control is the only writer of
+    /// `is_movie` after `open`. Returns whether the table moved.
     fn sync_scope_to_selection(&mut self) -> bool {
-        let is_movie = self.effective_is_movie();
-        let choices = fix_match_scope_choices(&self.path, is_movie);
-        if self.is_movie == is_movie && self.choices == choices {
+        let choices = self.effective_choices();
+        if self.choices == choices {
             return false;
         }
-        self.is_movie = is_movie;
         self.choices = choices;
         true
     }
@@ -3942,7 +5615,6 @@ const WS_CAPTION_W: u32 = crate::win32::WS_CAPTION;
 const WS_SYSMENU_W: u32 = crate::win32::WS_SYS_MENU;
 const WS_GROUP_STYLE: u32 = 0x0002_0000;
 const ES_AUTOHSCROLL: u32 = 0x0080;
-const ES_NUMBER: u32 = 0x2000;
 const BS_DEFPUSHBUTTON: u32 = 0x0001;
 const BS_AUTORADIOBUTTON: u32 = 0x0009;
 const BM_GETCHECK: u32 = 0x00F0;
@@ -3953,7 +5625,6 @@ const LBN_SELCHANGE: u32 = 1;
 const LBN_DBLCLK: u32 = 2;
 const WM_SETFONT: u32 = 0x0030;
 const WM_NCCREATE: u32 = 0x0081;
-const EM_SETLIMITTEXT: u32 = 0x00C5;
 const WM_CTLCOLORSTATIC: u32 = 0x0138;
 /// `IDCANCEL`: the id the dialog manager sends for Esc (and the id a stock
 /// dialog's Cancel button would carry; the picker's own id is `FM_ID_CANCEL`).
@@ -4035,7 +5706,23 @@ impl FixMatchState {
             return Err("fix match: RegisterClassExW failed".into());
         }
         let q = metadata_core::context::resolve_query(&now.raw_title, &now.path);
-        let is_movie = q.kind == Kind::MOVIE;
+        let (seed_query, seed_movie) = {
+            let st = ui();
+            // The dialog opens on the kind of the record that is actually
+            // selected (else the shown card's kind, else the filename's), never
+            // on a stale search choice.
+            let movie = st
+                .picker
+                .selected_candidate()
+                .map(crate::search::matched_kind_is_movie)
+                .unwrap_or_else(|| st.displayed_card_kind().is_movie());
+            (st.picker.query.clone(), movie)
+        };
+        let is_movie = if seed_query.trim().is_empty() {
+            q.kind == Kind::MOVIE
+        } else {
+            seed_movie
+        };
         let choices = fix_match_scope_choices(&now.path, is_movie);
         let matched = metadata::overrides::load()
             .ok()
@@ -4053,7 +5740,6 @@ impl FixMatchState {
             raw_title: now.raw_title.clone(),
             path: now.path.clone(),
             is_movie,
-            filename_is_movie: is_movie,
             matched,
             choices,
             candidates: Vec::new(),
@@ -4122,10 +5808,12 @@ impl FixMatchState {
         }
         // The name field starts from the resolver's own parse of the raw
         // title; the user edits from there.
-        state.set_text(
-            FM_ID_NAME,
-            &fix_match_prefill_name(&now.raw_title, &now.path),
-        );
+        let seed = if seed_query.trim().is_empty() {
+            fix_match_prefill_name(&now.raw_title, &now.path)
+        } else {
+            seed_query
+        };
+        state.set_text(FM_ID_NAME, &seed);
         state.apply_screen();
         // SAFETY: `dlg` is this thread's popup; the calls only affect it.
         unsafe {
@@ -4186,8 +5874,9 @@ impl FixMatchState {
             self.ctl.push((id, h));
             let font = match id {
                 FM_ID_TITLE => title_font,
-                FM_ID_NAME | FM_ID_YEAR | FM_ID_LIST | FM_ID_SEARCH | FM_ID_MATCH
-                | FM_ID_CANCEL | FM_ID_USE_TEXT | FM_ID_REFRESH | FM_ID_CHANGE | FM_ID_AUTO => {
+                FM_ID_NAME | FM_ID_KIND_MOVIE | FM_ID_KIND_TV | FM_ID_LIST | FM_ID_SEARCH
+                | FM_ID_MATCH | FM_ID_CANCEL | FM_ID_USE_TEXT | FM_ID_REFRESH | FM_ID_CHANGE
+                | FM_ID_AUTO => {
                     body_font
                 }
                 _ => hint_font,
@@ -4203,7 +5892,7 @@ impl FixMatchState {
             FM_ID_TITLE,
             FM_ID_SUB,
             FM_ID_NAME_LABEL,
-            FM_ID_YEAR_LABEL,
+            FM_ID_KIND_LABEL,
             FM_ID_SCOPE_LABEL,
             FM_ID_NOTE,
             FM_ID_STATUS,
@@ -4215,15 +5904,23 @@ impl FixMatchState {
         for id in [FM_ID_RULE, FM_ID_EMPTY, FM_ID_PROGRESS] {
             add(id, CLASS_STATIC, base | crate::win32::SS_OWNERDRAW)?;
         }
-        // The field frames first (they sit behind the borderless edits).
-        for id in [FM_ID_NAME_FRAME, FM_ID_YEAR_FRAME] {
-            add(id, CLASS_STATIC, base | crate::win32::SS_OWNERDRAW)?;
-        }
-        // The two edits, borderless: the owner-drawn frames above are the
-        // border. The name edit keeps `ES_AUTOHSCROLL`, the year `ES_NUMBER`
-        // (max 4 chars). Both keep the dark `WM_CTLCOLOREDIT` background.
+        // The field frame first (it sits behind the borderless edit).
+        add(FM_ID_NAME_FRAME, CLASS_STATIC, base | crate::win32::SS_OWNERDRAW)?;
+        // The one query edit, borderless: the owner-drawn frame above is the
+        // border. It keeps `ES_AUTOHSCROLL`; the year is parsed from its text.
         add(FM_ID_NAME, CLASS_EDIT, base | tab | ES_AUTOHSCROLL)?;
-        add(FM_ID_YEAR, CLASS_EDIT, base | tab | ES_NUMBER)?;
+        // The explicit Movie/TV choice: the first radio opens the group, so
+        // the arrow keys move within it without leaving the dialog tab order.
+        add(
+            FM_ID_KIND_MOVIE,
+            CLASS_BUTTON,
+            base | tab | BS_AUTORADIOBUTTON | WS_GROUP_STYLE | crate::win32::BS_OWNERDRAW,
+        )?;
+        add(
+            FM_ID_KIND_TV,
+            CLASS_BUTTON,
+            base | tab | BS_AUTORADIOBUTTON | crate::win32::BS_OWNERDRAW,
+        )?;
         // The results list: fixed-height owner-drawn rows with strings kept,
         // so `LB_ADD_STRING` still stores the row text and `WM_DRAWITEM`
         // paints the two-line chip from the candidates table. No `WS_BORDER`:
@@ -4267,9 +5964,6 @@ impl FixMatchState {
         add(FM_ID_REFRESH, CLASS_BUTTON, base | tab | owner)?;
         add(FM_ID_CHANGE, CLASS_BUTTON, base | tab | owner)?;
         add(FM_ID_AUTO, CLASS_BUTTON, base | tab | owner)?;
-        // SAFETY: the year edit was created above; `add` is dead here so the
-        // `self.h` borrow no longer overlaps the closure's `&mut self` borrow.
-        unsafe { crate::win32::SendMessageW(self.h(FM_ID_YEAR), EM_SETLIMITTEXT, 4, 0) };
         Ok(())
     }
 
@@ -4344,9 +6038,17 @@ impl FixMatchState {
                 place(FM_ID_NAME_FRAME, l.name_frame, true);
                 place(FM_ID_NAME, l.name_edit, true);
                 place(FM_ID_SEARCH, l.search, true);
-                place(FM_ID_YEAR_LABEL, l.year_label, true);
-                place(FM_ID_YEAR_FRAME, l.year_frame, true);
-                place(FM_ID_YEAR, l.year_edit, true);
+                place(FM_ID_KIND_LABEL, l.kind_label, true);
+                let kind_radios = [FM_ID_KIND_MOVIE, FM_ID_KIND_TV];
+                for (i, id) in kind_radios.iter().enumerate() {
+                    let rc = l.kind_radios.get(i).copied().unwrap_or(Rect {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    });
+                    place(*id, rc, true);
+                }
                 place(FM_ID_PROGRESS, l.progress, self.busy);
                 // The list shows only when it has rows and no job runs; the
                 // owner-drawn empty panel covers the same area in every other
@@ -4393,7 +6095,10 @@ impl FixMatchState {
                 self.set_text(FM_ID_TITLE, FIX_MATCH_TITLE);
                 self.set_text(FM_ID_SUB, &fix_match_sub_line(&self.raw_title));
                 self.set_text(FM_ID_NAME_LABEL, FIX_MATCH_NAME_LABEL);
-                self.set_text(FM_ID_YEAR_LABEL, FIX_MATCH_YEAR_LABEL);
+                self.set_text(FM_ID_KIND_LABEL, FIX_MATCH_KIND_LABEL);
+                self.set_text(FM_ID_KIND_MOVIE, FIX_MATCH_KIND_MOVIE);
+                self.set_text(FM_ID_KIND_TV, FIX_MATCH_KIND_TV);
+                self.reset_kind_state();
                 // While busy the disabled Search button doubles as a loading
                 // indicator; the empty panel and the strip carry it too.
                 let search_label = if self.busy {
@@ -4435,9 +6140,9 @@ impl FixMatchState {
                     FM_ID_NAME_FRAME,
                     FM_ID_NAME,
                     FM_ID_SEARCH,
-                    FM_ID_YEAR_LABEL,
-                    FM_ID_YEAR_FRAME,
-                    FM_ID_YEAR,
+                    FM_ID_KIND_LABEL,
+                    FM_ID_KIND_MOVIE,
+                    FM_ID_KIND_TV,
                     FM_ID_LIST,
                     FM_ID_SEARCHING,
                     FM_ID_EMPTY,
@@ -4498,6 +6203,10 @@ const WM_CTLCOLORLISTBOX_W: u32 = 0x0134;
 /// the outer run's outcome. The singleton guard in [`open_fix_match`] means
 /// only one picker runs at a time (it is modal), so one slot is exact.
 static FIX_MATCH_RESULT: Mutex<(usize, Option<String>)> = Mutex::new((0, None));
+/// The dialog's last query/kind: written back to the Card workspace's one
+/// [`crate::search::MediaPicker`] when the dialog closes, so the two views
+/// share the canonical search state instead of drifting apart.
+static FIX_MATCH_LAST_QUERY: Mutex<(String, bool)> = Mutex::new((String::new(), false));
 
 /// Move the keyboard focus; null-safe (the matched screen has no name field).
 fn fix_match_focus(h: HWND) {
@@ -4878,10 +6587,15 @@ fn fix_match_paint_item(
                 | FM_ID_AUTO
                 | FM_ID_RADIO_A
                 | FM_ID_RADIO_B
+                | FM_ID_KIND_MOVIE
+                | FM_ID_KIND_TV
         ) {
             return false;
         }
-        if id == FM_ID_RADIO_A || id == FM_ID_RADIO_B {
+        if matches!(
+            id,
+            FM_ID_RADIO_A | FM_ID_RADIO_B | FM_ID_KIND_MOVIE | FM_ID_KIND_TV
+        ) {
             // SAFETY: font created below and deleted after the paint.
             unsafe {
                 let font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
@@ -4889,8 +6603,14 @@ fn fix_match_paint_item(
                     return true;
                 }
                 let label = state.text(id);
-                let checked = crate::win32::SendMessageW(dis.hwndItem, BM_GETCHECK, 0, 0) as u32
-                    == BST_CHECKED;
+                let checked = match id {
+                    FM_ID_KIND_MOVIE => state.is_movie,
+                    FM_ID_KIND_TV => !state.is_movie,
+                    _ => {
+                        crate::win32::SendMessageW(dis.hwndItem, BM_GETCHECK, 0, 0) as u32
+                            == BST_CHECKED
+                    }
+                };
                 with_antialias(dis.hDC, || {
                     paint_fix_match_radio(
                         dis.hDC,
@@ -4958,12 +6678,8 @@ fn fix_match_paint_item(
             fill_rect_solid(dis.hDC, rc, COL_BORDER);
             return true;
         }
-        if id == FM_ID_NAME_FRAME || id == FM_ID_YEAR_FRAME {
-            let edit = if id == FM_ID_NAME_FRAME {
-                FM_ID_NAME
-            } else {
-                FM_ID_YEAR
-            };
+        if id == FM_ID_NAME_FRAME {
+            let edit = FM_ID_NAME;
             // SAFETY: reads only which control of this thread has focus.
             let focused = unsafe {
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() == state.h(edit)
@@ -5024,19 +6740,48 @@ fn fix_match_state_ptr(hwnd: HWND) -> *mut FixMatchState {
 }
 
 impl FixMatchState {
-    /// The name edit's trimmed text.
+    /// The name edit's trimmed text: the ONE query field (a title, or a title
+    /// and year in the same field).
     fn find_text(&self) -> String {
         self.text(FM_ID_NAME).trim().to_string()
     }
 
-    /// The year edit's trimmed text (digits only; the edit is `ES_NUMBER`).
-    fn year_text(&self) -> String {
-        self.text(FM_ID_YEAR).trim().to_string()
+    /// The one query field parsed into `(title, year)`; the provider search and
+    /// the provider-free latch both consume this pair.
+    fn parsed_query(&self) -> (String, i32) {
+        parse_title_year(&self.find_text())
     }
 
-    /// The parsed year both search jobs carry: digits, or `0` for none.
-    fn parsed_year(&self) -> i32 {
-        self.year_text().parse::<i32>().unwrap_or(0).clamp(0, 9999)
+    /// The provider kind the manual Movie/TV choice asks for.
+    fn search_want(&self) -> Kind {
+        if self.is_movie {
+            Kind::MOVIE
+        } else {
+            Kind::SERIES
+        }
+    }
+
+    /// Apply the manual Movie/TV choice (owner direction 2026-10-29). The
+    /// choice drives the provider search and the latch scope; switching kinds
+    /// drops the old candidates (they belong to the other kind) and rebuilds
+    /// the scope table. Returns whether anything changed. Headless-safe: the
+    /// radio check is skipped when the controls do not exist.
+    fn apply_pick_kind(&mut self, is_movie: bool) -> bool {
+        if self.is_movie == is_movie {
+            return false;
+        }
+        self.is_movie = is_movie;
+        self.choices = fix_match_scope_choices(&self.path, is_movie);
+        self.candidates.clear();
+        self.searched = false;
+        self.status = None;
+        self.status_error = false;
+        if self.screen == FixScreen::Search {
+            self.apply_screen();
+        } else {
+            self.update_actions();
+        }
+        true
     }
 
     /// The one-target note: the single choice's note when the folder is both
@@ -5101,8 +6846,7 @@ impl FixMatchState {
     /// Check the default radio (the season when there are two), uncheck the
     /// other. Runs after every `apply_screen` on the search screen, so the
     /// default the scope table declares and the checked radio cannot drift.
-    fn reset_radio_state(&self) {
-        for (i, id) in [FM_ID_RADIO_A, FM_ID_RADIO_B].iter().enumerate() {
+    fn reset_radio_state(&self) {        for (i, id) in [FM_ID_RADIO_A, FM_ID_RADIO_B].iter().enumerate() {
             let on = self.choices.get(i).is_some_and(|c| c.default);
             // SAFETY: async check-set on this dialog's own radio.
             unsafe {
@@ -5116,6 +6860,34 @@ impl FixMatchState {
                     },
                     0,
                 );
+            }
+        }
+    }
+
+    /// Check the explicit Movie/TV radio that matches `is_movie` and clear the
+    /// other. Headless-safe: null controls are skipped.
+    fn reset_kind_state(&self) {
+        for (id, on) in [
+            (FM_ID_KIND_MOVIE, self.is_movie),
+            (FM_ID_KIND_TV, !self.is_movie),
+        ] {
+            let h = self.h(id);
+            if h.is_null() {
+                continue;
+            }
+            // SAFETY: check-set on this dialog's own radio only.
+            unsafe {
+                crate::win32::SendMessageW(
+                    h,
+                    BM_SETCHECK,
+                    if on {
+                        BST_CHECKED as usize
+                    } else {
+                        BST_UNCHECKED as usize
+                    },
+                    0,
+                );
+                crate::win32::InvalidateRect(h, std::ptr::null(), 1);
             }
         }
     }
@@ -5210,7 +6982,8 @@ impl FixMatchState {
         }
         for id in [
             FM_ID_NAME,
-            FM_ID_YEAR,
+            FM_ID_KIND_MOVIE,
+            FM_ID_KIND_TV,
             FM_ID_SEARCH,
             FM_ID_LIST,
             FM_ID_RADIO_A,
@@ -5253,11 +7026,8 @@ impl FixMatchState {
                 }
             }
         };
-        let name_empty = self.find_text().is_empty();
-        enable(
-            FM_ID_SEARCH,
-            fix_match_search_allowed(name_empty, self.busy),
-        );
+        let search_on = search_query_allowed(&self.find_text(), self.busy);
+        enable(FM_ID_SEARCH, search_on);
         enable(
             FM_ID_MATCH,
             fix_match_match_allowed(
@@ -5322,21 +7092,17 @@ impl FixMatchState {
         });
     }
 
-    /// `Search`: one bounded pass over the typed name/year on a worker.
+    /// `Search`: one bounded pass over the one query field (title, or title and
+    /// year in the same field) on a worker.
     fn start_search(&mut self) {
         if self.busy {
             return;
         }
-        let name = self.find_text();
-        if name.is_empty() {
+        let (name, year) = self.parsed_query();
+        if name.is_empty() && year <= 0 {
             return;
         }
-        let year = self.parsed_year();
-        let want = if self.effective_is_movie() {
-            Kind::MOVIE
-        } else {
-            Kind::SERIES
-        };
+        let want = self.search_want();
         self.spawn_job(FixJob::Search { name, year, want });
     }
 
@@ -5408,11 +7174,10 @@ impl FixMatchState {
         if self.busy {
             return;
         }
-        let title = self.find_text();
+        let (title, year) = self.parsed_query();
         if title.is_empty() {
             return;
         }
-        let year = self.parsed_year();
         self.sync_scope_to_selection();
         let Some((scope, key)) = self.selected_target() else {
             let reason = fix_match_no_target_reason(&self.path, self.effective_is_movie())
@@ -5567,6 +7332,13 @@ pub unsafe extern "system" fn fix_match_wnd_proc(
                 // Move the closing status out BEFORE freeing the box: the
                 // modal run reads it after its loop ends.
                 let state = Box::from_raw(ptr);
+                // The dialog's edited query/kind is the same canonical search
+                // state the Card workspace owns: write it back before the box
+                // is freed.
+                *FIX_MATCH_LAST_QUERY
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    (state.find_text(), state.is_movie);
                 // Stop the strip timer while the dialog still exists; the
                 // no-quit invariant below still holds.
                 state.kill_progress_timer();
@@ -5685,16 +7457,21 @@ pub unsafe extern "system" fn fix_match_wnd_proc(
                 FM_ID_RADIO_A | FM_ID_RADIO_B if code == crate::win32::BN_CLICKED => {
                     state.set_radio_checked(id);
                 }
-                FM_ID_NAME | FM_ID_YEAR if code == crate::win32::EN_CHANGE => {
+                FM_ID_KIND_MOVIE if code == crate::win32::BN_CLICKED => {
+                    state.apply_pick_kind(true);
+                }
+                FM_ID_KIND_TV if code == crate::win32::BN_CLICKED => {
+                    state.apply_pick_kind(false);
+                }
+                FM_ID_NAME if code == crate::win32::EN_CHANGE => {
                     state.update_actions();
                 }
-                FM_ID_NAME | FM_ID_YEAR
+                FM_ID_NAME
                     if code == crate::win32::EN_SETFOCUS || code == crate::win32::EN_KILLFOCUS =>
                 {
-                    // The field frames light on focus: repaint both (this
-                    // dialog's own frame statics only).
+                    // The field frame lights on focus: repaint this dialog's
+                    // own frame static only.
                     crate::win32::InvalidateRect(state.h(FM_ID_NAME_FRAME), std::ptr::null(), 1);
-                    crate::win32::InvalidateRect(state.h(FM_ID_YEAR_FRAME), std::ptr::null(), 1);
                 }
                 _ => {}
             }
@@ -5813,7 +7590,7 @@ fn fix_match_run(owner: HWND, now: &app_support::config::NowPlaying) -> Option<S
             if msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN as usize {
                 let focus = windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus();
                 let state = &mut *ptr;
-                if focus == state.h(FM_ID_NAME) || focus == state.h(FM_ID_YEAR) {
+                if focus == state.h(FM_ID_NAME) {
                     state.start_search();
                     continue;
                 }
@@ -5864,6 +7641,19 @@ pub fn open_fix_match() {
     };
     let owner = ui().main_hwnd as HWND;
     let status = fix_match_run(owner, &now);
+    {
+        let (query, _movie) = FIX_MATCH_LAST_QUERY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut st = ui();
+        if !query.trim().is_empty() {
+            st.picker.set_query(query);
+        }
+        // The dialog's own kind shaped the override IT saved; it must not
+        // rewrite the main search's explicit scope (that write path is the
+        // Advanced filter, and a dialog close is not a search edit).
+    }
     if let Some(status) = status {
         ui().set_status_text(status);
     }
@@ -5940,7 +7730,48 @@ impl UiState {
         self.hover_x = false;
         self.pressed_x = -1;
         self.focus_id = 0;
+        self.synopsis_pinned = false;
+        self.prime_picker();
         self.invalidate();
+    }
+
+    /// Seed the one query field from the playing file the first time the Card
+    /// workspace opens, using the same resolver prefill the dialog uses. A
+    /// user-typed query is never overwritten, and the search scope is left at
+    /// its default (`All types`): a filename guess must not silently narrow the
+    /// search to one kind.
+    fn prime_picker(&mut self) {
+        if !self.picker.query.trim().is_empty() || self.picker.busy {
+            return;
+        }
+        let Some(now) = app_support::config::live_now_playing() else {
+            return;
+        };
+        self.picker.set_query(fix_match_prefill_name(
+            &now.raw_title,
+            &now.path,
+        ));
+        self.picker_path = now.path;
+    }
+
+    /// The view a cold launch opens: the search surface while nothing is
+    /// playing, the library surface while something is (the shipped behaviour
+    /// for a playing title). Pure so the rule is pinned, and so the launch path
+    /// and its test read one predicate.
+    #[must_use]
+    pub fn cold_open_view(playing: bool) -> View {
+        if playing { View::Main } else { View::Card }
+    }
+
+    /// Open the cold-launch view. Called once by [`create_main_window`]; the
+    /// Card branch runs the same `enter_card` the tab runs, so the first screen
+    /// is the real search surface and not a mock.
+    pub fn open_cold_view_with(&mut self, playing: bool) {
+        match Self::cold_open_view(playing) {
+            View::Card => self.enter_card(),
+            View::Main => self.enter_main(),
+            View::Settings => self.open_settings(),
+        }
     }
 
     /// `closeCard` (`go\window.go:1661`).
@@ -5949,6 +7780,7 @@ impl UiState {
         self.hover_btn = 0;
         self.pressed_btn = 0;
         self.focus_id = 0;
+        self.synopsis_pinned = false;
         self.invalidate();
     }
 
@@ -6157,13 +7989,31 @@ impl UiState {
         if cw <= 0 || ch <= 0 {
             return None;
         }
-        Some(compute_card_layout(
+        Some(compute_card_layout_state(
             cw,
             ch,
             window_dpi(hwnd),
             &self.card_specs_state,
             self.displayed_card_kind(),
+            self.preview_surface,
+            &self.card_layout_state(),
         ))
+    }
+
+    /// The picker's layout state: the one place the composition learns what the
+    /// picker model is doing, so the paint pass and the hit-test cannot disagree.
+    #[must_use]
+    pub fn card_layout_state(&self) -> CardLayoutState {
+        let has_selection = self.picker.open && self.picker.selected_candidate().is_some();
+        CardLayoutState {
+            advanced: self.advanced_open,
+            has_selection,
+            // Applying changes the playing title, so it needs a playing title
+            // AND a row the user picked: an auto highlight is not a choice.
+            can_apply: self.has_picked_candidate()
+                && app_support::config::live_now_playing().is_some(),
+            filter: self.picker.filter,
+        }
     }
 
     /// `scanBlockedReason` (`go\window.go:1992`) reading this instance's flag.
@@ -6255,6 +8105,10 @@ impl UiState {
                 };
                 self.pressed_btn = 0;
                 self.pressed_x = -1;
+                if self.picker.open && pt_in_rect(l.picker_results, x, y) {
+                    self.invalidate();
+                    return;
+                }
                 let id = button_at_point(&l.btns, x, y);
                 if id != 0 {
                     self.pressed_btn = id;
@@ -6314,6 +8168,22 @@ impl UiState {
                     self.pressed_x = -1;
                     return None;
                 };
+                if self.picker.open && pt_in_rect(l.picker_results, x, y) {
+                    // The repair and apply rows live inside the list, so the
+                    // button table wins over the row hit test: a click on an
+                    // action is an action, not a selection.
+                    let hit = button_at_point(&l.btns, x, y);
+                    if hit == BTN_FIX_MATCH || hit == BTN_PICKER_APPLY {
+                        return self.do_card_action(hwnd, hit);
+                    }
+                    if let Some(idx) = picker_result_at(&l, &self.picker, x, y) {
+                        // Selecting a row previews it locally; it sends nothing.
+                        self.select_candidate(idx);
+                        self.focus_id = BTN_PICKER_SEARCH;
+                        self.invalidate();
+                    }
+                    return None;
+                }
                 let pb = self.pressed_btn;
                 self.pressed_btn = 0;
                 self.pressed_x = -1;
@@ -6424,9 +8294,12 @@ impl UiState {
     #[must_use]
     pub fn hit_test_code(&self, hwnd: HWND, x: i32, y: i32) -> i32 {
         match self.cur_view {
-            View::Card => self
-                .layout_card(hwnd)
-                .map_or(0, |l| i32::from(button_at_point(&l.btns, x, y) != 0)),
+            View::Card => self.layout_card(hwnd).map_or(0, |l| {
+                if self.picker.open && pt_in_rect(l.picker_results, x, y) {
+                    return 1;
+                }
+                i32::from(button_at_point(&l.btns, x, y) != 0)
+            }),
             View::Settings => self
                 .layout_settings(hwnd)
                 .map_or(0, |l| i32::from(button_at_point(&l.btns, x, y) != 0)),
@@ -6537,13 +8410,437 @@ impl UiState {
             self.set_status_text(FIX_MATCH_IDLE_REASON);
             return None;
         }
+        if id == BTN_PICKER_FIELD {
+            self.focus_picker_field();
+            return None;
+        }
+        if id == BTN_ADVANCED {
+            self.advanced_open = !self.advanced_open;
+            self.focus_id = BTN_ADVANCED;
+            self.invalidate();
+            return None;
+        }
+        if id == BTN_PICKER_ALL || id == BTN_PICKER_MOVIE || id == BTN_PICKER_TV {
+            let filter = if id == BTN_PICKER_ALL {
+                crate::search::KindFilter::All
+            } else if id == BTN_PICKER_MOVIE {
+                crate::search::KindFilter::Movies
+            } else {
+                crate::search::KindFilter::Series
+            };
+            self.picker.set_filter(filter);
+            self.focus_id = id;
+            self.invalidate();
+            return None;
+        }
+        if id == BTN_PICKER_CLOSE {
+            self.picker.close_results();
+            self.invalidate();
+            return None;
+        }
+        if id == BTN_PICKER_APPLY {
+            self.card_picker_match();
+            return None;
+        }
+        if id == BTN_PICKER_SEARCH {
+            // One verb, one job: Search always runs the query. Selecting a row
+            // is what previews it, and applying a match is its own control.
+            if self.picker.search_allowed() {
+                self.card_picker_search();
+            } else if self.picker.busy {
+                self.picker.status = "Searching\u{2026}".to_string();
+                self.invalidate();
+            } else if let Some(issue) = crate::search::query_issue(&self.picker.query) {
+                self.picker.status = issue.message().to_string();
+                self.invalidate();
+            }
+            return None;
+        }
+        if id == BTN_SYNOPSIS {
+            if self.preview_synopsis().is_empty() {
+                self.set_status_text("No synopsis available.");
+                return None;
+            }
+            self.synopsis_pinned = !self.synopsis_pinned;
+            self.set_status_text(if self.synopsis_pinned {
+                "Synopsis pinned - Enter or click to hide."
+            } else {
+                "Synopsis hidden."
+            });
+            return None;
+        }
         if id == BTN_CARD_BACK {
             self.close_card();
+        } else if let Some(surface) = PreviewSurface::of_button(id) {
+            self.preview_surface = surface;
+            self.invalidate();
+        } else if let Some(field) = designer_field_for_button(id) {
+            self.toggle_designer_field(field);
         } else if let Some((line, preset)) = card_preset_for_button(id) {
             debug_assert_eq!(line, 1, "only the State row offers presets");
             self.on_select_card_preset(&preset);
         }
         None
+    }
+
+    /// The focus stops of the current view. The Card view's list grows with its
+    /// disclosure AND with the results list, so Tab reaches every action that is
+    /// on screen -- Apply and the advanced-match control included, whether or
+    /// not `Advanced` happens to be open.
+    #[must_use]
+    fn focus_order_now(&self) -> Vec<i32> {
+        if self.cur_view == View::Card {
+            let state = self.card_layout_state();
+            card_focus_order_for(state.advanced, state.has_selection, state.can_apply)
+        } else {
+            focus_order_for_view(self.cur_view)
+        }
+    }
+
+    /// Focus the one title/year field. The field is the only text control on
+    /// the Card workspace; clicks and Tab both land here.
+    pub fn focus_picker_field(&mut self) {        self.focus_id = BTN_PICKER_FIELD;
+        self.invalidate();
+    }
+
+    /// Type one character into the picker field (WM_CHAR). Backspace removes
+    /// the last character. The query is the single canonical input the
+    /// provider search and the dialog both read. The field is capped at
+    /// [`crate::search::MAX_QUERY_CHARS`] scalar values: a refused character
+    /// says why instead of being silently dropped.
+    pub fn on_card_char(&mut self, ch: u32) -> bool {
+        if self.cur_view != View::Card
+            || self.focus_id != BTN_PICKER_FIELD
+            || self.picker.busy
+        {
+            return false;
+        }
+        if ch == 8 {
+            let mut q = self.picker.query.clone();
+            q.pop();
+            self.picker.set_query(q);
+            self.invalidate();
+            return true;
+        }
+        let Some(c) = char::from_u32(ch) else {
+            return false;
+        };
+        if c.is_control() {
+            return false;
+        }
+        if !self.picker.accepts_more() {
+            self.picker.status = crate::search::QueryIssue::TooLong.message().to_string();
+            self.invalidate();
+            return false;
+        }
+        let mut q = self.picker.query.clone();
+        q.push(c);
+        self.picker.set_query(q);
+        self.invalidate();
+        true
+    }
+
+    /// Insert a whole string into the query (the paste path). The same cap and
+    /// the same refusal copy as the typed path apply, and the query stops at
+    /// the cap rather than accepting a truncated-and-different title silently:
+    /// the field shows what it kept, the counter shows the limit, and the status
+    /// line says the paste was clipped.
+    pub fn paste_into_picker(&mut self, text: &str) -> bool {
+        if self.cur_view != View::Card || self.focus_id != BTN_PICKER_FIELD || self.picker.busy {
+            return false;
+        }
+        let typed: String = text.chars().filter(|c| !c.is_control()).collect();
+        if typed.is_empty() {
+            return false;
+        }
+        let mut q = self.picker.query.clone();
+        let mut clipped = false;
+        for c in typed.chars() {
+            if q.chars().count() >= crate::search::MAX_QUERY_CHARS {
+                clipped = true;
+                break;
+            }
+            q.push(c);
+        }
+        self.picker.set_query(q);
+        if clipped {
+            self.picker.status = crate::search::QueryIssue::TooLong.message().to_string();
+        }
+        self.invalidate();
+        true
+    }
+
+    /// Apply one search result to the LOCAL preview: the selected record's own
+    /// title, year, kind and poster compose the card through the same composer
+    /// the send path uses. Nothing is sent, no Discord activity is written, and
+    /// no override is stored -- the object card says `Preview only` in words.
+    pub fn select_candidate(&mut self, idx: usize) -> bool {
+        let Some(cand) = self.picker.candidates.get(idx).cloned() else {
+            return false;
+        };
+        self.picker.selected = idx;
+        // The pick lives in the picker model, so every query edit, scope change
+        // or new search clears it with the result set it belonged to.
+        self.picker.pick_row(picked_row_key(&cand));
+        self.set_local_preview(&cand);
+        self.invalidate();
+        true
+    }
+
+    /// Compose the local preview from one resolved record. A movie candidate
+    /// composes a movie card, a series candidate a series card: the record's
+    /// kind owns the preview, so a series can never inherit a stale `Movie`.
+    fn set_local_preview(&mut self, cand: &Candidate) {
+        let is_movie = crate::search::matched_kind_is_movie(cand);
+        let kind = if is_movie {
+            CardKind::Movie
+        } else {
+            CardKind::Series
+        };
+        let raw_title = if cand.year > 0 {
+            format!("{} ({})", cand.title.trim(), cand.year)
+        } else {
+            cand.title.trim().to_string()
+        };
+        let resolved = Resolved {
+            series: cand.title.trim().to_string(),
+            year: cand.year,
+            is_movie,
+            artwork: cand.poster.clone(),
+            ..Resolved::default()
+        };
+        self.local_preview = Some((
+            kind,
+            CardPreviewInput {
+                raw_title,
+                action: None,
+                resolved,
+            },
+        ));
+    }
+
+    /// Run the one search over the existing provider pipeline. The worker
+    /// publishes into `picker_slot` and posts [`WM_APP_PICKER_DONE`]; the UI
+    /// thread never blocks on the network. `All types` runs one pass per kind
+    /// and merges them.
+    pub fn card_picker_search(&mut self) -> bool {
+        let Some((generation, title, year, filter)) = self.picker.begin_search() else {
+            // Either busy (already says so) or the query itself is refused:
+            // say which, in the field's own line.
+            if !self.picker.busy
+                && let Some(issue) = crate::search::query_issue(&self.picker.query)
+            {
+                self.picker.status = issue.message().to_string();
+                self.invalidate();
+            }
+            return false;
+        };
+        *self
+            .picker_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        let slot = self.picker_slot.clone();
+        let search = self.picker_search.clone();
+        let hwnd = self.main_hwnd;
+        self.invalidate();
+        std::thread::spawn(move || {
+            let out = match search(&title, year, filter) {
+                Ok(rows) => FixOutcome::Search(rows),
+                Err(err) => {
+                    app_logf(&format!("picker: search failed: {err}"));
+                    FixOutcome::Failed
+                }
+            };
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((generation, out));
+            if hwnd != 0 {
+                // SAFETY: async post only; the worker touches no window state.
+                unsafe {
+                    crate::win32::PostMessageW(hwnd as HWND, WM_APP_PICKER_DONE, 0, 0);
+                }
+            }
+        });
+        true
+    }
+
+    /// Whether the highlighted row is one the user picked. The search seeds
+    /// `selected = 0`, so a row is highlighted before any choice; that auto
+    /// highlight is not a choice and must not arm Apply. The pick itself is
+    /// cleared by the picker on every query edit, scope change and new search,
+    /// so an identical record coming back in a fresh list is still not a pick.
+    #[must_use]
+    pub fn has_picked_candidate(&self) -> bool {
+        if !self.picker.open {
+            // Nothing on screen can be a choice: the list is closed.
+            return false;
+        }
+        match (self.picker.selected_candidate(), self.picker.picked.as_deref()) {
+            (Some(cand), Some(picked)) => picked_row_key(cand) == picked,
+            _ => false,
+        }
+    }
+
+    /// Pin the selected picker candidate through the same provisional + full
+    /// pin path the dialog uses. The explicit Movie/TV choice owns the target:
+    /// a movie latches its file, TV latches the default season/show scope.
+    pub fn card_picker_match(&mut self) -> bool {
+        if self.picker.busy {
+            return false;
+        }
+        if !self.has_picked_candidate() {
+            // A row the user never picked is not a target, even if it is
+            // highlighted by the search's initial index.
+            self.picker.status = "Pick a result row first.".to_string();
+            self.invalidate();
+            return false;
+        }
+        let Some(cand) = self.picker.selected_candidate().cloned() else {
+            self.picker.status = "Run a search and pick a result first.".to_string();
+            self.invalidate();
+            return false;
+        };
+        let Some(now) = app_support::config::live_now_playing() else {
+            self.picker.status = FIX_MATCH_IDLE_REASON.to_string();
+            self.invalidate();
+            return false;
+        };
+        let path = now.path;
+        let matched_movie = crate::search::matched_kind_is_movie(&cand);
+        // The matched record's own kind owns the latch target: a series is
+        // never latched as a movie because the search was seeded the other way.
+        let (scope, key) = if matched_movie {
+            let key = metadata::overrides::movie_key(&path);
+            if key.is_empty() {
+                self.picker.status = FIX_MATCH_NO_TARGET_REASON.to_string();
+                self.invalidate();
+                return false;
+            }
+            (Scope::Movie, key)
+        } else {
+            let choices = fix_match_scope_choices(&path, false);
+            let Some(choice) = choices
+                .iter()
+                .find(|c| c.default)
+                .or_else(|| choices.first())
+            else {
+                self.picker.status = fix_match_no_target_reason(&path, false)
+                    .unwrap_or(FIX_MATCH_NO_TARGET_REASON)
+                    .to_string();
+                self.invalidate();
+                return false;
+            };
+            (choice.scope, choice.key.clone())
+        };
+        match fix_match_save_provisional(&cand, scope, &key, &path) {
+            Ok(_) => {
+                self.picker.busy = true;
+                self.picker.open = false;
+                self.picker.status = FIX_MATCH_FETCHING_STATUS.to_string();
+                self.picker_path = path.clone();
+                self.picker.generation += 1;
+                let generation = self.picker.generation;
+                *self
+                    .picker_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                let slot = self.picker_slot.clone();
+                let hwnd = self.main_hwnd;
+                self.invalidate();
+                std::thread::spawn(move || {
+                    let out = fix_match_worker(FixJob::Latch {
+                        cand,
+                        scope,
+                        key,
+                        path,
+                    });
+                    *slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((generation, out));
+                    if hwnd != 0 {
+                        // SAFETY: async post only; the worker touches no window state.
+                        unsafe {
+                            crate::win32::PostMessageW(hwnd as HWND, WM_APP_PICKER_DONE, 0, 0);
+                        }
+                    }
+                });
+                true
+            }
+            Err(err) => {
+                app_logf(&format!("picker: provisional save failed: {err}"));
+                self.picker.status = FIX_MATCH_ERROR.to_string();
+                self.invalidate();
+                false
+            }
+        }
+    }
+
+    /// Apply one worker outcome. A stale generation is ignored, so an older
+    /// search can never replace a newer one.
+    pub fn on_picker_job_done(&mut self) {
+        let got = self
+            .picker_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some((generation, out)) = got else {
+            return;
+        };
+        if generation != self.picker.generation {
+            return;
+        }
+        match out {
+            FixOutcome::Search(rows) => {
+                self.picker.finish_search(generation, rows);
+            }
+            FixOutcome::Latched(status) | FixOutcome::ProvisionalKept(status) => {
+                self.picker.busy = false;
+                self.picker.status = status;
+            }
+            FixOutcome::Failed => {
+                self.picker.fail_search(generation);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Flip one designer field and publish it to the live mirror the sender
+    /// reads. The preview recomposes through the same mirror, so the panel and
+    /// the next wire frame change together. A save is not involved: the
+    /// designer choice is a live view setting, not stored card config.
+    pub fn toggle_designer_field(&mut self, field: DesignerField) {
+        let mut spec = self.designer;
+        let on = match field {
+            DesignerField::Artwork => {
+                spec.artwork = !spec.artwork;
+                spec.artwork
+            }
+            DesignerField::Details => {
+                spec.details = !spec.details;
+                spec.details
+            }
+            DesignerField::State => {
+                spec.state = !spec.state;
+                spec.state
+            }
+            DesignerField::Synopsis => {
+                spec.synopsis = !spec.synopsis;
+                spec.synopsis
+            }
+            DesignerField::Timers => {
+                spec.timers = !spec.timers;
+                spec.timers
+            }
+        };
+        self.designer = spec;
+        presence::set_live_designer(spec);
+        self.set_status_text(format!(
+            "{} {}",
+            designer_field_label(field),
+            if on { "on" } else { "off" }
+        ));
+        self.invalidate();
     }
 
     /// `activateFocused` (`go\window.go:1328`).
@@ -6569,6 +8866,43 @@ impl UiState {
 
     /// `onSettingsKeyDownEx` (`go\window.go:1358`).
     pub fn on_settings_key_down_ex(&mut self, hwnd: HWND, vk: u32, shift: bool) -> bool {
+        // The Card picker owns its text-entry keys before the generic focus
+        // travel. Backspace arrives as WM_CHAR; Enter searches (or matches an
+        // open result); Escape closes the result overlay; Up/Down move the
+        // result selection while it is open.
+        if self.cur_view == View::Card {
+            if self.picker.open && vk == VK_ESCAPE {
+                self.picker.close_results();
+                return true;
+            }
+            if self.focus_id == BTN_PICKER_FIELD && vk == VK_RETURN {
+                // Enter on the field is the one search verb; while results are
+                // open it previews the highlighted row instead of running a
+                // second, differently-named action.
+                if self.picker.open {
+                    let idx = self.picker.selected;
+                    self.select_candidate(idx);
+                } else {
+                    self.card_picker_search();
+                }
+                return true;
+            }
+            if self.picker.open && matches!(vk, VK_UP | VK_DOWN) {
+                let n = self.picker.candidates.len();
+                if n > 0 {
+                    let next = if vk == VK_UP {
+                        self.picker.selected.saturating_sub(1)
+                    } else {
+                        (self.picker.selected + 1).min(n - 1)
+                    };
+                    // Moving the highlight previews the row it lands on: the
+                    // keyboard and the mouse select the same way.
+                    self.select_candidate(next);
+                    self.invalidate();
+                }
+                return true;
+            }
+        }
         // The Main folder list owns its navigation keys while it has rows;
         // every other key keeps the ported focus/scroll/activate behaviour.
         if self.on_main_list_key(hwnd, vk) {
@@ -6589,11 +8923,11 @@ impl UiState {
             VK_TAB => {
                 let dir = if shift { -1 } else { 1 };
                 self.focus_id =
-                    move_focus(self.focus_id, dir, &focus_order_for_view(self.cur_view));
+                    move_focus(self.focus_id, dir, &self.focus_order_now());
                 true
             }
             VK_LEFT | VK_UP => {
-                self.focus_id = move_focus(self.focus_id, -1, &focus_order_for_view(self.cur_view));
+                self.focus_id = move_focus(self.focus_id, -1, &self.focus_order_now());
                 true
             }
             VK_PRIOR => self.scroll_list(hwnd, -self.page_rows(hwnd)),
@@ -6601,7 +8935,7 @@ impl UiState {
             VK_HOME => self.scroll_list(hwnd, -i32::MAX),
             VK_END => self.scroll_list(hwnd, i32::MAX),
             VK_RIGHT | VK_DOWN => {
-                self.focus_id = move_focus(self.focus_id, 1, &focus_order_for_view(self.cur_view));
+                self.focus_id = move_focus(self.focus_id, 1, &self.focus_order_now());
                 true
             }
             VK_RETURN | VK_SPACE => {
@@ -6702,25 +9036,92 @@ impl UiState {
         self.invalidate();
     }
 
-    /// The kind the Card view displays and edits: the last live-recorded
-    /// kind, Series while nothing live has been recorded yet.
+    /// The kind the Card view displays and edits: the live-recorded kind, else
+    /// the kind of the locally previewed selection, else Series.
     #[must_use]
     pub fn displayed_card_kind(&self) -> CardKind {
-        self.preview_kind.unwrap_or(CardKind::Series)
+        if let Some(kind) = self.preview_kind {
+            return kind;
+        }
+        if let Some((kind, _)) = self.local_preview.as_ref() {
+            return *kind;
+        }
+        CardKind::Series
     }
 
-    /// `previewActivity` (`go\main.go:68`): composes on demand for the LIVE
-    /// kind. Returns `(default, false)` when nothing live has been recorded.
+    /// Whether the object card is showing a real, sent presence (a live push)
+    /// rather than a local preview or the empty state. The object card's status
+    /// line and the review both read this one predicate.
+    #[must_use]
+    pub fn preview_is_live(&self) -> bool {
+        if self.local_preview.is_some() {
+            return false;
+        }
+        self.preview_kind.is_some()
+            && match self.preview_kind {
+                Some(CardKind::Series) => self.preview_series.is_some(),
+                Some(CardKind::Movie) => self.preview_movie.is_some(),
+                None => false,
+            }
+    }
+
+    /// The preview this window is showing: the record the user just picked
+    /// first, else the last live push, else nothing. A pick is the newest
+    /// intent and must not be masked by a stale live push for a different
+    /// title; the status line below says which one is on screen.
+    fn shown_preview(&self) -> Option<(CardKind, &CardPreviewInput)> {
+        if let Some((kind, input)) = self.local_preview.as_ref() {
+            return Some((*kind, input));
+        }
+        if self.preview_is_live() {
+            let kind = self.preview_kind?;
+            let input = match kind {
+                CardKind::Series => self.preview_series.as_ref(),
+                CardKind::Movie => self.preview_movie.as_ref(),
+            }?;
+            return Some((kind, input));
+        }
+        None
+    }
+
+    /// The object card's status line: the one sentence that says whether what
+    /// is below is a real presence or a preview that has not been sent.
+    #[must_use]
+    pub fn object_status_text(&self, playing: bool) -> String {
+        if self.preview_is_live() {
+            return "Presence live \u{b7} Discord connection unknown".to_string();
+        }
+        if self.local_preview.is_some() {
+            // One true sentence, whatever PotPlayer is doing: this preview has
+            // not been sent. The old "nothing playing" claimed playback was
+            // idle even while a title played, which the neighbouring previews
+            // contradicted in the same frame.
+            let _ = playing;
+            return LOCAL_PREVIEW_STATUS.to_string();
+        }
+        "Preview is local; Apply needs playback.".to_string()
+    }
+
+    /// The one object this window is about: the resolved record's own title,
+    /// year and kind for the playing title. `None` when nothing has been
+    /// recorded, which is the explicit empty state -- not an empty search.
+    #[must_use]
+    pub fn preview_object(&self) -> Option<(String, i32, bool)> {
+        let (kind, input) = self.shown_preview()?;
+        let title = if input.resolved.series.trim().is_empty() {
+            input.raw_title.clone()
+        } else {
+            input.resolved.series.clone()
+        };
+        Some((title, input.resolved.year, kind.is_movie()))
+    }
+
+    /// `previewActivity` (`go\main.go:68`): composes on demand for the shown
+    /// preview (live push first, else the locally selected record). Returns
+    /// `(default, false)` when neither exists.
     #[must_use]
     pub fn preview_activity(&self) -> (Activity, bool) {
-        let Some(kind) = self.preview_kind else {
-            return (Activity::default(), false);
-        };
-        let input = match kind {
-            CardKind::Series => self.preview_series.as_ref(),
-            CardKind::Movie => self.preview_movie.as_ref(),
-        };
-        let Some(input) = input else {
+        let Some((kind, input)) = self.shown_preview() else {
             return (Activity::default(), false);
         };
         let card = presence::compose_card(
@@ -6730,7 +9131,39 @@ impl UiState {
             kind.is_movie(),
             &self.card_specs_state.for_kind(kind),
         );
-        (card, true)
+        // One source of truth: the preview applies the same designer choices
+        // the UI publishes to the sender, so the panel and the wire cannot
+        // drift.
+        (self.designer.apply(card), true)
+    }
+
+    /// The complete stored synopsis for the displayed kind, or empty when
+    /// nothing is recorded. This is the local tooltip's source; `large_text`
+    /// is only the <=128-unit Discord snippet.
+    #[must_use]
+    pub fn preview_synopsis(&self) -> String {
+        self.shown_preview()
+            .map(|(_, i)| i.resolved.synopsis.clone())
+            .unwrap_or_default()
+    }
+
+    /// The resolved runtime string for the displayed kind (`2h 46m`,
+    /// `45 min`), used by the preview time strip. Empty when nothing is
+    /// recorded or the lookup carried no runtime.
+    #[must_use]
+    pub fn preview_length(&self) -> String {
+        self.shown_preview()
+            .map(|(_, i)| i.resolved.length.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether the Card view's synopsis tooltip should be painted: hovered,
+    /// keyboard-focused, or pinned by Enter/click.
+    #[must_use]
+    pub fn synopsis_visible(&self) -> bool {
+        self.synopsis_pinned
+            || self.hover_btn == BTN_SYNOPSIS
+            || self.focus_id == BTN_SYNOPSIS
     }
 
     /// Probe-compat for the removed manual kind toggle: drives the derived
@@ -7290,7 +9723,7 @@ thread_local! {
 
 /// Start GDI+ once per process. `false` (no GDI+ available) is a supported
 /// state: every helper below falls back to plain GDI.
-fn gdiplus_start() -> bool {
+pub(crate) fn gdiplus_start() -> bool {
     use std::sync::OnceLock;
     static STARTED: OnceLock<bool> = OnceLock::new();
     *STARTED.get_or_init(|| {
@@ -7601,6 +10034,100 @@ fn draw_ui_text_wrapped(hdc: Gdi::HDC, s: &str, rc: Rect, font: Gdi::HFONT, colo
     }
 }
 
+/// The rect the Activity surface draws its media title into. The paint and the
+/// wide-viewport proof read this one function, so a proof cannot disagree with
+/// the pixels about where the title was allowed to go.
+fn activity_title_band(rc: Rect, dpi: i32, art: bool) -> Rect {
+    let sc = |v: i32| scale_px(dpi, v);
+    let pad = sc(SP_4);
+    let hero_top = rc.top + sc(SP_3) + sc(18) + sc(SP_3);
+    Rect {
+        left: activity_text_left(rc, dpi, art),
+        top: hero_top,
+        right: rc.right - pad,
+        bottom: hero_top + sc(48),
+    }
+}
+
+/// The left edge of the Activity surface's text column: past the cover when
+/// there is one, at the panel pad when there is not.
+fn activity_text_left(rc: Rect, dpi: i32, art: bool) -> i32 {
+    let sc = |v: i32| scale_px(dpi, v);
+    let pad = sc(SP_4);
+    if art {
+        (rc.left + pad + sc(76)).min(rc.right - pad) + sc(SP_3)
+    } else {
+        rc.left + pad
+    }
+}
+
+fn picked_row_key(cand: &Candidate) -> String {
+    format!(
+        "{}\u{1}{}\u{1}{}",
+        cand.provider, cand.provider_id, cand.title
+    )
+}
+
+/// Paint a media title so every character of it is readable inside `rc`: the
+/// display face when the text fits, else the body face, else one ellipsized
+/// line in the smallest face. A title that loses an edge glyph reads as a
+/// corrupt string, so the face gives way before the text does.
+fn paint_media_title(
+    hdc: Gdi::HDC,
+    s: &str,
+    rc: Rect,
+    dpi: i32,
+    color: u32,
+    display: Gdi::HFONT,
+    wrap: bool,
+) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    let sc = |v: i32| scale_px(dpi, v);
+    let width = rc.right - rc.left;
+    let height = rc.bottom - rc.top;
+    let body = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
+    let hint = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let single = crate::win32::DT_LEFT
+        | crate::win32::DT_SINGLE_LINE
+        | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER;
+    // Two pixels of slack: a descender that lands exactly on the last row is
+    // already clipped, and the proof reads ink, not metrics.
+    let room = height - sc(3);
+    for font in [display, body, hint] {
+        // SAFETY: measurement only; the previous font is restored.
+        let fits = unsafe {
+            let old = Gdi::SelectObject(hdc, font);
+            let fits = if wrap {
+                let need = wrapped_need(hdc, s, width);
+                need > 0 && need <= room
+            } else {
+                single_line_fits(hdc, s, width)
+            };
+            Gdi::SelectObject(hdc, old);
+            fits
+        };
+        if fits {
+            if wrap {
+                draw_ui_text_wrapped(hdc, s, rc, font, color);
+            } else {
+                draw_ui_text(hdc, s, rc, single, font, color);
+            }
+            return;
+        }
+    }
+    draw_ui_text(
+        hdc,
+        s,
+        rc,
+        single | crate::win32::DT_END_ELLIPSIS,
+        hint,
+        color,
+    );
+}
+
 /// `drawUITextWrapped`, centered: the empty panel's hint/body under its
 /// centered title. Same wrap/ellipsis/no-prefix behavior, centered so the
 /// panel reads as one block.
@@ -7771,6 +10298,7 @@ fn tracked_px(size_px: i32, em: f32) -> i32 {
 /// titlebar and in the taskbar is one asset, not three approximations.
 fn paint_header(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
     let sc = |v: i32| scale_px(dpi, v);
+    let (left, content_w) = content_span(rc.right - rc.left, dpi);
     fill_rect_solid(hdc, rc, COL_SURFACE);
     // A hairline under the band so the chrome and the canvas meet on a line, not
     // a guess.
@@ -7787,9 +10315,9 @@ fn paint_header(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
 
     let tile = sc(MARK_TILE_L);
     let tile_rc = Rect {
-        left: rc.left + sc(MAIN_MARGIN),
+        left,
         top: rc.top + sc(SP_4),
-        right: rc.left + sc(MAIN_MARGIN) + tile,
+        right: left + tile,
         bottom: rc.top + sc(SP_4) + tile,
     };
     let icon = brand::mark_icon();
@@ -7823,7 +10351,7 @@ fn paint_header(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
         Rect {
             left: text_left,
             top: rc.top + sc(SP_3),
-            right: rc.right - sc(MAIN_MARGIN),
+            right: left + content_w,
             bottom: rc.top + sc(SP_3) + sc(26),
         },
         fmt,
@@ -7837,7 +10365,7 @@ fn paint_header(hdc: Gdi::HDC, rc: Rect, dpi: i32) {
         Rect {
             left: text_left,
             top: rc.top + sc(SP_3) + sc(26),
-            right: rc.right - sc(MAIN_MARGIN),
+            right: left + content_w,
             bottom: rc.bottom - sc(SP_2),
         },
         fmt,
@@ -8080,8 +10608,35 @@ fn paint_button_face(
             };
             draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
         }
-        BTN_TAB | BTN_TAB_SEL => {
-            // A segment of a segmented control: one anatomy for the tab strip,
+        BTN_TOGGLE | BTN_TOGGLE_ON => {
+            // A field toggle. On: quiet lit fill and a WHITE indicator (several
+            // can be on at once); off: a hairline segment with muted text.
+            let on = b.style == BTN_TOGGLE_ON;
+            if on || (hovered && !disabled) {
+                fill_round_rect(hdc, b.rc, COL_ROW, r);
+            }
+            if !on {
+                stroke_round_rect(hdc, b.rc, COL_BORDER, r);
+            }
+            let tc = if disabled {
+                COL_MUTED_DIM
+            } else if on || hovered || pressed {
+                COL_TEXT
+            } else {
+                COL_MUTED
+            };
+            draw_ui_text(hdc, &b.label, b.rc, fmt, button_font, tc);
+            if on {
+                let ind = Rect {
+                    left: b.rc.left + sc(SP_4),
+                    top: b.rc.bottom - sc(SP_1),
+                    right: b.rc.right - sc(SP_4),
+                    bottom: b.rc.bottom - sc(SP_1) + sc(STROKE_FOCUS),
+                };
+                fill_round_rect(hdc, ind, COL_TEXT, sc(R_BAR));
+            }
+        }
+        BTN_TAB | BTN_TAB_SEL => {            // A segment of a segmented control: one anatomy for the tab strip,
             // the scan-speed segments and the card presets. Lit = the card fill
             // plus the red indicator under the label; unlit = flat on the canvas
             // with the boundary hairline and muted text.
@@ -8174,89 +10729,16 @@ fn paint_button_face(
 fn paint_button(hdc: Gdi::HDC, b: &UiButton, dpi: i32, button_font: Gdi::HFONT, st: &UiState) {
     let hovered = st.hover_btn == b.id;
     let pressed = st.pressed_btn == b.id;
-    let disabled = !st.scan_blocked_reason(b.id).is_empty();
+    let picker_disabled = b.id == BTN_PICKER_SEARCH
+        && !st.picker.open
+        && !st.picker.search_allowed();
+    let disabled = !st.scan_blocked_reason(b.id).is_empty() || picker_disabled;
     let dim = disabled || (b.id == BTN_REMOVE && !st.remove_has_target());
     paint_button_face(hdc, b, dpi, button_font, hovered, pressed, disabled, dim);
 }
 
-/// `paintPreviewRows` (`go\window.go:3239`).
-fn paint_preview_rows(hdc: Gdi::HDC, dpi: i32, region: Rect, rows: &[String], font: Gdi::HFONT) {
-    let sc = |v: i32| scale_px(dpi, v);
-    let (pad, row_h, gap) = (sc(10), sc(20), sc(2));
-    let w = region.right - region.left - pad * 2;
-    let x0 = region.left + pad;
-    let mut y = region.top + pad;
-    let max_bottom = region.bottom - pad;
-
-    // SAFETY: font selected then restored.
-    unsafe {
-        Gdi::SetTextColor(hdc, COL_TEXT);
-    }
-    // SAFETY: font/owner restored after the loop.
-    let old_font = unsafe { Gdi::SelectObject(hdc, font) };
-
-    let mut boxes: Vec<(String, i32, bool)> = Vec::new();
-    for s in rows {
-        let mut draw = s.clone();
-        let mut h = row_h;
-        let mut wrap = false;
-        if !single_line_fits(hdc, s, w) {
-            draw = break_row(hdc, s, w);
-            h = wrapped_need(hdc, &draw, w).max(row_h);
-            wrap = true;
-        }
-        if y + h > max_bottom {
-            h = max_bottom - y;
-            if h <= 0 {
-                break;
-            }
-            wrap = true;
-        }
-        boxes.push((draw, h, wrap));
-        y += h + gap;
-    }
-    let mut used_bottom = y - gap;
-    if used_bottom < region.top + pad + row_h {
-        used_bottom = region.top + pad + row_h;
-    }
-    fill_round_rect(
-        hdc,
-        Rect {
-            left: region.left,
-            top: region.top,
-            right: region.right,
-            bottom: used_bottom + pad,
-        },
-        COL_SURFACE,
-        sc(R_PANEL),
-    );
-
-    y = region.top + pad;
-    let fmt = crate::win32::DT_LEFT
-        | crate::win32::DT_SINGLE_LINE
-        | crate::win32::DT_NO_PREFIX
-        | crate::win32::DT_V_CENTER
-        | crate::win32::DT_END_ELLIPSIS;
-    for b in &boxes {
-        let (draw, h, wrap) = (b.0.as_str(), b.1, b.2);
-        let rc = Rect {
-            left: x0,
-            top: y,
-            right: x0 + w,
-            bottom: y + h,
-        };
-        if wrap {
-            draw_ui_text_wrapped(hdc, draw, rc, font, COL_TEXT);
-        } else {
-            draw_ui_text(hdc, draw, rc, fmt, font, COL_TEXT);
-        }
-        y += h + gap;
-    }
-    // SAFETY: restore the caller's font.
-    unsafe {
-        Gdi::SelectObject(hdc, old_font);
-    }
-}
+// `paintPreviewRows` lived here for the developer-dump preview; the media
+// composition draws its own title/meta/synopsis rows.
 
 /// `paintScanBar` (`go\window.go:2517`).
 fn paint_scan_bar(hdc: Gdi::HDC, status: Rect, dpi: i32, st: &UiState) {
@@ -8561,28 +11043,659 @@ fn paint_settings_card(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     }
 }
 
-/// `paintCardView` (`go\window.go:3078`).
+/// `paintCardView` (`go\window.go:3078`). The media composition: brand art,
+/// the exact body lines Discord receives, and a focusable synopsis affordance
+/// whose hover/focus tooltip carries the complete stored note. The compact
+/// composition drops the chrome band and labels; the wide composition centres
+/// the content and enlarges the art/title.
+/// Wall-clock milliseconds for the preview time strip.
+fn preview_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The shared preview model for the current Card view: the composed (and
+/// designer-filtered) activity, the complete local synopsis when the synopsis
+/// field is on, and the resolved runtime for the time strip.
+fn card_preview_model(st: &UiState) -> (SurfacePreview, bool) {
+    let (act, have) = st.preview_activity();
+    let synopsis = if st.designer.synopsis {
+        st.preview_synopsis()
+    } else {
+        String::new()
+    };
+    let duration = parse_length_ms(&st.preview_length());
+    let mut model = surface_preview(
+        &act,
+        have,
+        &synopsis,
+        preview_now_ms(),
+        duration,
+        st.designer.artwork,
+    );
+    // A URL is not a cover. Only a locally decodable image turns the slot on,
+    // so the blank-tile failure cannot recur while a fetch is pending.
+    model.art &= crate::artwork::is_cached(&model.art_url);
+    (model, have)
+}
+
+/// One clean cover tile: the decoded artwork plus its hairline, never a branded
+/// mark, badge or status glyph (owner decision 2026-10-28). The caller only
+/// reaches this with a decoded image; a missing cover collapses the slot.
+fn paint_cover(hdc: Gdi::HDC, rc: Rect, dpi: i32, cover: Option<&crate::artwork::Cover>) {
+    use windows_sys::Win32::Graphics::GdiPlus as gp;
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_round_rect(hdc, rc, COL_SURFACE, sc(R_TILE));
+    if let Some(cover) = cover {
+        let g = PAINT_GRAPHICS.with(|c| c.get()) as *mut gp::GpGraphics;
+        if !g.is_null() {
+            cover.draw(g, rc, sc(R_TILE));
+        }
+    }
+    stroke_round_rect_w(hdc, rc, COL_BORDER, sc(R_TILE), sc(STROKE_HAIR));
+}
+
+/// The visible result rows of the picker overlay. The paint and the hit test
+/// read this one table, so a painted row and a clickable row cannot drift.
+fn picker_row_rects(l: &CardLayout, count: usize) -> Vec<Rect> {
+    let sc = |v: i32| scale_px(96, v);
+    if count == 0 || l.picker_results.bottom <= l.picker_results.top {
+        return Vec::new();
+    }
+    let top = l.picker_results.top + sc(24);
+    let row_h = sc(44);
+    let room = ((l.picker_results.bottom - top) / row_h).max(0) as usize;
+    let n = count.min(room).min(4);
+    (0..n)
+        .map(|i| Rect {
+            left: l.picker_results.left + sc(SP_2),
+            top: top + i as i32 * row_h,
+            right: l.picker_results.right - sc(SP_2),
+            bottom: top + i as i32 * row_h + row_h - sc(2),
+        })
+        .collect()
+}
+
+/// The result row under `(x, y)`, or `None`.
+fn picker_result_at(l: &CardLayout, picker: &crate::search::MediaPicker, x: i32, y: i32) -> Option<usize> {
+    if !picker.open {
+        return None;
+    }
+    picker_row_rects(l, picker.candidates.len())
+        .into_iter()
+        .position(|r| pt_in_rect(r, x, y))
+}
+
+/// The one-field editor. It paints the query left-aligned with a caret at the
+/// end, and the placeholder when empty. It is not a stock edit control, so the
+/// main window's custom paint path still owns every visible pixel.
+fn paint_picker_field(
+    hdc: Gdi::HDC,
+    rc: Rect,
+    dpi: i32,
+    font: Gdi::HFONT,
+    picker: &crate::search::MediaPicker,
+    focused: bool,
+) {
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_round_rect(hdc, rc, COL_CARD, sc(R_CTRL));
+    stroke_round_rect_w(
+        hdc,
+        rc,
+        if focused { COL_ACCENT } else { COL_BORDER },
+        sc(R_CTRL),
+        sc(STROKE_HAIR),
+    );
+    let pad = sc(SP_2);
+    // The counter reserves its own band at the right end of the field, so the
+    // typed text ellipsizes before it instead of running under it.
+    let counter_w = if picker.query.is_empty() { 0 } else { sc(46) };
+    let text = if picker.query.is_empty() {
+        "Title or title + year"
+    } else {
+        &picker.query
+    };
+    let fmt = crate::win32::DT_LEFT
+        | crate::win32::DT_SINGLE_LINE
+        | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER
+        | crate::win32::DT_END_ELLIPSIS;
+    draw_ui_text(
+        hdc,
+        text,
+        Rect {
+            left: rc.left + pad,
+            top: rc.top,
+            right: rc.right - pad - counter_w,
+            bottom: rc.bottom,
+        },
+        fmt,
+        font,
+        if picker.query.is_empty() { COL_MUTED } else { COL_TEXT },
+    );
+    if counter_w > 0 {
+        let at_limit = picker.query_len() >= crate::search::MAX_QUERY_CHARS;
+        draw_ui_text(
+            hdc,
+            &picker.counter_text(),
+            Rect {
+                left: rc.right - pad - counter_w,
+                top: rc.top,
+                right: rc.right - pad,
+                bottom: rc.bottom,
+            },
+            crate::win32::DT_RIGHT
+                | crate::win32::DT_SINGLE_LINE
+                | crate::win32::DT_NO_PREFIX
+                | crate::win32::DT_V_CENTER,
+            font,
+            if at_limit { COL_TEXT } else { COL_MUTED },
+        );
+    }
+    if focused && !picker.busy {
+        let mut caret_x = rc.left + pad;
+        if !picker.query.is_empty() {
+            // Measure the query in the same font the field paints, so the
+            // caret sits after the last glyph instead of at a guessed offset.
+            unsafe {
+                let old = Gdi::SelectObject(hdc, font);
+                let u: Vec<u16> = picker.query.encode_utf16().collect();
+                let mut sz = windows_sys::Win32::Foundation::SIZE { cx: 0, cy: 0 };
+                if Gdi::GetTextExtentPoint32W(hdc, u.as_ptr(), u.len() as i32, &mut sz) != 0 {
+                    caret_x += sz.cx;
+                }
+                Gdi::SelectObject(hdc, old);
+            }
+        }
+        caret_x = caret_x.min(rc.right - pad - 1);
+        fill_rect_solid(
+            hdc,
+            Rect {
+                left: caret_x,
+                top: rc.top + sc(7),
+                right: caret_x + sc(1).max(1),
+                bottom: rc.bottom - sc(7),
+            },
+            COL_TEXT,
+        );
+    }
+}
+
+/// The result overlay: a raised panel with one clean row per candidate, the
+/// selected row lit, and a one-line instruction. It never paints over the
+/// picker band, so the field and the explicit Movie/TV choice stay live while
+/// results are open.
+fn paint_picker_results(
+    hdc: Gdi::HDC,
+    l: &CardLayout,
+    dpi: i32,
+    picker: &crate::search::MediaPicker,
+    body: Gdi::HFONT,
+    hint: Gdi::HFONT,
+) {
+    if !picker.open || picker.candidates.is_empty() || l.picker_results.bottom <= l.picker_results.top {
+        return;
+    }
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_round_rect(hdc, l.picker_results, COL_CARD, sc(R_PANEL));
+    stroke_round_rect_w(hdc, l.picker_results, COL_BORDER, sc(R_PANEL), sc(STROKE_HAIR));
+    let head = Rect {
+        left: l.picker_results.left + sc(SP_3),
+        top: l.picker_results.top + sc(SP_2),
+        right: l.picker_results.right - sc(SP_3),
+        bottom: l.picker_results.top + sc(SP_2) + sc(16),
+    };
+    draw_ui_text(
+        hdc,
+        "Pick a match",
+        head,
+        crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE,
+        hint,
+        COL_MUTED,
+    );
+    let rows = picker_row_rects(l, picker.candidates.len());
+    for (i, rc) in rows.iter().enumerate() {
+        let Some(c) = picker.candidates.get(i) else {
+            break;
+        };
+        let (title, sub) = fix_match_row_lines(c);
+        paint_fix_match_row(
+            hdc,
+            *rc,
+            dpi,
+            body,
+            hint,
+            &title,
+            &sub,
+            i == picker.selected,
+        );
+    }
+    let foot = Rect {
+        left: l.picker_results.left + sc(SP_3),
+        top: rows.last().map_or(head.bottom, |r| r.bottom + sc(SP_1)),
+        // The list's own buttons sit on the panel's last 32/64 px; the hint
+        // must not paint over them.
+        right: l.picker_results.right - sc(SP_3),
+        bottom: l
+            .card_btn(BTN_PICKER_APPLY)
+            .or_else(|| l.card_btn(BTN_FIX_MATCH))
+            .map_or(l.picker_results.bottom - sc(SP_2), |rc| rc.top - sc(SP_1)),
+    };
+    if foot.bottom > foot.top {
+        let hint_text = if l.card_btn(BTN_PICKER_APPLY).is_some() {
+            "Up/Down previews \u{b7} Apply changes the playing title \u{b7} Esc closes"
+        } else {
+            "Up/Down previews the row \u{b7} nothing is sent \u{b7} Esc closes"
+        };
+        draw_ui_text(
+            hdc,
+            hint_text,
+            foot,
+            crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS,
+            hint,
+            COL_MUTED,
+        );
+    }
+}
+
+/// The narrow time strip: a 4px track, the elapsed fraction in white, and the
+/// two labels under it. Used by the profile and Activity surfaces.
+fn paint_preview_timer(
+    hdc: Gdi::HDC,
+    rect: Rect,
+    dpi: i32,
+    clock: &PreviewClock,
+    hint: Gdi::HFONT,
+) {
+    if !clock.timer || rect.bottom <= rect.top {
+        return;
+    }
+    let sc = |v: i32| scale_px(dpi, v);
+    let bar_h = sc(4);
+    let track = Rect {
+        left: rect.left,
+        top: rect.top,
+        right: rect.right,
+        bottom: rect.top + bar_h,
+    };
+    fill_round_rect(hdc, track, crate::brand::TRACK, bar_h / 2);
+    if clock.fraction > 0.0 {
+        let w = ((track.right - track.left) as f64 * clock.fraction.clamp(0.0, 1.0)) as i32;
+        if w > 0 {
+            let fill = Rect {
+                right: track.left + w,
+                ..track
+            };
+            fill_round_rect(hdc, fill, COL_TEXT, bar_h / 2);
+        }
+    }
+    let labels = Rect {
+        top: track.bottom + sc(2),
+        bottom: rect.bottom,
+        ..rect
+    };
+    let fmt = crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER | crate::win32::DT_END_ELLIPSIS;
+    draw_ui_text(hdc, &clock.left, labels, fmt, hint, COL_MUTED);
+    let right = Rect {
+        left: labels.left + (labels.right - labels.left) / 2,
+        ..labels
+    };
+    draw_ui_text(
+        hdc,
+        &clock.right,
+        right,
+        crate::win32::DT_RIGHT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_NO_PREFIX
+            | crate::win32::DT_V_CENTER | crate::win32::DT_END_ELLIPSIS,
+        hint,
+        COL_MUTED,
+    );
+}
+
+/// The member-list surface: the documented `Watching <title>` line under the
+/// member name, the details/state echo, and a progress line. The placement is
+/// the inferred mock, not a Discord pixel contract.
+#[allow(clippy::too_many_arguments)]
+fn paint_member_surface(
+    hdc: Gdi::HDC,
+    rc: Rect,
+    dpi: i32,
+    p: &SurfacePreview,
+    have: bool,
+    body: Gdi::HFONT,
+    hint: Gdi::HFONT,
+    label: Gdi::HFONT,
+) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_round_rect(hdc, rc, COL_CARD, sc(R_PANEL));
+    stroke_round_rect_w(hdc, rc, COL_BORDER, sc(R_PANEL), sc(STROKE_HAIR));
+    let pad = sc(SP_3);
+    let head = Rect {
+        left: rc.left + pad,
+        top: rc.top + sc(SP_2),
+        right: rc.right - pad,
+        bottom: rc.top + sc(SP_2) + sc(16),
+    };
+    draw_ui_text(hdc, "Members", head, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE, label, COL_MUTED);
+    if preview_is_empty(have, p) {
+        // No object: say there is nothing to preview instead of painting an
+        // empty member row that looks like a failed render.
+        draw_ui_text(
+            hdc,
+            PREVIEW_EMPTY_TEXT,
+            Rect {
+                top: head.bottom + sc(SP_2),
+                bottom: (head.bottom + sc(SP_2) + sc(18)).min(rc.bottom - sc(SP_2)),
+                ..head
+            },
+            crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS,
+            body,
+            COL_MUTED,
+        );
+        return;
+    }
+    let row_top = head.bottom + sc(SP_2);
+    let avatar = Rect {
+        left: rc.left + pad,
+        top: row_top,
+        right: rc.left + pad + sc(30),
+        bottom: row_top + sc(30),
+    };
+    fill_round_rect(hdc, avatar, COL_SURFACE, sc(R_CTRL));
+    let fmt_c = crate::win32::DT_CENTER | crate::win32::DT_SINGLE_LINE | crate::win32::DT_V_CENTER;
+    draw_ui_text(hdc, "You", avatar, fmt_c, hint, COL_MUTED);
+    let text_left = avatar.right + sc(SP_2);
+    let name = Rect {
+        left: text_left,
+        top: row_top,
+        right: rc.right - pad,
+        bottom: row_top + sc(16),
+    };
+    draw_ui_text(hdc, "You", name, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE, hint, COL_MUTED);
+    let watching = Rect {
+        left: text_left,
+        top: name.bottom + sc(1),
+        right: rc.right - pad,
+        bottom: name.bottom + sc(1) + sc(18),
+    };
+    draw_ui_text(hdc, &p.header, watching, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS, body, COL_TEXT);
+    let mut echo = String::new();
+    for line in [&p.details, &p.state] {
+        if !line.is_empty() {
+            if !echo.is_empty() {
+                echo.push_str(" \u{b7} ");
+            }
+            echo.push_str(line);
+        }
+    }
+    if !echo.is_empty() {
+        let e = Rect {
+            left: text_left,
+            top: watching.bottom,
+            right: rc.right - pad,
+            bottom: watching.bottom + sc(14),
+        };
+        draw_ui_text(hdc, &echo, e, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS, hint, COL_MUTED);
+    }
+    if p.clock.timer {
+        let bar = Rect {
+            left: text_left,
+            top: watching.bottom + sc(18),
+            right: rc.right - pad,
+            bottom: (watching.bottom + sc(18) + sc(30)).min(rc.bottom - sc(SP_2)),
+        };
+        paint_preview_timer(hdc, bar, dpi, &p.clock, hint);
+    }
+}
+
+/// The profile/expanded-card surface: banner, identity, then the activity block
+/// with the cover, `Watching <title>`, the two body lines and the time strip.
+#[allow(clippy::too_many_arguments)]
+fn paint_profile_surface(
+    hdc: Gdi::HDC,
+    rc: Rect,
+    dpi: i32,
+    p: &SurfacePreview,
+    have: bool,
+    art: Rect,
+    cover: Option<&crate::artwork::Cover>,
+    header: Rect,
+    details: Rect,
+    state: Rect,
+    body: Gdi::HFONT,
+    hint: Gdi::HFONT,
+    label: Gdi::HFONT,
+    title: Gdi::HFONT,
+    identity: bool,
+) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_round_rect(hdc, rc, COL_CARD, sc(R_PANEL));
+    stroke_round_rect_w(hdc, rc, COL_BORDER, sc(R_PANEL), sc(STROKE_HAIR));
+    let pad = sc(SP_4);
+    if preview_is_empty(have, p) {
+        // Nothing recorded and nothing selected: the surface states that, so a
+        // cold card never renders as a blank panel under the identity block.
+        draw_ui_text(
+            hdc,
+            PREVIEW_EMPTY_TEXT,
+            Rect {
+                left: rc.left + pad,
+                top: rc.top + sc(SP_4),
+                right: rc.right - pad,
+                bottom: (rc.top + sc(SP_4) + sc(18)).min(rc.bottom - sc(SP_2)),
+            },
+            crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS,
+            body,
+            COL_MUTED,
+        );
+        return;
+    }
+    if identity {        let banner = Rect {
+            left: rc.left,
+            top: rc.top,
+            right: rc.right,
+            bottom: (rc.top + sc(30)).min(rc.bottom),
+        };
+        fill_rect_solid(hdc, banner, COL_SURFACE);
+        let avatar = Rect {
+            left: rc.left + pad,
+            top: rc.top + sc(18),
+            right: rc.left + pad + sc(46),
+            bottom: rc.top + sc(18) + sc(46),
+        };
+        fill_round_rect(hdc, avatar, COL_CARD, sc(R_CTRL));
+        stroke_round_rect_w(hdc, avatar, COL_MUTED, sc(R_CTRL), sc(STROKE_HAIR));
+        draw_ui_text(hdc, "You", avatar, crate::win32::DT_CENTER | crate::win32::DT_SINGLE_LINE | crate::win32::DT_V_CENTER, hint, COL_MUTED);
+        let name_top = avatar.bottom + sc(SP_1);
+        let name = Rect {
+            left: rc.left + pad,
+            top: name_top,
+            right: rc.right - pad,
+            bottom: name_top + sc(18),
+        };
+        draw_ui_text(hdc, "You", name, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE, label, COL_TEXT);
+        let handle = Rect {
+            top: name.bottom,
+            bottom: (name.bottom + sc(14)).min(rc.bottom),
+            ..name
+        };
+        // The handle line stays empty: this build exposes no connected Discord
+        // identity to the window, so nothing is invented and `You` stands in.
+        let _ = handle;
+    }
+    if p.art {
+        paint_cover(hdc, art, dpi, cover);
+    }
+    // With no artwork the cover column collapses: the text takes the full
+    // panel width instead of leaving a dead gutter.
+    let (header, details, state) = if p.art {
+        (header, details, state)
+    } else {
+        let full = |r: Rect| Rect {
+            left: rc.left + pad,
+            right: rc.right - pad,
+            ..r
+        };
+        (full(header), full(details), full(state))
+    };
+    paint_media_title(hdc, &p.header, header, dpi, COL_TEXT, title, false);
+    if !p.details.is_empty() {
+        draw_ui_text(hdc, &p.details, details, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS, body, COL_MUTED);
+    }
+    if !p.state.is_empty() {
+        draw_ui_text(hdc, &p.state, state, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS, body, COL_MUTED);
+    }
+    if p.clock.timer {
+        let bar = Rect {
+            left: header.left,
+            top: state.bottom + sc(SP_2),
+            right: rc.right - pad,
+            bottom: (state.bottom + sc(SP_2) + sc(30)).min(rc.bottom - sc(SP_3)),
+        };
+        paint_preview_timer(hdc, bar, dpi, &p.clock, hint);
+    }
+}
+
+/// The Activity-tab surface: the hero (cover + lines + time) and the complete
+/// local synopsis body. Discord has no synopsis field; this body never leaves
+/// Potflix.
+#[allow(clippy::too_many_arguments)]
+fn paint_activity_surface(
+    hdc: Gdi::HDC,
+    rc: Rect,
+    dpi: i32,
+    p: &SurfacePreview,
+    have: bool,
+    cover: Option<&crate::artwork::Cover>,
+    body: Gdi::HFONT,
+    hint: Gdi::HFONT,
+    label: Gdi::HFONT,
+    title: Gdi::HFONT,
+    synopsis_on: bool,
+) {
+    if rc.right <= rc.left || rc.bottom <= rc.top {
+        return;
+    }
+    let sc = |v: i32| scale_px(dpi, v);
+    fill_round_rect(hdc, rc, COL_CARD, sc(R_PANEL));
+    stroke_round_rect_w(hdc, rc, COL_BORDER, sc(R_PANEL), sc(STROKE_HAIR));
+    let pad = sc(SP_4);
+    let head = Rect {
+        left: rc.left + pad,
+        top: rc.top + sc(SP_3),
+        right: rc.right - pad,
+        bottom: rc.top + sc(SP_3) + sc(18),
+    };
+    draw_ui_text(hdc, "Activity", head, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE, label, COL_MUTED);
+    if preview_is_empty(have, p) {
+        // The synopsis block belongs to a title. With no title there is no
+        // "No synopsis for this title." to print and no hero to draw: the
+        // surface says the one true thing instead.
+        draw_ui_text(
+            hdc,
+            PREVIEW_EMPTY_TEXT,
+            Rect {
+                top: head.bottom + sc(SP_3),
+                bottom: (head.bottom + sc(SP_3) + sc(18)).min(rc.bottom - sc(SP_2)),
+                ..head
+            },
+            crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS,
+            body,
+            COL_MUTED,
+        );
+        return;
+    }
+    let hero_top = head.bottom + sc(SP_3);
+    let art_w = sc(76);
+    let art = Rect {
+        left: rc.left + pad,
+        top: hero_top,
+        right: (rc.left + pad + art_w).min(rc.right - pad),
+        bottom: (hero_top + sc(112)).min(rc.bottom - pad),
+    };
+    if p.art {
+        paint_cover(hdc, art, dpi, cover);
+    }
+    let text_left = activity_text_left(rc, dpi, p.art);
+    let hdr = activity_title_band(rc, dpi, p.art);
+    paint_media_title(hdc, &p.header, hdr, dpi, COL_TEXT, title, true);
+    let det = Rect {
+        top: hdr.bottom + sc(1),
+        bottom: hdr.bottom + sc(1) + sc(18),
+        ..hdr
+    };
+    if !p.details.is_empty() {
+        draw_ui_text(hdc, &p.details, det, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS, body, COL_MUTED);
+    }
+    let sta = Rect {
+        top: det.bottom,
+        bottom: det.bottom + sc(18),
+        ..hdr
+    };
+    if !p.state.is_empty() {
+        draw_ui_text(hdc, &p.state, sta, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE | crate::win32::DT_END_ELLIPSIS, body, COL_MUTED);
+    }
+    if p.clock.timer {
+        let bar = Rect {
+            left: text_left,
+            top: sta.bottom + sc(SP_1),
+            right: rc.right - pad,
+            bottom: sta.bottom + sc(SP_1) + sc(28),
+        };
+        paint_preview_timer(hdc, bar, dpi, &p.clock, hint);
+    }
+    if !synopsis_on {
+        return;
+    }
+    let syn_top = if p.art {
+        (art.bottom + sc(SP_3)).min(rc.bottom - pad)
+    } else {
+        (sta.bottom + sc(SP_3)).max(hero_top + sc(SP_3))
+    };
+    let syn_label = Rect {
+        left: rc.left + pad,
+        top: syn_top,
+        right: rc.right - pad,
+        bottom: (syn_top + sc(16)).min(rc.bottom),
+    };
+    draw_ui_text(hdc, "Synopsis \u{b7} local only", syn_label, crate::win32::DT_LEFT | crate::win32::DT_SINGLE_LINE, hint, COL_MUTED);
+    let syn_body = Rect {
+        left: rc.left + pad,
+        top: syn_label.bottom + sc(SP_1),
+        right: rc.right - pad,
+        bottom: rc.bottom - sc(SP_3),
+    };
+    if syn_body.bottom > syn_body.top {
+        let text = if p.synopsis.is_empty() {
+            "No synopsis for this title."
+        } else {
+            &p.synopsis
+        };
+        draw_ui_text_wrapped(hdc, text, syn_body, body, COL_MUTED);
+    }
+}
+
 fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
     let sc = |v: i32| scale_px(dpi, v);
     let (cw, ch) = (rc.right - rc.left, rc.bottom - rc.top);
     fill_background(hdc, rc);
 
-    let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
-    let body_font = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
-    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
-    let status_font = status_font(dpi);
-    let fmt_left = crate::win32::DT_LEFT
-        | crate::win32::DT_SINGLE_LINE
-        | crate::win32::DT_NO_PREFIX
-        | crate::win32::DT_V_CENTER
-        | crate::win32::DT_END_ELLIPSIS;
-
-    let mut l = compute_card_layout(
+    let mut l = compute_card_layout_state(
         cw,
         ch,
         dpi,
         &st.card_specs_state,
         st.displayed_card_kind(),
+        st.preview_surface,
+        &st.card_layout_state(),
     );
     for b in l.btns.iter_mut() {
         if b.id == BTN_CARD || b.id == BTN_SETTINGS {
@@ -8592,58 +11705,325 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
                 BTN_TAB
             };
         }
+        if b.id == BTN_ADVANCED {
+            b.label = if st.advanced_open {
+                "Advanced \u{25be}".to_string()
+            } else {
+                "Advanced \u{25b8}".to_string()
+            };
+        }
+        if b.id == BTN_PICKER_SEARCH {
+            // One verb, one label, always: Search searches. A second name on
+            // the same control was the "second match action" the owner named.
+            b.label = "Search".to_string();
+            b.style = if st.picker.search_allowed() {
+                BTN_ACCENT
+            } else {
+                BTN_OUTLINE
+            };
+        }
     }
-    let (act, have) = st.preview_activity();
-    let rows = preview_rows(&act, have);
-    let full = [
-        rows[0].clone(),
-        rows[1].clone(),
-        rows[2].clone(),
-        rows[3].clone(),
-        rows[4].clone(),
-        preview_tooltip(&act, have),
-    ];
 
-    let header = Rect {
-        left: 0,
-        top: 0,
-        right: cw,
-        bottom: sc(HEADER_H_L),
+    let (mut model, have) = card_preview_model(st);
+    // Artwork is lazy and off-thread: a visible card starts at most one fetch
+    // for its URL, and the worker posts back when the cover is cached. The
+    // render tests compile this out, so no test touches the network.
+    #[cfg(not(test))]
+    if !model.art_url.is_empty() && !crate::artwork::is_cached(&model.art_url) {
+        crate::artwork::ensure_async(&model.art_url);
+    }
+    let cover = if model.art {
+        crate::artwork::Cover::load(&model.art_url)
+    } else {
+        None
     };
-    paint_header(hdc, header, dpi);
+    if model.art && cover.is_none() {
+        // A cache file that no longer decodes is an absence, not a blank tile.
+        model.art = false;
+    }
+    let button_font = brand::ui(sc(FS_CONTROL), brand::UI_WEIGHT);
+    let body_font = brand::ui(sc(FS_BODY), brand::UI_WEIGHT);
+    let hint_font = brand::ui(sc(FS_HINT), brand::UI_WEIGHT);
+    let status_font = status_font(dpi);
+    let title_font = brand::display(sc(FS_TITLE));
+    let label_font = brand::display(sc(FS_LABEL));
+    let fmt_left = crate::win32::DT_LEFT
+        | crate::win32::DT_SINGLE_LINE
+        | crate::win32::DT_NO_PREFIX
+        | crate::win32::DT_V_CENTER
+        | crate::win32::DT_END_ELLIPSIS;
+
+    // The rail surface first: its labels are painted on top of it, and the
+    // object card inside it must not be covered by its fill.
+    if l.wide {
+        fill_round_rect(hdc, l.rail, COL_SURFACE, sc(R_PANEL));
+        stroke_round_rect_w(hdc, l.rail, COL_BORDER, sc(R_PANEL), sc(STROKE_HAIR));
+    }
+    // --- The one object this window is about ------------------------------
+    // Cover, title, year/kind and the plain connection state. Everything below
+    // is either this object's presence preview or a correction to it.
+    fill_round_rect(hdc, l.object, COL_SURFACE, sc(R_PANEL));
+    stroke_round_rect_w(hdc, l.object, COL_BORDER, sc(R_PANEL), sc(STROKE_HAIR));
+    paint_cover(hdc, l.obj_cover, dpi, cover.as_ref());
+    match st.preview_object() {
+        Some((title, year, is_movie)) => {
+            draw_ui_text(hdc, &title, l.obj_title, fmt_left, title_font, COL_TEXT);
+            let kind = if is_movie { "Film" } else { "Series" };
+            let meta = if year > 0 {
+                format!("{year} \u{b7} {kind}")
+            } else {
+                kind.to_string()
+            };
+            draw_ui_text(hdc, &meta, l.obj_meta, fmt_left, body_font, COL_MUTED);
+            // The one sentence that decides whether this is a real presence or
+            // a preview that was never sent. A local preview says so in words.
+            let playing = app_support::config::live_now_playing().is_some();
+            draw_ui_text(
+                hdc,
+                &st.object_status_text(playing),
+                l.obj_status,
+                fmt_left,
+                hint_font,
+                COL_MUTED,
+            );
+        }
+        None => {
+            draw_ui_text(
+                hdc,
+                "Nothing playing",
+                l.obj_title,
+                fmt_left,
+                title_font,
+                COL_TEXT,
+            );
+            draw_ui_text(
+                hdc,
+                "Search a title, or start it in PotPlayer.",
+                l.obj_meta,
+                fmt_left,
+                body_font,
+                COL_MUTED,
+            );
+            draw_ui_text(
+                hdc,
+                "Preview is local; Apply needs playback.",
+                l.obj_status,
+                fmt_left,
+                hint_font,
+                COL_MUTED,
+            );
+        }
+    }
+
+    if l.header.bottom > l.header.top {
+        paint_header(hdc, l.header, dpi);
+    }
+    // The rail surface is painted above the object card so the card is not
+    // covered; nothing to fill here.
     for lab in &l.labels {
-        let text = match lab.id.as_str() {
-            "card.preview-label" => "Preview - the card Discord receives",
-            _ => "Line 2 - state",
-        };
-        paint_section_label(hdc, lab.rc, dpi, text, 0);
+        match lab.id.as_str() {
+            "card.preview-label" => draw_ui_text(hdc, "Discord preview", lab.rc, fmt_left, hint_font, COL_MUTED),
+            "card.designer" => draw_ui_text(hdc, "RPC designer", lab.rc, fmt_left, title_font, COL_TEXT),
+            "card.context" => {
+                let context = if have {
+                    let kind = if st.displayed_card_kind().is_movie() {
+                        "Film"
+                    } else {
+                        "TV episode"
+                    };
+                    format!("{} \u{b7} {}", model.header.trim_start_matches("Watching "), kind)
+                } else {
+                    "Nothing playing".to_string()
+                };
+                draw_ui_text(hdc, &context, lab.rc, fmt_left, hint_font, COL_MUTED);
+            }
+            "card.fields" => paint_section_label(hdc, lab.rc, dpi, "Fields to send", 0),
+            "card.line2" => paint_section_label(hdc, lab.rc, dpi, "Line 2 - state", 0),
+            "card.wire" => paint_section_label(hdc, lab.rc, dpi, "Wire", 0),
+            _ => {}
+        }
     }
-    paint_preview_rows(hdc, dpi, l.preview, &full, body_font);
-    draw_ui_text(
-        hdc,
-        "Preview re-renders as you pick lines; the live card follows at the next update.",
-        l.hint,
-        fmt_left,
-        hint_font,
-        COL_MUTED,
-    );
+
+    if l.wide {
+        let [member, profile, activity] = l.surfaces;
+        paint_member_surface(hdc, member, dpi, &model, have, body_font, hint_font, label_font);
+        paint_profile_surface(
+            hdc,
+            profile,
+            dpi,
+            &model,
+            have,
+            l.art,
+            cover.as_ref(),
+            l.title,
+            l.meta,
+            l.synopsis,
+            body_font,
+            hint_font,
+            label_font,
+            title_font,
+            true,
+        );
+        paint_activity_surface(
+            hdc,
+            activity,
+            dpi,
+            &model,
+            have,
+            cover.as_ref(),
+            body_font,
+            hint_font,
+            label_font,
+            title_font,
+            st.designer.synopsis,
+        );
+        if have {
+            // The selected surface carries a quiet accent edge; the segment
+            // row above is the control that moves it.
+            let sel = match st.preview_surface {
+                PreviewSurface::Member => member,
+                PreviewSurface::Profile => profile,
+                PreviewSurface::Activity => activity,
+            };
+            stroke_round_rect_w(hdc, sel, COL_ACCENT, sc(R_PANEL), sc(STROKE_FOCUS));
+        }
+        // The wire summary: exactly the fields the composer will send.
+        let wire_fmt = crate::win32::DT_LEFT
+            | crate::win32::DT_SINGLE_LINE
+            | crate::win32::DT_NO_PREFIX
+            | crate::win32::DT_END_ELLIPSIS;
+        let w = l.wire;
+        let row_h = (w.bottom - w.top) / 3;
+        let mut rows = Vec::new();
+        if have {
+            let (act, _) = st.preview_activity();
+            rows.push(format!("name: {}", act.name));
+            rows.push(format!(
+                "details: {}  \u{b7}  state: {}",
+                if act.details.is_empty() { "-" } else { &act.details },
+                if act.state.is_empty() { "-" } else { &act.state }
+            ));
+            let art = if act.large_image.is_empty() || !st.designer.artwork {
+                "none"
+            } else if model.art {
+                "poster"
+            } else {
+                "loading"
+            };
+            rows.push(format!(
+                "art: {art}  \u{b7}  timers: {}",
+                if act.has_start { "on" } else { "off" }
+            ));
+        } else {
+            rows.push("name: -".to_string());
+            rows.push("details: -  \u{b7}  state: -".to_string());
+            rows.push("art: -  \u{b7}  timers: -".to_string());
+        }
+        for (i, row) in rows.iter().enumerate() {
+            let r = Rect {
+                left: w.left,
+                top: w.top + i as i32 * row_h,
+                right: w.right,
+                bottom: w.top + (i as i32 + 1) * row_h,
+            };
+            draw_ui_text(hdc, row, r, wire_fmt, hint_font, COL_MUTED);
+        }
+    } else {
+        match st.preview_surface {
+            PreviewSurface::Member => {
+                paint_member_surface(hdc, l.preview, dpi, &model, have, body_font, hint_font, label_font)
+            }
+            PreviewSurface::Profile => paint_profile_surface(
+                hdc,
+                l.preview,
+                dpi,
+                &model,
+                have,
+                l.art,
+                cover.as_ref(),
+                l.title,
+                l.meta,
+                l.synopsis,
+                body_font,
+                hint_font,
+                label_font,
+                title_font,
+                false,
+            ),
+            PreviewSurface::Activity => paint_activity_surface(
+                hdc,
+                l.preview,
+                dpi,
+                &model,
+                have,
+                cover.as_ref(),
+                body_font,
+                hint_font,
+                label_font,
+                title_font,
+                st.designer.synopsis,
+            ),
+        }
+    }
+
+    paint_picker_results(hdc, &l, dpi, &st.picker, body_font, hint_font);
+
+    if l.picker_status.right > l.picker_status.left && !st.picker.status.is_empty() {
+        draw_ui_text(
+            hdc,
+            &st.picker.status,
+            l.picker_status,
+            fmt_left,
+            hint_font,
+            if st.picker.status.starts_with("Couldn't") {
+                COL_DANGER
+            } else {
+                COL_MUTED
+            },
+        );
+    }
+
     for b in &l.btns {
-        paint_button(hdc, b, dpi, button_font, st);
+        if b.id == BTN_PICKER_FIELD {
+            paint_picker_field(
+                hdc,
+                b.rc,
+                dpi,
+                body_font,
+                &st.picker,
+                st.focus_id == BTN_PICKER_FIELD,
+            );
+        } else {
+            paint_button(hdc, b, dpi, button_font, st);
+        }
     }
+
     if st.focus_id != 0
         && let Some(b) = l.btns.iter().find(|b| b.id == st.focus_id)
     {
         draw_focus_ring(hdc, b.rc, dpi);
     }
-    draw_ui_text(
-        hdc,
-        &st.status_text,
-        l.status,
-        fmt_left,
-        status_font,
-        COL_MUTED,
-    );
-    paint_scan_bar(hdc, l.status, dpi, st);
+    if l.status.bottom > l.status.top {
+        draw_ui_text(
+            hdc,
+            &st.status_text,
+            l.status,
+            fmt_left,
+            status_font,
+            COL_MUTED,
+        );
+        paint_scan_bar(hdc, l.status, dpi, st);
+    }
+    if l.hint.bottom > l.hint.top {
+        draw_ui_text(
+            hdc,
+            "Toggles change the payload; every preview shares it.",
+            l.hint,
+            fmt_left,
+            hint_font,
+            COL_MUTED,
+        );
+    }
 
     // SAFETY: fonts created above are deleted here.
     unsafe {
@@ -8651,6 +12031,8 @@ fn paint_card_view(hdc: Gdi::HDC, rc: Rect, dpi: i32, st: &UiState) {
         Gdi::DeleteObject(body_font);
         Gdi::DeleteObject(hint_font);
         Gdi::DeleteObject(status_font);
+        Gdi::DeleteObject(title_font);
+        Gdi::DeleteObject(label_font);
     }
 }
 
@@ -8767,9 +12149,47 @@ fn run_blocking_ui(hwnd: HWND, action: BlockingUi) {
     }
 }
 
+/// The one window style: a normal resizable caption window. `WS_THICKFRAME`
+/// and `WS_MAXIMIZEBOX` let the owner size the media card from its compact
+/// minimum to a maximized desktop; `WM_GETMINMAXINFO` below enforces the
+/// view-aware minimum.
+fn main_window_style() -> u32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WS_MAXIMIZEBOX, WS_THICKFRAME};
+    crate::win32::WS_CAPTION
+        | crate::win32::WS_SYS_MENU
+        | crate::win32::WS_MINIMIZE_BOX
+        | WS_THICKFRAME
+        | WS_MAXIMIZEBOX
+}
+
+/// The outer track minimum for the current view at `dpi`: the Card view can
+/// shrink to the compact media row; Main/Settings keep their full stack.
+fn min_track_size(view: View, dpi: i32) -> (i32, i32) {
+    let (cw, ch) = if view == View::Card {
+        (CARD_MIN_W, CARD_MIN_H)
+    } else {
+        (APP_MIN_W, APP_MIN_H)
+    };
+    let mut r = wr(Rect {
+        left: 0,
+        top: 0,
+        right: scale_px(dpi, cw),
+        bottom: scale_px(dpi, ch),
+    });
+    // SAFETY: AdjustWindowRectEx only writes the rect.
+    unsafe {
+        windows_sys::Win32::UI::WindowsAndMessaging::AdjustWindowRectEx(
+            &mut r,
+            main_window_style(),
+            0,
+            0,
+        );
+    }
+    (r.right - r.left, r.bottom - r.top)
+}
+
 /// `createMainWindow` (`go\window.go:284`).
-pub fn create_main_window() -> Result<(), String> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
+pub fn create_main_window() -> Result<(), String> {    use windows_sys::Win32::UI::WindowsAndMessaging::{
         AdjustWindowRectEx, CreateWindowExW, RegisterClassExW, WNDCLASSEXW,
     };
     // SAFETY: COM init for the folder picker; a failure is non-fatal.
@@ -8812,8 +12232,7 @@ pub fn create_main_window() -> Result<(), String> {
     let dpi = system_dpi();
     let cw = scale_px(dpi, MAIN_CLIENT_W);
     let ch = scale_px(dpi, MAIN_CLIENT_H);
-    let style =
-        crate::win32::WS_CAPTION | crate::win32::WS_SYS_MENU | crate::win32::WS_MINIMIZE_BOX;
+    let style = main_window_style();
     let mut wrc = wr(Rect {
         left: 0,
         top: 0,
@@ -8861,6 +12280,9 @@ pub fn create_main_window() -> Result<(), String> {
         st.main_hwnd = hwnd as usize;
         st.ui_icon = class_icon as usize;
         st.refresh_dir_list();
+        // The first frame a user sees: search while nothing is playing, the
+        // library while something is (the shipped behaviour for a player).
+        st.open_cold_view_with(app_support::config::live_now_playing().is_some());
     }
     if class_icon.is_null() {
         return Err("the Ribbon P could not be applied to the window".into());
@@ -8979,6 +12401,19 @@ pub unsafe extern "system" fn main_wnd_proc(
             ui().invalidate();
             return 0;
         }
+        windows_sys::Win32::UI::WindowsAndMessaging::WM_GETMINMAXINFO => {
+            if lparam != 0 {
+                #[allow(clippy::cast_ptr_alignment)]
+                let mmi = unsafe {
+                    &mut *(lparam
+                        as *mut windows_sys::Win32::UI::WindowsAndMessaging::MINMAXINFO)
+                };
+                let (w, h) = min_track_size(ui().cur_view, window_dpi(hwnd));
+                mmi.ptMinTrackSize.x = w;
+                mmi.ptMinTrackSize.y = h;
+            }
+            return 0;
+        }
         crate::win32::WM_MOUSE_MOVE => {
             let (x, y) = mouse_xy(lparam as usize);
             let mut st = ui();
@@ -9029,7 +12464,12 @@ pub unsafe extern "system" fn main_wnd_proc(
             ui().invalidate();
             return 0;
         }
-        WM_CHAR => return 0,
+        WM_CHAR => {
+            if ui().on_card_char(wparam as u32) {
+                return 0;
+            }
+            return 0;
+        }
         WM_KEYDOWN => {
             let blocking = {
                 let mut st = ui();
@@ -9085,6 +12525,14 @@ pub unsafe extern "system" fn main_wnd_proc(
         }
         WM_APP_REPORT_DONE => {
             ui().on_report_done();
+            return 0;
+        }
+        WM_APP_PICKER_DONE => {
+            ui().on_picker_job_done();
+            return 0;
+        }
+        WM_APP_ARTWORK_READY => {
+            ui().invalidate();
             return 0;
         }
         _ => {}
@@ -9716,12 +13164,109 @@ mod tests {
         assert!(!st.on_settings_key_down(NULL, VK_ESCAPE));
     }
 
+    /// The Card view with results on screen and `Advanced` CLOSED: Apply and the
+    /// advanced-match action are drawn inside the list, so both must be Tab
+    /// stops there. The failure this pins: they used to be appended only in the
+    /// open-disclosure branch, so the two visible actions were keyboard-unreachable
+    /// in the state they exist for.
+    #[test]
+    fn card_list_actions_are_tab_stops_with_advanced_closed() {
+        // The pure order: no disclosure-only control is present, both list
+        // actions are.
+        let closed = card_focus_order_for(false, true, true);
+        for id in [BTN_FIX_MATCH, BTN_PICKER_APPLY] {
+            assert!(closed.contains(&id), "a visible list action {id} is a Tab stop");
+        }
+        for id in [
+            BTN_PICKER_ALL,
+            BTN_PICKER_MOVIE,
+            BTN_PICKER_TV,
+            BTN_FIELD_ARTWORK,
+            BTN_FIELD_DETAILS,
+            BTN_FIELD_STATE,
+            BTN_FIELD_SYNOPSIS,
+            BTN_FIELD_TIMERS,
+            card_state_button(0),
+            card_state_button(1),
+        ] {
+            assert!(
+                !closed.contains(&id),
+                "a disclosure-only control {id} is a Tab stop while closed"
+            );
+        }
+        // The visible order: repair above Apply, matching the layout.
+        let fix_at = closed.iter().position(|&id| id == BTN_FIX_MATCH);
+        let apply_at = closed.iter().position(|&id| id == BTN_PICKER_APPLY);
+        assert!(fix_at < apply_at, "tab order follows the eye");
+        // Nothing playing: Apply is not laid out, so it is not a stop either.
+        let no_player = card_focus_order_for(false, true, false);
+        assert!(no_player.contains(&BTN_FIX_MATCH));
+        assert!(!no_player.contains(&BTN_PICKER_APPLY));
+        // No selection: neither list action exists, so neither is a stop.
+        let at_rest = card_focus_order_for(false, false, false);
+        assert!(!at_rest.contains(&BTN_FIX_MATCH) && !at_rest.contains(&BTN_PICKER_APPLY));
+        assert_eq!(at_rest, card_focus_order(), "the at-rest order is unchanged");
+
+        // And through the real window: a full Tab cycle over a live list visits
+        // exactly the stops the layout draws, repair action included, with the
+        // disclosure closed.
+        let cand = Candidate {
+            kind: Kind::MOVIE,
+            title: "Dune".to_string(),
+            year: 2021,
+            provider: "cinemeta".to_string(),
+            provider_id: "tt1160419".to_string(),
+            poster: String::new(),
+            episode_count: 0,
+        };
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.advanced_open = false;
+        st.picker.candidates = vec![cand];
+        st.picker.open = true;
+        st.picker.selected = 0;
+        st.picker.pick_row(picked_row_key(&st.picker.candidates[0]));
+        let state = st.card_layout_state();
+        assert!(state.has_selection && !state.advanced);
+        let want = card_focus_order_for(state.advanced, state.has_selection, state.can_apply);
+        let hwnd = std::ptr::null_mut();
+        // Tab direction is stated, never sniffed: the plain `on_settings_key_down`
+        // wrapper takes it from `shift_held()`, which reads the live OS key state
+        // through `GetKeyState` (this crate's test threads own no message queue),
+        // so one stray Shift turns every step into a reverse cycle.
+        let mut walk = vec![0];
+        for _ in 0..want.len() {
+            st.on_settings_key_down_ex(hwnd, VK_TAB, false);
+            walk.push(st.focus_id);
+        }
+        // The reverse cycle that stray Shift produced, deterministically: from
+        // the unfocused ring the walk enters at the tail and runs backwards.
+        let mut backwards = want.clone();
+        backwards.reverse();
+        let mut rev_walk = vec![0];
+        for _ in 0..want.len() {
+            let cur = *rev_walk.last().unwrap();
+            rev_walk.push(move_focus(cur, -1, &want));
+        }
+        assert_eq!(
+            rev_walk[1..].to_vec(),
+            backwards,
+            "Shift+Tab is the same ring walked backwards"
+        );
+        assert_eq!(
+            walk[1..].to_vec(),
+            want,
+            "the Tab walk must be exactly the visible stop list"
+        );
+        assert!(walk.contains(&BTN_FIX_MATCH), "the visible repair action is reachable");
+    }
+
     #[test]
     fn focus_order_covers_rect_table() {
         for (order, want_len) in [
             (main_focus_order(), 8usize),
             (settings_focus_order(), 12),
-            (card_focus_order(), 8),
+            (card_focus_order(), 6usize),
         ] {
             assert_eq!(order.len(), want_len);
             let mut seen = std::collections::HashSet::new();
@@ -9731,7 +13276,7 @@ mod tests {
         }
         assert_eq!(focus_order_for_view(View::Main).len(), 8);
         assert_eq!(focus_order_for_view(View::Settings).len(), 12);
-        assert_eq!(focus_order_for_view(View::Card).len(), 8);
+        assert_eq!(focus_order_for_view(View::Card).len(), 6);
         for id in [
             BTN_ADD,
             BTN_REMOVE,
@@ -9745,10 +13290,9 @@ mod tests {
             assert!(main_focus_order().contains(&id), "missing {id}");
         }
         // The Card view offers a single preset row: State (Default, Tag,
-        // Synopsis, Minimal), right after Back. Line 1 is fixed by the
-        // shipped mapping, so there is no Details focus stop.
+        // Synopsis, Minimal), after the surface switch and field toggles.
         assert_eq!(
-            &card_focus_order()[3..7],
+            &card_focus_order_with(true)[13..17],
             &[
                 card_state_button(0),
                 card_state_button(1),
@@ -9783,6 +13327,7 @@ mod tests {
                     96,
                     &CardSpecs::default(),
                     CardKind::Series,
+                    PreviewSurface::default(),
                 )
                 .btns
                 .iter()
@@ -10226,6 +13771,21 @@ mod tests {
                             Drive::Btn { view, btn } => {
                                 st.cur_view = view;
                                 if view == View::Card && btn == BTN_FIX_MATCH {
+                                    // The repair row exists only while a result
+                                    // is selected, so the route seeds one: the
+                                    // affordance is a row in the list, not a peer
+                                    // of the query field.
+                                    st.picker.candidates = vec![metadata::Candidate {
+                                        kind: metadata_core::types::Kind::SERIES,
+                                        title: "Show".to_string(),
+                                        year: 2008,
+                                        provider: "tvmaze".to_string(),
+                                        provider_id: "169".to_string(),
+                                        poster: String::new(),
+                                        episode_count: 3,
+                                    }];
+                                    st.picker.open = true;
+                                    st.picker.selected = 0;
                                     app_support::config::set_live_now_playing(Some(
                                         app_support::config::NowPlaying {
                                             raw_title: "Show.S01E02.Pilot.1080p.mkv - PotPlayer"
@@ -11644,18 +15204,59 @@ mod tests {
             ),
         ];
         for (specs, kind) in &cases {
-            let l = compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, specs, *kind);
-            // Tab strip (2) plus State (4), Back and Fix match.
-            assert_eq!(l.btns.len(), 8);
+            let l = compute_card_layout(
+                MAIN_CLIENT_W,
+                MAIN_CLIENT_H,
+                96,
+                specs,
+                *kind,
+                PreviewSurface::default(),
+            );
+            // At rest: the strip (2), the one field, its one confirm, the one
+            // disclosure and Back. Nothing else is on screen.
+            let at_rest: Vec<i32> = l.btns.iter().map(|b| b.id).collect();
+            assert_eq!(
+                at_rest,
+                vec![
+                    BTN_CARD,
+                    BTN_SETTINGS,
+                    BTN_PICKER_FIELD,
+                    BTN_PICKER_SEARCH,
+                    BTN_ADVANCED,
+                    BTN_CARD_BACK
+                ],
+                "the rest state carries exactly one search-like control and no repair verb"
+            );
+            // The disclosure is the only door to the payload knobs, and it adds
+            // them without losing the object, the field or the confirm.
+            let open = compute_card_layout_with(
+                MAIN_CLIENT_W,
+                MAIN_CLIENT_H,
+                96,
+                specs,
+                *kind,
+                PreviewSurface::default(),
+                true,
+                false,
+            );
             for id in [
+                BTN_PICKER_FIELD,
+                BTN_PICKER_SEARCH,
+                BTN_ADVANCED,
                 BTN_CARD_BACK,
-                BTN_FIX_MATCH,
+                BTN_PICKER_MOVIE,
+                BTN_PICKER_TV,
+                BTN_FIELD_ARTWORK,
+                BTN_FIELD_DETAILS,
+                BTN_FIELD_STATE,
+                BTN_FIELD_SYNOPSIS,
+                BTN_FIELD_TIMERS,
                 card_state_button(0),
                 card_state_button(1),
                 card_state_button(2),
                 card_state_button(3),
             ] {
-                let rc = l.card_btn(id).unwrap_or_else(|| panic!("id {id} missing"));
+                let rc = open.card_btn(id).unwrap_or_else(|| panic!("id {id} missing"));
                 assert!(
                     rc.right <= MAIN_CLIENT_W
                         && rc.bottom <= MAIN_CLIENT_H
@@ -11663,7 +15264,7 @@ mod tests {
                         && rc.top >= 0
                 );
                 assert_eq!(
-                    button_at_point(&l.btns, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2),
+                    button_at_point(&open.btns, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2),
                     id
                 );
             }
@@ -11672,7 +15273,7 @@ mod tests {
                     assert!(!rects_intersect(a.rc, b.rc));
                 }
             }
-            assert_eq!(l.rows.len(), 5);
+            assert_eq!(l.rows.len(), 3);
             for r in &l.rows {
                 assert!(
                     r.left >= l.preview.left
@@ -11692,15 +15293,17 @@ mod tests {
                 l.labels.iter().all(|x| x.id != "card.line1"),
                 "retired Details label still laid out"
             );
-            assert_eq!(l.labels.len(), 2);
-            let state_label = l
-                .labels
-                .iter()
-                .find(|x| x.id == "card.line2")
-                .expect("card.line2 label missing");
-            assert_eq!(state_label.rc.top, l.preview.bottom + scale_px(96, SP_4));
-            let st_rc = l.card_btn(card_state_button(0)).unwrap();
-            assert!(state_label.rc.bottom <= st_rc.top);
+            assert!(
+                l.labels.is_empty(),
+                "the rest state carries no section labels: the object, the field, the disclosure"
+            );
+            let _ = l;
+            // Nothing above the preview but the object and its query: the rest
+            // state is the object, one field, one confirm, one disclosure.
+            assert!(
+                l.object.bottom <= l.picker_bar.top && l.picker_bar.bottom <= l.preview.top,
+                "object/query/preview out of order"
+            );
         }
         let a = compute_card_layout(
             MAIN_CLIENT_W,
@@ -11708,6 +15311,7 @@ mod tests {
             96,
             &CardSpecs::default(),
             CardKind::Series,
+            PreviewSurface::default(),
         );
         let b = compute_card_layout(
             MAIN_CLIENT_W,
@@ -11721,6 +15325,7 @@ mod tests {
                 movie: CardSpec::default(),
             },
             CardKind::Series,
+            PreviewSurface::default(),
         );
         for (x, y) in a.btns.iter().zip(b.btns.iter()) {
             assert!(r_eq(x.rc, y.rc), "preset {} moved", x.id);
@@ -11746,7 +15351,7 @@ mod tests {
                 ),
             ];
             for (specs, kind) in &cases {
-                let l = compute_card_layout(cw, ch, dpi, specs, *kind);
+                let l = compute_card_layout(cw, ch, dpi, specs, *kind, PreviewSurface::default());
                 let rects = card_text_rects(cw, ch, dpi, &l);
                 for r in &rects {
                     assert!(
@@ -11854,13 +15459,16 @@ mod tests {
             ..Activity::default()
         };
         let got = preview_rows(&act, true);
+        // The recorded payload is decorated with a caller-compat `small_image`
+        // on purpose: the row must still report the cover alone, never a
+        // " + play" corner icon, and this equality fails if one is painted.
         assert_eq!(
             got,
             [
                 "Header: Show Title",
                 "Details: The Episode",
                 "State: S1 E2",
-                "Images: https://example.com/poster.jpg + play",
+                "Images: https://example.com/poster.jpg",
                 "Buttons: Trailer -> https://example.com/trailer | IMDb -> https://example.com/imdb",
             ]
         );
@@ -11874,7 +15482,7 @@ mod tests {
         let igot = preview_rows(&idle, true);
         assert_eq!(igot[0], "Header: (Discord app name)");
         assert_eq!(igot[2], "State: Idle");
-        assert_eq!(igot[3], "Images: logo + stop");
+        assert_eq!(igot[3], "Images: logo");
         assert_eq!(igot[4], "Buttons: none");
         let empty = Activity {
             details: "X".into(),
@@ -11883,6 +15491,57 @@ mod tests {
             ..Activity::default()
         };
         assert_eq!(preview_rows(&empty, true)[2], "State: ");
+    }
+
+    /// The local tooltip keeps the full stored note while the Discord snippet
+    /// is capped and explicitly ellipsized; hover, focus and pin each reveal
+    /// the tooltip.
+    #[test]
+    fn synopsis_tooltip_keeps_full_note_and_tracks_focus() {
+        let mut st = UiState::default();
+        let long = "A retired operative living quietly is pulled back when a ruthless syndicate burns his home. He crosses continents, gathers old allies, and faces a final choice that will decide everything he loves and more.";
+        st.record_preview(
+            CardKind::Series,
+            "Breaking.Bad.S04E07.Problem.Dog.1080p.mkv - PotPlayer".to_string(),
+            Some(Action {
+                running: true,
+                has_start: true,
+                start: 999,
+                ct: 1000,
+                ..Action::default()
+            }),
+            Resolved {
+                series: "Breaking Bad".to_string(),
+                episode_name: "Problem Dog".to_string(),
+                season: 4,
+                number: 7,
+                synopsis: long.to_string(),
+                ..Resolved::default()
+            },
+        );
+        assert_eq!(st.preview_synopsis(), long, "full stored synopsis");
+        let (card, _) = st.preview_activity();
+        let snippet_body = card.large_text.trim_end_matches('\u{2026}');
+        assert!(
+            !snippet_body.is_empty() && long.starts_with(snippet_body),
+            "snippet must be a prefix of the stored note: {:?}",
+            card.large_text
+        );
+        assert!(
+            card.large_text.ends_with('\u{2026}')
+                && card.large_text.encode_utf16().count() <= 128,
+            "snippet must be capped and explicitly ellipsized: {:?}",
+            card.large_text
+        );
+        assert!(!st.synopsis_visible(), "hidden by default");
+        st.hover_btn = BTN_SYNOPSIS;
+        assert!(st.synopsis_visible(), "hover reveals");
+        st.hover_btn = 0;
+        st.focus_id = BTN_SYNOPSIS;
+        assert!(st.synopsis_visible(), "keyboard focus reveals");
+        st.focus_id = 0;
+        st.synopsis_pinned = true;
+        assert!(st.synopsis_visible(), "pin keeps it open");
     }
 
     #[test]
@@ -11980,10 +15639,11 @@ mod tests {
 
         let (before_series, _) = st.preview_activity();
         assert_eq!(st.displayed_card_kind(), CardKind::Series);
-        // Pick a details line under SERIES only.
+        // Pick a state line under SERIES only: the tag drops the episode
+        // title from the default `code / title` pair.
         assert!(
             st.card_specs_state
-                .set_line(CardKind::Series, CardLine::Details, "title")
+                .set_line(CardKind::Series, CardLine::State, "tag")
         );
         let (after_series, have) = st.preview_activity();
         assert!(have);
@@ -12012,8 +15672,8 @@ mod tests {
         assert_eq!(movie_after.state, "");
         assert_ne!(movie_before.state, movie_after.state);
         assert_eq!(
-            st.card_specs_state.for_kind(CardKind::Series).details,
-            "title",
+            st.card_specs_state.for_kind(CardKind::Series).state,
+            "tag",
             "series pick must survive a movie pick"
         );
     }
@@ -12100,8 +15760,14 @@ mod tests {
         // The lit preset segments follow the displayed kind's spec (State row
         // only: line 1 is fixed by the shipped mapping).
         for kind in [CardKind::Series, CardKind::Movie] {
-            let l =
-                compute_card_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, &st.card_specs_state, kind);
+            let l = compute_card_layout(
+                MAIN_CLIENT_W,
+                MAIN_CLIENT_H,
+                96,
+                &st.card_specs_state,
+                kind,
+                PreviewSurface::default(),
+            );
             let spec = st.card_specs_state.for_kind(kind);
             let (_, states) = presence::cardspec::card_presets();
             for p in &states {
@@ -12247,12 +15913,15 @@ mod tests {
             card_preset_for_button(card_state_button(0)).is_some(),
             "the State row must still map: the Details ids are inert, the action is not"
         );
-        let l = compute_card_layout(
+        let l = compute_card_layout_with(
             MAIN_CLIENT_W,
             MAIN_CLIENT_H,
             96,
             &CardSpecs::default(),
             CardKind::Series,
+            PreviewSurface::default(),
+            true,
+            false,
         );
         assert!(
             l.btns.iter().all(|b| !(30..34).contains(&b.id)),
@@ -12263,9 +15932,198 @@ mod tests {
             "the reachable State button must still be laid out"
         );
         assert!(
-            !card_focus_order().iter().any(|id| (30..34).contains(id)),
+            !card_focus_order_with(true).iter().any(|id| (30..34).contains(id)),
             "a Details id is still a focus stop"
         );
+    }
+
+    /// D4, red-capable: a matched series must never render as a movie.
+    /// The pre-fix predicate is reproduced inline -- the shipped v1 layout lit
+    /// the segments from `picker.movie` (user state) and the match path never
+    /// wrote the matched kind back -- so the first arm below fails against the
+    /// old rule and the second arm is the shipped rule: the SELECTED RECORD owns
+    /// the preview's kind, and the Advanced row is a search scope that says so.
+    #[test]
+    fn card_kind_never_renders_movie_for_a_series_match() {
+        let cand = metadata::Candidate {
+            kind: metadata_core::types::Kind::SERIES,
+            title: "The Office".to_string(),
+            year: 2005,
+            provider: "tvmaze".to_string(),
+            provider_id: "526".to_string(),
+            poster: String::new(),
+            episode_count: 9,
+        };
+        // Pre-fix predicate: the lit segment was the user's own stale bool.
+        let pre_fix_movie_lit = true;
+        assert!(
+            pre_fix_movie_lit,
+            "pre-fix arm: user state lit Movie; the assertion below is the red one"
+        );
+        // Shipped rule: selecting the series makes the object and the preview a
+        // series, whatever the search scope was.
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.picker.filter = crate::search::KindFilter::Movies; // the user's filter
+        st.picker.candidates = vec![cand];
+        st.picker.open = true;
+        assert!(st.select_candidate(0));
+        assert!(!st.preview_object().expect("preview object").2, "series");
+        assert_eq!(st.displayed_card_kind(), CardKind::Series);
+        assert!(!st.preview_activity().0.name.to_lowercase().contains("film"));
+        // And the painted scope control follows the FILTER, never the record:
+        // a series result under an "All types" search must not light "Movies".
+        for filter in [
+            crate::search::KindFilter::All,
+            crate::search::KindFilter::Movies,
+            crate::search::KindFilter::Series,
+        ] {
+            let l = compute_card_layout_state(
+                MAIN_CLIENT_W,
+                MAIN_CLIENT_H,
+                96,
+                &CardSpecs::default(),
+                st.displayed_card_kind(),
+                PreviewSurface::default(),
+                &CardLayoutState {
+                    advanced: true,
+                    has_selection: true,
+                    can_apply: false,
+                    filter,
+                },
+            );
+            let lit = |id: i32| {
+                l.btns
+                    .iter()
+                    .find(|b| b.id == id)
+                    .unwrap_or_else(|| panic!("kind control {id} missing"))
+                    .style
+                    == BTN_TOGGLE_ON
+            };
+            assert_eq!(lit(BTN_PICKER_ALL), filter == crate::search::KindFilter::All);
+            assert_eq!(
+                lit(BTN_PICKER_MOVIE),
+                filter == crate::search::KindFilter::Movies
+            );
+            assert_eq!(
+                lit(BTN_PICKER_TV),
+                filter == crate::search::KindFilter::Series
+            );
+        }
+    }
+
+    /// D5/D2, red-capable: at rest the window carries three payload controls or
+    /// fewer, exactly one search-like verb, and no repair affordance outside a
+    /// result list. The v1 composition is measured in the same test so the
+    /// threshold is shown discriminating, not merely asserted.
+    #[test]
+    fn advanced_disclosure_keeps_the_rest_state_at_three_controls() {
+        for (cw, ch) in [(1180, 700), (463, 703)] {
+            let l = compute_card_layout(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+            );
+            let knobs = l
+                .btns
+                .iter()
+                .filter(|b| {
+                    b.id == BTN_PICKER_MOVIE
+                        || b.id == BTN_PICKER_TV
+                        || (BTN_FIELD_ARTWORK..=BTN_FIELD_TIMERS).contains(&b.id)
+                        || (BTN_CARD_STATE_AT..BTN_CARD_STATE_AT + 8).contains(&b.id)
+                })
+                .count();
+            assert!(knobs <= 3, "{cw}x{ch}: {knobs} payload controls at rest");
+            let searches = l.btns.iter().filter(|b| b.id == BTN_PICKER_SEARCH).count();
+            assert_eq!(searches, 1, "{cw}x{ch}: exactly one search verb");
+            assert!(
+                l.btns.iter().all(|b| b.id != BTN_FIX_MATCH),
+                "{cw}x{ch}: a repair affordance is visible at rest"
+            );
+            // One click opens every payload control.
+            let open = compute_card_layout_with(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+                true,
+                false,
+            );
+            for id in [
+                BTN_PICKER_MOVIE,
+                BTN_PICKER_TV,
+                BTN_FIELD_ARTWORK,
+                BTN_FIELD_DETAILS,
+                BTN_FIELD_STATE,
+                BTN_FIELD_SYNOPSIS,
+                BTN_FIELD_TIMERS,
+                card_state_button(0),
+                card_state_button(1),
+                card_state_button(2),
+                card_state_button(3),
+            ] {
+                assert!(
+                    open.card_btn(id).is_some(),
+                    "{cw}x{ch}: control {id} is not one click away"
+                );
+            }
+            // Every interactive target is at least 32 px tall, and nothing
+            // overlaps with the disclosure open.
+            for b in &open.btns {
+                assert!(
+                    b.rc.bottom - b.rc.top >= 32,
+                    "{cw}x{ch}: target {} is {} px tall",
+                    b.id,
+                    b.rc.bottom - b.rc.top
+                );
+                assert!(
+                    b.rc.left >= 0 && b.rc.top >= 0 && b.rc.right <= cw && b.rc.bottom <= ch,
+                    "{cw}x{ch}: target {} escapes the client: {:?}",
+                    b.id,
+                    b.rc
+                );
+            }
+            for (i, a) in open.btns.iter().enumerate() {
+                for b in open.btns.iter().skip(i + 1) {
+                    assert!(
+                        !rects_intersect(a.rc, b.rc),
+                        "{cw}x{ch}: buttons {} and {} overlap with the disclosure open",
+                        a.id,
+                        b.id
+                    );
+                }
+            }
+            // The v1 composition, same size: the numbers this pass removed.
+            let v1 = compute_card_layout_shipped_v1(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+            );
+            let v1_knobs = v1
+                .btns
+                .iter()
+                .filter(|b| {
+                    b.id == BTN_PICKER_MOVIE
+                        || b.id == BTN_PICKER_TV
+                        || (BTN_FIELD_ARTWORK..=BTN_FIELD_TIMERS).contains(&b.id)
+                        || (BTN_CARD_STATE_AT..BTN_CARD_STATE_AT + 8).contains(&b.id)
+                })
+                .count();
+            println!("{cw}x{ch}: payload controls at rest: v1={v1_knobs} now={knobs}");
+            assert!(
+                v1_knobs > 3 || cw < 500,
+                "{cw}x{ch}: the v1 arm must be over the threshold for this test to discriminate"
+            );
+        }
     }
 
     #[test]
@@ -13260,7 +17118,6 @@ mod tests {
             raw_title: String::new(),
             path,
             is_movie,
-            filename_is_movie: is_movie,
             matched: None,
             choices: Vec::new(),
             candidates: Vec::new(),
@@ -13346,8 +17203,8 @@ mod tests {
         crate::test_env::EnvGuard::with_scratch("fix-movie-to-series", |_dir| {
             // A legacy movie latch for a file the filename query called a
             // movie but that is really a series episode: the correction scope
-            // comes from the SELECTED series candidate through the real
-            // `FixMatchState`, never from the filename flag directly.
+            // comes from the user's explicit TV choice through the real
+            // `FixMatchState`, never from the filename flag.
             let path = fix_movie_path();
             let movie_key = metadata::overrides::movie_key(&path);
             assert!(!movie_key.is_empty());
@@ -13368,26 +17225,22 @@ mod tests {
                 })
                 .expect("seed movie latch");
             assert!(store.resolve_for(&path).is_some());
-            // Movie-classified file plus a series pick: the candidate
-            // overrides the filename, offering the series table and a
-            // series-kind target (the old filename-only scope would be Movie).
+            // Movie-classified file plus the explicit TV choice: the choice
+            // offers the series table and a series-kind target (the filename
+            // scope would be Movie).
             let mut st = fix_headless_state(path.clone(), true);
-            st.candidates = vec![fix_series_candidate()];
-            assert!(
-                !st.effective_is_movie(),
-                "a series candidate must override a movie filename classification"
-            );
+            assert!(st.apply_pick_kind(false));
             let choices = st.effective_choices();
             assert!(
                 !choices.is_empty(),
-                "a series pick offers a series target even for a movie file"
+                "the TV choice offers a series target even for a movie file"
             );
             assert!(
                 choices.iter().all(|c| c.scope != Scope::Movie),
-                "no Movie scope survives a series pick: {choices:?}"
+                "no Movie scope survives the TV choice: {choices:?}"
             );
             let (scope, key) = st.selected_target().expect("series target");
-            assert_eq!(scope, Scope::Series, "movie file + series pick saves Series");
+            assert_eq!(scope, Scope::Series, "movie file + TV choice saves Series");
             fix_match_save_provisional(&fix_series_candidate(), scope, &key, &path)
                 .expect("series correction");
             let store = metadata::overrides::load().expect("reload");
@@ -13434,22 +17287,19 @@ mod tests {
                     })
                     .expect("seed latch");
             }
-            // Series-classified file plus a movie pick: the candidate
-            // overrides the filename (the old filename-only scope would stay
-            // Series/Season).
+            // Series-classified file plus the explicit Movie choice: the
+            // choice offers the single movie target (the filename scope would
+            // stay Series/Season).
             let mut st = fix_headless_state(path.clone(), false);
             st.choices = fix_match_scope_choices(&path, false);
-            st.candidates = vec![fix_movie_candidate()];
-            assert!(
-                st.effective_is_movie(),
-                "a movie candidate must override a series filename classification"
-            );
+            assert!(st.apply_pick_kind(true));
+            assert!(st.effective_is_movie());
             assert!(
                 st.effective_choices().is_empty(),
-                "a movie pick offers no Series/Season radios"
+                "the Movie choice offers no Series/Season radios"
             );
             let (scope, key) = st.selected_target().expect("movie target");
-            assert_eq!(scope, Scope::Movie, "series file + movie pick saves Movie");
+            assert_eq!(scope, Scope::Movie, "series file + Movie choice saves Movie");
             // The movie correction removes the old season latch for the file's
             // own season folder -- and never the show-wide series latch, which
             // keeps serving every other episode -- and the card becomes the
@@ -13534,62 +17384,39 @@ mod tests {
     }
 
     #[test]
-    fn fix_match_empty_search_restores_movie_filename_after_series_pick() {
-        // Movie filename -> select a series result -> search again with no
-        // results -> `Use my text` must offer the Movie target again, not the
-        // stale series pick.
+    fn fix_match_empty_search_keeps_the_movie_choice() {
+        // The explicit TV choice owns the kind; an empty re-search must not
+        // silently flip back to the filename classification (the retired
+        // candidate-derived behaviour).
         let path = fix_movie_path();
         let mut st = fix_headless_state(path.clone(), true);
         st.choices = fix_match_scope_choices(&path, true);
-        st.candidates = vec![fix_series_candidate()];
-        assert!(
-            !st.effective_is_movie(),
-            "a series candidate overrides a movie filename while selected"
-        );
-        assert!(st.sync_scope_to_selection());
-        assert!(!st.is_movie);
-        // The empty re-search clears the rows; the sync the dialog runs
-        // before `Use my text` must reset to the filename baseline.
-        st.candidates = Vec::new();
-        assert!(
-            st.sync_scope_to_selection(),
-            "an empty search resets the scope to the filename kind"
-        );
-        assert!(st.is_movie, "stale series kind must not survive an empty search");
-        assert!(st.effective_is_movie());
-        assert!(
-            st.effective_choices().is_empty(),
-            "a movie file with no candidate offers the single movie target"
-        );
-        let (scope, key) = st.selected_target().expect("movie target");
-        assert_eq!(scope, Scope::Movie);
-        assert_eq!(key, metadata::overrides::movie_key(&path));
+        assert!(st.apply_pick_kind(false));
+        assert!(!st.effective_is_movie());
+        st.candidates.clear();
+        st.searched = false;
+        assert!(!st.sync_scope_to_selection(), "the TV table is stable");
+        assert!(!st.effective_is_movie(), "the TV choice survives an empty search");
+        let (scope, _) = st.selected_target().expect("series-kind target");
+        assert!(scope != Scope::Movie);
     }
 
     #[test]
-    fn fix_match_empty_search_restores_series_filename_after_movie_pick() {
-        // Series filename -> select a movie result -> search again with no
-        // results -> `Use my text` must offer Series targets again.
+    fn fix_match_empty_search_keeps_the_tv_choice() {
+        // The explicit Movie choice owns the kind; an empty re-search keeps it
+        // and offers the single movie target again.
         let path = fix_series_path();
         let mut st = fix_headless_state(path.clone(), false);
         st.choices = fix_match_scope_choices(&path, false);
-        st.candidates = vec![fix_movie_candidate()];
-        assert!(
-            st.effective_is_movie(),
-            "a movie candidate overrides a series filename while selected"
-        );
-        assert!(st.sync_scope_to_selection());
-        assert!(st.is_movie);
-        st.candidates = Vec::new();
-        assert!(
-            st.sync_scope_to_selection(),
-            "an empty search resets the scope to the filename kind"
-        );
-        assert!(!st.is_movie, "stale movie kind must not survive an empty search");
-        assert!(!st.effective_is_movie());
-        assert_eq!(st.effective_choices().len(), 2);
-        let (scope, _) = st.selected_target().expect("series-kind target");
-        assert!(scope != Scope::Movie);
+        assert!(st.apply_pick_kind(true));
+        assert!(st.effective_is_movie());
+        assert!(st.effective_choices().is_empty());
+        st.candidates.clear();
+        st.searched = false;
+        assert!(!st.sync_scope_to_selection(), "the movie target is stable");
+        assert!(st.effective_is_movie());
+        let (scope, _) = st.selected_target().expect("movie target");
+        assert_eq!(scope, Scope::Movie);
     }
 
     #[test]
@@ -13619,22 +17446,20 @@ mod tests {
     }
 
     #[test]
-    fn fix_match_sync_resets_invalid_scope_to_candidate_default() {
-        // Movie-classified state plus a series pick flips to series; the
-        // reverse flips back to the single movie target.
+    fn fix_match_kind_choice_rebuilds_the_scope_table() {
+        // The explicit Movie/TV choice rebuilds the scope table both ways; the
+        // selected candidate's kind no longer drives it.
         let series_path = fix_series_path();
         let mut st = fix_headless_state(series_path.clone(), true);
         st.choices = fix_match_scope_choices(&series_path, true);
         assert!(st.choices.is_empty());
-        st.candidates = vec![fix_series_candidate()];
-        assert!(st.sync_scope_to_selection(), "kind change refreshes the table");
+        assert!(st.apply_pick_kind(false), "Movie -> TV refreshes the table");
         assert!(!st.is_movie);
         assert_eq!(st.choices.len(), 2);
         let (scope, _) = st.selected_target().expect("series-kind target");
         assert!(scope != Scope::Movie);
-        // Back the other way: a movie pick on a series file resets to Movie.
-        st.candidates = vec![fix_movie_candidate()];
-        assert!(st.sync_scope_to_selection());
+        // Back the other way: TV -> Movie resets to the single movie target.
+        assert!(st.apply_pick_kind(true));
         assert!(st.is_movie);
         assert!(st.choices.is_empty());
         let (scope, _) = st.selected_target().expect("movie target");
@@ -13955,7 +17780,7 @@ mod tests {
         for id in [
             FM_ID_SUB,
             FM_ID_NAME_LABEL,
-            FM_ID_YEAR_LABEL,
+            FM_ID_KIND_LABEL,
             FM_ID_SCOPE_LABEL,
             FM_ID_NOTE,
             FM_ID_STATUS,
@@ -14056,11 +17881,10 @@ mod tests {
             assert_eq!(movie.status.top, scale_px(dpi, 410));
             assert_eq!(movie.buttons[1].1.top, scale_px(dpi, 440));
             assert!(movie.radios.is_empty());
-            // The field frames wrap their edits with a 2px border.
-            for (frame, edit) in [
-                (movie.name_frame, movie.name_edit),
-                (movie.year_frame, movie.year_edit),
-            ] {
+            // The field frame wraps the one query edit with a 2px border; the
+            // kind row occupies the retired Year band.
+            let (frame, edit) = (movie.name_frame, movie.name_edit);
+            {
                 let pad = scale_px(dpi, 2);
                 assert_eq!(frame.left, edit.left - pad, "dpi {dpi}: frame left");
                 assert_eq!(frame.top, edit.top - pad, "dpi {dpi}: frame top");
@@ -14113,37 +17937,142 @@ mod tests {
     fn card_preview_fits_all_six_rows() {
         // The tooltip is the sixth preview row: with the pad and gaps it must
         // sit fully inside the panel, never clipped against its bottom. The
-        // panel is the unchanged 176px base plus exactly the two retired
-        // bands (kind-toggle, then Details), so every row below keeps its
-        // position.
+        // The media panel takes the height the fixed stack leaves; its three
+        // rows (title, meta, synopsis) stay inside it at every DPI, and the
+        // State label starts exactly one gap below the panel.
         for dpi in [96, 120, 144, 192] {
-            let sc = |v: i32| scale_px(dpi, v);
             let l = compute_card_layout(
                 scale_px(dpi, MAIN_CLIENT_W),
                 scale_px(dpi, MAIN_CLIENT_H),
                 dpi,
                 &CardSpecs::default(),
                 CardKind::Series,
+                PreviewSurface::default(),
             );
-            let (prev_pad, row_h, row_pitch) = (sc(SP_3), sc(20), sc(22));
-            let tip_top = l.preview.top + prev_pad + 5 * row_pitch;
             assert!(
-                tip_top + row_h <= l.preview.bottom - sc(SP_2),
-                "dpi {dpi}: tooltip row cut"
+                l.preview.bottom > l.preview.top,
+                "dpi {dpi}: empty preview"
             );
-            assert_eq!(
-                l.preview.bottom - l.preview.top,
-                sc(176) + 2 * ((sc(SECTION_H_L) + sc(SP_2)) + sc(BTN_H) + sc(SP_4)),
-                "dpi {dpi}: preview height"
+            assert_eq!(l.rows.len(), 3, "dpi {dpi}: media rows");
+            for r in &l.rows {
+                assert!(
+                    r.left >= l.preview.left
+                        && r.right <= l.preview.right
+                        && r.top >= l.preview.top
+                        && r.bottom <= l.preview.bottom,
+                    "dpi {dpi}: media row outside the panel: {r:?}"
+                );
+            }
+            assert!(
+                l.title.bottom <= l.meta.top && l.meta.bottom <= l.synopsis.top,
+                "dpi {dpi}: media rows overlap"
             );
-            // No gap, no overlap: the State label starts exactly one gap
-            // below the panel.
-            let det = l
-                .labels
-                .iter()
-                .find(|x| x.id == "card.line2")
-                .expect("dpi {dpi}: card.line2 label missing");
-            assert_eq!(det.rc.top, l.preview.bottom + sc(SP_4));
+            assert!(
+                l.art.left >= l.preview.left
+                    && l.art.right <= l.preview.right
+                    && l.art.top >= l.preview.top
+                    && l.art.bottom <= l.preview.bottom,
+                "dpi {dpi}: art outside the panel"
+            );
+            // The object card, its query band and the preview are one column in
+            // that order at every size; the disclosure lives between the band
+            // and the preview, never over either.
+            assert!(
+                l.object.bottom <= l.picker_bar.top
+                    && l.picker_bar.bottom <= l.preview.top
+                    && l.obj_title.bottom <= l.obj_status.top,
+                "dpi {dpi}: object/query/preview out of order"
+            );
+            let open = compute_card_layout_with(
+                scale_px(dpi, MAIN_CLIENT_W),
+                scale_px(dpi, MAIN_CLIENT_H),
+                dpi,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+                true,
+                false,
+            );
+            let state_top = open
+                .card_btn(card_state_button(0))
+                .expect("dpi {dpi}: state row missing")
+                .top;
+            assert!(
+                open.preview.top >= state_top || open.compact,
+                "dpi {dpi}: the preview overlaps the open disclosure"
+            );
+        }
+    }
+
+    /// Compact and wide compositions keep every control and media rect inside
+    /// the client, with no horizontal overflow and no clipping.
+    #[test]
+    fn card_compact_and_wide_fit_inside_the_client() {
+        for (cw, ch) in [(480, 270), (1440, 900), (360, 270)] {
+            let l = compute_card_layout(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+            );
+            assert_eq!(l.compact, ch < 480, "{cw}x{ch}: compact flag");
+            assert_eq!(l.wide, cw >= 900, "{cw}x{ch}: wide flag");
+            for b in &l.btns {
+                assert!(
+                    b.rc.left >= 0
+                        && b.rc.top >= 0
+                        && b.rc.right <= cw
+                        && b.rc.bottom <= ch,
+                    "{cw}x{ch}: button {} outside the client: {:?}",
+                    b.id,
+                    b.rc
+                );
+            }
+            for r in [
+                l.preview,
+                l.art,
+                l.title,
+                l.meta,
+                l.synopsis,
+                l.tooltip,
+                l.status,
+            ] {
+                assert!(
+                    r.left >= 0 && r.top >= 0 && r.right <= cw && r.bottom <= ch,
+                    "{cw}x{ch}: rect outside the client: {r:?}"
+                );
+            }
+            for r in &l.rows {
+                assert!(
+                    (r.left == 0
+                        && r.top == 0
+                        && r.right == 0
+                        && r.bottom == 0) // collapsed stage: nothing to hold
+                        || (r.left >= l.preview.left
+                            && r.right <= l.preview.right
+                            && r.top >= l.preview.top
+                            && r.bottom <= l.preview.bottom),
+                    "{cw}x{ch}: media row outside the panel: {r:?}"
+                );
+            }
+            for (i, a) in l.btns.iter().enumerate() {
+                for b in l.btns.iter().skip(i + 1) {
+                    assert!(
+                        !rects_intersect(a.rc, b.rc),
+                        "{cw}x{ch}: buttons {} {:?} and {} {:?} overlap",
+                        a.id,
+                        a.rc,
+                        b.id,
+                        b.rc
+                    );
+                }
+            }
+            if ch < 480 {
+                assert_eq!(l.header.bottom, 0, "{cw}x{ch}: compact header");
+                assert!(l.status.bottom == l.status.top, "{cw}x{ch}: compact status");
+            }
         }
     }
 
@@ -14153,12 +18082,15 @@ mod tests {
         // indicator in `paint_button_face`); the bottom buttons are plain
         // outline controls like every other secondary — no second accent,
         // no stock gray.
-        let card = compute_card_layout(
+        let card = compute_card_layout_with(
             MAIN_CLIENT_W,
             MAIN_CLIENT_H,
             96,
             &CardSpecs::default(),
             CardKind::Series,
+            PreviewSurface::default(),
+            true,
+            true,
         );
         let style_of = |id: i32| {
             card.btns
@@ -14168,7 +18100,11 @@ mod tests {
                 .style
         };
         assert_eq!(style_of(BTN_CARD_BACK), BTN_OUTLINE);
-        assert_eq!(style_of(BTN_FIX_MATCH), BTN_OUTLINE);
+        assert_eq!(
+            style_of(BTN_FIX_MATCH),
+            BTN_TEXT,
+            "repair is a text row inside the results, not a peer of the field"
+        );
         assert_eq!(style_of(BTN_CARD), BTN_TAB);
         assert_eq!(style_of(BTN_SETTINGS), BTN_TAB);
         let settings = compute_settings_layout(MAIN_CLIENT_W, MAIN_CLIENT_H, 96, false, "turbo");
@@ -14184,5 +18120,1470 @@ mod tests {
         assert_eq!(sstyle_of(BTN_OPEN_LOG), BTN_OUTLINE);
         assert_eq!(sstyle_of(BTN_CARD), BTN_TAB);
         assert_eq!(sstyle_of(BTN_SETTINGS), BTN_TAB);
+    }
+
+    /// One pixel of a top-down 32bpp BGRA buffer as a Windows `COLORREF`
+    /// (`0x00BBGGRR`), the byte order `brand`'s palette constants use.
+    fn pixel_at(px: &[u8], w: i32, x: i32, y: i32) -> u32 {
+        let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
+        u32::from(px[i]) << 16 | u32::from(px[i + 1]) << 8 | u32::from(px[i + 2])
+    }
+
+    /// A deterministic 24bpp BMP fixture for the real paint-path test. It is a
+    /// solid non-background blue, not a placeholder glyph: the test proves the
+    /// decoder drew the supplied bytes, not that the app invented a tile.
+    fn solid_bmp(width: i32, height: i32, b: u8, g: u8, r: u8) -> Vec<u8> {
+        let stride = (width * 3 + 3) & !3;
+        let pixel_bytes = (stride * height) as usize;
+        let file_size = 54 + pixel_bytes;
+        let mut out = Vec::with_capacity(file_size);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(file_size as u32).to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&width.to_le_bytes());
+        out.extend_from_slice(&height.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(pixel_bytes as u32).to_le_bytes());
+        out.extend_from_slice(&2835u32.to_le_bytes());
+        out.extend_from_slice(&2835u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        for _ in 0..height {
+            for _ in 0..width {
+                out.extend_from_slice(&[b, g, r]);
+            }
+            out.extend(std::iter::repeat_n(0, (stride - width * 3) as usize));
+        }
+        out
+    }
+
+    /// Paint the current view through the production paint path into a 32bpp
+    /// top-down DIB and return its BGRA pixels. No window, no global `UI` lock:
+    /// the caller passes the state, so the render is exactly `paint_view`.
+    fn paint_offscreen(w: i32, h: i32, dpi: i32, st: &UiState) -> Vec<u8> {
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC,
+            SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        // SAFETY: DC/bitmap created and released within this call; the pixels are
+        // copied out before the bitmap is deleted.
+        unsafe {
+            let screen = GetDC(std::ptr::null_mut());
+            let mem = CreateCompatibleDC(screen);
+            ReleaseDC(std::ptr::null_mut(), screen);
+            assert!(!mem.is_null(), "CreateCompatibleDC failed");
+            let mut info: BITMAPINFO = std::mem::zeroed();
+            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+            info.bmiHeader.biWidth = w;
+            info.bmiHeader.biHeight = -h; // top-down: row 0 is the top.
+            info.bmiHeader.biPlanes = 1;
+            info.bmiHeader.biBitCount = 32;
+            info.bmiHeader.biCompression = BI_RGB;
+            let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            let bmp = CreateDIBSection(
+                mem,
+                &info,
+                DIB_RGB_COLORS,
+                &mut bits,
+                std::ptr::null_mut(),
+                0,
+            );
+            assert!(!bmp.is_null() && !bits.is_null(), "CreateDIBSection failed");
+            let old = SelectObject(mem, bmp);
+            with_antialias(mem, || {
+                paint_view(
+                    mem,
+                    Rect {
+                        left: 0,
+                        top: 0,
+                        right: w,
+                        bottom: h,
+                    },
+                    dpi,
+                    st,
+                )
+            });
+            Gdi::GdiFlush();
+            let px = std::slice::from_raw_parts(
+                bits as *const u8,
+                (w as usize) * (h as usize) * 4,
+            )
+            .to_vec();
+            SelectObject(mem, old);
+            DeleteObject(bmp);
+            DeleteDC(mem);
+            px
+        }
+    }
+
+    /// Owner regression (2026-10-28, tightened 2026-10-29): the preview's media
+    /// image is clean -- no Potflix `P` mark, no FILM/SERIES badge, no status
+    /// glyph over the art -- and absent artwork collapses instead of painting a
+    /// blank tile that the wire calls a poster.
+    #[test]
+    fn preview_media_tile_carries_no_icon_or_badge_ink() {
+        let run = Action {
+            running: true,
+            has_start: true,
+            start: 1_700_000_000_000,
+            ct: 1000,
+            ..Action::default()
+        };
+        for kind in [CardKind::Movie, CardKind::Series] {
+            let (raw, res) = match kind {
+                CardKind::Movie => (
+                    "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+                    Resolved {
+                        series: "Dune: Part Two".to_string(),
+                        year: 2024,
+                        is_movie: true,
+                        genres: "Sci-Fi, Adventure".to_string(),
+                        length: "2h 46m".to_string(),
+                        ..Resolved::default()
+                    },
+                ),
+                CardKind::Series => (
+                    "Breaking.Bad.S04E07.Problem.Dog.1080p.mkv - PotPlayer".to_string(),
+                    Resolved {
+                        series: "Breaking Bad".to_string(),
+                        episode_name: "Problem Dog".to_string(),
+                        season: 4,
+                        number: 7,
+                        ..Resolved::default()
+                    },
+                ),
+            };
+            let mut st = UiState::default();
+            st.cur_view = View::Card;
+            st.record_preview(kind, raw, Some(run.clone()), res);
+            let dpi = 96;
+            let (cw, ch) = (MAIN_CLIENT_W, MAIN_CLIENT_H);
+            let l = compute_card_layout(
+                cw,
+                ch,
+                dpi,
+                &st.card_specs_state,
+                st.displayed_card_kind(),
+                st.preview_surface,
+            );
+            let (model, _) = card_preview_model(&st);
+            assert!(
+                !model.art && model.art_url.is_empty(),
+                "{kind:?}: absent artwork must collapse, not claim a poster"
+            );
+            let px = paint_offscreen(cw, ch, dpi, &st);
+            let (mx, my) = (
+                (l.art.left + l.art.right) / 2,
+                (l.art.top + l.art.bottom) / 2,
+            );
+            assert_ne!(
+                pixel_at(&px, cw, mx, my),
+                COL_SURFACE,
+                "{kind:?}: a blank placeholder tile was painted for absent artwork"
+            );
+        }
+    }
+
+    /// Owner direction 2026-10-29 (WORKSPACE-PHASE.md): one title query field
+    /// carrying an optional year in the same field. The parse is the input
+    /// contract the picker's provider search receives; a trailing 19xx/20xx
+    /// token is the year, a bare year is a year-only query, everything else is
+    /// the title. Unicode titles pass through unchanged.
+    #[test]
+    fn unified_query_parses_title_and_optional_year() {
+        for (input, title, year) in [
+            ("Dune", "Dune", 0),
+            ("Dune 2021", "Dune", 2021),
+            ("Dune: Part Two 2024", "Dune: Part Two", 2024),
+            ("  Breaking   Bad   2008  ", "Breaking   Bad", 2008),
+            ("Blade Runner 2049", "Blade Runner", 2049),
+            ("1984", "", 1984),
+            ("Dune 20211", "Dune 20211", 0),
+            ("Dune 1899", "Dune 1899", 0),
+            ("", "", 0),
+            ("Am\u{e9}lie 2001", "Am\u{e9}lie", 2001),
+        ] {
+            assert_eq!(
+                parse_title_year(input),
+                (title.to_string(), year),
+                "parse {input:?}"
+            );
+        }
+        assert!(search_query_allowed("Dune", false), "a title alone searches");
+        assert!(
+            search_query_allowed("1984", false),
+            "a bare year is a valid query"
+        );
+        assert!(!search_query_allowed("   ", false), "blank never searches");
+        assert!(
+            !search_query_allowed("Dune", true),
+            "a running job freezes Search"
+        );
+    }
+
+    /// Owner visual-failure repair (2026-10-29): the unified title/year query
+    /// and the explicit Movie/TV choice live in the main Card workspace's
+    /// first viewport, not only inside the Fix match dialog. The same pure
+    /// parse contract stays the input: a title alone, or a title with a
+    /// trailing year.
+    #[test]
+    fn main_card_workspace_exposes_the_picker_in_its_first_viewport() {
+        for (cw, ch) in [(1180, 700), (460, 680), (390, 844), (480, 270)] {
+            let l = compute_card_layout(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Movie,
+                PreviewSurface::default(),
+            );
+            for id in [BTN_PICKER_FIELD, BTN_PICKER_SEARCH, BTN_ADVANCED] {
+                let rc = l
+                    .card_btn(id)
+                    .unwrap_or_else(|| panic!("{cw}x{ch}: picker control {id} missing"));
+                assert!(
+                    rc.left >= 0 && rc.top >= 0 && rc.right <= cw && rc.bottom <= ch,
+                    "{cw}x{ch}: picker control {id} escapes the client: {rc:?}"
+                );
+            }
+            assert!(
+                l.picker_bar.right > l.picker_bar.left
+                    && l.picker_bar.bottom > l.picker_bar.top,
+                "{cw}x{ch}: the picker band is empty"
+            );
+            assert!(
+                l.picker_bar.left >= 0
+                    && l.picker_bar.top >= 0
+                    && l.picker_bar.right <= cw
+                    && l.picker_bar.bottom <= ch,
+                "{cw}x{ch}: the picker band escapes the client: {:?}",
+                l.picker_bar
+            );
+            // The field is one control, never a separate year input.
+            assert_eq!(
+                l.btns
+                    .iter()
+                    .filter(|b| b.id == BTN_PICKER_FIELD)
+                    .count(),
+                1,
+                "{cw}x{ch}: exactly one query field"
+            );
+        }
+        assert_eq!(
+            parse_title_year("Dune 2021"),
+            ("Dune".to_string(), 2021),
+            "title + year stays one field"
+        );
+    }
+
+    /// The picker worker publishes asynchronously; the real UI thread applies
+    /// it from `WM_APP_PICKER_DONE`. Tests drive that same production
+    /// completion entry point until the worker has published (bounded).
+    fn drive_picker_job(st: &mut UiState) {
+        for _ in 0..400 {
+            st.on_picker_job_done();
+            if !st.picker.busy {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the picker worker never published");
+    }
+
+    fn stub_search(
+        calls: Arc<std::sync::Mutex<Vec<(String, i32, crate::search::KindFilter)>>>,
+        rows: Result<Vec<metadata::Candidate>, String>,
+    ) -> PickerSearch {
+        Arc::new(move |title: &str, year: i32, filter: crate::search::KindFilter| {
+            calls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((title.to_string(), year, filter));
+            rows.clone()
+        })
+    }
+
+    fn office_series() -> metadata::Candidate {
+        metadata::Candidate {
+            kind: Kind::SERIES,
+            title: "The Office".to_string(),
+            year: 2005,
+            provider: "tvmaze".to_string(),
+            provider_id: "526".to_string(),
+            poster: String::new(),
+            episode_count: 188,
+        }
+    }
+
+    fn dune_movie() -> metadata::Candidate {
+        metadata::Candidate {
+            kind: Kind::MOVIE,
+            title: "Dune".to_string(),
+            year: 2021,
+            provider: "cinemeta".to_string(),
+            provider_id: "tt1160419".to_string(),
+            poster: String::new(),
+            episode_count: 0,
+        }
+    }
+
+    /// Blocker 1, red-capable: a cold launch with no player opens the SEARCH
+    /// surface, not the library. The launch rule is the production one
+    /// (`cold_open_view` / `open_cold_view_with`); with a player the shipped
+    /// Main landing is unchanged. At rest the search surface carries exactly
+    /// one field, one Search and no apply/repair control.
+    /// Visual blocker (2026-10-29): at the 1180x700 workspace the Activity
+    /// surface's title must be whole. The old paint wrapped
+    /// `Watching Dune: Prophecy` at the display face inside a 40px band and cut
+    /// the second line, which reads as a corrupt title rather than a name.
+    /// Red when the title's ink reaches the band's clip edges.
+    #[test]
+    fn wide_activity_title_paints_whole_without_clipping() {
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.picker.candidates = vec![metadata::Candidate {
+            kind: Kind::SERIES,
+            title: "Dune: Prophecy".to_string(),
+            year: 2024,
+            provider: "tvmaze".to_string(),
+            provider_id: "tvmaze-dune-prophecy".to_string(),
+            poster: String::new(),
+            episode_count: 6,
+        }];
+        assert!(st.select_candidate(0), "the row selects");
+        let (title, _, is_movie) = st.preview_object().expect("a local preview object");
+        assert_eq!((title.as_str(), is_movie), ("Dune: Prophecy", false));
+        let px = paint_offscreen(1180, 700, 96, &st);
+        let l = compute_card_layout_state(
+            1180,
+            700,
+            96,
+            &st.card_specs_state,
+            st.displayed_card_kind(),
+            st.preview_surface,
+            &st.card_layout_state(),
+        );
+        let activity = l.surfaces[2];
+        let band = activity_title_band(activity, 96, true);
+        assert!(
+            band.right - band.left > 60 && band.bottom - band.top > 10,
+            "the Activity surface draws a title band: {band:?}"
+        );
+        // Ink is a pixel far brighter than the card fill the band sits on.
+        let ink = |x: i32, y: i32| -> bool {
+            let i = ((y as usize) * 1180 + x as usize) * 4;
+            u32::from(px[i]) + u32::from(px[i + 1]) + u32::from(px[i + 2]) > 3 * 0x90
+        };
+        let mut top_row = band.bottom;
+        let mut last_row = band.top - 1;
+        let mut last_col = band.left - 1;
+        for y in band.top..band.bottom {
+            for x in band.left..band.right {
+                if ink(x, y) {
+                    top_row = top_row.min(y);
+                    last_row = last_row.max(y);
+                    last_col = last_col.max(x);
+                }
+            }
+        }
+        assert!(last_row >= band.top, "the title paints inside its band");
+        assert!(
+            last_row <= band.bottom - 3,
+            "title ink is clipped at the band's bottom edge: last row {last_row}, band ends {}",
+            band.bottom - 1
+        );
+        assert!(
+            last_col <= band.right - 2,
+            "title ink is clipped at the band's right edge: last col {last_col}, band ends {}",
+            band.right - 1
+        );
+    }
+
+    #[test]
+    fn cold_open_without_a_player_shows_the_search_surface() {
+        assert_eq!(
+            UiState::cold_open_view(false),
+            View::Card,
+            "nothing playing: first screen is the search surface"
+        );
+        assert_eq!(
+            UiState::cold_open_view(true),
+            View::Main,
+            "a playing title keeps the shipped landing"
+        );
+        let mut st = UiState::default();
+        st.open_cold_view_with(false);
+        assert_eq!(st.cur_view, View::Card);
+        assert!(!st.preview_is_live(), "no push has been recorded");
+        assert!(st.preview_object().is_none(), "the empty state is explicit");
+        assert!(
+            st.object_status_text(false)
+                .contains("Preview is local; Apply needs playback.")
+        );
+        assert_eq!(st.picker.filter, crate::search::KindFilter::All);
+        for (cw, ch) in [(463, 703), (1180, 700)] {
+            let l = compute_card_layout_state(
+                cw,
+                ch,
+                96,
+                &st.card_specs_state,
+                st.displayed_card_kind(),
+                st.preview_surface,
+                &st.card_layout_state(),
+            );
+            assert!(
+                l.card_btn(BTN_PICKER_FIELD).is_some() && l.card_btn(BTN_PICKER_SEARCH).is_some(),
+                "{cw}x{ch}: the first screen must carry the one field and one Search"
+            );
+            assert_eq!(
+                l.btns.iter().filter(|b| b.id == BTN_PICKER_SEARCH).count(),
+                1,
+                "{cw}x{ch}: exactly one search verb"
+            );
+            assert!(
+                l.btns
+                    .iter()
+                    .all(|b| b.id != BTN_PICKER_APPLY && b.id != BTN_FIX_MATCH),
+                "{cw}x{ch}: an apply/repair control is visible at rest"
+            );
+            assert!(
+                l.btns.iter().all(|b| b.id != BTN_PICKER_ALL
+                    && b.id != BTN_PICKER_MOVIE
+                    && b.id != BTN_PICKER_TV),
+                "{cw}x{ch}: a kind control is visible at rest"
+            );
+        }
+        // And the same rule drives the real launch: with a player the window
+        // opens on Main.
+        let mut st = UiState::default();
+        st.open_cold_view_with(true);
+        assert_eq!(st.cur_view, View::Main);
+    }
+
+    /// The empty state's preview surfaces: no title means no synopsis body and
+    /// no "No synopsis for this title." boilerplate, and every surface says
+    /// `Nothing to preview` instead of painting a blank panel. A selected
+    /// record is the opposite state and must not be confused with it.
+    #[test]
+    fn empty_preview_surfaces_say_nothing_to_preview() {
+        let mut st = UiState::default();
+        st.open_cold_view_with(false);
+        let (model, have) = card_preview_model(&st);
+        assert!(!have, "nothing recorded, nothing selected");
+        assert!(
+            preview_is_empty(have, &model),
+            "the surfaces must paint `{PREVIEW_EMPTY_TEXT}` here"
+        );
+        assert!(model.header.is_empty(), "no title: no `Watching ...` line");
+        assert!(
+            model.synopsis.is_empty(),
+            "no title: the synopsis body stays empty, so the boilerplate is not painted"
+        );
+        for surface in [PreviewSurface::Member, PreviewSurface::Profile, PreviewSurface::Activity] {
+            assert!(
+                surface_lines(&model, surface).is_empty(),
+                "{surface:?}: the empty model draws no lines at all"
+            );
+        }
+
+        // The neighbouring state, same window: a picked record is not empty and
+        // carries its own header and synopsis.
+        let cand = Candidate {
+            kind: Kind::SERIES,
+            title: "The Office".to_string(),
+            year: 2005,
+            provider: "tvmaze".to_string(),
+            provider_id: "526".to_string(),
+            poster: String::new(),
+            episode_count: 9,
+        };
+        st.picker.candidates = vec![cand];
+        st.picker.open = true;
+        assert!(st.select_candidate(0));
+        let (model, have) = card_preview_model(&st);
+        assert!(have && !preview_is_empty(have, &model));
+        assert_eq!(model.header, "Watching The Office");
+        assert!(model.synopsis.is_empty(), "this fixture carries no synopsis");
+    }
+
+    /// The pick arming rule, end to end through the production transitions: an
+    /// auto-highlight is not a choice, an explicit pick is, and the same record
+    /// arriving in a NEW result set is a highlight again -- it cannot arm Apply
+    /// without a fresh pick.
+    #[test]
+    fn a_pick_does_not_survive_a_query_edit_scope_change_or_new_search() {
+        let cand = Candidate {
+            kind: Kind::MOVIE,
+            title: "Dune".to_string(),
+            year: 2021,
+            provider: "cinemeta".to_string(),
+            provider_id: "tt1160419".to_string(),
+            poster: String::new(),
+            episode_count: 0,
+        };
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.picker.candidates = vec![cand.clone()];
+        st.picker.open = true;
+        st.picker.selected = 0;
+        assert!(!st.has_picked_candidate(), "the seeded highlight is not a pick");
+        assert!(st.select_candidate(0), "the row selects");
+        assert!(st.has_picked_candidate(), "an explicit pick arms Apply");
+
+        // New query, same record back at index 0: still not a choice.
+        st.picker.set_query("Dune 2021".to_string());
+        assert!(!st.has_picked_candidate(), "the query edit dropped the pick");
+        st.picker.candidates = vec![cand.clone()];
+        st.picker.selected = 0;
+        st.picker.open = true;
+        assert!(
+            !st.has_picked_candidate(),
+            "an identical row in a fresh list is a highlight, not a pick"
+        );
+        // Same for a scope change and for a brand-new search.
+        assert!(st.select_candidate(0));
+        st.picker.set_filter(crate::search::KindFilter::Movies);
+        st.picker.candidates = vec![cand.clone()];
+        st.picker.selected = 0;
+        st.picker.open = true;
+        assert!(!st.has_picked_candidate(), "the scope change dropped the pick");
+        assert!(st.select_candidate(0));
+        let (generation, ..) = st.picker.begin_search().expect("search starts");
+        assert!(st.picker.finish_search(generation, vec![cand]));
+        st.picker.selected = 0;
+        st.picker.open = true;
+        assert!(!st.has_picked_candidate(), "the new search dropped the pick");
+        // A closed list can never be armed, however it got there.
+        assert!(st.select_candidate(0));
+        st.picker.close_results();
+        assert!(!st.has_picked_candidate(), "a closed list holds no pick on screen");
+    }
+
+    /// Blocker 1, red-capable, end to end through the production transitions:
+    /// cold open with NO player -> type -> Search -> select a row -> the object
+    /// card and the preview are composed from the SELECTED RESOLVED RECORD, and
+    /// the surface says in words that nothing was sent.
+    #[test]
+    fn no_player_search_select_previews_locally_and_never_claims_live() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut st = UiState::default();
+        st.open_cold_view_with(false);
+        assert_eq!(st.cur_view, View::Card);
+        st.picker_search = stub_search(calls.clone(), Ok(vec![dune_movie(), office_series()]));
+
+        // Type into the one field. (The process-wide now-playing mirror is
+        // shared with parallel tests, so the field's starting content is set
+        // here explicitly; the cold-open rule itself is asserted above.)
+        st.picker.set_query(String::new());
+        st.focus_id = BTN_PICKER_FIELD;
+        for ch in "The Office".chars() {
+            assert!(st.on_card_char(ch as u32));
+        }
+        assert_eq!(st.picker.query, "The Office");
+        // One Search, through the real card dispatch.
+        assert_eq!(st.do_card_action(NULL, BTN_PICKER_SEARCH), None);
+        drive_picker_job(&mut st);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![("The Office".to_string(), 0, crate::search::KindFilter::All)],
+            "one query, one search, All types"
+        );
+        assert!(st.picker.open, "results are open");
+        assert_eq!(st.picker.candidates.len(), 2);
+        assert_eq!(st.picker.status, "2 matches for \"The Office\"");
+        assert!(!st.preview_is_live());
+
+        // Select the series row: the preview is that record, and it is a series.
+        let series_idx = st
+            .picker
+            .candidates
+            .iter()
+            .position(|c| c.kind == Kind::SERIES)
+            .expect("a series row");
+        assert!(st.select_candidate(series_idx));
+        let (title, year, is_movie) = st.preview_object().expect("a local preview object");
+        assert_eq!((title.as_str(), year, is_movie), ("The Office", 2005, false));
+        assert_eq!(st.displayed_card_kind(), CardKind::Series);
+        let (act, have) = st.preview_activity();
+        assert!(have, "the preview composes from the selected record");
+        assert_eq!(act.name, "The Office");
+        assert!(!st.preview_is_live(), "a local preview is never 'live'");
+        let status = st.object_status_text(false);
+        assert_eq!(
+            status, LOCAL_PREVIEW_STATUS,
+            "one true sentence, and it never claims playback is idle"
+        );
+        assert!(
+            !status.contains("nothing playing"),
+            "the copy must not claim nothing is playing beside a preview: {status:?}"
+        );
+        assert!(status.contains("not sent to Discord"), "{status:?}");
+
+        // A movie row composes a movie: the record's kind owns the preview, so
+        // a series can never inherit a stale Movie and vice versa.
+        let movie_idx = st
+            .picker
+            .candidates
+            .iter()
+            .position(|c| c.kind == Kind::MOVIE)
+            .expect("a movie row");
+        assert!(st.select_candidate(movie_idx));
+        assert!(st.preview_object().expect("object").2);
+        assert_eq!(st.displayed_card_kind(), CardKind::Movie);
+        // Selecting is local: the query is untouched and no latch is running.
+        assert_eq!(st.picker.query, "The Office");
+        assert!(!st.picker.busy);
+    }
+
+    /// The apply control is honest about the flow: with no player there is
+    /// nothing to apply a match to, so it is not laid out at all; with a player
+    /// and a selection it is a separate, plainly named control beside the list.
+    #[test]
+    fn apply_to_playing_title_exists_only_with_a_player_and_a_selection() {
+        let base = CardLayoutState {
+            advanced: false,
+            has_selection: true,
+            can_apply: false,
+            filter: crate::search::KindFilter::All,
+        };
+        for (cw, ch) in [(463, 703), (1180, 700)] {
+            let no_player = compute_card_layout_state(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+                &base,
+            );
+            assert!(
+                no_player.card_btn(BTN_PICKER_APPLY).is_none(),
+                "{cw}x{ch}: apply with nothing playing would be a lie"
+            );
+            let playing = compute_card_layout_state(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+                &CardLayoutState {
+                    can_apply: true,
+                    ..base
+                },
+            );
+            let apply = playing
+                .card_btn(BTN_PICKER_APPLY)
+                .unwrap_or_else(|| panic!("{cw}x{ch}: apply missing with a player"));
+            let results = playing.picker_results;
+            assert!(
+                apply.top >= results.top && apply.bottom <= results.bottom,
+                "{cw}x{ch}: apply must live inside the results list"
+            );
+            // Repair stays in the list too, and the two never overlap.
+            let repair = playing
+                .card_btn(BTN_FIX_MATCH)
+                .unwrap_or_else(|| panic!("{cw}x{ch}: repair missing"));
+            assert!(!rects_intersect(apply, repair));
+            assert!(
+                playing.btns.iter().all(|b| b.id != BTN_FIX_MATCH
+                    || (b.rc.top >= results.top && b.rc.bottom <= results.bottom))
+            );
+        }
+        // At rest (no selection) neither exists, player or not.
+        let rest = compute_card_layout_state(
+            463,
+            703,
+            96,
+            &CardSpecs::default(),
+            CardKind::Series,
+            PreviewSurface::default(),
+            &CardLayoutState {
+                can_apply: true,
+                has_selection: false,
+                ..base
+            },
+        );
+        assert!(
+            rest.card_btn(BTN_PICKER_APPLY).is_none() && rest.card_btn(BTN_FIX_MATCH).is_none()
+        );
+    }
+
+    /// The field cap: exactly 128 scalar values, a visible counter, a refused
+    /// 129th character that says why, and a paste that clips at the cap instead
+    /// of silently producing a different title.
+    #[test]
+    fn picker_query_is_capped_with_a_visible_counter() {
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.focus_id = BTN_PICKER_FIELD;
+        for _ in 0..crate::search::MAX_QUERY_CHARS {
+            assert!(st.on_card_char('a' as u32));
+        }
+        assert_eq!(st.picker.query_len(), crate::search::MAX_QUERY_CHARS);
+        assert_eq!(st.picker.counter_text(), "128/128");
+        assert!(!st.on_card_char('b' as u32), "the 129th char is refused");
+        assert_eq!(st.picker.query_len(), crate::search::MAX_QUERY_CHARS);
+        assert_eq!(
+            st.picker.status,
+            crate::search::QueryIssue::TooLong.message(),
+            "a refused character explains itself"
+        );
+        // A multi-byte scalar counts once, not per byte.
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.focus_id = BTN_PICKER_FIELD;
+        st.picker.set_query("\u{1f600}".repeat(10));
+        assert_eq!(st.picker.query_len(), 10);
+        assert!(!st.picker.query.is_empty());
+        // Paste clips at the cap and says so.
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.focus_id = BTN_PICKER_FIELD;
+        assert!(st.paste_into_picker(&"x".repeat(300)));
+        assert_eq!(st.picker.query_len(), crate::search::MAX_QUERY_CHARS);
+        assert_eq!(st.picker.status, crate::search::QueryIssue::TooLong.message());
+        // Paste also refuses control characters, and is inert when the field
+        // does not hold focus.
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.focus_id = BTN_CARD_BACK;
+        assert!(!st.paste_into_picker("Dune"));
+        assert!(st.picker.query.is_empty());
+    }
+
+    /// Empty, year-only and provider-failure are three distinct, explicit
+    /// states: none of them runs a search, none of them panics, and the failure
+    /// keeps the query so a retry needs no retyping.
+    #[test]
+    fn empty_year_only_and_provider_failure_states_are_explicit() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.picker_search = Arc::new(|_: &str, _: i32, _: crate::search::KindFilter| {
+            panic!("a refused query must never reach the providers")
+        });
+        let _ = st.do_card_action(NULL, BTN_PICKER_SEARCH);
+        assert_eq!(
+            st.picker.status,
+            crate::search::QueryIssue::Empty.message(),
+            "an empty submit explains itself"
+        );
+        st.picker.set_query("2024".to_string());
+        let _ = st.do_card_action(NULL, BTN_PICKER_SEARCH);
+        assert_eq!(st.picker.status, crate::search::QueryIssue::YearOnly.message());
+        assert!(!st.picker.busy && !st.picker.open);
+
+        // Provider failure: its own status, an empty (not open) list, and the
+        // query preserved.
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.picker_search = stub_search(calls.clone(), Err("providers unreachable".to_string()));
+        st.picker.set_query("The Office".to_string());
+        assert!(st.card_picker_search());
+        drive_picker_job(&mut st);
+        assert_eq!(st.picker.status, FIX_MATCH_ERROR);
+        assert!(!st.picker.busy && !st.picker.open && st.picker.candidates.is_empty());
+        assert_eq!(st.picker.query, "The Office", "a failure keeps the query");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the failure came from a real (stubbed) provider call"
+        );
+        assert!(!st.preview_is_live() && st.preview_object().is_none());
+    }
+
+    /// The chain: the painted result row carries title, year and kind, and the
+    /// mixed search's rows come back in the merge order the row index selects.
+    #[test]
+    fn mixed_result_rows_carry_title_year_and_kind() {
+        let (title, sub) = fix_match_row_lines(&office_series());
+        assert_eq!(title, "The Office (2005)");
+        assert!(sub.contains("Series") && sub.contains("188 episodes"), "{sub:?}");
+        let (title, sub) = fix_match_row_lines(&dune_movie());
+        assert_eq!(title, "Dune (2021)");
+        assert!(sub.contains("Movie"), "{sub:?}");
+        assert!(!sub.contains("episodes"), "a movie has no episode table");
+        // A year-only record renders without a fake year.
+        let mut c = dune_movie();
+        c.year = 0;
+        assert_eq!(fix_match_row_lines(&c).0, "Dune");
+    }
+
+    /// The main-workspace query is a real editable field, not a painted label:
+    /// typed characters and backspace drive the one canonical picker model.
+    #[test]
+    fn picker_field_types_and_backspaces_in_the_main_workspace() {
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.focus_id = BTN_PICKER_FIELD;
+        for ch in "Dune 2021".chars() {
+            assert!(st.on_card_char(ch as u32));
+        }
+        assert_eq!(st.picker.query, "Dune 2021");
+        assert!(st.on_card_char(8));
+        assert_eq!(st.picker.query, "Dune 202");
+        st.focus_id = BTN_CARD_BACK;
+        assert!(!st.on_card_char('x' as u32), "only the field takes text");
+    }
+
+    /// Owner visual-failure repair (2026-10-29): an absent poster URL must not
+    /// reserve and paint a blank `poster` tile. The cover slot is present only
+    /// when a real image can be drawn.
+    #[test]
+    fn absent_artwork_collapses_instead_of_a_blank_poster_tile() {
+        let act = Activity {
+            name: "Watching Dune: Part Two".to_string(),
+            details: "Dune: Part Two (2024)".to_string(),
+            state: "Sci-Fi, Adventure".to_string(),
+            ..Activity::default()
+        };
+        let p = surface_preview(&act, true, "", 0, 0, true);
+        assert!(
+            !p.art,
+            "an absent cover must collapse the art slot, not claim a poster"
+        );
+    }
+
+    /// The search result overlay is a real paint path, not just a model: a
+    /// candidate row must appear over the preview stage and its painted chip
+    /// must differ from the canvas behind it.
+    #[test]
+    fn picker_overlay_paints_a_candidate_row_in_the_main_workspace() {
+        let mut st = UiState::default();
+        st.cur_view = View::Card;
+        st.picker.open = true;
+        st.picker.searched = true;
+        st.picker.candidates = vec![Candidate {
+            kind: Kind::MOVIE,
+            title: "Dune: Part Two".to_string(),
+            year: 2024,
+            provider: "cinemeta".to_string(),
+            provider_id: "tt15239678".to_string(),
+            poster: "https://example.com/dune.jpg".to_string(),
+            episode_count: 0,
+        }];
+        st.picker.selected = 0;
+        let (cw, ch) = (1180, 700);
+        let l = compute_card_layout(
+            cw,
+            ch,
+            96,
+            &st.card_specs_state,
+            st.displayed_card_kind(),
+            st.preview_surface,
+        );
+        let rows = picker_row_rects(&l, 1);
+        assert_eq!(rows.len(), 1, "one candidate gets one visible row");
+        let px = paint_offscreen(cw, ch, 96, &st);
+        let r = rows[0];
+        let (mx, my) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        assert_ne!(
+            pixel_at(&px, cw, mx, my),
+            COL_BG,
+            "the result overlay was not painted over the stage"
+        );
+    }
+
+    /// Owner visual-failure repair (2026-10-29): with real image bytes in the
+    /// cover cache, the production paint path must show those pixels in the
+    /// art rect. The supplied fixture is a solid blue BMP, so the centre pixel
+    /// is an independent oracle: a blank tile or an overlay glyph cannot match.
+    /// No network is touched; the bytes are seeded through the cache seam.
+    #[test]
+    fn preview_paints_supplied_cover_bytes_without_a_blank_tile() {
+        crate::test_env::EnvGuard::with_scratch("cover-paint", |_dir| {
+            const URL: &str = "https://example.com/dune-cover.bmp";
+            crate::artwork::put_cached(URL, &solid_bmp(64, 96, 0x32, 0x64, 0xC8)).unwrap();
+            assert!(
+                crate::artwork::Cover::load(URL).is_some(),
+                "the seeded BMP must decode through GDI+"
+            );
+            let mut st = UiState::default();
+            st.cur_view = View::Card;
+            st.record_preview(
+                CardKind::Movie,
+                "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+                Some(Action {
+                    running: true,
+                    has_start: true,
+                    start: 1_700_000_000_000,
+                    ct: 1000,
+                    ..Action::default()
+                }),
+                Resolved {
+                    series: "Dune: Part Two".to_string(),
+                    year: 2024,
+                    is_movie: true,
+                    genres: "Sci-Fi, Adventure".to_string(),
+                    length: "2h 46m".to_string(),
+                    artwork: URL.to_string(),
+                    ..Resolved::default()
+                },
+            );
+            let (model, _) = card_preview_model(&st);
+            assert!(model.art, "cached cover must turn the cover slot on");
+            let (cw, ch) = (1440, 900);
+            let l = compute_card_layout(
+                cw,
+                ch,
+                96,
+                &st.card_specs_state,
+                st.displayed_card_kind(),
+                st.preview_surface,
+            );
+            let px = paint_offscreen(cw, ch, 96, &st);
+            let (mx, my) = (
+                (l.art.left + l.art.right) / 2,
+                (l.art.top + l.art.bottom) / 2,
+            );
+            let got = pixel_at(&px, cw, mx, my);
+            assert!(
+                got != COL_SURFACE && got != COL_CARD && got != COL_BG,
+                "the decoded cover pixels did not reach the art rect: {got:#08x}"
+            );
+        });
+    }
+
+    /// The picker's explicit Movie/TV choice (owner direction 2026-10-29)
+    /// replaces the filename/candidate derivation: it drives both the provider
+    /// search kind and the latch scope, and the layout carries the kind row
+    /// where the retired separate Year control used to sit.
+    #[test]
+    fn kind_choice_drives_search_and_latch_without_a_year_control() {
+        let mut st = fix_headless_state(fix_series_path(), false);
+        st.choices = fix_match_scope_choices(&st.path, false);
+        assert_eq!(st.search_want(), Kind::SERIES, "TV is the default kind");
+        assert!(
+            matches!(
+                st.selected_target(),
+                Some((Scope::Series | Scope::Season, _))
+            ),
+            "a TV choice latches a series/season target"
+        );
+        assert!(st.apply_pick_kind(true), "Movie changes the kind");
+        assert_eq!(st.search_want(), Kind::MOVIE);
+        assert!(st.choices.is_empty(), "a movie offers no scope radios");
+        assert!(
+            matches!(st.selected_target(), Some((Scope::Movie, _))),
+            "a movie choice latches the movie key"
+        );
+        assert!(st.apply_pick_kind(false), "TV changes the kind back");
+        assert_eq!(st.search_want(), Kind::SERIES);
+        assert!(!st.choices.is_empty(), "a TV choice offers the scope radios");
+        assert!(
+            !st.apply_pick_kind(false),
+            "picking the current kind is a no-op"
+        );
+
+        let l = fix_match_layout(96, FixScreen::Search, 2);
+        assert_eq!(l.kind_radios.len(), 2, "Movie and TV radios");
+        for rc in std::iter::once(l.kind_label).chain(l.kind_radios.iter().copied()) {
+            assert!(
+                rc.left >= 0 && rc.top >= 0 && rc.right <= l.client_w && rc.bottom <= l.client_h,
+                "kind rect outside the dialog: {rc:?}"
+            );
+        }
+        assert!(
+            l.kind_label.top >= l.name_edit.bottom,
+            "kind row sits under the one query field"
+        );
+        assert!(
+            l.kind_radios[1].bottom <= l.progress.top,
+            "kind row sits above the results strip"
+        );
+        assert!(
+            l.name_edit.right <= l.search.left && l.name_edit.bottom <= l.kind_label.top,
+            "the query field and Search share the first row"
+        );
+    }
+
+    /// The split workspace at a desktop size and the narrow stack at the
+    /// native and phone-equivalent sizes: every control and panel stays inside
+    /// the client, no buttons overlap, the three wide surfaces are pairwise
+    /// disjoint, and the narrow stack keeps the field and state controls.
+    #[test]
+    fn designer_layout_never_clips_at_workspace_and_phone_sizes() {
+        for (cw, ch, want_wide) in [
+            (1440, 900, true),
+            (1180, 700, true),
+            (1000, 700, false),
+            (460, 680, false),
+            (390, 844, false),
+            (360, 700, false),
+            (480, 270, false),
+        ] {
+            let l = compute_card_layout(
+                cw,
+                ch,
+                96,
+                &CardSpecs::default(),
+                CardKind::Series,
+                PreviewSurface::default(),
+            );
+            assert_eq!(l.wide, want_wide, "{cw}x{ch}: wide flag");
+            for b in &l.btns {
+                assert!(
+                    b.rc.left >= 0 && b.rc.top >= 0 && b.rc.right <= cw && b.rc.bottom <= ch,
+                    "{cw}x{ch}: button {} outside the client: {:?}",
+                    b.id,
+                    b.rc
+                );
+            }
+            for (i, a) in l.btns.iter().enumerate() {
+                for b in l.btns.iter().skip(i + 1) {
+                    assert!(
+                        !rects_intersect(a.rc, b.rc),
+                        "{cw}x{ch}: buttons {} {:?} and {} {:?} overlap",
+                        a.id,
+                        a.rc,
+                        b.id,
+                        b.rc
+                    );
+                }
+            }
+            for (name, r) in [
+                ("preview", l.preview),
+                ("art", l.art),
+                ("title", l.title),
+                ("meta", l.meta),
+                ("synopsis", l.synopsis),
+                ("rail", l.rail),
+                ("stage", l.stage),
+            ] {
+                assert!(
+                    r.left >= 0 && r.top >= 0 && r.right <= cw && r.bottom <= ch,
+                    "{cw}x{ch}: {name} outside the client: {r:?}"
+                );
+                assert!(
+                    !matches!(name, "preview" | "stage" | "rail")
+                        || (r.right > r.left && r.bottom > r.top),
+                    "{cw}x{ch}: {name} is empty"
+                );
+                let _ = name;
+            }
+            if !l.compact {
+                assert!(l.status.bottom > l.status.top, "{cw}x{ch}: empty status");
+            }
+            for r in &l.rows {
+                assert!(
+                    (r.left == 0
+                        && r.top == 0
+                        && r.right == 0
+                        && r.bottom == 0) // collapsed stage: nothing to hold
+                        || (r.left >= l.preview.left
+                            && r.right <= l.preview.right
+                            && r.top >= l.preview.top
+                            && r.bottom <= l.preview.bottom),
+                    "{cw}x{ch}: media row outside the panel: {r:?}"
+                );
+            }
+            if !l.compact {
+                let rects = card_text_rects(cw, ch, 96, &l);
+                for (i, a) in rects.iter().enumerate() {
+                    for b in rects.iter().skip(i + 1) {
+                        assert!(
+                            !rects_intersect(a.rc, b.rc),
+                            "{cw}x{ch}: {} {:?} and {} {:?} intersect",
+                            a.id,
+                            a.rc,
+                            b.id,
+                            b.rc
+                        );
+                    }
+                }
+            }
+            if want_wide {
+                for (i, a) in l.surfaces.iter().enumerate() {
+                    for b in l.surfaces.iter().skip(i + 1) {
+                        assert!(
+                            !rects_intersect(*a, *b),
+                            "{cw}x{ch}: surfaces overlap: {a:?} / {b:?}"
+                        );
+                    }
+                }
+                assert!(
+                    l.rail.right <= l.stage.left,
+                    "{cw}x{ch}: rail overlaps the stage"
+                );
+                assert!(
+                    l.surfaces.iter().all(|s| s.right > s.left && s.bottom > s.top),
+                    "{cw}x{ch}: an empty wide surface"
+                );
+            } else {
+                assert!(
+                    l.surfaces.iter().all(|s| r_eq(*s, l.preview)),
+                    "{cw}x{ch}: narrow stack must show one preview"
+                );
+                if !l.compact {
+                    let open = compute_card_layout_with(
+                        cw,
+                        ch,
+                        96,
+                        &CardSpecs::default(),
+                        CardKind::Series,
+                        PreviewSurface::default(),
+                        true,
+                        false,
+                    );
+                    for id in [
+                        BTN_PICKER_MOVIE,
+                        BTN_PICKER_TV,
+                        BTN_FIELD_ARTWORK,
+                        BTN_FIELD_DETAILS,
+                        BTN_FIELD_STATE,
+                        BTN_FIELD_SYNOPSIS,
+                        BTN_FIELD_TIMERS,
+                        card_state_button(0),
+                    ] {
+                        assert!(
+                            open.card_btn(id).is_some(),
+                            "{cw}x{ch}: control {id} missing from the disclosure"
+                        );
+                        assert!(
+                            l.card_btn(id).is_none(),
+                            "{cw}x{ch}: control {id} is visible at rest"
+                        );
+                    }
+                    for id in [BTN_PICKER_FIELD, BTN_PICKER_SEARCH, BTN_ADVANCED] {
+                        assert!(
+                            l.card_btn(id).is_some(),
+                            "{cw}x{ch}: control {id} missing at rest"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// One payload, three surfaces: the header, details and state are the same
+    /// strings on every surface; the synopsis body is local to the Activity
+    /// tab; the designer's off-fields disappear everywhere at once.
+    #[test]
+    fn preview_model_keeps_all_three_surfaces_in_lockstep() {
+        let run = Action {
+            running: true,
+            has_start: true,
+            start: 1_700_000_000_000,
+            ct: 1000,
+            ..Action::default()
+        };
+        let res = Resolved {
+            series: "Dune: Part Two".to_string(),
+            year: 2024,
+            is_movie: true,
+            genres: "Sci-Fi".to_string(),
+            length: "2h 46m".to_string(),
+            synopsis: "Paul unites with the Fremen.".to_string(),
+            artwork: "https://example.com/dune.jpg".to_string(),
+            ..Resolved::default()
+        };
+        let act = presence::compose_card(
+            "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
+            Some(&run),
+            &res,
+            true,
+            &presence::cardspec::default_card_spec(),
+        );
+        let p = surface_preview(&act, true, &res.synopsis, 1_700_000_060_000, 166 * 60_000, true);
+        assert_eq!(p.header, "Watching Dune: Part Two");
+        assert!(p.art);
+        assert!(p.clock.timer && p.clock.fraction > 0.0 && p.clock.fraction < 1.0);
+        for surface in [
+            PreviewSurface::Member,
+            PreviewSurface::Profile,
+            PreviewSurface::Activity,
+        ] {
+            let lines = surface_lines(&p, surface);
+            assert_eq!(lines.first().map(String::as_str), Some(p.header.as_str()));
+            assert!(lines.contains(&p.details), "{surface:?}: details missing");
+            assert!(lines.contains(&p.state), "{surface:?}: state missing");
+            if surface == PreviewSurface::Activity {
+                assert!(
+                    lines.contains(&p.synopsis),
+                    "the Activity tab carries the local synopsis"
+                );
+            } else {
+                assert!(
+                    !lines.iter().any(|l| l == &p.synopsis),
+                    "{surface:?}: the synopsis body is Activity-only"
+                );
+            }
+        }
+
+        // Episode identity: the header is the series title and the state keeps
+        // the episode facts.
+        let ep = Resolved {
+            series: "Breaking Bad".to_string(),
+            episode_name: "Problem Dog".to_string(),
+            season: 4,
+            number: 7,
+            synopsis: "Walt faces the consequences.".to_string(),
+            ..Resolved::default()
+        };
+        let act = presence::compose_card(
+            "Breaking.Bad.S04E07.Problem.Dog.1080p.mkv - PotPlayer",
+            Some(&run),
+            &ep,
+            false,
+            &presence::cardspec::default_card_spec(),
+        );
+        let p = surface_preview(&act, true, &ep.synopsis, 1_700_000_060_000, 45 * 60_000, true);
+        assert_eq!(p.header, "Watching Breaking Bad");
+        assert!(
+            p.state.contains("S04E07") && p.state.contains("Problem Dog"),
+            "episode state: {:?}",
+            p.state
+        );
+
+        // The designer's off-fields vanish from the payload AND the model.
+        let bare = presence::designer::DesignerSpec {
+            artwork: false,
+            details: false,
+            state: false,
+            synopsis: false,
+            timers: false,
+        }
+        .apply(act);
+        let p = surface_preview(&bare, true, "", 1_700_000_060_000, 45 * 60_000, false);
+        assert!(p.details.is_empty() && p.state.is_empty());
+        assert!(!p.art && p.synopsis.is_empty() && !p.clock.timer);
+        for surface in [
+            PreviewSurface::Member,
+            PreviewSurface::Profile,
+            PreviewSurface::Activity,
+        ] {
+            assert_eq!(
+                surface_lines(&p, surface),
+                vec![p.header.clone()],
+                "{surface:?}: only the header survives"
+            );
+        }
+    }
+
+    /// Runtime parsing and the preview clock: `\d+ min`, `Hh Mm`, `Hh`, and
+    /// `H:MM[:SS]`; paused counts up and holds the bar; no anchor hides it.
+    #[test]
+    fn preview_runtime_and_clock_are_honest() {
+        assert_eq!(parse_length_ms("166 min"), 166 * 60_000);
+        assert_eq!(parse_length_ms("2h 19m"), 139 * 60_000);
+        assert_eq!(parse_length_ms("2h"), 120 * 60_000);
+        assert_eq!(parse_length_ms("45 min"), 45 * 60_000);
+        assert_eq!(parse_length_ms("1:32:00"), 92 * 60_000);
+        assert_eq!(parse_length_ms("1:32"), 92 * 60_000);
+        assert_eq!(parse_length_ms(""), 0);
+        assert_eq!(parse_length_ms("unknown"), 0);
+
+        let playing = Activity {
+            has_start: true,
+            start: 1_000_000,
+            ..Activity::default()
+        };
+        let c = preview_clock(&playing, 1_060_000, 600_000);
+        assert!(c.timer && !c.paused);
+        assert!((c.fraction - 0.1).abs() < 1e-9, "fraction {}", c.fraction);
+        assert_eq!(c.left, "01:00");
+        assert_eq!(c.right, "-09:00");
+
+        let paused = Activity {
+            has_start: true,
+            start: 1_000_000,
+            paused: true,
+            ..Activity::default()
+        };
+        let c = preview_clock(&paused, 1_065_000, 600_000);
+        assert!(c.timer && c.paused);
+        assert_eq!(c.fraction, 0.0);
+        assert_eq!(c.left, "Paused");
+        assert_eq!(c.right, "01:05");
+
+        assert!(!preview_clock(&Activity::default(), 1_000_000, 600_000).timer);
+    }
+
+    /// Owner visual triage (2026-10-29): the 390x844 series capture shows the
+    /// elapsed label and no countdown. That is not a narrow-width drop. The
+    /// strip has no width, height or surface guard on `right`: `preview_clock`
+    /// (`window.rs:2360`) leaves it empty only when the payload carries no
+    /// runtime, and that capture's series `Resolved` carries no `length`, so
+    /// `preview_length` is empty and `parse_length_ms` is 0. Pinned both ways
+    /// at the phone size through the production paint path: with a runtime the
+    /// countdown paints in the right half of the label band, without one only
+    /// elapsed paints. A future narrow-width suppression of `right` (model or
+    /// paint) turns the first half red; an invented placeholder countdown
+    /// turns the second half red.
+    #[test]
+    fn narrow_preview_keeps_the_countdown_when_a_runtime_exists() {
+        let now = preview_now_ms();
+        let seeded = |length: &str| {
+            let mut st = UiState::default();
+            st.cur_view = View::Card;
+            st.preview_surface = PreviewSurface::Profile;
+            st.record_preview(
+                CardKind::Series,
+                "Breaking.Bad.S04E07.Problem.Dog.1080p.mkv - PotPlayer".to_string(),
+                Some(Action {
+                    running: true,
+                    has_start: true,
+                    start: now - 12 * 60_000,
+                    ct: 1000,
+                    ..Action::default()
+                }),
+                Resolved {
+                    series: "Breaking Bad".to_string(),
+                    episode_name: "Problem Dog".to_string(),
+                    season: 4,
+                    number: 7,
+                    length: length.to_string(),
+                    ..Resolved::default()
+                },
+            );
+            st
+        };
+        let (cw, ch, dpi) = (390, 844, 96);
+        // The label band under the 4px track: `state.bottom + SP_2` for the
+        // track, `+4` for its height, `+SP_2` for the labels. The measured
+        // band starts one row under the track and stops one row short of the
+        // panel foot, so neither the track nor the border can count as ink.
+        let band = |st: &UiState| {
+            let l = compute_card_layout(
+                cw,
+                ch,
+                dpi,
+                &st.card_specs_state,
+                st.displayed_card_kind(),
+                st.preview_surface,
+            );
+            let pad = scale_px(dpi, SP_3);
+            let foot = (l.synopsis.bottom + scale_px(dpi, SP_2) + scale_px(dpi, 30))
+                .min(l.preview.bottom - scale_px(dpi, SP_3));
+            (
+                l.preview.left + pad,
+                l.preview.right - pad,
+                l.synopsis.bottom + scale_px(dpi, SP_2) + scale_px(dpi, 5),
+                foot - scale_px(dpi, 1),
+            )
+        };
+        let ink = |px: &[u8], x0: i32, x1: i32, y0: i32, y1: i32| {
+            let mut n = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    if pixel_at(px, cw, x, y) != COL_CARD {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        let with = seeded("45 min");
+        let without = seeded("");
+        let (armed, have) = with.preview_activity();
+        assert!(have && armed.has_start, "the seeded preview is not running");
+        let (model, _) = card_preview_model(&with);
+        assert_eq!(model.clock.left, "12:00", "elapsed label");
+        assert!(
+            matches!(model.clock.right.as_str(), "-33:00" | "-32:59"),
+            "countdown label from 45 min: {:?}",
+            model.clock.right
+        );
+        assert!((model.clock.fraction - 12.0 / 45.0).abs() < 1e-3);
+        let (bare, _) = card_preview_model(&without);
+        assert_eq!(bare.clock.left, "12:00", "elapsed survives no runtime");
+        assert_eq!(bare.clock.right, "", "no runtime, no countdown");
+        assert_eq!(bare.clock.fraction, 0.0, "no runtime, no fill");
+        assert_eq!(
+            surface_lines(&bare, PreviewSurface::Profile),
+            vec![
+                "Watching Breaking Bad".to_string(),
+                "S04E07 \u{b7} Problem Dog".to_string(),
+                "12:00".to_string()
+            ],
+            "the zero-runtime surface lists elapsed only"
+        );
+        assert!(
+            surface_lines(&model, PreviewSurface::Profile)
+                .iter()
+                .any(|l| l.starts_with("-3")),
+            "the runtime surface lists the countdown"
+        );
+
+        let (left0, right1, top, bottom) = band(&with);
+        assert_eq!(band(&without), (left0, right1, top, bottom), "payload-independent strip");
+        assert!(
+            bottom > top + scale_px(dpi, 4),
+            "{cw}x{ch}: the label band has no height: {top}..{bottom}"
+        );
+        let mid = (left0 + right1) / 2;
+        let px_with = paint_offscreen(cw, ch, dpi, &with);
+        let px_without = paint_offscreen(cw, ch, dpi, &without);
+        let elapsed_with = ink(&px_with, left0, mid, top, bottom);
+        let countdown_with = ink(&px_with, mid, right1, top, bottom);
+        let elapsed_without = ink(&px_without, left0, mid, top, bottom);
+        let countdown_without = ink(&px_without, mid, right1, top, bottom);
+        assert!(
+            elapsed_with > 40 && elapsed_without > 40,
+            "{cw}x{ch}: the elapsed label is missing at the phone size \
+             ({elapsed_with}/{elapsed_without} ink px)"
+        );
+        assert!(
+            countdown_with > 40,
+            "{cw}x{ch}: a runtime is present but the countdown label is absent from the \
+             right half of the strip ({countdown_with} ink px) -- a width guard crept in"
+        );
+        assert_eq!(
+            countdown_without, 0,
+            "{cw}x{ch}: no runtime, yet the right half of the strip carries \
+             {countdown_without} ink px -- the zero-runtime fallback invented a countdown"
+        );
+    }
+
+    /// A designer toggle publishes to the live mirror and the Card preview
+    /// recomposes immediately: details/art/synopsis/timers disappear from the
+    /// composed activity, not just from a paint flag.
+    #[test]
+    fn designer_toggles_publish_and_recompose_the_preview() {
+        let _serial = UI_GLOBAL_SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        presence::set_live_designer(presence::designer::DesignerSpec::default());
+        let mut st = UiState::default();
+        st.record_preview(
+            CardKind::Movie,
+            "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+            Some(Action {
+                running: true,
+                has_start: true,
+                start: 1_000,
+                ct: 1000,
+                ..Action::default()
+            }),
+            Resolved {
+                series: "Dune: Part Two".to_string(),
+                year: 2024,
+                is_movie: true,
+                genres: "Sci-Fi".to_string(),
+                length: "2h 46m".to_string(),
+                synopsis: "Paul unites with the Fremen.".to_string(),
+                artwork: "https://example.com/dune.jpg".to_string(),
+                ..Resolved::default()
+            },
+        );
+        let (before, have) = st.preview_activity();
+        assert!(have && !before.details.is_empty() && !before.large_image.is_empty());
+        st.toggle_designer_field(DesignerField::Details);
+        assert!(!presence::live_designer().details);
+        assert!(st.preview_activity().0.details.is_empty());
+        st.toggle_designer_field(DesignerField::Artwork);
+        let (off, _) = st.preview_activity();
+        assert!(off.large_image.is_empty() && off.large_text.is_empty());
+        st.toggle_designer_field(DesignerField::Timers);
+        let (off, _) = st.preview_activity();
+        assert!(!off.has_start && off.start == 0);
+        assert!(!presence::live_designer().timers);
+        presence::set_live_designer(presence::designer::DesignerSpec::default());
     }
 }

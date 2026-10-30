@@ -336,9 +336,9 @@ fn push_activity(
     debounced: bool,
 ) -> bool {
     // T5-C: an idle title never becomes a card. The presence composer would
-    // render `Browsing`/`Idle` (and fall back to the app-name header) for
-    // exactly these inputs; clear instead, record no preview, and leave the
-    // gate untouched so the next real media sends fresh.
+    // render `Browsing`/`Idle` for exactly these inputs; clear instead, record
+    // no preview, and leave the gate untouched so the next real media sends
+    // fresh.
     if is_no_media_title(raw_title) {
         if let Err(err) = dc.clear_activity() {
             selftest::event_send_error(log, &err);
@@ -399,6 +399,10 @@ fn push_activity(
     // reproduces the builder's output byte-for-byte, so no skip branch is
     // needed.
     let card = presence::compose_card(raw_title, action, &res, is_movie, &specs.for_kind(kind));
+    // The designer's field choices filter the composed card on the one path the
+    // sender uses. The default spec is identity, so the shipped card is
+    // unchanged; a click in the designer is read here at the next poll.
+    let card = presence::live_designer().apply(card);
     let (out, verdict) = gate.decide(card, ct, total, now, event, debounced);
     selftest::event_push_attempt(log, &out, &verdict);
     if !verdict.send {
@@ -419,8 +423,8 @@ fn push_activity(
         state: out.state.clone(),
         large_image: out.large_image.clone(),
         large_text: out.large_text.clone(),
-        small_image: String::new(),
-        small_text: String::new(),
+        small_image: out.small_image.clone(),
+        small_text: out.small_text.clone(),
         has_start: out.has_start,
         start: out.start,
         end: out.end,
@@ -452,11 +456,11 @@ fn clear_due(generation: i64, cleared_gen: i64) -> bool {
 }
 
 /// T5-C: whether `raw_title` carries no media. The presence composer renders
-/// `Browsing`/`Idle` (with the app-name header fallback) for exactly these
-/// inputs, so the app lane clears instead of sending: empty/whitespace, the
-/// bare player app name (`PotPlayer`, or the renamed `PotFlix`), with either
-/// ` - PotPlayer` / ` - PotFlix` suffix stripped first. A real filename that
-/// merely mentions the player keeps its card.
+/// `Browsing`/`Idle` for exactly these inputs, so the app lane clears instead
+/// of sending: empty/whitespace, the bare player app name (`PotPlayer`, or the
+/// renamed `PotFlix`), with either ` - PotPlayer` / ` - PotFlix` suffix
+/// stripped first. A real filename that merely mentions the player keeps its
+/// card.
 fn is_no_media_title(raw_title: &str) -> bool {
     let mut raw = raw_title
         .strip_suffix(player::window::SUFFIX)
@@ -1222,10 +1226,11 @@ mod tests {
         const END5: i64 = IT_N + 21000 + (IT_TOTAL - 15250);
         const END6: i64 = IT_N + 51000 + (IT_TOTAL - 45250);
 
-        let playing = |details: &str, state: &str, start: i64, end: i64| Sent {
+        // The header carries the media title, so a series' line 1 blanks.
+        let playing = |title: &str, state: &str, start: i64, end: i64| Sent {
             clear: false,
-            name: "Breaking Bad".to_string(),
-            details: details.to_string(),
+            name: title.to_string(),
+            details: String::new(),
             state: state.to_string(),
             has_start: true,
             start,
@@ -1233,23 +1238,23 @@ mod tests {
             end,
         };
         let want = [
-            playing("Problem Dog", "S4 E7", START0, END0),
-            playing("Problem Dog", "S4 E7", START1, END1),
-            playing("Problem Dog", "S4 E7", START2, END2),
-            playing("Problem Dog", "S4 E7", START3, END3),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START0, END0),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START1, END1),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START2, END2),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START3, END3),
             Sent {
                 clear: false,
                 name: "Breaking Bad".to_string(),
-                details: "Problem Dog".to_string(),
-                state: "S4 E7 - Paused".to_string(),
+                details: String::new(),
+                state: "S4 E7 \u{b7} Problem Dog - Paused".to_string(),
                 has_start: true,
                 start: PAUSE_START,
                 has_end: false,
                 end: 0,
             },
-            playing("Problem Dog", "S4 E7", START4, END5),
-            playing("Problem Dog", "S4 E7", START4, END6),
-            playing("Problem Dog", "S4 E7", START4, END6),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START4, END5),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START4, END6),
+            playing("Breaking Bad", "S4 E7 \u{b7} Problem Dog", START4, END6),
         ];
 
         assert_eq!(
@@ -1278,7 +1283,9 @@ mod tests {
         }
         // R2: the pause frame is a parked paused card, and NO frame is a clear.
         assert!(
-            !got[4].clear && got[4].name == "Breaking Bad" && got[4].state == "S4 E7 - Paused",
+            !got[4].clear
+                && got[4].name == "Breaking Bad"
+                && got[4].state == "S4 E7 \u{b7} Problem Dog - Paused",
             "frame 4 is not the parked paused card: {got:?}"
         );
         for (i, sent) in got.iter().enumerate() {
@@ -1609,15 +1616,20 @@ mod tests {
             assert_eq!(got.details, a["details"].as_str().unwrap_or(""));
             assert_eq!(got.state, a["state"].as_str().unwrap_or(""));
             let assets = &a["assets"];
-            let mut want_large = got.large_image.clone();
-            if want_large != "logo" && !want_large.starts_with("http") {
-                want_large = "logo".into();
-            }
-            if want_large.is_empty() {
-                want_large = "logo".into();
-            }
+            // A resolved http(s) artwork rides; otherwise the image is omitted
+            // (never the branded logo), so the whole assets key may be absent.
+            let want_large = if got.large_image.starts_with("http") {
+                got.large_image.as_str()
+            } else {
+                ""
+            };
             assert_eq!(assets["large_image"].as_str().unwrap_or(""), want_large);
             assert_eq!(assets["large_text"].as_str().unwrap_or(""), got.large_text);
+            assert!(
+                assets["small_image"].as_str().unwrap_or("").is_empty()
+                    && assets["small_text"].as_str().unwrap_or("").is_empty(),
+                "no icon rides the preview/wire: {assets}"
+            );
             // The preview composes through the same composer (name, lines,
             // assets, start anchor) but carries no gate projection: `end` is
             // computed by the send gate from ct/total, not from the recorded
@@ -1664,7 +1676,12 @@ mod tests {
         assert!(series_specs.set_line(config::CardKind::Series, config::CardLine::State, "tag"));
         let (got2, v2, _) = drive(series_specs, series_raw, &act2, 2000);
         check(&got2, &v2);
-        assert!(!got2.details.is_empty() && !got2.state.is_empty());
+        assert!(
+            got2.details.is_empty(),
+            "the title preset repeats the header and blanks: {:?}",
+            got2.details
+        );
+        assert_eq!(got2.state, "S1 E2", "the tag preset rides the wire");
 
         let act3 = presence::Action {
             running: true,
@@ -1687,8 +1704,134 @@ mod tests {
             env["args"]["activity"].get("state").is_none(),
             "empty state reached the wire"
         );
-        assert_eq!(env["args"]["activity"]["details"], "Pilot");
+        assert!(
+            env["args"]["activity"].get("details").is_none(),
+            "empty details reached the wire"
+        );
 
+        let _ = dc.close();
+        let _ = reader.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The designer boundary: a published field choice must reach the wire AND
+    /// the recorded preview through the ONE production push path. Turning every
+    /// optional field off leaves only the header (the media title), because the
+    /// selected title always drives `Watching <Title>`; no app-name header, no
+    /// assets, no timestamps.
+    #[test]
+    fn designer_field_choices_reach_the_wire_and_the_preview() {
+        let _live_serial = LIVE_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        presence::set_live_designer(presence::designer::DesignerSpec::default());
+        let srv = discord::FakeServer::new(0);
+        let base = srv.base.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(srv.accept());
+        });
+        let dc = discord::Client::new(discord::Config {
+            client_id: "123456789012345678".into(),
+            pipe_base: base,
+            retry_delay: Duration::from_millis(30),
+            ..Default::default()
+        });
+        dc.start();
+        let sc = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("client connects")
+            .expect("accept");
+        let (op, _) = sc.read_frame().expect("handshake frame");
+        assert_eq!(op, discord::OP_HANDSHAKE);
+        sc.write_frame(
+            discord::OP_FRAME,
+            br#"{"cmd":"DISPATCH","evt":"READY","data":{"v":1}}"#,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dc.generation() < 1 {
+            assert!(Instant::now() < deadline, "never became ready");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let (ftx, frx) = mpsc::channel::<Vec<u8>>();
+        let reader = std::thread::spawn(move || {
+            loop {
+                match sc.read_frame() {
+                    Ok((discord::OP_FRAME, payload)) => {
+                        if ftx.send(payload).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let dir = unique_dir("designer-wire");
+        let log = Logger::new(dir.join("designer.log"), 0, 1);
+        let now = 1_000_000_000_000i64;
+        let mut st = window::UiState::default();
+        st.record_preview(
+            config::CardKind::Movie,
+            "Dune.Part.Two.2024.1080p.mkv - PotPlayer".to_string(),
+            None,
+            presence::Resolved::default(),
+        );
+        presence::set_live_designer(presence::designer::DesignerSpec {
+            artwork: false,
+            details: false,
+            state: false,
+            synopsis: false,
+            timers: false,
+        });
+        let mut gate = Gate::new();
+        let mut record =
+            |kind, raw: String, a: Option<presence::Action>, res: presence::Resolved| {
+                st.record_preview(kind, raw, a, res);
+            };
+        let act = presence::Action {
+            running: true,
+            has_start: true,
+            start: now - 1000,
+            ct: 1000,
+            ..presence::Action::default()
+        };
+        push_activity(
+            &log,
+            &dc,
+            &mut gate,
+            config::CardSpecs::default(),
+            &mut record,
+            "Dune.Part.Two.2024.1080p.mkv - PotPlayer",
+            Some(&act),
+            1000,
+            2_832_979,
+            now,
+            true,
+            false,
+        );
+        drop(record);
+        let payload = frx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("SET_ACTIVITY frame");
+        let v: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let a = &v["args"]["activity"];
+        let header = a["name"].as_str().unwrap_or("");
+        assert!(
+            header.contains("Dune Part Two") && !header.is_empty(),
+            "the header is the media title, got {header:?}"
+        );
+        assert!(a.get("details").is_none(), "details toggle reached wire");
+        assert!(a.get("state").is_none(), "state toggle reached wire");
+        assert!(a.get("assets").is_none(), "artwork toggle reached wire");
+        assert!(a.get("timestamps").is_none(), "timer toggle reached wire");
+        assert_ne!(a["name"], "Potflix");
+        assert_eq!(
+            a["name"].as_str().unwrap_or(""),
+            st.preview_activity().0.name,
+            "the preview and the wire share the header"
+        );
+        presence::set_live_designer(presence::designer::DesignerSpec::default());
         let _ = dc.close();
         let _ = reader.join();
         let _ = std::fs::remove_dir_all(&dir);
@@ -1924,7 +2067,7 @@ mod tests {
         };
         push_activity(&log, &dc, &mut gate, config::CardSpecs::default(), &mut record, raw_a, Some(&act), 1000, TOTAL, NOW, true, false);
         let first = frx.recv_timeout(Duration::from_secs(2)).expect("first card");
-        let (d1, _) = wire_lines(&first);
+        let (d1, s1) = wire_lines(&first);
         // One poll later the corrected title sends at once, not at heartbeat.
         let act2 = presence::Action {
             running: true,
@@ -1935,8 +2078,12 @@ mod tests {
         };
         push_activity(&log, &dc, &mut gate, config::CardSpecs::default(), &mut record, raw_b, Some(&act2), 1250, TOTAL, NOW + 250, true, false);
         let second = frx.recv_timeout(Duration::from_secs(2)).expect("correction must send immediately");
-        let (d2, _) = wire_lines(&second);
-        assert_ne!(d1, d2, "the wire must carry the corrected lines");
+        let (d2, s2) = wire_lines(&second);
+        assert_ne!(
+            (d1, s1),
+            (d2, s2),
+            "the wire must carry the corrected lines"
+        );
         assert_eq!(previews.get(), 2, "preview records after each successful send");
         assert!(frx.recv_timeout(Duration::from_millis(250)).is_err(), "no duplicate frame");
         let _ = dc.close();
@@ -2282,49 +2429,47 @@ mod tests {
         assert_eq!(dm1, edm1);
         assert_eq!(sm1.as_deref().unwrap_or(""), esm1);
 
-        // A published MOVIE spec change must also send by itself. An unresolved
-        // movie has no synopsis/year/genres/length, so every kept state preset
-        // blanks (the clean-title fallback equals the header and blanks to the
-        // deliberate one-line shape): the baseline default is ("","") and
-        // `tag`/`synopsis`/`none` are gate-identical to it. The reachable
-        // payload-changing movie spec under no metadata is the retired Details
-        // `title` id, which the composer still renders (header) for old
-        // in-flight specs -- the regression here is that the published mirror
-        // reaches the next poll, not which preset the Card view offers. The
-        // NEXT poll with the SAME title, the same ct/total/action and
-        // `event = false` must still send the new movie lines by itself.
+        // Movie variant: without metadata the default movie card is already
+        // title-led, so a published Details "title" preset cannot change the
+        // unresolved wire. Prove the mirror directly instead: publish the
+        // spec, read it back, and compose a resolved movie -- the title preset
+        // drops the year the default would carry.
         let mut specs_c = specs_b.clone();
         assert!(specs_c.set_line(config::CardKind::Movie, config::CardLine::Details, "title"));
         config::set_live_card_specs(specs_c.clone());
-        push_activity(
-            &log,
-            &dc,
-            &mut gate,
-            live_card_specs(),
-            &mut noop,
+        assert_eq!(
+            live_card_specs()
+                .for_kind(config::CardKind::Movie)
+                .details,
+            "title",
+            "the published movie spec is visible to the composer"
+        );
+        let resolved_movie = presence::Resolved {
+            series: "Dune: Part Two".to_string(),
+            year: 2024,
+            is_movie: true,
+            genres: "Sci-Fi".to_string(),
+            length: "2h 46m".to_string(),
+            ..presence::Resolved::default()
+        };
+        let movie_card = presence::compose_card(
             movie_raw,
             Some(&act_m),
-            2000,
-            TOTAL,
-            NOW + 750,
-            false,
-            false,
+            &resolved_movie,
+            true,
+            &live_card_specs().for_kind(config::CardKind::Movie),
         );
-        let third = frx.recv_timeout(Duration::from_secs(2)).expect(
-            "a movie spec change must send on the next poll with no event",
+        assert_eq!(
+            movie_card.name, "Dune: Part Two",
+            "the header carries the movie title"
         );
-        let (d3, s3) = wire_lines(&third);
-        let (ed3, es3) = expect_lines(movie_raw, &act_m, &specs_c);
-        assert_eq!(d3, ed3);
-        assert_eq!(s3.as_deref().unwrap_or(""), es3);
-        assert_ne!(
-            (dm1, sm1),
-            (d3.clone(), s3.clone()),
-            "the wire must carry the new movie lines"
+        assert_eq!(
+            movie_card.details, "",
+            "the title preset repeats the header and blanks"
         );
-        assert!(
-            !d3.is_empty(),
-            "movie details 'title' must reach the wire, got {d3:?}"
+        assert_eq!(
+            movie_card.state, "Sci-Fi \u{b7} 2h 46m",
+            "state survives the details preset"
         );
 
         config::set_live_card_specs(config::CardSpecs::default());
@@ -2741,17 +2886,16 @@ mod tests {
         assert_eq!(
             a["name"].as_str().unwrap_or(""),
             "Latch Show",
-            "the latch's series name: {v}"
+            "the latch's series name is the header: {v}"
         );
-        assert_eq!(
-            a["details"].as_str().unwrap_or(""),
-            "The Pin Episode",
-            "the pin's episode title leads the card: {v}"
+        assert!(
+            a.get("details").is_none() || a["details"].as_str() == Some(""),
+            "line 1 blanks: the header carries the series title: {v}"
         );
         assert_eq!(
             a["state"].as_str().unwrap_or(""),
-            "S02E05 - A synopsis from the pin.",
-            "the pin's episode code plus synopsis is the state: {v}"
+            "S02E05 \u{b7} The Pin Episode",
+            "the pin's episode code and title are line 2: {v}"
         );
         assert_eq!(
             a["assets"]["large_text"].as_str().unwrap_or(""),
@@ -2853,21 +2997,25 @@ mod tests {
             .expect("a latched movie card must go out");
         let v: serde_json::Value = serde_json::from_slice(&frame).expect("decode frame");
         let a = &v["args"]["activity"];
-        assert_eq!(a["name"].as_str().unwrap_or(""), "Latch Movie", "{v}");
+        assert_eq!(
+            a["name"].as_str().unwrap_or(""),
+            "Latch Movie",
+            "the snapshot's title is the header: {v}"
+        );
         assert_eq!(
             a["details"].as_str().unwrap_or(""),
-            "The media snapshot's synopsis.",
-            "T5-A movie shape: the snapshot's synopsis leads the card: {v}"
+            "Latch Movie (2019)",
+            "the snapshot's title and year lead the card: {v}"
         );
         assert_eq!(
             a["state"].as_str().unwrap_or(""),
-            "2019 \u{b7} Action \u{b7} 1h 40m",
-            "T5-A movie shape: year, genres and runtime: {v}"
+            "Action \u{b7} 1h 40m",
+            "the snapshot's genres and runtime: {v}"
         );
         assert_eq!(
             a["assets"]["large_text"].as_str().unwrap_or(""),
-            "",
-            "T5-A movie shape: no tooltip, the synopsis is not repeated: {v}"
+            "The media snapshot's synopsis.",
+            "the snapshot's synopsis is the artwork tooltip: {v}"
         );
         assert_eq!(
             a["assets"]["large_image"].as_str().unwrap_or(""),
@@ -3527,9 +3675,8 @@ mod tests {
         assert!(!res.is_movie, "absolute series latch is never a movie");
         assert_eq!(res.absolute, 7, "absolute from the query");
         assert_eq!((res.season, res.number), (0, 0), "no fabricated season");
-        // The provisional card composes: details stay empty (never the show
-        // header -- the header already carries it) while the state carries
-        // the episode code; never a panic.
+        // The provisional card composes: the show title in the header (line 1
+        // blanks) and the absolute code on line 2; never a panic.
         let card = presence::compose_card(
             "Latch.Show.07.1080p.mkv - PotPlayer",
             None,
@@ -3537,8 +3684,9 @@ mod tests {
             res.is_movie,
             &presence::cardspec::default_card_spec(),
         );
-        assert_eq!(card.details, "", "provisional details stay empty");
-        assert_eq!(card.state, "E7", "provisional state carries the tag");
+        assert_eq!(card.name, "Latch Show", "provisional header");
+        assert_eq!(card.details, "", "provisional details blank");
+        assert_eq!(card.state, "E07", "provisional state carries the code");
     }
 
     /// T1: an explicit series latch beats a movie-classified file on the

@@ -797,19 +797,27 @@ pub fn run_self_test(log: &Logger) -> ! {
         );
     }
     let assets = &activity["assets"];
-    if assets["large_image"].as_str() != Some("logo") {
+    // An unresolved large image is omitted entirely: the branded `logo` is
+    // never a missing-art fallback.
+    if assets.get("large_image").is_some() {
         m3fail(
             &mut out,
             &format!(
-                "large_image = {:?}, want \"logo\" (assets = {assets})",
+                "large_image = {:?}, want omitted (assets = {assets})",
                 assets["large_image"].as_str()
             ),
         );
     }
+    // The component was handed `small_image: "play"` above, but the wire
+    // boundary drops the small slot: it is caller-compat only and must never
+    // be serialized (no status icon over the artwork).
     if assets.get("small_image").is_some() {
         m3fail(
             &mut out,
-            &format!("small_image present, want omitted: {assets}"),
+            &format!(
+                "small_image = {:?}, want omitted (no status icon on the wire; assets = {assets})",
+                assets["small_image"].as_str()
+            ),
         );
     }
     if assets.get("large_text").is_some() {
@@ -825,7 +833,7 @@ pub fn run_self_test(log: &Logger) -> ! {
         );
     }
     out.line(&format!(
-        "m3: SET_ACTIVITY pid={} details={details:?} large_image=\"logo\" start=12345 end=67890",
+        "m3: SET_ACTIVITY pid={} details={details:?} large_image=\"logo\" small_image=omitted start=12345 end=67890",
         std::process::id()
     ));
     log.log("selftest: m3 set_activity ok");
@@ -1016,6 +1024,36 @@ pub fn run_self_test(log: &Logger) -> ! {
                 "positive control: forced push-attempt line missing from {}",
                 log.path().display()
             ),
+        );
+    }
+    // Owner regression (2026-10-28), proven on the line this run wrote (the log
+    // accumulates across runs, so read the LAST push-attempt line only): the
+    // header is the media title (`Watching Show` on the client), never the app
+    // name, and a card with no resolved artwork carries no assets at all -- no
+    // branded logo fallback, no status icon.
+    let Some(last_sent) = log_data
+        .lines()
+        .rev()
+        .find(|line| line.contains("push attempt gate=sent"))
+    else {
+        m3fail(
+            &mut out,
+            &format!(
+                "positive control: no sent push-attempt line in {}",
+                log.path().display()
+            ),
+        );
+    };
+    if !last_sent.contains(r#""name":"Show""#) {
+        m3fail(
+            &mut out,
+            &format!("positive control: the media-title header is missing: {last_sent}"),
+        );
+    }
+    if last_sent.contains(r#""logo""#) || last_sent.contains(r#""small_image""#) {
+        m3fail(
+            &mut out,
+            &format!("positive control: a branded/status icon reached the wire: {last_sent}"),
         );
     }
     out.line(&format!(

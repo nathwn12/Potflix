@@ -27,7 +27,10 @@ use titleclean::{clean, trunc};
 use crate::clock::IntervalClock;
 
 pub mod cardspec;
+pub mod designer;
 pub mod gate;
+
+pub use designer::{DesignerSpec, live_designer, set_live_designer};
 
 pub(crate) mod clock;
 
@@ -391,9 +394,9 @@ pub(crate) const LARGE_TEXT_BUDGET: usize = 128;
 
 /// Discord caps `large_image` at 300 chars (`code=4000` otherwise). A
 /// Kitsu-signed Backblaze URL can exceed it, so an over-budget URL is omitted
-/// (fallback to `"logo"`) rather than truncated (a cut signed URL is a broken
-/// link). `Resolved` carries no alternative short artwork URL, so `"logo"` is
-/// the stable short asset; no new network calls.
+/// whole rather than truncated (a cut signed URL is a broken link). No
+/// substitute is sent: the branded mark is never a missing-art fallback; no
+/// new network calls.
 pub(crate) const LARGE_IMAGE_BUDGET: usize = 300;
 
 /// The body-line joiner: U+00B7 MIDDLE DOT with single spaces.
@@ -401,12 +404,6 @@ pub(crate) const JOINER: &str = " \u{b7} ";
 
 /// The `1<<28` "no cap" budget the sanitizers use before a real cap is applied.
 pub(crate) const HUGE: usize = 1 << 28;
-
-/// Enables the SET_ACTIVITY `name` header override: the card header becomes
-/// "Watching <title>" instead of the Discord app name (`presence.go:281`).
-/// REVERT IN ONE EDIT: set this to `false` to drop the override entirely (the
-/// header then falls back to the app name); nothing else needs to change.
-const ACTIVITY_NAME_HEADER: bool = true;
 
 /// Java's `\s` class (`[ \t\n\x0B\f\r]`), the class `^\s*-\s*` matches on.
 const JAVA_WS: [char; 6] = [' ', '\t', '\n', '\u{0b}', '\u{0c}', '\r'];
@@ -446,14 +443,14 @@ pub fn with_state_time(context: &str, suffix: &str) -> String {
 /// The Discord payload (contract section 5) (`presence.go:318-344`). `type_` is
 /// always "PLAYING"; the fields not listed are deliberately unset.
 ///
-/// Netflix-style mapping (no buttons, no status icons): the header (`name`) is
-/// the media title, the first body line (`details`) is the episode name when
-/// known, else the episode tag, else the title, and the second body line
-/// (`state`) is the episode tag when it adds information, else empty. `large_text`
-/// names the app ("PotFlix"); `name` is governed by `ACTIVITY_NAME_HEADER`:
-/// empty falls back to the Discord app name header. `paused` marks the parked
-/// pause card for the send gate (the pause timer is carried by timestamps, not
-/// by an icon).
+/// Netflix-style mapping: the header (`name`) is the media title -- the movie
+/// title, or the series title for an episode -- so the client renders
+/// `Watching <title>`, never `Watching Potflix`. The first body line
+/// (`details`) is the movie `Title (Year)` (and blanks for a series, whose
+/// title the header now carries); the second body line (`state`) is the movie
+/// genre/runtime or the episode `SxxEyy · Episode`. `large_text` is the
+/// synopsis snippet; `large_image` is the resolved artwork and nothing else.
+/// `paused` marks the parked pause card for the send gate.
 ///
 /// `small_image`/`small_text`/`buttons` are retained only so existing callers
 /// keep compiling; the builders never populate them and the wire never
@@ -463,24 +460,24 @@ pub fn with_state_time(context: &str, suffix: &str) -> String {
 pub struct Activity {
     /// The activity type; always "PLAYING" from the builders.
     pub type_: String,
-    /// The card header; empty falls back to the Discord app name.
+    /// The card header: the media title (movie title, or series title for an
+    /// episode). Empty only on the idle card.
     pub name: String,
     /// The first body line.
     pub details: String,
     /// The second body line.
     pub state: String,
-    /// "logo", or the resolved https artwork URL.
+    /// The resolved https artwork URL, or empty when none resolved. Never the
+    /// branded app mark.
     pub large_image: String,
-    /// "PotFlix", or the synopsis in the hover slot.
+    /// The synopsis snippet (<=128, explicitly ellipsized), or empty.
     pub large_text: String,
     /// True for the parked pause card. The gate keys its once-and-park behaviour
     /// off this, not off `small_image`.
     pub paused: bool,
-    /// Legacy: the builders never populate it. The gate still honours
-    /// `small_image == "pause"` as a pause signal so previously built cards keep
-    /// their meaning.
+    /// Legacy compat: never populated by the builders (no corner icon).
     pub small_image: String,
-    /// Legacy: the builders never populate it.
+    /// Legacy compat: never populated by the builders (no corner icon).
     pub small_text: String,
     /// Whether `start` is meaningful.
     pub has_start: bool,
@@ -521,10 +518,7 @@ pub fn build_activity(raw_title: &str, a: Option<&Action>) -> Activity {
             type_: "PLAYING".to_string(),
             details: "Browsing".to_string(),
             state: "Idle".to_string(),
-            large_image: "logo".to_string(),
-            large_text: "PotFlix".to_string(),
-            // `name` intentionally unset: the header falls back to the app name.
-            // No small image/text: the idle card carries no status icon.
+            // No assets on the idle card: no branded mark as artwork, no icon.
             ..Activity::default()
         };
     }
@@ -559,14 +553,15 @@ pub fn build_activity(raw_title: &str, a: Option<&Action>) -> Activity {
         type_: "PLAYING".to_string(),
         details,
         state,
-        large_image: "logo".to_string(),
-        large_text: "PotFlix".to_string(),
+        // No artwork is resolved on the filename-only path, and no branded mark
+        // is ever substituted for it.
         paused: a.paused,
         ..Activity::default()
     };
-    if ACTIVITY_NAME_HEADER {
-        act.name = title;
-    }
+    // The header is the media title on every path. The shipped per-kind
+    // composer sets the same identity; this fallback is pinned by its own
+    // unit tests, not sent.
+    act.name = title;
     // No small_image/small_text on any branch: the card carries no
     // play/pause/stop corner icon. The pause is signalled by `paused` (for the
     // gate) and the " - Paused" state marker (for the viewer).
@@ -918,6 +913,47 @@ pub(crate) fn smart_trim_synopsis(s: &str, max: usize) -> String {
     format!("{base}\u{2026}")
 }
 
+/// The Discord artwork-tooltip snippet: the stored synopsis at
+/// [`LARGE_TEXT_BUDGET`] UTF-16 units. A note that fits rides whole; a longer
+/// note is cut on a character boundary (word-aware when the text has spaces)
+/// and ALWAYS ends with a single U+2026, so a truncated Discord tooltip is
+/// never mistaken for the complete note. The complete stored note stays in
+/// Potflix's own hover/focus tooltip; this function is only the snippet that
+/// fits Discord's 128-unit `large_text` cap.
+pub(crate) fn synopsis_snippet(s: &str) -> String {
+    let full = rp_text(s, HUGE);
+    if utf16_units(&full) <= LARGE_TEXT_BUDGET {
+        return full;
+    }
+    if LARGE_TEXT_BUDGET <= 1 {
+        return "\u{2026}".to_string();
+    }
+    let runes: Vec<char> = full.chars().collect();
+    let mut used = 0usize;
+    let mut end = 0usize;
+    for (i, r) in runes.iter().enumerate() {
+        let sz = r.len_utf16();
+        if used + sz > LARGE_TEXT_BUDGET - 1 {
+            break;
+        }
+        used += sz;
+        end = i + 1;
+    }
+    let mut prefix: String = runes[..end].iter().collect();
+    // Prefer a whole word: cut at the last space inside the budget. A spaceless
+    // run keeps the character-boundary prefix.
+    if let Some(pos) = prefix.rfind(' ') {
+        prefix.truncate(pos);
+    }
+    let base = strip_cut_trail(prefix.trim())
+        .trim_end_matches(['.', '!', '?'])
+        .trim_end();
+    if base.is_empty() {
+        return "\u{2026}".to_string();
+    }
+    format!("{base}\u{2026}")
+}
+
 /// The header identity: the canonical series/movie title, else the clean
 /// filename title. Empty only for the idle card (the caller returns early).
 fn compose_name_inner(raw_title: &str, r: &Resolved) -> String {
@@ -936,34 +972,41 @@ fn compose_name_inner(raw_title: &str, r: &Resolved) -> String {
     }
 }
 
-/// The hover slot: series carry the whole synopsis (word-aware,
-/// [`LARGE_TEXT_BUDGET`]), else the canonical series title, else "PotFlix".
-/// Movies omit the tooltip (`""`, dropped on the wire) so the synopsis is not
-/// repeated: it already lives on the details line.
-fn compose_large_text_inner(r: &Resolved, is_movie: bool) -> String {
-    if is_movie {
+/// The Discord card header exactly as the client renders it: `Watching <name>`.
+/// `name` is the media title (the movie title, or the series title for an
+/// episode), never the application name; an empty `name` (the idle card) has no
+/// header line. One definition, so the Card-view preview and the wire can never
+/// disagree about the header.
+pub fn header_line(a: &Activity) -> String {
+    if a.name.trim().is_empty() {
         return String::new();
     }
-    let s = trim_word(&r.synopsis, LARGE_TEXT_BUDGET);
-    if !s.is_empty() {
-        return s;
-    }
-    if !r.series.is_empty() {
-        return trunc(&r.series, LARGE_TEXT_BUDGET);
-    }
-    "PotFlix".to_string()
+    format!("Watching {}", a.name)
+}
+
+/// The hover slot: the synopsis snippet for BOTH kinds. Discord has no
+/// dedicated synopsis field, so the complete stored note lives in Potflix's
+/// own hover/focus tooltip and this slot carries the <=128-unit, explicitly
+/// ellipsized snippet. A movie's note is no longer omitted: it is the only
+/// place the Discord card can surface a synopsis. No synopsis means no
+/// tooltip (empty, omitted on the wire), never a duplicate of the title.
+fn compose_large_text_inner(r: &Resolved, _is_movie: bool) -> String {
+    synopsis_snippet(&r.synopsis)
 }
 
 /// The artwork slot: the https URL when present and within
-/// [`LARGE_IMAGE_BUDGET`], else "logo". Never empty, never truncated, never
-/// over budget (Discord rejects `large_image` longer than 300 chars).
+/// [`LARGE_IMAGE_BUDGET`], else EMPTY. The card never substitutes the branded
+/// app mark for missing artwork (owner decision 2026-10-28): an unresolved
+/// poster means no image, never a Potflix icon standing in for the media. Never
+/// truncated and never over budget (Discord rejects `large_image` longer than
+/// 300 chars); an over-budget signed URL is dropped for the same reason.
 fn compose_large_image_inner(r: &Resolved) -> String {
     if (r.artwork.starts_with("http://") || r.artwork.starts_with("https://"))
         && r.artwork.len() <= LARGE_IMAGE_BUDGET
     {
         r.artwork.clone()
     } else {
-        "logo".to_string()
+        String::new()
     }
 }
 
@@ -1107,30 +1150,13 @@ fn split_digits(s: &str) -> Option<(&str, &str)> {
     Some(s.split_at(n))
 }
 
-/// The details fill ladder (a series line without an episode title and a bare
-/// movie with no synopsis/year/genres/length stay empty rather than repeating
-/// the title). Series `default` is the canonical episode title, else the
-/// filename's own episode name, else empty -- never the show title (the show
-/// title is the activity header) and never the episode code (the code lives
-/// on the state line). Series `episode` is the episode title alone.
-/// `title`/`series` keep their
-/// current meanings and never add a second code. Movie `default` is the
-/// synopsis (word-aware, [`DETAILS_BUDGET`]), never the title and never
-/// `Title (Year)`; with no synopsis it falls back to the year when `year > 0`,
-/// else genres/length joined with [`JOINER`], else empty -- never the movie
-/// title (the title is the activity header/pill). Movie `title`/`series`
-/// branches keep their current meanings for compatibility, but the movie
-/// default never uses them. Movie branches never consult the episode code.
-///
-/// Test seam for the details-line exemption: the filename's own episode name
-/// exactly as this ladder derives it (suffix stripped, then cleaned), so the
-/// corpus sweep exempts precisely the inputs the composer itself would leave
-/// without a filename fact -- never a parallel derivation in the test.
-#[cfg(test)]
-pub(crate) fn file_episode_name(raw_title: &str) -> String {
-    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
-    clean(raw).episode_name
-}
+/// The details fill ladder. Movie `default` is `Title (Year)` (the canonical
+/// title, else the clean filename title; the year suffix is reserved out of the
+/// budget); series `default` is the canonical series title, else the clean
+/// filename title. The episode title/code never reach line 1 under the
+/// default. The retired `title`/`series`/`episode` ids keep their legacy
+/// meanings for old in-flight specs. Movie branches never consult the episode
+/// code.
 pub(crate) fn compose_details_for(
     raw_title: &str,
     r: &Resolved,
@@ -1138,12 +1164,6 @@ pub(crate) fn compose_details_for(
     details_preset: &str,
 ) -> String {
     let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
-    let c = clean(raw);
-    // The filename's own episode name: the only filename-derived fact the
-    // series default may carry. The clean title and the raw title never reach
-    // this line: both can repeat the show header the activity header already
-    // carries.
-    let file_ep = trunc(&c.episode_name, DETAILS_BUDGET);
     let canonical_ep = if r.episode_name.is_empty() {
         String::new()
     } else {
@@ -1161,44 +1181,40 @@ pub(crate) fn compose_details_for(
     };
     // The episode code never reaches the details line; movies never consult
     // it either.
-    // T5-A: the movie default is the synopsis, never the title. Fallback is
-    // the year, else genres/length, else empty -- never the title.
-    let movie_synopsis_default = trim_word(&r.synopsis, DETAILS_BUDGET);
-    let movie_genres_length_default = {
-        let g = rp_text(&r.genres, HUGE);
-        let l = rp_text(&r.length, HUGE);
-        let mut parts: Vec<&str> = Vec::new();
-        if !g.is_empty() {
-            parts.push(&g);
-        }
-        if !l.is_empty() {
-            parts.push(&l);
-        }
-        let joined = parts.join(JOINER);
-        if joined.is_empty() {
-            String::new()
-        } else {
-            trim_word(&joined, DETAILS_BUDGET)
-        }
-    };
-    let movie_fallback_default = if r.year > 0 {
-        r.year.to_string()
+    // Owner mapping: MOVIE line 1 is `Title (Year)`; SERIES line 1 is the
+    // canonical series title, never the episode title or the episode code.
+    // Both fall back to the clean filename title when the lookup is a miss.
+    // The year is reserved out of the budget first so a long title can never
+    // eat the ` (YYYY)` suffix.
+    let title_base = if !r.series.is_empty() {
+        r.series.clone()
     } else {
-        movie_genres_length_default.clone()
+        let t = clean(raw).title;
+        if t.is_empty() {
+            rp_text(raw.trim(), HUGE)
+        } else {
+            t
+        }
     };
     let default_line = if is_movie {
-        if !movie_synopsis_default.is_empty() {
-            movie_synopsis_default.clone()
+        let year_suffix = if r.year > 0 {
+            format!(" ({})", r.year)
         } else {
-            movie_fallback_default.clone()
+            String::new()
+        };
+        if title_base.is_empty() {
+            String::new()
+        } else {
+            let budget = DETAILS_BUDGET.saturating_sub(utf16_units(&year_suffix));
+            let title = trim_word(&title_base, budget);
+            if title.is_empty() {
+                String::new()
+            } else {
+                format!("{title}{year_suffix}")
+            }
         }
-    } else if !canonical_ep.is_empty() {
-        canonical_ep.clone()
     } else {
-        // No episode title: the filename's episode name, else empty. The
-        // show title never stands here (it is the activity header); the
-        // state line already carries the code/synopsis for this episode.
-        file_ep.clone()
+        trim_word(&title_base, DETAILS_BUDGET)
     };
     match details_preset {
         cardspec::CARD_DETAILS_TITLE => {
@@ -1230,28 +1246,102 @@ pub(crate) fn compose_details_for(
 }
 
 /// The state fill ladder (first non-empty rung wins; only `none` may empty the
-/// line, plus a bare movie default with no year/genres/length, which stays
-/// empty rather than repeating the title, plus any rung whose final text
-/// would equal the activity header, which blanks the same way). Series:
-/// `default` is the synopsis line -- the `SxxExx` code plus the synopsis (the
-/// raw tag when no code is available), capped word-aware at
-/// [`STATE_SYNOPSIS_BUDGET`] -- else the tag, else the clean title unless it
-/// repeats the header, so a series card with no episode facts anywhere is a
-/// deliberate one-line card; it never carries the episode title (that lives
-/// on the details line). `tag` is tag, else synopsis, else clean unless
-/// header-equal; `synopsis` is the same code-plus-synopsis line, else tag,
-/// else clean unless header-equal. Movie `default`
-/// never repeats the details line: with a synopsis it is
-/// `<Year> · <Genres> · <Runtime>` (missing parts skipped, word-aware at
-/// [`STATE_BUDGET`]); without one it is genres/length beside a year-showing
-/// details line, and empty beside a genres/length-showing one; with nothing
-/// known it stays empty. Never the title.
-/// Movie `tag` is the filename tag, else
-/// genres-plus-length, else synopsis, else clean unless header-equal;
-/// `synopsis` is genres-length-plus-synopsis, else synopsis, else clean
-/// unless header-equal. A header-equal rung blanks to `""` (`"Paused"` when
-/// paused), so no body line ever repeats the header. Every other rung carries
-/// the paused marker when paused; paused with nothing reads "Paused".
+/// line, plus any rung whose final text would equal the series title). Series
+/// `default` is `SxxEyy · Episode` (the filename tag when no code is available,
+/// the episode title else the filename's own episode name), plus the paused
+/// marker. The explicit `tag`/`synopsis` presets keep their legacy shapes.
+/// Movie `default` is `<Genres> · <Runtime>`, missing parts skipped, plus the
+/// paused marker; the year lives on the details line.
+///
+/// The shipped MOVIE state line: concise genre/playback information --
+/// `<Genres> · <Runtime>`, with missing parts skipped, and the paused marker
+/// when paused. The year lives on the details line (`Title (Year)`), so it is
+/// never repeated here.
+fn default_movie_state(r: &Resolved, a: Option<&Action>) -> String {
+    let paused = a.is_some_and(|x| x.paused);
+    let g = rp_text(&r.genres, HUGE);
+    let l = rp_text(&r.length, HUGE);
+    let mut parts: Vec<&str> = Vec::new();
+    if !g.is_empty() {
+        parts.push(&g);
+    }
+    if !l.is_empty() {
+        parts.push(&l);
+    }
+    let base = parts.join(JOINER);
+    if base.is_empty() {
+        return if paused {
+            strip_leading_dash(PAUSED_MARKER).to_string()
+        } else {
+            String::new()
+        };
+    }
+    let cap = if paused {
+        STATE_BUDGET - PAUSED_MARKER.len()
+    } else {
+        STATE_BUDGET
+    };
+    let line = trim_word(&base, cap);
+    if paused {
+        with_state_time(&line, PAUSED_MARKER)
+    } else {
+        line
+    }
+}
+
+/// The shipped SERIES episode state line: `SxxEyy • Episode`. The code comes
+/// from the resolved season/number (absolute when that is all the provider
+/// gives); the episode title is the resolved title, else the filename's own
+/// episode name. With no code and no title the filename tag is the fallback;
+/// with no episode fact at all the line stays empty rather than repeat the
+/// series title that now lives on the details line. The paused marker rides
+/// the line exactly as before.
+fn default_episode_state(raw_title: &str, a: Option<&Action>, r: &Resolved) -> String {
+    let raw = raw_title.strip_suffix(SUFFIX).unwrap_or(raw_title);
+    let c = clean(raw);
+    let code = episode_code(r.season, r.number, r.absolute, &c.episode_tag);
+    // No resolved numbers: the filename's own tag is the only honest code, and
+    // it rides as-is (never normalized into a season the lookup did not give).
+    let code = if code.is_empty() {
+        rp_text(&c.episode_tag, STATE_BUDGET)
+    } else {
+        code
+    };
+    let ep = if r.episode_name.is_empty() {
+        rp_text(&c.episode_name, HUGE)
+    } else {
+        rp_text(&r.episode_name, HUGE)
+    };
+    let base = if !code.is_empty() && !ep.is_empty() {
+        format!("{code}{JOINER}{ep}")
+    } else if !code.is_empty() {
+        code
+    } else if !ep.is_empty() {
+        ep
+    } else {
+        rp_text(&c.episode_tag, STATE_BUDGET)
+    };
+    let paused = a.is_some_and(|x| x.paused);
+    if base.is_empty() {
+        return if paused {
+            strip_leading_dash(PAUSED_MARKER).to_string()
+        } else {
+            String::new()
+        };
+    }
+    let cap = if paused {
+        STATE_BUDGET - PAUSED_MARKER.len()
+    } else {
+        STATE_BUDGET
+    };
+    let line = trim_word(&base, cap);
+    if paused {
+        with_state_time(&line, PAUSED_MARKER)
+    } else {
+        line
+    }
+}
+
 pub(crate) fn compose_state_for(
     raw_title: &str,
     a: Option<&Action>,
@@ -1332,47 +1422,7 @@ fn compose_state_inner(
                 }
             }
             _ => {
-                // The movie default never repeats a line the details line
-                // already carries. With a synopsis (details = synopsis) the
-                // state joins year, genres and runtime with the middle-dot
-                // joiner, skipping missing parts. Without one the details
-                // line already shows the year (when known) or the
-                // genres/length pair, so the state carries only what details
-                // does not: genres/length beside a year, and nothing at all
-                // beside genres/length. A bare movie (nothing known) stays
-                // empty rather than repeating the title.
-                let has_synopsis = !rp_text(&r.synopsis, HUGE).is_empty();
-                let y_full = if has_synopsis && r.year > 0 {
-                    r.year.to_string()
-                } else {
-                    String::new()
-                };
-                let g_full = rp_text(&r.genres, HUGE);
-                let l_full = rp_text(&r.length, HUGE);
-                let mut parts: Vec<&str> = Vec::new();
-                if !y_full.is_empty() {
-                    parts.push(&y_full);
-                }
-                if (has_synopsis || r.year > 0) && !g_full.is_empty() {
-                    parts.push(&g_full);
-                }
-                if (has_synopsis || r.year > 0) && !l_full.is_empty() {
-                    parts.push(&l_full);
-                }
-                let joined = parts.join(JOINER);
-                if joined.is_empty() {
-                    if paused {
-                        return with_state_time("", PAUSED_MARKER);
-                    }
-                    return String::new();
-                }
-                if paused {
-                    return with_state_time(
-                        &trim_word(&joined, STATE_BUDGET - PAUSED_MARKER.len()),
-                        PAUSED_MARKER,
-                    );
-                }
-                return trim_word(&joined, STATE_BUDGET);
+                return default_movie_state(r, a);
             }
         }
     } else {
@@ -1400,19 +1450,7 @@ fn compose_state_inner(
                 }
             }
             _ => {
-                // T4: the default is the synopsis line (the `synopsis`
-                // preset's combined rung): the code plus the synopsis where
-                // known, else the tag, else the clean title. The episode
-                // title never appears here; it lives on the details line.
-                if !combined.is_empty() {
-                    return combined;
-                }
-                if !tag.is_empty() {
-                    return tag;
-                }
-                if !clean.is_empty() {
-                    return clean;
-                }
+                return default_episode_state(raw_title, a, r);
             }
         }
     }
@@ -1427,6 +1465,10 @@ fn compose_state_inner(
 /// ladder (a bare movie default with no synopsis/year/genres/length stays
 /// empty rather than repeating the title). `is_movie` drives the
 /// kind branches; the idle card keeps its shipped lines under any spec.
+///
+/// The header (`name`) is always the media title, so the client renders
+/// `Watching <title>`; the artwork slot is the resolved poster URL or empty
+/// (never the branded mark), and the small status slot is never populated.
 pub fn compose_card(
     raw_title: &str,
     a: Option<&Action>,
@@ -1440,25 +1482,24 @@ pub fn compose_card(
             type_: "PLAYING".to_string(),
             details: "Browsing".to_string(),
             state: "Idle".to_string(),
-            large_image: "logo".to_string(),
-            large_text: "PotFlix".to_string(),
+            // No assets on the idle card: no branded mark as artwork, no icon.
             ..Activity::default()
         };
     }
     let (details, state) = spec.render_kind(raw_title, a, r, is_movie);
     let name = compose_name_inner(raw_title, r);
+    let paused = a.is_some_and(|x| x.paused);
     let mut act = Activity {
         type_: "PLAYING".to_string(),
+        name,
         details,
         state,
         large_image: compose_large_image_inner(r),
         large_text: compose_large_text_inner(r, is_movie),
-        paused: a.is_some_and(|x| x.paused),
+        paused,
+        // No small slot: the card carries no status icon over the artwork.
         ..Activity::default()
     };
-    if ACTIVITY_NAME_HEADER {
-        act.name = name;
-    }
     if let Some(x) = a
         && x.has_start
     {
@@ -1471,21 +1512,15 @@ pub fn compose_card(
 /// [`compose_card`] with the stored kind and the shipped default spec
 /// (`presence.go:662`).
 ///
-/// Movie (`r.is_movie`): details is the synopsis (word-aware at 128), else the
-/// year when `year > 0`, else genres/length, else empty -- never the title
-/// (the title is the header/pill); state repeats nothing details shows: with
-/// a synopsis it is `<Year> · <Genres> · <Runtime>` with missing parts
-/// skipped, without one it is genres/length beside a year or empty beside
-/// genres/length; the tooltip is omitted (empty)
-/// so the synopsis is not repeated. Series: details is the episode title, else the
-/// filename's own episode name, else empty (never the show title: the show
-/// title lives in the header; never the episode code: the code lives on the
-/// state line); state is the `SxxExx` code plus the
-/// synopsis (the synopsis-preset line at [`STATE_SYNOPSIS_BUDGET`]), else the
-/// episode tag, else the clean title unless it repeats the header -- then the
-/// line blanks to `""` (`"Paused"` when paused) for a deliberate one-line
-/// card. The series hover tooltip carries the whole synopsis; the paused
-/// " - Paused" marker path is preserved on every rung.
+/// Movie (`r.is_movie`): header is the movie title; details is
+/// `Title (Year)` (the clean filename title when the lookup is a miss); state
+/// is `<Genres> · <Runtime>` with missing parts skipped, plus the paused
+/// marker when paused. Series: header is the series title (clean-title
+/// fallback); details blanks because the header already carries the title;
+/// state is `SxxEyy · Episode`, else the filename tag, else the episode title,
+/// plus the paused marker. Both kinds carry the synopsis only in `large_text`
+/// as a <=128-unit, explicitly ellipsized snippet; the complete note stays in
+/// Potflix's own tooltip. `large_image` is the resolved artwork URL or empty.
 pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved) -> Activity {
     compose_card(raw_title, a, r, r.is_movie, &cardspec::default_card_spec())
 }
@@ -1494,9 +1529,8 @@ pub fn build_activity_resolved(raw_title: &str, a: Option<&Action>, r: &Resolved
 /// synopsis with " \u{b7} "; a series joins the `SxxExx` episode code (the
 /// raw episode tag when no code is available) and the synopsis with a literal
 /// `" - "`, both capped word-aware at [`STATE_SYNOPSIS_BUDGET`]. It backs
-/// the combined rung of the [`compose_state_for`] ladder under the
-/// [`cardspec::CARD_STATE_SYNOPSIS`] preset and the series default; the movie
-/// default carries no synopsis.
+/// the explicit [`cardspec::CARD_STATE_SYNOPSIS`] preset only; the shipped
+/// default keeps the synopsis in `large_text`.
 /// With no synopsis the slot hides (`""`, `"Paused"` when paused), so the
 /// preset honors the empty-hides contract (`cardspec_test::card_spec_empty_hide`).
 pub(crate) fn synopsis_state(raw_title: &str, a: Option<&Action>, r: &Resolved) -> String {

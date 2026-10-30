@@ -6,6 +6,7 @@
 //! Workspace seam: the app-support half is its only intra-repo dependency, and
 //! `windows-sys` is the only FFI path -- no C toolchain.
 
+pub mod artwork;
 pub mod brand;
 pub mod search;
 pub mod settings;
